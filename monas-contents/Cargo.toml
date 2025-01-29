@@ -1,0 +1,8 @@
+[package]
+name = "monas-contents"
+authors.workspace = true
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
