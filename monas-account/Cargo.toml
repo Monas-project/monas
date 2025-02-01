@@ -7,3 +7,4 @@ rust-version.workspace = true
 
 [dependencies]
 k256 = "0.13.4"
+p256 = "0.13.2"
