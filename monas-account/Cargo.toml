@@ -6,3 +6,4 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+k256 = "0.13.4"
