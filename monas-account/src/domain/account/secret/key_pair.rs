@@ -1,15 +1,26 @@
 pub mod k256_key_pair;
 pub mod p256_key_pair;
-use k256_key_pair as k256;
-use p256_key_pair as p256;
 
-#[derive(Clone)]
+use std::fmt::Debug;
+use crate::domain::account::secret::key_pair::k256_key_pair::K256KeyPair;
+use crate::domain::account::secret::key_pair::p256_key_pair::P256KeyPair;
+
+impl KeyPair {
+    pub fn generate(&self) -> Self {
+        match self {
+            KeyPair::K256KeyPair(_) => KeyPair::K256KeyPair(K256KeyPair::generate()),
+            KeyPair::P256KeyPair(_) => KeyPair::P256KeyPair(P256KeyPair::generate())
+        }
+    }
+}
+
 pub enum KeyPair {
-    K256KeyPair(k256::K256KeyPair),
-    P256KeyPair(p256::P256KeyPair),
+    K256KeyPair(K256KeyPair),
+    P256KeyPair(P256KeyPair),
     //AesKeyPair(AesKeyPair),
     //RsaKeyPair(RsaKeyPair),
 }
+
 
 #[derive(Debug, Clone, Copy)]
 pub enum KeyType {
@@ -17,13 +28,3 @@ pub enum KeyType {
     P256
 }
 
-impl KeyPair {
-    pub fn generate(
-        key_type: KeyType,
-    ) -> Self {
-        match key_type {
-            KeyType::K256 => KeyPair::K256KeyPair(k256::K256KeyPair::generate()),
-            KeyType::P256 => KeyPair::P256KeyPair(p256::P256KeyPair::generate()),
-        }
-    }
-}
