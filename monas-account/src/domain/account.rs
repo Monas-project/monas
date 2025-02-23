@@ -12,7 +12,7 @@ pub enum AccountError {
 
 
 impl Account {
-    pub(crate) fn init(key_pair: KeyPair) -> Self {
+    pub fn init(key_pair: KeyPair) -> Self {
         Account {
             key_pair,
             deleted: false,
@@ -79,7 +79,8 @@ mod account_tests {
         assert!(account.is_deleted());
         assert_eq!(account.regenerate_keypair(KeyPair::generate(K256)), Err(AccountError::AccountAlreadyDeleted));
     }
-
+    
+    #[test]
     fn delete_account() {
         let mut account = Account::init(KeyPair::generate(K256));
         account.delete().unwrap();

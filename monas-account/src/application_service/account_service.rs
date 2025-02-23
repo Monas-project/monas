@@ -20,7 +20,7 @@ mod account_application_tests {
 
         let is_created_key_type =
             match &account.keypair() {
-                KeyPair::K256KeyPair(k256) => true,
+                KeyPair::K256KeyPair(_) => true,
                 _ => false,
             }.clone();
         assert_eq!(is_created_key_type, true);

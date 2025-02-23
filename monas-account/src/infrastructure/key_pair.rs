@@ -27,3 +27,22 @@ impl KeyPair {
         }
     }
 }
+
+#[cfg(test)]
+mod key_pair_tests {
+    use crate::infrastructure::key_pair::{KeyPair, KeyType};
+
+    #[test]
+    fn key_pair_k256_generate_test() {
+        let k256 = KeyPair::generate(KeyType::K256);
+        match k256 {
+            KeyPair::K256KeyPair(k256_key_pair) => {
+                assert!(k256_key_pair.public_key());
+                assert!(k256_key_pair.secret_key());
+            }
+            _ => {
+                panic!("not k256 key type");
+            }
+        }
+    }
+}

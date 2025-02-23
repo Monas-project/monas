@@ -1,1 +1,1 @@
-pub(crate) mod key_pair;
+pub mod key_pair;
