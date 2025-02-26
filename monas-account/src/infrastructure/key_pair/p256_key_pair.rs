@@ -34,8 +34,8 @@ impl PartialEq for P256KeyPair {
 
 #[cfg(test)]
 mod p256_key_pair_tests {
-    use p256::ecdsa::VerifyingKey;
     use crate::infrastructure::key_pair::{KeyPair, KeyType};
+    use p256::ecdsa::VerifyingKey;
 
     #[test]
     fn key_pair_p256_generate_test() {
@@ -56,7 +56,7 @@ mod p256_key_pair_tests {
                     &signature,
                     recovery_id,
                 )
-                    .unwrap();
+                .unwrap();
 
                 let encoded_point = p256_key_pair.public_key.to_owned().to_encoded_point(false);
                 let expected_key_bytes = encoded_point.as_bytes();
