@@ -1,11 +1,10 @@
 use p256::ecdsa::{SigningKey, VerifyingKey};
 use p256::elliptic_curve::rand_core::OsRng;
-use crate::infrastructure::key_pair::{KeyPair, KeyType};
 
 #[derive(Clone)]
 pub struct P256KeyPair {
     secret_key: SigningKey,
-    public_key: VerifyingKey
+    public_key: VerifyingKey,
 }
 
 impl P256KeyPair {
@@ -22,7 +21,7 @@ impl P256KeyPair {
         let public_key = VerifyingKey::from(&secret_key);
         P256KeyPair {
             secret_key,
-            public_key
+            public_key,
         }
     }
 }
@@ -33,30 +32,40 @@ impl PartialEq for P256KeyPair {
     }
 }
 
-#[test]
-fn key_pair_p256_generate_test() {
-    let p256 = KeyPair::generate(KeyType::P256);
-    use sha3::{Keccak256, Digest};
-    let target = b"test signature target";
+#[cfg(test)]
+mod p256_key_pair_tests {
+    use p256::ecdsa::VerifyingKey;
+    use crate::infrastructure::key_pair::{KeyPair, KeyType};
 
-    match p256 {
-        KeyPair::P256KeyPair(p256_key_pair) => {
-            let digest = Keccak256::new_with_prefix(target);
-            let (signature, recovery_id) = p256_key_pair.secret_key.sign_digest_recoverable(digest).unwrap();
+    #[test]
+    fn key_pair_p256_generate_test() {
+        let p256 = KeyPair::generate(KeyType::P256);
+        use sha3::{Digest, Keccak256};
+        let target = b"test signature target";
 
-            let recovered_key = VerifyingKey::recover_from_digest(
-                Keccak256::new_with_prefix(target),
-                &signature,
-                recovery_id
-            ).unwrap();
+        match p256 {
+            KeyPair::P256KeyPair(p256_key_pair) => {
+                let digest = Keccak256::new_with_prefix(target);
+                let (signature, recovery_id) = p256_key_pair
+                    .secret_key
+                    .sign_digest_recoverable(digest)
+                    .unwrap();
 
-            let encoded_point = p256_key_pair.public_key.to_owned().to_encoded_point(false);
-            let expected_key_bytes = encoded_point.as_bytes();
-            let expected_key = VerifyingKey::from_sec1_bytes(expected_key_bytes).unwrap();
-            assert_eq!(recovered_key, expected_key);
-        }
-        _ => {
-            panic!("not p256 key type");
+                let recovered_key = VerifyingKey::recover_from_digest(
+                    Keccak256::new_with_prefix(target),
+                    &signature,
+                    recovery_id,
+                )
+                    .unwrap();
+
+                let encoded_point = p256_key_pair.public_key.to_owned().to_encoded_point(false);
+                let expected_key_bytes = encoded_point.as_bytes();
+                let expected_key = VerifyingKey::from_sec1_bytes(expected_key_bytes).unwrap();
+                assert_eq!(recovered_key, expected_key);
+            }
+            _ => {
+                panic!("not p256 key type");
+            }
         }
     }
 }
