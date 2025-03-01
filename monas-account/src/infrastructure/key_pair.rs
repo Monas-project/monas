@@ -5,7 +5,7 @@ use crate::infrastructure::key_pair::k256_key_pair::K256KeyPair;
 use crate::infrastructure::key_pair::p256_key_pair::P256KeyPair;
 use std::fmt::Debug;
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub enum KeyPair {
     K256KeyPair(K256KeyPair),
     P256KeyPair(P256KeyPair),

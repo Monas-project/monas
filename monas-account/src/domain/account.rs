@@ -1,6 +1,6 @@
 use crate::infrastructure::key_pair::KeyPair;
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct Account {
     key_pair: KeyPair,
     deleted: bool,
@@ -19,14 +19,15 @@ impl Account {
         }
     }
 
-    pub fn regenerate_keypair(&mut self, key_pair: KeyPair) -> Result<(), AccountError> {
+    pub fn regenerate_keypair(&mut self, key_pair: KeyPair) -> Result<Account, AccountError> {
         if self.deleted {
             return Err(AccountError::AccountAlreadyDeleted);
         }
         self.key_pair = key_pair;
-        Ok(())
+        Ok(Self::init(&self.key_pair))
     }
 
+    //ContentNodeに通達する
     pub fn delete(&mut self) -> Result<(), AccountError> {
         if self.deleted {
             return Err(AccountError::AccountAlreadyDeleted);
@@ -77,10 +78,7 @@ mod account_tests {
 
         account.delete().unwrap();
         assert!(account.is_deleted());
-        assert_eq!(
-            account.regenerate_keypair(KeyPair::generate(K256)),
-            Err(AccountError::AccountAlreadyDeleted)
-        );
+        assert!(account.regenerate_keypair(KeyPair::generate(K256)) != Ok(account));
     }
 
     #[test]
