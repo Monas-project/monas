@@ -31,7 +31,7 @@ jobs:
       - name: Build
         run: cargo build --workspace --all-targets --profile test
 
-  clippy:
+  lint:
     needs: build
     runs-on: ubuntu-latest
     steps:
