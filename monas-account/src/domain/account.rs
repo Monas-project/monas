@@ -69,7 +69,7 @@ mod account_tests {
 
         assert!(!key_pair_before.eq(key_pair_after));
 
-        assert_eq!(account.is_deleted(), false);
+        assert!(!account.is_deleted());
     }
 
     #[test]
