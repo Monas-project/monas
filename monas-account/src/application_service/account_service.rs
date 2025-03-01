@@ -38,7 +38,7 @@ mod account_application_tests {
     fn create_account() {
         let account = AccountService::create(KeyTypeMapper::K256).unwrap();
 
-        let is_created_key_pair = matches!(account.keypair(), KeyPair::K256KeyPair(_));
+        let is_created_key_type = matches!(account.keypair(), KeyPair::K256KeyPair(_));
         assert!(is_created_key_type);
         assert!(!account.is_deleted());
     }
