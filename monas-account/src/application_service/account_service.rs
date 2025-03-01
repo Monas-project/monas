@@ -1,6 +1,5 @@
 use crate::domain::account::Account;
 use crate::infrastructure::key_pair::{KeyPair, KeyType};
-use crate::infrastructure::public_key_repository::PersistenceKey;
 
 #[derive(Debug)]
 pub enum AccountServiceError {
