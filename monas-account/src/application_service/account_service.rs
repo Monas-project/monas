@@ -38,13 +38,9 @@ mod account_application_tests {
     fn create_account() {
         let account = AccountService::create(KeyTypeMapper::K256).unwrap();
 
-        let is_created_key_type = match account.keypair() {
-            KeyPair::K256KeyPair(_) => true,
-            _ => false,
-        }
-        .clone();
-        assert_eq!(is_created_key_type, true);
-        assert_eq!(account.is_deleted(), false);
+        let is_created_key_type = matches!(account.keypair(), KeyPair::K256KeyPair(_));
+        assert!(is_created_key_type);
+        assert!(!account.is_deleted());
     }
 }
 
@@ -55,7 +51,7 @@ mod key_type_mapper_tests {
 
     #[test]
     fn to_p256_test() {
-        let key_type: KeyType = KeyType::from(KeyTypeMapper::P256).into();
+        let key_type: KeyType = KeyType::from(KeyTypeMapper::P256);
         assert_eq!(key_type, KeyType::P256);
     }
 

@@ -9,12 +9,12 @@ pub struct ReqArguments {
 }
 
 pub struct Response {
-    generated_key_pair: GeneratedKeyPair,
+    pub generated_key_pair: GeneratedKeyPair,
 }
 
 pub struct GeneratedKeyPair {
-    public_key: Vec<u8>,
-    secret_key: Vec<u8>,
+    pub public_key: Vec<u8>,
+    pub secret_key: Vec<u8>,
 }
 
 impl GeneratedKeyPair {
@@ -25,7 +25,7 @@ impl GeneratedKeyPair {
         }
     }
 
-    pub fn secret_key(key_pair: &KeyPair) -> Vec<u8> {
+    pub fn secret_key(_key_pair: &KeyPair) -> Vec<u8> {
         //TODO
         String::from("please implement").into_bytes()
     }
