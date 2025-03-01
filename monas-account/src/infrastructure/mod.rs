@@ -1,2 +1,2 @@
 pub mod key_pair;
-mod public_key_repository;
+pub mod public_key_repository;
