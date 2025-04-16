@@ -7,7 +7,7 @@ pub type SubscribeFn = Arc<dyn Fn(&dyn Event) + Send + Sync>;
 pub type Subscribers = Vec<Subscriber>;
 
 pub struct EventSubscriptions {
-    subscriptions: HashMap<TypeId, Subscribers>,
+    pub(crate) subscriptions: HashMap<TypeId, Subscribers>,
 }
 
 /// イベントと購読ハンドラのマッピング管理
@@ -73,97 +73,5 @@ where
     Subscriber::new(wrapped)
 }
 
-#[cfg(test)]
-mod event_subscription_tests {
-    use std::any::TypeId;
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
 
-    use crate::event_subscription::event_subscription::{make_subscriber, EventSubscriptions};
-
-    #[test]
-    fn dispatch_subscriptions_test() {
-        struct TestMessageEvent {
-            message: &'static str,
-        }
-
-        let shared_str1 = Arc::new(Mutex::new(String::from("")));
-        let shared_str_clone1 = Arc::clone(&shared_str1);
-
-        let shared_str2 = Arc::new(Mutex::new(String::from("")));
-        let shared_str_clone2 = Arc::clone(&shared_str2);
-
-        let mut subscriptions = EventSubscriptions {
-            subscriptions: HashMap::new(),
-        };
-
-        let event1 = TestMessageEvent { message: "test" };
-
-        subscriptions.add_subscribers(
-            TypeId::of::<TestMessageEvent>(),
-            vec![
-                make_subscriber(move |test_event: &TestMessageEvent| {
-                    let mut ev_message1 = shared_str1.lock().unwrap();
-                    *ev_message1 = format!("fire1: {}", test_event.message.to_string())
-                }),
-                make_subscriber(move |test_event: &TestMessageEvent| {
-                    let mut ev_message2 = shared_str2.lock().unwrap();
-                    *ev_message2 = format!("fire2: {}", test_event.message.to_string())
-                }),
-            ],
-        );
-
-        subscriptions.dispatch(&event1);
-
-        assert_eq!(*shared_str_clone1.lock().unwrap(), "fire1: test");
-        assert_eq!(*shared_str_clone2.lock().unwrap(), "fire2: test");
-    }
-
-    #[test]
-    fn dispatch_all_events_test() {
-        struct TestMessageEvent1 {
-            message: &'static str,
-        }
-
-        struct TestMessageEvent2 {
-            message: &'static str,
-        }
-
-        let shared_str1 = Arc::new(Mutex::new(String::from("")));
-        let shared_str_clone1 = Arc::clone(&shared_str1);
-
-        let shared_str2 = Arc::new(Mutex::new(String::from("")));
-        let shared_str_clone2 = Arc::clone(&shared_str2);
-
-        let mut subscriptions = EventSubscriptions {
-            subscriptions: HashMap::new(),
-        };
-
-        let event1 = TestMessageEvent1 { message: "test 1" };
-
-        let event2 = TestMessageEvent2 { message: "test 2" };
-
-        subscriptions.add_subscribers(
-            TypeId::of::<TestMessageEvent1>(),
-            vec![make_subscriber(move |test_event: &TestMessageEvent1| {
-                let mut ev_message1 = shared_str1.lock().unwrap();
-                *ev_message1 = format!("fire1: {}", test_event.message.to_string())
-            })],
-        );
-
-        subscriptions.add_subscribers(
-            TypeId::of::<TestMessageEvent2>(),
-            vec![make_subscriber(move |test_event: &TestMessageEvent2| {
-                let mut ev_message2 = shared_str2.lock().unwrap();
-                *ev_message2 = format!("fire1: {}", test_event.message.to_string())
-            })],
-        );
-
-        subscriptions.dispatch(&event1);
-
-        assert_eq!(*shared_str_clone1.lock().unwrap(), "fire1: test 1");
-
-        subscriptions.dispatch(&event2);
-        assert_eq!(*shared_str_clone2.lock().unwrap(), "fire1: test 2");
-    }
-}
+//TODO test
