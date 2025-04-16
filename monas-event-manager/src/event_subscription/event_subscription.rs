@@ -1,5 +1,5 @@
 use crate::event_bus::event_bus::Event;
-use std::any::{Any, TypeId};
+use std::any::TypeId;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -72,6 +72,5 @@ where
 
     Subscriber::new(wrapped)
 }
-
 
 //TODO test

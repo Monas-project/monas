@@ -40,11 +40,11 @@ impl EventBus {
 
 #[cfg(test)]
 mod event_bus_tests {
+    use crate::event_bus::event_bus::EventBus;
+    use crate::event_subscription::event_subscription::{make_subscriber, EventSubscriptions};
     use std::any::TypeId;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
-    use crate::event_bus::event_bus::EventBus;
-    use crate::event_subscription::event_subscription::{make_subscriber, EventSubscriptions};
 
     #[test]
     fn publish_subscriptions_test() {
@@ -78,7 +78,9 @@ mod event_bus_tests {
             ],
         );
 
-        let publisher = EventBus { event_subscriptions: subscriptions };
+        let publisher = EventBus {
+            event_subscriptions: subscriptions,
+        };
 
         publisher.publish(&event1);
 
@@ -120,13 +122,15 @@ mod event_bus_tests {
 
         subscriptions.add_subscribers(
             TypeId::of::<TestMessageEvent2>(),
-            vec![        make_subscriber(move |test_event: &TestMessageEvent2| {
+            vec![make_subscriber(move |test_event: &TestMessageEvent2| {
                 let mut ev_message2 = shared_str2.lock().unwrap();
                 *ev_message2 = format!("fire1: {}", test_event.message.to_string())
             })],
         );
 
-        let publisher = EventBus { event_subscriptions: subscriptions };
+        let publisher = EventBus {
+            event_subscriptions: subscriptions,
+        };
 
         let result1 = publisher.publish(&event1);
 
@@ -157,7 +161,6 @@ mod event_bus_tests {
 
         let event2 = TestMessageEvent2 { message: "test 2" };
 
-
         subscriptions.add_subscribers(
             TypeId::of::<TestMessageEvent1>(),
             vec![make_subscriber(move |test_event: &TestMessageEvent1| {
@@ -165,7 +168,9 @@ mod event_bus_tests {
             })],
         );
 
-        let publisher = EventBus { event_subscriptions: subscriptions };
+        let publisher = EventBus {
+            event_subscriptions: subscriptions,
+        };
 
         let result = publisher.publish(&event2);
 
