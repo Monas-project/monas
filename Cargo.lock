@@ -219,6 +219,10 @@ name = "monas-contents"
 version = "0.1.0"
 
 [[package]]
+name = "monas-event-manager"
+version = "0.1.0"
+
+[[package]]
 name = "once_cell"
 version = "1.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
