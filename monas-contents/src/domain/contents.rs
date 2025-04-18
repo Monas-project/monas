@@ -1,5 +1,4 @@
 use crate::domain::metadata::Metadata;
-use crate::domain::license::License;
 use crate::domain::state_nodes::StateNodes;
 use crate::infrastructure::key_pair::{KeyPair, KeyPairFactory, KeyType};
 use crate::infrastructure::storage::StorageError;
@@ -31,7 +30,6 @@ pub enum ContentsEvent {
         name: String,
         path: String,
         public_key: String, // KeyPairから取得
-        license: License,
         nodes: StateNodes,
     },
     ContentsUpdated {
@@ -64,11 +62,10 @@ impl Contents {
         name: String,
         raw_contents: Vec<u8>,
         path: String,
-        license: License,
         nodes: StateNodes,
         key_pair: Box<dyn KeyPair>,
     ) -> Result<(Self, ContentsEvent), ContentsError> {
-        let metadata = Metadata::new(name.clone(), &raw_contents, path.clone(), license.clone(), nodes.clone());
+        let metadata = Metadata::new(name.clone(), &raw_contents, path.clone(), nodes.clone());
 
         let mut contents = Self {
             raw_contents: Some(raw_contents),
@@ -86,7 +83,6 @@ impl Contents {
             name,
             path,
             public_key: contents.key_pair.public_key(),
-            license,
             nodes,
         };
 
@@ -191,12 +187,11 @@ impl Contents {
         name: String,
         raw_contents: Vec<u8>,
         path: String,
-        license: License,
         nodes: StateNodes,
         key_type: KeyType,
     ) -> Result<(Self, ContentsEvent), ContentsError> {
         let key_pair = KeyPairFactory::generate(key_type);
-        Self::create(name, raw_contents, path, license, nodes, key_pair)
+        Self::create(name, raw_contents, path, nodes, key_pair)
     }
 
     // 削除状態を取得
@@ -225,7 +220,7 @@ impl Contents {
         }
         self.delete_status = DeleteStatus::Deleted;
         self.deleted = true;
-        
+
         // イベント発行
         let event = ContentsEvent::ContentsDeleted {
             name: self.metadata.name().to_string(),
