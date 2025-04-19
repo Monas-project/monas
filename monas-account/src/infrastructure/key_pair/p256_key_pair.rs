@@ -1,4 +1,4 @@
-use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
+use p256::ecdsa::{SigningKey, VerifyingKey};
 use p256::elliptic_curve::rand_core::OsRng;
 use p256::{EncodedPoint, FieldBytes};
 use p256::ecdsa::signature::digest::Digest;
@@ -34,10 +34,10 @@ impl AccountKeyPair for P256KeyPair {
     }
 
     fn sign(&self, message: &[u8]) -> (Vec<u8>, Option<u8>) {
-        let sig = self
+        let (signature, _) = self
             .secret_key
             .sign_digest(Keccak256::new_with_prefix(message));
-        (sig, ())
+        (signature.to_vec(), None)
     }
 }
 
@@ -50,7 +50,7 @@ impl PartialEq for P256KeyPair {
 
 #[cfg(test)]
 mod p256_key_pair_tests {
-    use k256::ecdsa::VerifyingKey;
+    use k256::ecdsa::{Signature, VerifyingKey};
     use sha3::{Digest, Keccak256};
     use p256::ecdsa::{signature::DigestVerifier};
     use crate::domain::account::AccountKeyPair;
@@ -69,13 +69,16 @@ mod p256_key_pair_tests {
         let p256 = P256KeyPair::generate();
         let message = b"test message";
 
-        let (signature, _) = p256.sign(message);
+        let (sig_bytes, _rec_id) = p256.sign(message);
 
-        // Change to p256::VerifyingKey
-        let verify_key = VerifyingKey::from_sec1_bytes(p256.public_key_bytes()).unwrap();
-        verify_key
-            .verify_digest(Keccak256::new_with_prefix(message), &signature)
-            .unwrap();
+        let signature = Signature::from_slice(&sig_bytes.as_slice())
+            .expect("invalid signature bytes");
+
+        let verifying_key = VerifyingKey::from_sec1_bytes(p256.public_key_bytes())
+            .expect("invalid public key bytes");
+
+        verifying_key.verify_digest(Keccak256::new_with_prefix(message), &signature)
+            .expect("signature should verify");
     }
 
     #[test]
