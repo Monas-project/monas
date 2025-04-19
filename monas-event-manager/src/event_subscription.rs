@@ -1,4 +1,4 @@
-use crate::event_bus::event_bus::Event;
+use crate::event_bus::Event;
 use std::any::TypeId;
 use std::collections::HashMap;
 use std::sync::Arc;

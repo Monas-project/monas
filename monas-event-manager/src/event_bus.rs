@@ -1,4 +1,4 @@
-use crate::event_subscription::event_subscription::EventSubscriptions;
+use crate::event_subscription::EventSubscriptions;
 use std::any::Any;
 
 // publisher側はこの型を継承してね
@@ -34,8 +34,8 @@ impl EventBus {
 
 #[cfg(test)]
 mod event_bus_tests {
-    use crate::event_bus::event_bus::EventBus;
-    use crate::event_subscription::event_subscription::{make_subscriber, EventSubscriptions};
+    use crate::event_bus::EventBus;
+    use crate::event_subscription::{make_subscriber, EventSubscriptions};
     use std::any::TypeId;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
