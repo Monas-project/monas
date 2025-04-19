@@ -18,15 +18,9 @@ pub struct EventBus {
 }
 
 impl EventBus {
-    pub fn initialize(event_subscriptions: EventSubscriptions) -> Self {
-        Self {
-            event_subscriptions: event_subscriptions,
-        }
-    }
-
     fn publish(&self, event: &dyn Event) -> Option<()> {
         let type_id = event.as_any().type_id();
-        if let Some(subscribers) = self.event_subscriptions.get_subscriptions().get(&type_id) {
+        if let Some(subscribers) = self.event_subscriptions.get_subscribers(&type_id) {
             for subscriber in subscribers {
                 subscriber.subscriber()(event);
             }
@@ -69,11 +63,11 @@ mod event_bus_tests {
             vec![
                 make_subscriber(move |test_event: &TestMessageEvent| {
                     let mut ev_message1 = shared_str1.lock().unwrap();
-                    *ev_message1 = format!("fire1: {}", test_event.message.to_string())
+                    *ev_message1 = format!("fire1: {}", test_event.message)
                 }),
                 make_subscriber(move |test_event: &TestMessageEvent| {
                     let mut ev_message2 = shared_str2.lock().unwrap();
-                    *ev_message2 = format!("fire2: {}", test_event.message.to_string())
+                    *ev_message2 = format!("fire2: {}", test_event.message)
                 }),
             ],
         );
@@ -116,7 +110,7 @@ mod event_bus_tests {
             TypeId::of::<TestMessageEvent1>(),
             vec![make_subscriber(move |test_event: &TestMessageEvent1| {
                 let mut ev_message1 = shared_str1.lock().unwrap();
-                *ev_message1 = format!("fire1: {}", test_event.message.to_string())
+                *ev_message1 = format!("fire1: {}", test_event.message)
             })],
         );
 
@@ -124,7 +118,7 @@ mod event_bus_tests {
             TypeId::of::<TestMessageEvent2>(),
             vec![make_subscriber(move |test_event: &TestMessageEvent2| {
                 let mut ev_message2 = shared_str2.lock().unwrap();
-                *ev_message2 = format!("fire1: {}", test_event.message.to_string())
+                *ev_message2 = format!("fire1: {}", test_event.message)
             })],
         );
 
@@ -149,22 +143,18 @@ mod event_bus_tests {
             message: &'static str,
         }
 
-        struct TestMessageEvent2 {
-            message: &'static str,
-        }
+        struct TestMessageEvent2;
 
         let mut subscriptions = EventSubscriptions {
             subscriptions: HashMap::new(),
         };
 
-        let event1 = TestMessageEvent1 { message: "test 1" };
-
-        let event2 = TestMessageEvent2 { message: "test 2" };
+        let empty_event = TestMessageEvent2;
 
         subscriptions.add_subscribers(
             TypeId::of::<TestMessageEvent1>(),
             vec![make_subscriber(move |test_event: &TestMessageEvent1| {
-                println!("empty");
+                println!("empty: {}", test_event.message);
             })],
         );
 
@@ -172,7 +162,7 @@ mod event_bus_tests {
             event_subscriptions: subscriptions,
         };
 
-        let result = publisher.publish(&event2);
+        let result = publisher.publish(&empty_event);
 
         assert!(result.is_none());
     }

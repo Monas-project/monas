@@ -12,18 +12,8 @@ pub struct EventSubscriptions {
 
 /// イベントと購読ハンドラのマッピング管理
 impl EventSubscriptions {
-    pub fn new() -> Self {
-        Self {
-            subscriptions: HashMap::new(),
-        }
-    }
-
-    pub fn get_subscriptions(&self) -> &HashMap<TypeId, Subscribers> {
-        &self.subscriptions
-    }
-
     /// 指定した TypeId に対応する Subscribers を返す
-    pub fn lookup_subscribers(&self, lookup: &TypeId) -> Option<&Subscribers> {
+    pub fn get_subscribers(&self, lookup: &TypeId) -> Option<&Subscribers> {
         self.subscriptions.get(lookup)
     }
 
