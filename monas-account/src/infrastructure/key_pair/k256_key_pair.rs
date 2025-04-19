@@ -9,7 +9,6 @@ use sha3::Keccak256;
 #[derive(Clone)]
 pub struct K256KeyPair {
     secret_key: SigningKey,
-    public_key: VerifyingKey,
     public_key_point: EncodedPoint,
     secret_key_field_key: FieldBytes,
 }
@@ -22,7 +21,6 @@ impl K256KeyPair {
         let secret_key_field_key = secret_key.to_bytes();
         K256KeyPair {
             secret_key,
-            public_key,
             public_key_point,
             secret_key_field_key,
         }
@@ -76,7 +74,7 @@ mod k256_key_pair_tests {
         let (sig_bytes, _rec_id) = k256.sign(message);
 
         let signature =
-            Signature::from_slice(&sig_bytes.as_slice()).expect("invalid signature bytes");
+            Signature::from_slice(sig_bytes.as_slice()).expect("invalid signature bytes");
 
         let verifying_key = VerifyingKey::from_sec1_bytes(k256.public_key_bytes())
             .expect("invalid public key bytes");

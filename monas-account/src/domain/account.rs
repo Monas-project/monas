@@ -64,13 +64,13 @@ mod account_tests {
     fn regenerate_key_pair() {
         let account = Account::init(KeyPairGenerateFactory::generate(K256));
 
-        let key_pair_before = account.key_pair.public_key_bytes().clone();
+        let key_pair_before = account.key_pair.public_key_bytes();
 
         account
             .regenerate_keypair(KeyPairGenerateFactory::generate(K256))
             .unwrap();
 
-        let key_pair_after = account.key_pair.public_key_bytes().clone();
+        let key_pair_after = account.key_pair.public_key_bytes();
 
         assert!(!key_pair_before.eq(key_pair_after));
 

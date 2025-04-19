@@ -38,10 +38,10 @@ mod account_application_tests {
     #[test]
     fn create_account() {
         let account = AccountService::create(KeyTypeMapper::K256).unwrap();
-        let expected = KeyPairGenerateFactory::generate(K256).public_key_bytes();
+        let generated = KeyPairGenerateFactory::generate(K256);
+        let expected = generated.public_key_bytes();
 
-        let is_created_key_type = matches!(account.keypair().public_key_bytes(), expected);
-        assert!(is_created_key_type);
+        assert_eq!(account.keypair().public_key_bytes(), expected);
         assert!(!account.is_deleted());
     }
 }
