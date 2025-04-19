@@ -37,10 +37,7 @@ impl PartialEq for K256KeyPair {
 }
 
 impl AccountKeyPair for K256KeyPair {
-    type Signature = Signature;
-    type RecoveryId = RecoveryId;
-
-    fn sign(&self, message: &[u8]) -> (Self::Signature, Self::RecoveryId) {
+    fn sign(&self, message: &[u8]) -> (Vec<u8>, Option<u8>) {
         self.secret_key
             .sign_digest(Keccak256::new_with_prefix(message));
     }

@@ -1,4 +1,3 @@
-use crate::infrastructure::key_pair::KeyPair;
 
 #[derive(Clone, PartialEq)]
 pub struct Account {
@@ -45,10 +44,17 @@ impl Account {
     }
 }
 
+pub trait AccountKeyPair {
+    fn sign(&self, msg: &[u8]) -> (Vec<u8>, Option<u8>);
+    fn public_key_bytes(&self) -> &[u8];
+
+    fn secret_key_bytes(&self) -> &[u8];
+}
+
+
 #[cfg(test)]
 mod account_tests {
     use super::*;
-    use crate::infrastructure::key_pair::KeyType::K256;
 
     #[test]
     fn regenerate_key_pair() {

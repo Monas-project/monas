@@ -25,9 +25,6 @@ impl P256KeyPair {
 }
 
 impl AccountKeyPair for P256KeyPair {
-    type Signature = Signature;
-    type RecoveryId = ();
-
     fn public_key_bytes(&self) -> &[u8] {
         self.public_key_point.as_bytes()
     }
@@ -36,7 +33,7 @@ impl AccountKeyPair for P256KeyPair {
         self.secret_key_field_key.as_ref()
     }
 
-    fn sign(&self, message: &[u8]) -> (Self::Signature, Self::RecoveryId) {
+    fn sign(&self, message: &[u8]) -> (Vec<u8>, Option<u8>) {
         let sig = self
             .secret_key
             .sign_digest(Keccak256::new_with_prefix(message));
