@@ -1,28 +1,46 @@
-use p256::ecdsa::{SigningKey, VerifyingKey};
+use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
 use p256::elliptic_curve::rand_core::OsRng;
+use p256::{EncodedPoint, FieldBytes};
+use p256::ecdsa::signature::digest::Digest;
+use p256::ecdsa::signature::DigestSigner;
+use sha3::Keccak256;
+use crate::domain::account::AccountKeyPair;
 
 #[derive(Clone)]
 pub struct P256KeyPair {
     secret_key: SigningKey,
     public_key: VerifyingKey,
+    public_key_point: EncodedPoint,
+    secret_key_field_key: FieldBytes,
 }
 
 impl P256KeyPair {
-    pub fn secret_key(&self) -> &SigningKey {
-        &self.secret_key
-    }
-
-    pub fn public_key(&self) -> &VerifyingKey {
-        &self.public_key
-    }
-
-    pub fn generate() -> P256KeyPair {
+    pub fn generate() -> Self {
         let secret_key = SigningKey::random(&mut OsRng);
         let public_key = VerifyingKey::from(&secret_key);
-        P256KeyPair {
-            secret_key,
-            public_key,
-        }
+        let public_key_point = public_key.to_encoded_point(false);
+        let secret_key_field_key = secret_key.to_bytes();
+        Self { secret_key, public_key, public_key_point, secret_key_field_key }
+    }
+}
+
+impl AccountKeyPair for P256KeyPair {
+    type Signature = Signature;
+    type RecoveryId = ();
+
+    fn public_key_bytes(&self) -> &[u8] {
+        self.public_key_point.as_bytes()
+    }
+
+    fn secret_key_bytes(&self) -> &[u8] {
+        self.secret_key_field_key.as_ref()
+    }
+
+    fn sign(&self, message: &[u8]) -> (Self::Signature, Self::RecoveryId) {
+        let sig = self
+            .secret_key
+            .sign_digest(Keccak256::new_with_prefix(message));
+        (sig, ())
     }
 }
 
@@ -32,40 +50,50 @@ impl PartialEq for P256KeyPair {
     }
 }
 
+
 #[cfg(test)]
 mod p256_key_pair_tests {
-    use crate::infrastructure::key_pair::{KeyPair, KeyType};
-    use p256::ecdsa::VerifyingKey;
+    use k256::ecdsa::VerifyingKey;
+    use sha3::{Digest, Keccak256};
+    use p256::ecdsa::{signature::DigestVerifier};
+    use crate::domain::account::AccountKeyPair;
+    use crate::infrastructure::key_pair::p256_key_pair::P256KeyPair;
 
     #[test]
-    fn key_pair_p256_generate_test() {
-        let p256 = KeyPair::generate(KeyType::P256);
-        use sha3::{Digest, Keccak256};
-        let target = b"test signature target";
+    fn generate_has_valid_sizes() {
+        let kp = P256KeyPair::generate();
 
-        match p256 {
-            KeyPair::P256KeyPair(p256_key_pair) => {
-                let digest = Keccak256::new_with_prefix(target);
-                let (signature, recovery_id) = p256_key_pair
-                    .secret_key
-                    .sign_digest_recoverable(digest)
-                    .unwrap();
+        assert_eq!(kp.public_key_bytes().len(), 65);
+        assert_eq!(kp.secret_key_bytes().len(), 32);
+    }
 
-                let recovered_key = VerifyingKey::recover_from_digest(
-                    Keccak256::new_with_prefix(target),
-                    &signature,
-                    recovery_id,
-                )
-                .unwrap();
+    #[test]
+    fn sign_and_verify() {
+        let p256 = P256KeyPair::generate();
+        let message = b"test message";
 
-                let encoded_point = p256_key_pair.public_key.to_owned().to_encoded_point(false);
-                let expected_key_bytes = encoded_point.as_bytes();
-                let expected_key = VerifyingKey::from_sec1_bytes(expected_key_bytes).unwrap();
-                assert_eq!(recovered_key, expected_key);
-            }
-            _ => {
-                panic!("not p256 key type");
-            }
-        }
+        let (signature, _) = p256.sign(message);
+
+        // Change to p256::VerifyingKey
+        let verify_key = VerifyingKey::from_sec1_bytes(p256.public_key_bytes()).unwrap();
+        verify_key
+            .verify_digest(Keccak256::new_with_prefix(message), &signature)
+            .unwrap();
+    }
+
+    #[test]
+    fn different_message_gives_different_signature() {
+        let p256 = P256KeyPair::generate();
+        let (sig1, _) = p256.sign(b"same");
+        let (sig2, _) = p256.sign(b"different");
+        assert_ne!(sig1, sig2);
+    }
+
+    #[test]
+    fn same_message_gives_same_signature() {
+        let p256 = P256KeyPair::generate();
+        let (sig1, _) = p256.sign(b"same");
+        let (sig2, _) = p256.sign(b"same");
+        assert_eq!(sig1, sig2);
     }
 }
