@@ -19,7 +19,10 @@ impl Account {
         }
     }
 
-    pub fn regenerate_keypair(&self, key_pair: Box<dyn AccountKeyPair>) -> Result<Account, AccountError> {
+    pub fn regenerate_keypair(
+        &self,
+        key_pair: Box<dyn AccountKeyPair>,
+    ) -> Result<Account, AccountError> {
         if self.deleted {
             return Err(AccountError::AccountAlreadyDeleted);
         }
@@ -51,12 +54,11 @@ pub trait AccountKeyPair: Send + Sync {
     fn secret_key_bytes(&self) -> &[u8];
 }
 
-
 #[cfg(test)]
 mod account_tests {
-    use crate::infrastructure::key_pair::KeyAlgorithm::K256;
-    use crate::infrastructure::key_pair::{KeyPairGenerateFactory};
     use super::*;
+    use crate::infrastructure::key_pair::KeyAlgorithm::K256;
+    use crate::infrastructure::key_pair::KeyPairGenerateFactory;
 
     #[test]
     fn regenerate_key_pair() {
@@ -64,7 +66,9 @@ mod account_tests {
 
         let key_pair_before = account.key_pair.public_key_bytes().clone();
 
-        account.regenerate_keypair(KeyPairGenerateFactory::generate(K256)).unwrap();
+        account
+            .regenerate_keypair(KeyPairGenerateFactory::generate(K256))
+            .unwrap();
 
         let key_pair_after = account.key_pair.public_key_bytes().clone();
 
@@ -79,9 +83,7 @@ mod account_tests {
 
         account.delete().unwrap();
         assert!(account.is_deleted());
-        let result = account.regenerate_keypair(
-            KeyPairGenerateFactory::generate(K256),
-        );
+        let result = account.regenerate_keypair(KeyPairGenerateFactory::generate(K256));
         matches!(result, Err(AccountError::AccountAlreadyDeleted));
     }
 

@@ -1,10 +1,10 @@
 pub mod k256_key_pair;
 pub mod p256_key_pair;
 
+use crate::domain::account::AccountKeyPair;
 use crate::infrastructure::key_pair::k256_key_pair::K256KeyPair;
 use crate::infrastructure::key_pair::p256_key_pair::P256KeyPair;
 use std::fmt::Debug;
-use crate::domain::account::AccountKeyPair;
 
 #[derive(Clone, PartialEq)]
 pub enum KeyPair {
@@ -34,9 +34,9 @@ impl KeyPairGenerateFactory {
 #[cfg(test)]
 mod key_pair_tests {
     use crate::domain::account::AccountKeyPair;
-    use crate::infrastructure::key_pair::{KeyPairGenerateFactory, KeyAlgorithm};
     use crate::infrastructure::key_pair::k256_key_pair::K256KeyPair;
     use crate::infrastructure::key_pair::p256_key_pair::P256KeyPair;
+    use crate::infrastructure::key_pair::{KeyAlgorithm, KeyPairGenerateFactory};
 
     #[test]
     fn key_pair_k256_generate_test() {

@@ -17,10 +17,7 @@ pub struct GeneratedKeyPair {
 }
 
 impl GeneratedKeyPair {
-    pub fn new(
-        public_key: Vec<u8>,
-        secret_key: Vec<u8>,
-    ) -> Self {
+    pub fn new(public_key: Vec<u8>, secret_key: Vec<u8>) -> Self {
         Self {
             public_key,
             secret_key,
@@ -47,11 +44,9 @@ fn to_response(account: Account) -> Response {
     let key_pair = account.keypair();
     let generated_key_pair = GeneratedKeyPair::new(
         Vec::from(key_pair.public_key_bytes()),
-        Vec::from(key_pair.secret_key_bytes())
+        Vec::from(key_pair.secret_key_bytes()),
     );
-    Response {
-        generated_key_pair
-    }
+    Response { generated_key_pair }
 }
 
 #[cfg(test)]

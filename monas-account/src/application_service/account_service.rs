@@ -33,7 +33,7 @@ impl AccountService {
 mod account_application_tests {
     use crate::application_service::account_service::{AccountService, KeyTypeMapper};
     use crate::infrastructure::key_pair::KeyAlgorithm::K256;
-    use crate::infrastructure::key_pair::{KeyPairGenerateFactory};
+    use crate::infrastructure::key_pair::KeyPairGenerateFactory;
 
     #[test]
     fn create_account() {

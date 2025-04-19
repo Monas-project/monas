@@ -1,10 +1,10 @@
+use crate::domain::account::AccountKeyPair;
+use k256::ecdsa::signature::DigestSigner;
 use k256::ecdsa::{SigningKey, VerifyingKey};
 use k256::elliptic_curve::rand_core::OsRng;
-use k256::{EncodedPoint, FieldBytes};
-use k256::ecdsa::signature::DigestSigner;
 use k256::sha2::Digest;
+use k256::{EncodedPoint, FieldBytes};
 use sha3::Keccak256;
-use crate::domain::account::AccountKeyPair;
 
 #[derive(Clone)]
 pub struct K256KeyPair {
@@ -24,7 +24,7 @@ impl K256KeyPair {
             secret_key,
             public_key,
             public_key_point,
-            secret_key_field_key
+            secret_key_field_key,
         }
     }
 }
@@ -37,7 +37,8 @@ impl PartialEq for K256KeyPair {
 
 impl AccountKeyPair for K256KeyPair {
     fn sign(&self, message: &[u8]) -> (Vec<u8>, Option<u8>) {
-        let (signature, recover_id) = self.secret_key
+        let (signature, recover_id) = self
+            .secret_key
             .sign_digest(Keccak256::new_with_prefix(message));
         (signature.to_vec(), Some(recover_id.to_byte()))
     }
@@ -53,11 +54,11 @@ impl AccountKeyPair for K256KeyPair {
 
 #[cfg(test)]
 mod k256_key_pair_tests {
+    use crate::domain::account::AccountKeyPair;
+    use crate::infrastructure::key_pair::k256_key_pair::K256KeyPair;
     use k256::ecdsa::signature::DigestVerifier;
     use k256::ecdsa::{Signature, VerifyingKey};
     use sha3::{Digest, Keccak256};
-    use crate::domain::account::AccountKeyPair;
-    use crate::infrastructure::key_pair::k256_key_pair::K256KeyPair;
 
     #[test]
     fn generate_has_valid_sizes() {
@@ -74,13 +75,14 @@ mod k256_key_pair_tests {
 
         let (sig_bytes, _rec_id) = k256.sign(message);
 
-        let signature = Signature::from_slice(&sig_bytes.as_slice())
-            .expect("invalid signature bytes");
+        let signature =
+            Signature::from_slice(&sig_bytes.as_slice()).expect("invalid signature bytes");
 
         let verifying_key = VerifyingKey::from_sec1_bytes(k256.public_key_bytes())
             .expect("invalid public key bytes");
 
-        verifying_key.verify_digest(Keccak256::new_with_prefix(message), &signature)
+        verifying_key
+            .verify_digest(Keccak256::new_with_prefix(message), &signature)
             .expect("signature should verify");
     }
 
