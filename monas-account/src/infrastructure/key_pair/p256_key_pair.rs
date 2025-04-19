@@ -54,8 +54,8 @@ impl PartialEq for P256KeyPair {
 mod p256_key_pair_tests {
     use crate::domain::account::AccountKeyPair;
     use crate::infrastructure::key_pair::p256_key_pair::P256KeyPair;
-    use k256::ecdsa::{Signature, VerifyingKey};
     use p256::ecdsa::signature::DigestVerifier;
+    use p256::ecdsa::{Signature, VerifyingKey};
     use sha3::{Digest, Keccak256};
 
     #[test]
@@ -71,10 +71,10 @@ mod p256_key_pair_tests {
         let p256 = P256KeyPair::generate();
         let message = b"test message";
 
-        let (sig_bytes, _rec_id) = p256.sign(message);
+        let (sig_bytes, _) = p256.sign(message);
 
-        let signature =
-            Signature::from_slice(sig_bytes.as_slice()).expect("invalid signature bytes");
+        let signature = Signature::from_slice(sig_bytes.as_slice())
+            .expect("invalid signature bytes");
 
         let verifying_key = VerifyingKey::from_sec1_bytes(p256.public_key_bytes())
             .expect("invalid public key bytes");

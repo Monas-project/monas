@@ -71,7 +71,7 @@ mod k256_key_pair_tests {
         let k256 = K256KeyPair::generate();
         let message = b"test message";
 
-        let (sig_bytes, _rec_id) = k256.sign(message);
+        let (sig_bytes, _) = k256.sign(message);
 
         let signature =
             Signature::from_slice(sig_bytes.as_slice()).expect("invalid signature bytes");
