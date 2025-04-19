@@ -10,20 +10,20 @@ pub struct EventSubscriptions {
     pub(crate) subscriptions: HashMap<TypeId, Subscribers>,
 }
 
-/// イベントと購読ハンドラのマッピング管理
+/// Manages the mapping between events and their subscriber handlers
 impl EventSubscriptions {
-    /// 指定した TypeId に対応する Subscribers を返す
+    /// Returns the Subscribers associated with the given TypeId
     pub fn get_subscribers(&self, lookup: &TypeId) -> Option<&Subscribers> {
         self.subscriptions.get(lookup)
     }
 
-    /// 指定した TypeId に対応する Subscribersを渡す
+    /// Registers the Subscribers associated with the given TypeId
     pub fn add_subscribers(&mut self, type_id: TypeId, subscribers: Subscribers) {
         self.subscriptions.insert(type_id, subscribers);
     }
 }
 
-// Subscriber の定義
+// Definition of a Subscriber
 pub struct Subscriber {
     subscriber: Option<SubscribeFn>,
 }
@@ -46,7 +46,7 @@ impl Subscriber {
     }
 }
 
-/// 型特有のハンドラを生成するユーティリティ関数
+/// Utility function to create a type-specific handler
 pub fn make_subscriber<T, F>(handler: F) -> Subscriber
 where
     T: Event + 'static,
@@ -63,4 +63,4 @@ where
     Subscriber::new(wrapped)
 }
 
-//TODO test
+// TODO: test

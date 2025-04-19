@@ -1,7 +1,7 @@
 use crate::event_subscription::EventSubscriptions;
 use std::any::Any;
 
-// publisher側はこの型を継承してね
+// Publishers should implement this trait
 pub trait Event: Any {
     fn as_any(&self) -> &dyn Any;
 }
@@ -12,7 +12,7 @@ impl<T: Any> Event for T {
     }
 }
 
-/// イベント処理: TODO 命名は要検討
+/// Event processor: TODO Consider renaming
 pub struct EventBus {
     event_subscriptions: EventSubscriptions,
 }
