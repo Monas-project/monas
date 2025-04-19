@@ -259,10 +259,6 @@ impl From<StorageError> for ContentsError {
     }
 }
 
-// chrono クレートを使うためにCargo.tomlに追加する必要があります
-// [dependencies]
-// chrono = { version = "0.4", features = ["serde"] }
-
 // テストケース用のClone実装
 #[cfg(test)]
 impl Clone for Contents {
