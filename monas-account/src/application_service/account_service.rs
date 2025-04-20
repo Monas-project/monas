@@ -32,16 +32,22 @@ impl AccountService {
 #[cfg(test)]
 mod account_application_tests {
     use crate::application_service::account_service::{AccountService, KeyTypeMapper};
-    use crate::infrastructure::key_pair::KeyAlgorithm::K256;
-    use crate::infrastructure::key_pair::KeyPairGenerateFactory;
 
     #[test]
-    fn create_account() {
+    fn create_valid_key_pair_account_k256() {
         let account = AccountService::create(KeyTypeMapper::K256).unwrap();
-        let generated = KeyPairGenerateFactory::generate(K256);
-        let expected = generated.public_key_bytes();
+        account.keypair().public_key_bytes();
+        assert_eq!(account.keypair().public_key_bytes().len(), 65);
+        assert_eq!(account.keypair().secret_key_bytes().len(), 32);
+        assert!(!account.is_deleted());
+    }
 
-        assert_eq!(account.keypair().public_key_bytes(), expected);
+    #[test]
+    fn create_valid_key_pair_account_p256() {
+        let account = AccountService::create(KeyTypeMapper::P256).unwrap();
+        account.keypair().public_key_bytes();
+        assert_eq!(account.keypair().public_key_bytes().len(), 65);
+        assert_eq!(account.keypair().secret_key_bytes().len(), 32);
         assert!(!account.is_deleted());
     }
 }
