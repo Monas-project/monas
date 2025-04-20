@@ -28,19 +28,19 @@ impl P256KeyPair {
 }
 
 impl AccountKeyPair for P256KeyPair {
+    fn sign(&self, message: &[u8]) -> (Vec<u8>, Option<u8>) {
+        let (signature, _) = self
+            .secret_key
+            .sign_digest(Keccak256::new_with_prefix(message));
+        (signature.to_vec(), None)
+    }
+
     fn public_key_bytes(&self) -> &[u8] {
         self.public_key_point.as_bytes()
     }
 
     fn secret_key_bytes(&self) -> &[u8] {
         self.secret_key_field_key.as_ref()
-    }
-
-    fn sign(&self, message: &[u8]) -> (Vec<u8>, Option<u8>) {
-        let (signature, _) = self
-            .secret_key
-            .sign_digest(Keccak256::new_with_prefix(message));
-        (signature.to_vec(), None)
     }
 }
 
