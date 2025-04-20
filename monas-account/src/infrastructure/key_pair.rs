@@ -33,24 +33,19 @@ impl KeyPairGenerateFactory {
 
 #[cfg(test)]
 mod key_pair_tests {
-    use crate::domain::account::AccountKeyPair;
-    use crate::infrastructure::key_pair::k256_key_pair::K256KeyPair;
-    use crate::infrastructure::key_pair::p256_key_pair::P256KeyPair;
     use crate::infrastructure::key_pair::{KeyAlgorithm, KeyPairGenerateFactory};
 
     #[test]
     fn key_pair_k256_generate_test() {
         let k256 = KeyPairGenerateFactory::generate(KeyAlgorithm::K256);
-        let key_pair = K256KeyPair::generate();
-        let key_pair_to_byte = key_pair.public_key_bytes();
-        assert_eq!(k256.public_key_bytes(), key_pair_to_byte);
+        assert_eq!(k256.public_key_bytes().len(), 65);
+        assert_eq!(k256.secret_key_bytes().len(), 32);
     }
 
     #[test]
     fn key_pair_p256_generate_test() {
         let p256 = KeyPairGenerateFactory::generate(KeyAlgorithm::P256);
-        let key_pair = P256KeyPair::generate();
-        let key_pair_to_byte = key_pair.public_key_bytes();
-        assert_eq!(p256.public_key_bytes(), key_pair_to_byte);
+        assert_eq!(p256.public_key_bytes().len(), 65);
+        assert_eq!(p256.secret_key_bytes().len(), 32);
     }
 }
