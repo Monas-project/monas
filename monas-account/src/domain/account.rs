@@ -62,19 +62,19 @@ mod account_tests {
 
     #[test]
     fn regenerate_key_pair() {
-        let account = Account::init(KeyPairGenerateFactory::generate(K256));
+        let before_account = Account::init(KeyPairGenerateFactory::generate(K256));
 
-        let key_pair_before = account.key_pair.public_key_bytes();
+        let before_key_pair = before_account.key_pair.public_key_bytes();
 
-        account
+        let after_account = before_account
             .regenerate_keypair(KeyPairGenerateFactory::generate(K256))
             .unwrap();
 
-        let key_pair_after = account.key_pair.public_key_bytes();
+        let after_key_pair = after_account.key_pair.public_key_bytes();
 
-        assert!(!key_pair_before.eq(key_pair_after));
+        assert_ne!(before_key_pair, after_key_pair);
 
-        assert!(!account.is_deleted());
+        assert!(!before_account.is_deleted());
     }
 
     #[test]
