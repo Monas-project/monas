@@ -1,14 +1,10 @@
-use crate::domain::state_nodes::StateNodes;
 use chrono::{DateTime, Utc};
-use crate::infrastructure::storage::StorageError;
-use crate::domain::contents::ContentsError;
+use std::fmt::Debug;
 
 #[derive(Debug, Clone)]
 pub struct Metadata {
     name: String,
-    version: u32,
     path: String,
-    nodes: StateNodes,
     hash: String,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
@@ -19,48 +15,31 @@ impl Metadata {
         name: String,
         raw_contents: &[u8],
         path: String,
-        nodes: StateNodes,
     ) -> Self {
         let now = Utc::now();
         Self {
             name,
-            version: 1,
             path,
-            nodes,
             hash: Self::calculate_hash(raw_contents),
             created_at: now,
             updated_at: now,
         }
     }
 
-    pub fn increment_version(&mut self) {
-        self.version += 1;
-        self.updated_at = Utc::now();
-    }
-
     fn calculate_hash(raw_contents: &[u8]) -> String {
-        // ハッシュ計算のダミー実装 (sha2 クレートを使う例)
+        // ハッシュ計算で sha2 クレートを使用
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(raw_contents);
         hex::encode(hasher.finalize())
     }
 
-    // ゲッター
     pub fn name(&self) -> &str {
         &self.name
     }
 
-    pub fn version(&self) -> u32 {
-        self.version
-    }
-
     pub fn path(&self) -> &str {
         &self.path
-    }
-
-    pub fn nodes(&self) -> &StateNodes {
-        &self.nodes
     }
 
     pub fn hash(&self) -> &str {
@@ -111,10 +90,9 @@ mod tests {
             "1f38b148591b024f56cd04fa661758d758dd31d855a225c4645126e76be72f32"
         );
 
-        // // バイナリデータのハッシュ
+        // バイナリデータのハッシュ
         let binary_data = vec![0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09];
         let binary_hash = Metadata::calculate_hash(&binary_data);
-        println!("binary_hash: {}", binary_hash);
         assert_eq!(
             binary_hash,
             "1f825aa2f0020ef7cf91dfa30da4668d791c5d4824fc8e41354b89ec05795ab3"
@@ -122,18 +100,16 @@ mod tests {
     }
     
     #[test]
-    // メタデータ生成プロセスの整合性を検証
-    fn test_metadata_hash_in_new() {
-        // テスト用のデータを準備
-        let name = "テストメタデータ".to_string();
+    fn test_metadata_creation_and_hash_validation() {
+        let name = "テストファイル".to_string();
         let raw_contents = "テストコンテンツ".as_bytes();
         let path = "/test/path".to_string();
-        let nodes = StateNodes::new(Vec::new());
-        
-        // メタデータを作成
-        let metadata = Metadata::new(name, raw_contents, path, nodes);
-        
-        // ハッシュが正しく計算されていることを確認
+        let metadata = Metadata::new(name.clone(), raw_contents, path.clone());
+
+        assert_eq!(metadata.name(), name);
+        assert_eq!(metadata.path(), path);
+        assert_eq!(metadata.created_at(), metadata.updated_at());
+
         let expected_hash = Metadata::calculate_hash(raw_contents);
         assert_eq!(metadata.hash(), expected_hash);
     }
