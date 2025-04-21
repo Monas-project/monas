@@ -189,3 +189,161 @@ impl Clone for Content {
         }
     }
 }
+
+#[cfg(test)]
+mod mock {
+    use super::*;
+
+    pub struct MockContentKeyPairFactory;
+
+    impl MockContentKeyPairFactory {
+        pub fn create_key_pair(id: &str) -> Box<dyn ContentKeyPair> {
+            Box::new(MockKeyPair {
+                id: id.to_string(),
+            })
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct MockKeyPair {
+        pub id: String,
+    }
+
+    impl ContentKeyPair for MockKeyPair {
+        fn encrypt(&self, data: &[u8]) -> Vec<u8> {
+            // 簡易的な暗号化: データの各バイトに1を加算
+            data.iter().map(|b| b.wrapping_add(1)).collect()
+        }
+
+        fn decrypt(&self, data: &[u8]) -> Vec<u8> {
+            // 簡易的な復号化: データの各バイトから1を減算
+            data.iter().map(|b| b.wrapping_sub(1)).collect()
+        }
+
+        fn public_key(&self) -> String {
+            format!("mock_public_key_{}", self.id)
+        }
+
+        fn clone_box(&self) -> Box<dyn ContentKeyPair> {
+            Box::new(self.clone())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::SystemTime;
+
+    fn create_test_metadata() -> Metadata {
+        Metadata::new(
+            "test_content".to_string(),
+            b"test content data",
+            "test/path".to_string(),
+        )
+    }
+
+    #[test]
+    fn test_content_lifecycle() {
+        // Test: Content::create()
+        let name = "test document".to_string();
+        let raw_data = b"This is test content".to_vec();
+        let path = "documents/test.txt".to_string();
+        let key_pair = mock::MockContentKeyPairFactory::create_key_pair("test");
+
+        let (content, event) = Content::create(name.clone(), raw_data.clone(), path.clone(), key_pair).unwrap();
+
+        assert_eq!(content.metadata().name(), &name);
+        assert_eq!(content.metadata().path(), &path);
+        assert_eq!(content.raw_content().unwrap(), &raw_data);
+        assert_eq!(content.is_deleted(), false);
+        assert_eq!(content.delete_status(), &DeleteStatus::Active);
+        assert_eq!(event, ContentEvent::Created);
+        assert!(content.encrypted_content().is_some());
+
+        // Test: Content::update()
+        let updated_data = b"Updated content".to_vec();
+        let (updated_content, event) = content.update(updated_data.clone(), None).unwrap();
+
+        assert_eq!(updated_content.raw_content().unwrap(), &updated_data);
+        assert_eq!(event, ContentEvent::Updated);
+        assert_eq!(updated_content.metadata().path(), content.metadata().path());
+
+        // Test: Content::delete()
+        let (deleted_content, event) = updated_content.delete().unwrap();
+
+        assert_eq!(deleted_content.is_deleted(), true);
+        assert!(deleted_content.raw_content().is_none());
+        assert!(deleted_content.encrypted_content().is_none());
+        assert_eq!(event, ContentEvent::Deleted);
+
+        // Test: try to delete deleted content
+        let result = deleted_content.delete();
+        assert!(matches!(result, Err(ContentError::AlreadyDeleted)));
+
+        // Test: try to update deleted content
+        let result = deleted_content.update(b"New data".to_vec(), None);
+        assert!(matches!(result, Err(ContentError::AlreadyDeleted)));
+    }
+
+    #[test]
+    fn test_decrypt_error_handling_for_missing_components() {
+        let name = "test file".to_string();
+        let raw_data = b"Sensitive information".to_vec();
+        let path = "documents/secrets.txt".to_string();
+        let key_pair = mock::MockContentKeyPairFactory::create_key_pair("test");
+        let (content, _) = Content::create(name, raw_data.clone(), path, key_pair).unwrap();
+
+        assert!(content.encrypted_content().is_some());
+
+        let decrypted_data = content.decrypt().unwrap();
+        assert_eq!(decrypted_data, raw_data);
+
+        let metadata = create_test_metadata();
+        let content_missing_encrypted = Content::new(
+            metadata.clone(),
+            Some(b"Raw data".to_vec()),
+            None,
+            Some(mock::MockContentKeyPairFactory::create_key_pair("test")),
+            false,
+        );
+        // Test: try to decrypt content with missing encrypted data
+        let result = content_missing_encrypted.decrypt();
+        assert!(matches!(result, Err(ContentError::DecryptionError(_))));
+
+        let content_missing_key = Content::new(
+            metadata,
+            Some(b"Raw data".to_vec()),
+            Some(b"Encrypted data".to_vec()),
+            None,
+            false,
+        );
+        // Test: try to decrypt content with missing key pair
+        let result = content_missing_key.decrypt();
+        assert!(matches!(result, Err(ContentError::DecryptionError(_))));
+    }
+
+    #[test]
+    fn test_operations_on_deleted_content_return_already_deleted_error() {
+        let metadata = create_test_metadata();
+
+        let deleted_content = Content::new(
+            metadata,
+            None,
+            None,
+            Some(mock::MockContentKeyPairFactory::create_key_pair("test")),
+            true,
+        );
+        // Test: try to delete deleted content
+        let result = deleted_content.delete();
+        assert!(matches!(result, Err(ContentError::AlreadyDeleted)));
+
+        // Test: try to update deleted content
+        let result = deleted_content.update(b"New data".to_vec(), None);
+        assert!(matches!(result, Err(ContentError::AlreadyDeleted)));
+
+        // Test: try to decrypt deleted content
+        let result = deleted_content.decrypt();
+        assert!(matches!(result, Err(ContentError::AlreadyDeleted)));
+    }
+}
