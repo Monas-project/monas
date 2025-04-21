@@ -1,3 +1,2 @@
-pub mod contents;
+pub mod content;
 pub mod metadata;
-pub mod state_nodes;
