@@ -2,7 +2,7 @@ use crate::domain::metadata::Metadata;
 use std::fmt::Debug;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DeleteStatus {
+pub enum ContentStatus {
     Active,
     Deleting,
     Deleted,
@@ -44,7 +44,7 @@ pub struct Content {
     encrypted_content: Option<Vec<u8>>,
     key_pair: Option<Box<dyn ContentKeyPair>>,
     is_deleted: bool,
-    delete_status: DeleteStatus,
+    content_status: ContentStatus,
     // TODO: 必要性があるかもしれないので追加した
     // last_updated_by: Option<StateNodeId>, // 最後に更新を行ったStateNodeのID
 }
@@ -65,7 +65,7 @@ impl Content {
             encrypted_content,
             key_pair,
             is_deleted,
-            delete_status: DeleteStatus::Active,
+            content_status: ContentStatus::Active,
         }
     }
 
@@ -85,7 +85,7 @@ impl Content {
             encrypted_content: Some(encrypted_content),
             key_pair: Some(key_pair),
             is_deleted: false,
-            delete_status: DeleteStatus::Active,
+            content_status: ContentStatus::Active,
         };
 
         Ok((content, ContentEvent::Created))
@@ -111,7 +111,7 @@ impl Content {
             encrypted_content: Some(encrypted_content),
             key_pair: Some(key_pair),
             is_deleted: false,
-            delete_status: DeleteStatus::Active,
+            content_status: ContentStatus::Active,
         };
 
         Ok((content, ContentEvent::Updated))
@@ -129,7 +129,7 @@ impl Content {
             encrypted_content: None,
             key_pair: self.key_pair.clone(),
             is_deleted: true,
-            delete_status: DeleteStatus::Deleted,
+            content_status: ContentStatus::Deleted,
         };
 
         Ok((content, ContentEvent::Deleted))
@@ -169,8 +169,8 @@ impl Content {
         self.is_deleted
     }
 
-    pub fn delete_status(&self) -> &DeleteStatus {
-        &self.delete_status
+    pub fn content_status(&self) -> &ContentStatus {
+        &self.content_status
     }
 }
 
@@ -182,7 +182,7 @@ impl Clone for Content {
             encrypted_content: self.encrypted_content.clone(),
             key_pair: self.key_pair.clone(),
             is_deleted: self.is_deleted,
-            delete_status: self.delete_status.clone(),
+            content_status: self.content_status.clone(),
         }
     }
 }
@@ -252,7 +252,7 @@ mod tests {
         assert_eq!(content.metadata().path(), &path);
         assert_eq!(content.raw_content().unwrap(), &raw_data);
         assert!(!content.is_deleted());
-        assert_eq!(content.delete_status(), &DeleteStatus::Active);
+        assert_eq!(content.content_status(), &ContentStatus::Active);
         assert_eq!(event, ContentEvent::Created);
         assert!(content.encrypted_content().is_some());
 
