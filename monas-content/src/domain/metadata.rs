@@ -11,11 +11,7 @@ pub struct Metadata {
 }
 
 impl Metadata {
-    pub fn new(
-        name: String,
-        raw_contents: &[u8],
-        path: String,
-    ) -> Self {
+    pub fn new(name: String, raw_contents: &[u8], path: String) -> Self {
         let now = Utc::now();
         Self {
             name,
@@ -98,7 +94,7 @@ mod tests {
             "1f825aa2f0020ef7cf91dfa30da4668d791c5d4824fc8e41354b89ec05795ab3"
         );
     }
-    
+
     #[test]
     fn test_metadata_creation_and_hash_validation() {
         let name = "テストファイル".to_string();

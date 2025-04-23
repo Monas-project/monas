@@ -1,7 +1,5 @@
 use crate::domain::metadata::Metadata;
-use chrono::{DateTime, Utc};
 use std::fmt::Debug;
-
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeleteStatus {
@@ -59,7 +57,6 @@ impl Content {
         key_pair: Option<Box<dyn ContentKeyPair>>,
         is_deleted: bool,
     ) -> Self {
-
         // TODO: 事前条件を追加する
 
         Self {
@@ -164,8 +161,8 @@ impl Content {
         self.encrypted_content.as_ref()
     }
 
-    pub fn key_pair(&self) -> Option<&Box<dyn ContentKeyPair>> {
-        self.key_pair.as_ref()
+    pub fn key_pair(&self) -> Option<&dyn ContentKeyPair> {
+        self.key_pair.as_deref()
     }
 
     pub fn is_deleted(&self) -> bool {
@@ -198,9 +195,7 @@ mod mock {
 
     impl MockContentKeyPairFactory {
         pub fn create_key_pair(id: &str) -> Box<dyn ContentKeyPair> {
-            Box::new(MockKeyPair {
-                id: id.to_string(),
-            })
+            Box::new(MockKeyPair { id: id.to_string() })
         }
     }
 
@@ -233,7 +228,6 @@ mod mock {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::SystemTime;
 
     fn create_test_metadata() -> Metadata {
         Metadata::new(
@@ -251,12 +245,13 @@ mod tests {
         let path = "documents/test.txt".to_string();
         let key_pair = mock::MockContentKeyPairFactory::create_key_pair("test");
 
-        let (content, event) = Content::create(name.clone(), raw_data.clone(), path.clone(), key_pair).unwrap();
+        let (content, event) =
+            Content::create(name.clone(), raw_data.clone(), path.clone(), key_pair).unwrap();
 
         assert_eq!(content.metadata().name(), &name);
         assert_eq!(content.metadata().path(), &path);
         assert_eq!(content.raw_content().unwrap(), &raw_data);
-        assert_eq!(content.is_deleted(), false);
+        assert!(!content.is_deleted());
         assert_eq!(content.delete_status(), &DeleteStatus::Active);
         assert_eq!(event, ContentEvent::Created);
         assert!(content.encrypted_content().is_some());
@@ -272,7 +267,7 @@ mod tests {
         // Test: Content::delete()
         let (deleted_content, event) = updated_content.delete().unwrap();
 
-        assert_eq!(deleted_content.is_deleted(), true);
+        assert!(deleted_content.is_deleted());
         assert!(deleted_content.raw_content().is_none());
         assert!(deleted_content.encrypted_content().is_none());
         assert_eq!(event, ContentEvent::Deleted);
