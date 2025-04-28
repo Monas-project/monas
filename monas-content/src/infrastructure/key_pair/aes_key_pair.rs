@@ -21,3 +21,18 @@ impl AesKeyPair {
         self.encrypt(data)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_aes_key_pair() {
+        let key_pair = AesKeyPair::new();
+        let data = b"Hello, World!";
+        let encrypted = key_pair.encrypt(data);
+        assert_ne!(encrypted, data);
+        let decrypted = key_pair.decrypt(&encrypted);
+        assert_eq!(decrypted, data);
+    }
+}
