@@ -72,3 +72,40 @@ impl Drop for AesCipher {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::mem;
+
+    #[test]
+    fn test_encrypt_and_decrypt() {
+        let key = [0u8; 32];
+        let cipher = AesCipher::new(key);
+        let data = b"Hello, World!";
+
+        let encrypted = cipher.encrypt(data).unwrap();
+        assert_ne!(&encrypted[12..], data);
+
+        let decrypted = cipher.decrypt(&encrypted).unwrap();
+        assert_eq!(decrypted, data);
+    }
+
+    #[test]
+    fn test_drop_key() {
+        let key = [0x12; 32];
+        let boxed_cipher = Box::new(AesCipher::new(key));
+        assert_eq!(*boxed_cipher.key_for_test(), key);
+
+        let ptr = &*boxed_cipher as *const AesCipher;
+        mem::drop(boxed_cipher);
+
+        unsafe {
+            // ドロップ後のメモリを直接操作するのは避けるべき
+            let dropped_cipher = &*ptr;
+            for byte in dropped_cipher.key.iter() {
+                assert_eq!(*byte, 0);
+            }
+        }
+    }
+}
