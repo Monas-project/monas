@@ -40,3 +40,35 @@ impl HmacSha256 {
         Self::verify(key, data, expected_hash).is_ok()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_hmac_compute_and_verify() {
+        let key = b"test key";
+        let data = b"test data";
+
+        let hmac = HmacSha256::compute(key, data).unwrap();
+        let hmac2 = HmacSha256::compute(key, data).unwrap();
+        assert_eq!(hmac, hmac2);
+
+        assert!(HmacSha256::verify(key, data, &hmac).is_ok());
+        assert!(HmacSha256::is_verified(key, data, &hmac));
+    }
+
+    #[test]
+    fn test_different_data_causes_verification_failure() {
+        let key = b"test key";
+        let data = b"test data";
+        let hmac = HmacSha256::compute(key, data).unwrap();
+
+        let different_data = b"different data";
+        let incorrect_hmac = HmacSha256::compute(key, different_data).unwrap();
+        assert_ne!(hmac, incorrect_hmac);
+
+        assert!(HmacSha256::verify(key, data, &incorrect_hmac).is_err());
+        assert!(!HmacSha256::is_verified(key, data, &incorrect_hmac));
+    }
+}
