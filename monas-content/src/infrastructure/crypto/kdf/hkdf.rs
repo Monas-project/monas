@@ -47,3 +47,36 @@ impl HkdfKeyDerivation {
         Ok(key)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_derive_aes_256_key_consistency() {
+        let shared_secret = b"this is a shared secret for testing";
+        let salt = b"salt value";
+        let info = b"test context info";
+
+        let aes_key =
+            HkdfKeyDerivation::derive_aes_256_key(shared_secret, Some(salt), Some(info)).unwrap();
+        let aes_key2 =
+            HkdfKeyDerivation::derive_aes_256_key(shared_secret, Some(salt), Some(info)).unwrap();
+        assert_eq!(aes_key, aes_key2);
+    }
+
+    #[test]
+    fn test_different_salt_causes_different_key() {
+        let shared_secret = b"this is a shared secret for testing";
+        let salt = b"salt value";
+        let info = b"test context info";
+        let aes_key =
+            HkdfKeyDerivation::derive_aes_256_key(shared_secret, Some(salt), Some(info)).unwrap();
+
+        let different_salt = b"different salt";
+        let different_aes_key =
+            HkdfKeyDerivation::derive_aes_256_key(shared_secret, Some(different_salt), Some(info))
+                .unwrap();
+        assert_ne!(aes_key, different_aes_key);
+    }
+}
