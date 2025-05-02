@@ -115,3 +115,82 @@ impl PartialEq for ContentKeyPair {
         self.private_key == other.private_key
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use p256::ecdsa::{SigningKey, VerifyingKey};
+    use p256::elliptic_curve::rand_core::OsRng;
+
+    fn generate_test_account_key_pair() -> (SigningKey, VerifyingKey) {
+        let private_key = SigningKey::random(&mut OsRng);
+        let public_key = VerifyingKey::from(&private_key);
+        (private_key, public_key)
+    }
+
+    #[test]
+    fn test_generate_content_id_from_key() {
+        let key_pair = ContentKeyPair::generate();
+        let content_id = key_pair.to_content_id();
+        assert!(!content_id.is_empty());
+
+        // プレフィックスを除いた部分が16進数であることを確認
+        assert!(content_id.starts_with("0xPub"));
+        assert!(content_id[5..].chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_key_derivation() {
+        let (account_private_key, _account_public_key) = generate_test_account_key_pair();
+        let content_key_pair = ContentKeyPair::generate();
+
+        let shared_secret = ContentKeyPair::generate_shared_secret(
+            &account_private_key,
+            &content_key_pair.public_key(),
+        )
+        .unwrap();
+
+        let aes_key =
+            ContentKeyPair::derive_encryption_key(&shared_secret, Some(b"test context")).unwrap();
+
+        assert_eq!(aes_key.len(), 32);
+
+        let aes_key2 =
+            ContentKeyPair::derive_encryption_key(&shared_secret, Some(b"test context")).unwrap();
+
+        assert_eq!(aes_key, aes_key2);
+    }
+
+    #[test]
+    fn test_aes_encryption() {
+        let key = [1u8; 32];
+        let data = b"Test data for AES encryption";
+        let encrypted = ContentKeyPair::encrypt_with_aes_key(key, data).unwrap();
+        let encrypted_data = &encrypted[12..encrypted.len() - 16];
+
+        assert_ne!(encrypted_data, data);
+
+        let decrypted = ContentKeyPair::decrypt_with_aes_key(key, &encrypted).unwrap();
+
+        assert_eq!(decrypted, data);
+    }
+
+    #[test]
+    fn test_content_encryption_lifecycle() {
+        let (account_private_key, _account_public_key) = generate_test_account_key_pair();
+        let content = ContentKeyPair::generate();
+        let data = b"This is a secret content";
+
+        let encrypted =
+            ContentKeyPair::encrypt_content(&account_private_key, content.public_key(), data)
+                .unwrap();
+
+        assert_ne!(encrypted, data);
+
+        let decrypted =
+            ContentKeyPair::decrypt_content(&account_private_key, content.public_key(), &encrypted)
+                .unwrap();
+
+        assert_eq!(decrypted, data);
+    }
+}
