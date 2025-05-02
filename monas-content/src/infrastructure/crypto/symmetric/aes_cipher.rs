@@ -1,9 +1,8 @@
+use crate::infrastructure::crypto::symmetric::nonce::{NonceError, NonceGenerator};
 use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
 };
-use rand::rng;
-use rand::RngCore;
 
 pub trait SymmetricEncryption {
     // TODO: 改ざん攻撃に対する保護のために，認証付きデータ（AAD）をパラメータとして追加することを検討する
@@ -18,16 +17,21 @@ pub enum CryptoError {
     DecryptingError,
     InvalidKey,
     InvalidFormat,
+    NonceGenerationError(NonceError),
 }
 
 #[derive(Debug)]
 pub struct AesCipher {
     key: [u8; 32],
+    nonce_generator: NonceGenerator,
 }
 
 impl AesCipher {
     pub fn new(key: [u8; 32]) -> Self {
-        Self { key }
+        Self {
+            key,
+            nonce_generator: NonceGenerator::new(),
+        }
     }
 
     #[cfg(test)]
@@ -39,8 +43,11 @@ impl AesCipher {
 impl SymmetricEncryption for AesCipher {
     fn encrypt(&self, target: &[u8]) -> Result<Vec<u8>, CryptoError> {
         let cipher = Aes256Gcm::new_from_slice(&self.key).map_err(|_| CryptoError::InvalidKey)?;
-        let mut nonce_bytes = [0u8; 12];
-        rng().fill_bytes(&mut nonce_bytes);
+
+        let nonce_bytes = self
+            .nonce_generator
+            .generate()
+            .map_err(CryptoError::NonceGenerationError)?;
         let nonce = Nonce::from_slice(&nonce_bytes);
         // TODO: タイミング攻撃対策のために定数時間処理の確保を検討する
         let encrypted_data = cipher
