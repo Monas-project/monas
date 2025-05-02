@@ -1,11 +1,11 @@
-use hkdf::Hkdf;
-use sha2::Sha256;
+use crate::infrastructure::crypto::hash::hmac_sha256::HmacSha256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HkdfError {
     ExpansionError,
     OutputTooLong,
     InvalidParameter(&'static str),
+    HmacError,
 }
 
 /// RFC 5869に準拠したHKDFを使用
@@ -25,15 +25,38 @@ impl HkdfKeyDerivation {
             return Err(HkdfError::InvalidParameter("length must be larger than 0"));
         }
 
-        let hkdf = Hkdf::<Sha256>::new(salt, shared_secret);
+        // Extract phase
+        let pseudo_random_key = HmacSha256::compute(salt.unwrap_or(&[0u8; 32]), shared_secret)
+            .map_err(|_| HkdfError::HmacError)?;
 
-        // Output Keying Material（出力鍵材料）from RFC 5869
-        let mut okm = vec![0u8; length];
+        // Expand phase
+        let mut output_keying_material = vec![0u8; length];
+        let mut previous_hmac_result = Vec::new();
+        let mut counter = 1u8;
+        let mut output_length = 0;
 
-        // キー導出
-        hkdf.expand(info.unwrap_or(&[]), &mut okm)
-            .map_err(|_| HkdfError::ExpansionError)?;
-        Ok(okm)
+        while output_length < length {
+            if counter == 0 {
+                return Err(HkdfError::OutputTooLong);
+            }
+
+            let mut hmac_input = previous_hmac_result.clone();
+            hmac_input.extend_from_slice(info.unwrap_or(&[]));
+            hmac_input.push(counter);
+
+            previous_hmac_result = HmacSha256::compute(&pseudo_random_key, &hmac_input)
+                .map_err(|_| HkdfError::HmacError)?;
+
+            let remaining = length - output_length;
+            let copy_length = std::cmp::min(previous_hmac_result.len(), remaining);
+            output_keying_material[output_length..output_length + copy_length]
+                .copy_from_slice(&previous_hmac_result[..copy_length]);
+
+            output_length += copy_length;
+            counter = counter.checked_add(1).ok_or(HkdfError::OutputTooLong)?;
+        }
+
+        Ok(output_keying_material)
     }
 
     pub fn derive_aes_256_key(
