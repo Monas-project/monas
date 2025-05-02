@@ -51,3 +51,80 @@ impl NonceGenerator {
         Ok(nonce)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::thread;
+    use std::time::Duration;
+
+    #[test]
+    fn test_generate_unique_nonce() {
+        let generator = NonceGenerator::new();
+        let mut nonces = HashSet::new();
+
+        for i in 0..1000 {
+            let nonce = generator.generate().unwrap();
+            assert!(
+                nonces.insert(nonce),
+                "Duplicate nonce detected at iteration {}",
+                i + 1
+            );
+
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn test_nonce_format() {
+        let generator = NonceGenerator::new();
+        let nonce = generator.generate().unwrap();
+
+        let timestamp = u32::from_be_bytes(nonce[..4].try_into().unwrap());
+        assert!(timestamp > 0);
+
+        let counter = u32::from_be_bytes(nonce[4..8].try_into().unwrap());
+        assert_eq!(counter, 0);
+
+        let random_bytes = &nonce[8..];
+        assert_ne!(random_bytes, &[0u8; 4]);
+    }
+
+    #[test]
+    fn test_thread_safety() {
+        let generator = std::sync::Arc::new(NonceGenerator::new());
+        let all_nonces = std::sync::Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let mut handles = vec![];
+
+        for _ in 0..10 {
+            let generator = generator.clone();
+            let all_nonces = all_nonces.clone();
+            handles.push(thread::spawn(move || {
+                for _ in 0..100 {
+                    let nonce = generator.generate().unwrap();
+                    let mut all_nonces = all_nonces.lock().unwrap();
+                    assert!(all_nonces.insert(nonce), "Duplicate nonce detected");
+                }
+            }));
+        }
+    }
+
+    #[test]
+    fn test_counter_overflow() {
+        let generator = NonceGenerator::new();
+
+        unsafe {
+            let counter_ptr = &generator.counter as *const AtomicU64 as *mut AtomicU64;
+            (*counter_ptr).store(u32::MAX as u64 - 1, Ordering::SeqCst);
+        }
+
+        // 1回目のNonceGenerator::generate()でcounterをu32::MAXとする
+        let _ = generator.generate().unwrap();
+
+        assert!(matches!(
+            generator.generate(),
+            Err(NonceError::CounterOverflow)
+        ));
+    }
+}
