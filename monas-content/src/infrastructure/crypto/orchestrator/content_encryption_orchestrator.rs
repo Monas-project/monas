@@ -4,12 +4,12 @@ use p256::ecdsa::{SigningKey, VerifyingKey};
 use p256::elliptic_curve::rand_core::OsRng;
 
 #[derive(Debug, Clone)]
-pub struct ContentKeyPair {
+pub struct ContentEncryptionOrchestrator {
     private_key: SigningKey,
     public_key: VerifyingKey,
 }
 
-impl ContentKeyPair {
+impl ContentEncryptionOrchestrator {
     pub fn private_key(&self) -> &SigningKey {
         &self.private_key
     }
@@ -22,7 +22,7 @@ impl ContentKeyPair {
     pub fn generate() -> Self {
         let private_key = SigningKey::random(&mut OsRng);
         let public_key = VerifyingKey::from(&private_key);
-        ContentKeyPair {
+        ContentEncryptionOrchestrator {
             private_key,
             public_key,
         }
@@ -112,7 +112,7 @@ impl ContentKeyPair {
     }
 }
 
-impl PartialEq for ContentKeyPair {
+impl PartialEq for ContentEncryptionOrchestrator {
     fn eq(&self, other: &Self) -> bool {
         self.private_key == other.private_key
     }
@@ -132,8 +132,8 @@ mod tests {
 
     #[test]
     fn test_generate_content_id_from_key() {
-        let key_pair = ContentKeyPair::generate();
-        let content_id = key_pair.to_content_id();
+        let orchestrator = ContentEncryptionOrchestrator::generate();
+        let content_id = orchestrator.to_content_id();
         assert!(!content_id.is_empty());
 
         // プレフィックスを除いた部分が16進数であることを確認
@@ -144,21 +144,21 @@ mod tests {
     #[test]
     fn test_key_derivation() {
         let (account_private_key, _account_public_key) = generate_test_account_key_pair();
-        let content_key_pair = ContentKeyPair::generate();
+        let content_encryption_orchestrator = ContentEncryptionOrchestrator::generate();
 
-        let shared_secret = ContentKeyPair::generate_shared_secret(
+        let shared_secret = ContentEncryptionOrchestrator::generate_shared_secret(
             &account_private_key,
-            &content_key_pair.public_key(),
+            &content_encryption_orchestrator.public_key(),
         )
         .unwrap();
 
         let aes_key =
-            ContentKeyPair::derive_encryption_key(&shared_secret, Some(b"test context")).unwrap();
+            ContentEncryptionOrchestrator::derive_encryption_key(&shared_secret, Some(b"test context")).unwrap();
 
         assert_eq!(aes_key.len(), 32);
 
         let aes_key2 =
-            ContentKeyPair::derive_encryption_key(&shared_secret, Some(b"test context")).unwrap();
+            ContentEncryptionOrchestrator::derive_encryption_key(&shared_secret, Some(b"test context")).unwrap();
 
         assert_eq!(aes_key, aes_key2);
     }
@@ -167,12 +167,12 @@ mod tests {
     fn test_aes_encryption() {
         let key = [1u8; 32];
         let data = b"Test data for AES encryption";
-        let encrypted = ContentKeyPair::encrypt_with_aes_key(key, data).unwrap();
+        let encrypted = ContentEncryptionOrchestrator::encrypt_with_aes_key(key, data).unwrap();
         let encrypted_data = &encrypted[12..encrypted.len() - 16];
 
         assert_ne!(encrypted_data, data);
 
-        let decrypted = ContentKeyPair::decrypt_with_aes_key(key, &encrypted).unwrap();
+        let decrypted = ContentEncryptionOrchestrator::decrypt_with_aes_key(key, &encrypted).unwrap();
 
         assert_eq!(decrypted, data);
     }
@@ -180,17 +180,17 @@ mod tests {
     #[test]
     fn test_content_encryption_lifecycle() {
         let (account_private_key, _account_public_key) = generate_test_account_key_pair();
-        let content = ContentKeyPair::generate();
+        let content = ContentEncryptionOrchestrator::generate();
         let data = b"This is a secret content";
 
         let encrypted =
-            ContentKeyPair::encrypt_content(&account_private_key, content.public_key(), data)
+            ContentEncryptionOrchestrator::encrypt_content(&account_private_key, content.public_key(), data)
                 .unwrap();
 
         assert_ne!(encrypted, data);
 
         let decrypted =
-            ContentKeyPair::decrypt_content(&account_private_key, content.public_key(), &encrypted)
+            ContentEncryptionOrchestrator::decrypt_content(&account_private_key, content.public_key(), &encrypted)
                 .unwrap();
 
         assert_eq!(decrypted, data);
