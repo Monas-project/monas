@@ -29,6 +29,8 @@ impl ContentKeyPair {
     }
 
     // 公開鍵をContent IDとして使用する
+    // TODO: 将来的にCIDの生成ロジックはDASLで実装する
+    // Ref: https://github.com/Monas-project/crsl-lib/blob/main/src/dasl/node.rs
     pub fn to_content_id(&self) -> String {
         let encoded_point = self.public_key.to_encoded_point(false);
         format!("0xPub{}", hex::encode(encoded_point.as_bytes()))
@@ -50,7 +52,7 @@ impl ContentKeyPair {
     ) -> Result<[u8; 32], String> {
         HkdfKeyDerivation::derive_aes_256_key(
             shared_secret,
-            None,
+            None, // salt
             context_info.or(Some(b"content_encryption")),
         )
         .map_err(|e| format!("Deriving encryption key failed: {:?}", e))
@@ -74,7 +76,7 @@ impl ContentKeyPair {
         // 2: HKDFで共有秘密からAES鍵を導出する
         let aes_key = Self::derive_encryption_key(
             &shared_secret,
-            Some(b"content_encryption"), // コンテキスト情報
+            Some(b"content_encryption"), // Cotentのハッシュ値などが考えられる
         )?;
 
         // 3: AES鍵でContentデータを暗号化する
