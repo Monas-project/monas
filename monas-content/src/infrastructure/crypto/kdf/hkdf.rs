@@ -8,10 +8,21 @@ pub enum HkdfError {
     HmacError,
 }
 
-/// RFC 5869に準拠したHKDFを使用
+/// RFC 5869[1]に準拠したHKDF（HMACベースの鍵導出関数）を使用
+/// HKDFの定義については以下の文献[2]が参考になります．
+///
+/// [1] RFC 5869, https://datatracker.ietf.org/doc/html/rfc5869
+/// [2] 鍵導出アルゴリズム, https://hazm.at/mox/security/kdf/index.html
 pub struct HkdfKeyDerivation;
 
 impl HkdfKeyDerivation {
+    /// 共有秘密から指定された長さの鍵を導出する
+    ///
+    /// # 引数
+    /// * `shared_secret` - 鍵導出の元となる共有秘密
+    /// * `salt` - Extractフェーズで使用するソルト．指定しない場合は0で埋められた32バイトの配列を使用
+    /// * `info` - Expandフェーズで使用するコンテキスト情報．指定しない場合は空の配列を使用
+    /// * `length` - 導出する鍵の長さ（バイト）
     pub fn derive_key(
         shared_secret: &[u8],
         salt: Option<&[u8]>,
@@ -25,11 +36,11 @@ impl HkdfKeyDerivation {
             return Err(HkdfError::InvalidParameter("length must be larger than 0"));
         }
 
-        // Extract phase
+        // Extractフェーズ
         let pseudo_random_key = HmacSha256::compute(salt.unwrap_or(&[0u8; 32]), shared_secret)
             .map_err(|_| HkdfError::HmacError)?;
 
-        // Expand phase
+        // Expandフェーズ
         let mut output_keying_material = vec![0u8; length];
         let mut previous_hmac_result = Vec::new();
         let mut counter = 1u8;
@@ -59,6 +70,7 @@ impl HkdfKeyDerivation {
         Ok(output_keying_material)
     }
 
+    /// 共有秘密からAES-256用の32バイト鍵を導出する
     pub fn derive_aes_256_key(
         shared_secret: &[u8],
         salt: Option<&[u8]>,
