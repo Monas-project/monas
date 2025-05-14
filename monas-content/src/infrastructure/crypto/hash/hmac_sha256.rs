@@ -10,6 +10,11 @@ pub enum HmacError {
 pub struct HmacSha256;
 
 impl HmacSha256 {
+    /// HMAC-SHA256を使用してメッセージ認証コードを計算する
+    ///
+    /// # 引数
+    /// * `key` - 認証に使用する鍵．HKDFのExtractフェーズではsalt，Expandフェーズでは擬似乱数鍵として使用
+    /// * `data` - 認証対象のデータ．HKDFのExtractフェーズでは共有秘密，ExpandフェーズではHMAC入力として使用
     pub fn compute(key: &[u8], data: &[u8]) -> Result<Vec<u8>, HmacError> {
         let mut mac =
             <Hmac<Sha256>>::new_from_slice(key).map_err(|_| HmacError::KeyInitializationError)?;
@@ -18,6 +23,7 @@ impl HmacSha256 {
         Ok(result.into_bytes().to_vec())
     }
 
+    /// HMAC-SHA256を使用してメッセージ認証コードを検証する
     pub fn verify(key: &[u8], data: &[u8], expected_hash: &[u8]) -> Result<(), HmacError> {
         let computed = Self::compute(key, data)?;
 
@@ -36,6 +42,7 @@ impl HmacSha256 {
         }
     }
 
+    /// HmacSha256::verify()の検証結果をboolで返す
     pub fn is_verified(key: &[u8], data: &[u8], expected_hash: &[u8]) -> bool {
         Self::verify(key, data, expected_hash).is_ok()
     }
