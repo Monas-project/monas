@@ -6,7 +6,10 @@ use aes_gcm::{
 
 pub trait SymmetricEncryption {
     // TODO: 改ざん攻撃に対する保護のために，認証付きデータ（AAD）をパラメータとして追加することを検討する
+    /// データを暗号化する
     fn encrypt(&self, data: &[u8]) -> Result<Vec<u8>, CryptoError>;
+
+    /// 暗号化されたデータを復号する
     fn decrypt(&self, encrypted_data: &[u8]) -> Result<Vec<u8>, CryptoError>;
 }
 
@@ -27,6 +30,10 @@ pub struct AesCipher {
 }
 
 impl AesCipher {
+    /// AES-256 GCM 暗号化鍵を生成する
+    ///
+    /// # 引数
+    /// * `key` - HKDFで導出したAES-256用の32バイト鍵
     pub fn new(key: [u8; 32]) -> Self {
         Self {
             key,
@@ -41,6 +48,7 @@ impl AesCipher {
 }
 
 impl SymmetricEncryption for AesCipher {
+    /// AES-256-GCMでデータを暗号化する
     fn encrypt(&self, target: &[u8]) -> Result<Vec<u8>, CryptoError> {
         let cipher = Aes256Gcm::new_from_slice(&self.key).map_err(|_| CryptoError::InvalidKey)?;
 
@@ -59,6 +67,10 @@ impl SymmetricEncryption for AesCipher {
         Ok(result)
     }
 
+    /// AES-256 GCMで暗号化されたデータを復号する
+    ///
+    /// # 引数
+    /// * `encrypted_target` - 復号対象の暗号化データ（ノンス + 暗号文）
     fn decrypt(&self, encrypted_target: &[u8]) -> Result<Vec<u8>, CryptoError> {
         if encrypted_target.len() <= 12 {
             return Err(CryptoError::InvalidFormat);
