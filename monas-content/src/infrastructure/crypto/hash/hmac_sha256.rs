@@ -86,4 +86,21 @@ mod tests {
         assert!(HmacSha256::verify(key, data, &incorrect_hmac).is_err());
         assert!(!HmacSha256::is_verified(key, data, &incorrect_hmac));
     }
+
+    #[test]
+    fn test_hmac_output_correct_bytes_length_with_various_keys() {
+        let data = b"test data";
+        let key_lengths = vec![0, 1, 32, 64, 100];
+
+        for length in key_lengths {
+            let key = vec![0u8; length];
+            let result = HmacSha256::compute(&key, data).unwrap();
+            assert_eq!(
+                result.len(),
+                32,
+                "HMAC output should be 32 bytes for key length {}",
+                length
+            );
+        }
+    }
 }
