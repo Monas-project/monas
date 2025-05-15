@@ -1,10 +1,11 @@
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use thiserror::Error;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Error)]
 pub enum HmacError {
-    KeyInitializationError,
-    VerificationError,
+    #[error("HMAC verification failed: {0}")]
+    VerificationError(String),
 }
 
 pub struct HmacSha256;
@@ -17,7 +18,7 @@ impl HmacSha256 {
     /// * `data` - 認証対象のデータ．HKDFのExtractフェーズでは共有秘密，ExpandフェーズではHMAC入力として使用
     pub fn compute(key: &[u8], data: &[u8]) -> Result<Vec<u8>, HmacError> {
         let mut mac =
-            <Hmac<Sha256>>::new_from_slice(key).map_err(|_| HmacError::KeyInitializationError)?;
+            <Hmac<Sha256>>::new_from_slice(key).expect("HMAC key initialization should never fail");
         mac.update(data);
         let result = mac.finalize();
         Ok(result.into_bytes().to_vec())
@@ -28,8 +29,13 @@ impl HmacSha256 {
         let computed = Self::compute(key, data)?;
 
         if computed.len() != expected_hash.len() {
-            return Err(HmacError::VerificationError);
+            return Err(HmacError::VerificationError(format!(
+                "Length mismatch: computed={}, expected={}",
+                computed.len(),
+                expected_hash.len()
+            )));
         }
+
         let mut result = 0;
         for (a, b) in computed.iter().zip(expected_hash.iter()) {
             result |= a ^ b;
@@ -38,7 +44,9 @@ impl HmacSha256 {
         if result == 0 {
             Ok(())
         } else {
-            Err(HmacError::VerificationError)
+            Err(HmacError::VerificationError(
+                "Hash values do not match".to_string(),
+            ))
         }
     }
 
