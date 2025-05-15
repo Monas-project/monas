@@ -3,7 +3,7 @@ use crate::infrastructure::crypto::symmetric::aes_cipher::{AesCipher, SymmetricE
 use p256::ecdsa::{SigningKey, VerifyingKey};
 use p256::elliptic_curve::rand_core::OsRng;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ContentEncryptionOrchestrator {
     private_key: SigningKey,
     public_key: VerifyingKey,
@@ -109,12 +109,6 @@ impl ContentEncryptionOrchestrator {
 
         // 3: AES鍵でデータを復号する
         Self::decrypt_with_aes_key(aes_key, encrypted_data)
-    }
-}
-
-impl PartialEq for ContentEncryptionOrchestrator {
-    fn eq(&self, other: &Self) -> bool {
-        self.private_key == other.private_key
     }
 }
 
