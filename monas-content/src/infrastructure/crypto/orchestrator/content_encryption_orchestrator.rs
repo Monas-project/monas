@@ -4,12 +4,12 @@ use p256::ecdsa::{SigningKey, VerifyingKey};
 use p256::elliptic_curve::rand_core::OsRng;
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct ContentEncryptionOrchestrator {
+pub struct ContentKeyPair {
     private_key: SigningKey,
     public_key: VerifyingKey,
 }
 
-impl ContentEncryptionOrchestrator {
+impl ContentKeyPair {
     pub fn private_key(&self) -> &SigningKey {
         &self.private_key
     }
@@ -22,7 +22,7 @@ impl ContentEncryptionOrchestrator {
     pub fn generate() -> Self {
         let private_key = SigningKey::random(&mut OsRng);
         let public_key = VerifyingKey::from(&private_key);
-        ContentEncryptionOrchestrator {
+        ContentKeyPair {
             private_key,
             public_key,
         }
@@ -35,7 +35,11 @@ impl ContentEncryptionOrchestrator {
         let encoded_point = self.public_key.to_encoded_point(false);
         format!("0xPub{}", hex::encode(encoded_point.as_bytes()))
     }
+}
 
+pub struct ContentEncryptionOrchestrator;
+
+impl ContentEncryptionOrchestrator {
     /// アカウントの秘密鍵とコンテンツの公開鍵から共有秘密を生成する
     pub fn generate_shared_secret(
         _account_private_key: &SigningKey,
@@ -76,7 +80,7 @@ impl ContentEncryptionOrchestrator {
         // 2: HKDFで共有秘密からAES鍵を導出する
         let aes_key = Self::derive_encryption_key(
             &shared_secret,
-            Some(b"content_encryption"), // Cotentのハッシュ値などが考えられる
+            Some(b"content_encryption"), // Contentのハッシュ値などが考えられる
         )?;
 
         // 3: AES鍵でContentデータを暗号化する
@@ -115,8 +119,6 @@ impl ContentEncryptionOrchestrator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use p256::ecdsa::{SigningKey, VerifyingKey};
-    use p256::elliptic_curve::rand_core::OsRng;
 
     fn generate_test_account_key_pair() -> (SigningKey, VerifyingKey) {
         let private_key = SigningKey::random(&mut OsRng);
@@ -126,8 +128,8 @@ mod tests {
 
     #[test]
     fn test_generate_content_id_from_key() {
-        let orchestrator = ContentEncryptionOrchestrator::generate();
-        let content_id = orchestrator.to_content_id();
+        let key_pair = ContentKeyPair::generate();
+        let content_id = key_pair.to_content_id();
         assert!(!content_id.is_empty());
 
         // プレフィックスを除いた部分が16進数であることを確認
@@ -138,21 +140,27 @@ mod tests {
     #[test]
     fn test_key_derivation() {
         let (account_private_key, _account_public_key) = generate_test_account_key_pair();
-        let content_encryption_orchestrator = ContentEncryptionOrchestrator::generate();
+        let content_key_pair = ContentKeyPair::generate();
 
         let shared_secret = ContentEncryptionOrchestrator::generate_shared_secret(
             &account_private_key,
-            &content_encryption_orchestrator.public_key(),
+            content_key_pair.public_key(),
         )
         .unwrap();
 
-        let aes_key =
-            ContentEncryptionOrchestrator::derive_encryption_key(&shared_secret, Some(b"test context")).unwrap();
+        let aes_key = ContentEncryptionOrchestrator::derive_encryption_key(
+            &shared_secret,
+            Some(b"test context"),
+        )
+        .unwrap();
 
         assert_eq!(aes_key.len(), 32);
 
-        let aes_key2 =
-            ContentEncryptionOrchestrator::derive_encryption_key(&shared_secret, Some(b"test context")).unwrap();
+        let aes_key2 = ContentEncryptionOrchestrator::derive_encryption_key(
+            &shared_secret,
+            Some(b"test context"),
+        )
+        .unwrap();
 
         assert_eq!(aes_key, aes_key2);
     }
@@ -166,7 +174,8 @@ mod tests {
 
         assert_ne!(encrypted_data, data);
 
-        let decrypted = ContentEncryptionOrchestrator::decrypt_with_aes_key(key, &encrypted).unwrap();
+        let decrypted =
+            ContentEncryptionOrchestrator::decrypt_with_aes_key(key, &encrypted).unwrap();
 
         assert_eq!(decrypted, data);
     }
@@ -174,18 +183,24 @@ mod tests {
     #[test]
     fn test_content_encryption_lifecycle() {
         let (account_private_key, _account_public_key) = generate_test_account_key_pair();
-        let content = ContentEncryptionOrchestrator::generate();
+        let content_key_pair = ContentKeyPair::generate();
         let data = b"This is a secret content";
 
-        let encrypted =
-            ContentEncryptionOrchestrator::encrypt_content(&account_private_key, content.public_key(), data)
-                .unwrap();
+        let encrypted = ContentEncryptionOrchestrator::encrypt_content(
+            &account_private_key,
+            content_key_pair.public_key(),
+            data,
+        )
+        .unwrap();
 
         assert_ne!(encrypted, data);
 
-        let decrypted =
-            ContentEncryptionOrchestrator::decrypt_content(&account_private_key, content.public_key(), &encrypted)
-                .unwrap();
+        let decrypted = ContentEncryptionOrchestrator::decrypt_content(
+            &account_private_key,
+            content_key_pair.public_key(),
+            &encrypted,
+        )
+        .unwrap();
 
         assert_eq!(decrypted, data);
     }
