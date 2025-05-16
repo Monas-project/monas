@@ -1,11 +1,24 @@
-use crate::infrastructure::crypto::hash::hmac_sha256::HmacSha256;
+use crate::infrastructure::crypto::hash::hmac_sha256::{HmacSha256Key, HmacError};
+use thiserror::Error;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Error)]
+pub enum InvalidParameterKind {
+    #[error("Shared secret is empty")]
+    EmptySharedSecret,
+    #[error("Length is zero")]
+    ZeroLength,
+    #[error("Length is too long (maximum: {0} bytes)")]
+    TooLong(usize),
+}
+
+#[derive(Debug, Error)]
 pub enum HkdfError {
-    ExpansionError,
+    #[error("HMAC operation failed: {0}")]
+    HmacError(#[from] HmacError),
+    #[error("Invalid parameter: {0}")]
+    InvalidParameter(#[from] InvalidParameterKind),
+    #[error("Output length exceeds maximum allowed length")]
     OutputTooLong,
-    InvalidParameter(&'static str),
-    HmacError,
 }
 
 /// RFC 5869[1]に準拠したHKDF（HMACベースの鍵導出関数）を使用
@@ -30,18 +43,21 @@ impl HkdfKeyDerivation {
         length: usize,
     ) -> Result<Vec<u8>, HkdfError> {
         if shared_secret.is_empty() {
-            return Err(HkdfError::InvalidParameter("shared_secret cannot be empty"));
+            return Err(InvalidParameterKind::EmptySharedSecret.into());
         }
         if length == 0 {
-            return Err(HkdfError::InvalidParameter("length must be larger than 0"));
+            return Err(InvalidParameterKind::ZeroLength.into());
+        }
+        if length > 255 * 32 {
+            return Err(InvalidParameterKind::TooLong(255 * 32).into());
         }
 
-        // Extractフェーズ
-        let pseudo_random_key = HmacSha256::compute(salt.unwrap_or(&[0u8; 32]), shared_secret)
-            .map_err(|_| HkdfError::HmacError)?;
+        // Extract phase
+        let salt_key = HmacSha256Key::new(salt.unwrap_or(&[0u8; 32]));
+        let pseudo_random_key = salt_key.compute(shared_secret)?;
 
-        // Expandフェーズ
-        let mut output_keying_material = vec![0u8; length];
+        // Expand phase
+        let mut output_key = Vec::with_capacity(length);
         let mut previous_hmac_result = Vec::new();
         let mut counter = 1u8;
         let mut output_length = 0;
@@ -55,19 +71,18 @@ impl HkdfKeyDerivation {
             hmac_input.extend_from_slice(info.unwrap_or(&[]));
             hmac_input.push(counter);
 
-            previous_hmac_result = HmacSha256::compute(&pseudo_random_key, &hmac_input)
-                .map_err(|_| HkdfError::HmacError)?;
+            let hmac_key = HmacSha256Key::new(&pseudo_random_key);
+            previous_hmac_result = hmac_key.compute(&hmac_input)?;
 
             let remaining = length - output_length;
             let copy_length = std::cmp::min(previous_hmac_result.len(), remaining);
-            output_keying_material[output_length..output_length + copy_length]
-                .copy_from_slice(&previous_hmac_result[..copy_length]);
+            output_key.extend_from_slice(&previous_hmac_result[..copy_length]);
 
             output_length += copy_length;
             counter = counter.checked_add(1).ok_or(HkdfError::OutputTooLong)?;
         }
 
-        Ok(output_keying_material)
+        Ok(output_key)
     }
 
     /// 共有秘密からAES-256用の32バイト鍵を導出する
