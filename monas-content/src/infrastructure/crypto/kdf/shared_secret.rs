@@ -67,3 +67,53 @@ impl SharedSecret {
             .map_err(SharedSecretError::KeyDerivationFailed)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use p256::elliptic_curve::rand_core::OsRng;
+
+    fn create_from_test_bytes(value: &[u8]) -> Result<SharedSecret, SharedSecretError> {
+        if value.is_empty() {
+            return Err(SharedSecretError::Invalid(
+                "Shared secret cannot be empty".to_string(),
+            ));
+        }
+
+        Ok(SharedSecret {
+            data: value.to_vec(),
+        })
+    }
+
+    #[test]
+    fn test_shared_secret_creation() {
+        let account_private_key = SigningKey::random(&mut OsRng);
+        let content_public_key = VerifyingKey::from(&SigningKey::random(&mut OsRng));
+
+        let shared_secret = SharedSecret::new(&account_private_key, &content_public_key).unwrap();
+        assert!(!shared_secret.as_ref().is_empty());
+    }
+
+    #[test]
+    fn test_empty_shared_secret() {
+        let result = create_from_test_bytes(&[]);
+        assert!(result.is_err());
+        if let Err(SharedSecretError::Invalid(msg)) = result {
+            assert_eq!(msg, "Shared secret cannot be empty");
+        } else {
+            panic!("Expected Invalid error");
+        }
+    }
+
+    #[test]
+    fn test_shared_secret_key_derivation_integration() {
+        let test_value = b"test_shared_secret_for_key_derivation";
+        let shared_secret = create_from_test_bytes(test_value).unwrap();
+
+        let key = shared_secret.derive_key(None, None, 32).unwrap();
+        assert_eq!(key.len(), 32);
+
+        let aes_key = shared_secret.derive_aes_256_key(None, None).unwrap();
+        assert_eq!(aes_key.len(), 32);
+    }
+}
