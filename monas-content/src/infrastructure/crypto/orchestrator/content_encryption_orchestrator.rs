@@ -1,4 +1,4 @@
-use crate::infrastructure::crypto::kdf::hkdf::HkdfKeyDerivation;
+use crate::infrastructure::crypto::kdf::shared_secret::SharedSecret;
 use crate::infrastructure::crypto::symmetric::aes_cipher::{AesCipher, SymmetricEncryption};
 use p256::ecdsa::{SigningKey, VerifyingKey};
 use p256::elliptic_curve::rand_core::OsRng;
@@ -40,26 +40,17 @@ impl ContentKeyPair {
 pub struct ContentEncryptionOrchestrator;
 
 impl ContentEncryptionOrchestrator {
-    /// アカウントの秘密鍵とコンテンツの公開鍵から共有秘密を生成する
-    pub fn generate_shared_secret(
-        _account_private_key: &SigningKey,
-        _content_public_key: &VerifyingKey,
-    ) -> Result<Vec<u8>, String> {
-        // TODO: monas-account/で実装された共有秘密生成ロジックを使用する
-        let test_shared_secret = b"test_shared_secret_for_content_encryption";
-        Ok(test_shared_secret.to_vec())
-    }
-
+    /// 共有秘密からAES-256鍵を導出する
     pub fn derive_encryption_key(
-        shared_secret: &[u8],
+        shared_secret: &SharedSecret,
         context_info: Option<&[u8]>,
     ) -> Result<[u8; 32], String> {
-        HkdfKeyDerivation::derive_aes_256_key(
-            shared_secret,
-            None, // salt
-            context_info.or(Some(b"content_encryption")),
-        )
-        .map_err(|e| format!("Deriving encryption key failed: {:?}", e))
+        shared_secret
+            .derive_aes_256_key(
+                None, // salt
+                context_info.or(Some(b"content_encryption")),
+            )
+            .map_err(|e| format!("Deriving encryption key failed: {:?}", e))
     }
 
     pub fn encrypt_with_aes_key(aes_key: [u8; 32], data: &[u8]) -> Result<Vec<u8>, String> {
@@ -75,22 +66,17 @@ impl ContentEncryptionOrchestrator {
         data: &[u8],
     ) -> Result<Vec<u8>, String> {
         // 1: 共有秘密を生成する
-        let shared_secret = Self::generate_shared_secret(account_private_key, content_public_key)?;
+        let shared_secret = SharedSecret::new(account_private_key, content_public_key)
+            .map_err(|e| format!("Failed to generate shared secret: {}", e))?;
 
-        // 2: HKDFで共有秘密からAES鍵を導出する
-        let aes_key = Self::derive_encryption_key(
-            &shared_secret,
-            Some(b"content_encryption"), // Contentのハッシュ値などが考えられる
-        )?;
+        // 2: SharedSecretオブジェクトから直接AES鍵を導出
+        let aes_key = Self::derive_encryption_key(&shared_secret, Some(b"content_encryption"))?;
 
         // 3: AES鍵でContentデータを暗号化する
         Self::encrypt_with_aes_key(aes_key, data)
     }
 
-    pub fn decrypt_with_aes_key(
-        aes_key: [u8; 32],
-        encrypted_data: &[u8],
-    ) -> Result<Vec<u8>, String> {
+    pub fn decrypt_with_aes_key(aes_key: [u8; 32], encrypted_data: &[u8]) -> Result<Vec<u8>, String> {
         let cipher = AesCipher::new(aes_key);
         cipher
             .decrypt(encrypted_data)
@@ -103,13 +89,11 @@ impl ContentEncryptionOrchestrator {
         encrypted_data: &[u8],
     ) -> Result<Vec<u8>, String> {
         // 1: 共有秘密を生成する
-        let shared_secret = Self::generate_shared_secret(account_private_key, content_public_key)?;
+        let shared_secret = SharedSecret::new(account_private_key, content_public_key)
+            .map_err(|e| format!("Failed to generate shared secret: {}", e))?;
 
-        // 2: HKDFで共有秘密からAES鍵を導出する
-        let aes_key = Self::derive_encryption_key(
-            &shared_secret,
-            Some(b"content_encryption"), // コンテキスト情報
-        )?;
+        // 2: SharedSecretオブジェクトから直接AES鍵を導出
+        let aes_key = Self::derive_encryption_key(&shared_secret, Some(b"content_encryption"))?;
 
         // 3: AES鍵でデータを復号する
         Self::decrypt_with_aes_key(aes_key, encrypted_data)
