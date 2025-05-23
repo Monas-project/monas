@@ -41,7 +41,7 @@ pub struct ContentEncryptionOrchestrator;
 
 impl ContentEncryptionOrchestrator {
     /// 共有秘密からAES-256鍵を導出する
-    pub fn derive_encryption_key(
+    fn derive_encryption_key(
         shared_secret: &SharedSecret,
         context_info: Option<&[u8]>,
     ) -> Result<[u8; 32], String> {
@@ -53,7 +53,7 @@ impl ContentEncryptionOrchestrator {
             .map_err(|e| format!("Deriving encryption key failed: {:?}", e))
     }
 
-    pub fn encrypt_with_aes_key(aes_key: [u8; 32], data: &[u8]) -> Result<Vec<u8>, String> {
+    fn encrypt_with_aes_key(aes_key: [u8; 32], data: &[u8]) -> Result<Vec<u8>, String> {
         let cipher = AesCipher::new(aes_key);
         cipher
             .encrypt(data)
@@ -76,7 +76,7 @@ impl ContentEncryptionOrchestrator {
         Self::encrypt_with_aes_key(aes_key, data)
     }
 
-    pub fn decrypt_with_aes_key(aes_key: [u8; 32], encrypted_data: &[u8]) -> Result<Vec<u8>, String> {
+    fn decrypt_with_aes_key(aes_key: [u8; 32], encrypted_data: &[u8]) -> Result<Vec<u8>, String> {
         let cipher = AesCipher::new(aes_key);
         cipher
             .decrypt(encrypted_data)
@@ -155,13 +155,13 @@ mod tests {
             .unwrap();
 
         // SharedSecretから直接AES鍵を導出
-        let aes_key1 = ContentEncryptionOrchestrator::derive_encryption_key(
+        let aes_key1 = ContentEncryptionOrchestrator::test_derive_encryption_key(
             &shared_secret,
             Some(b"test context"), // コンテキスト情報
         )
         .unwrap();
 
-        let aes_key2 = ContentEncryptionOrchestrator::derive_encryption_key(
+        let aes_key2 = ContentEncryptionOrchestrator::test_derive_encryption_key(
             &shared_secret,
             Some(b"test context"),
         )
@@ -179,13 +179,13 @@ mod tests {
         let key = [1u8; 32];
         let data = b"Test data for AES encryption";
         let encrypted =
-            ContentEncryptionOrchestrator::encrypt_with_aes_key(key, data).unwrap();
+            ContentEncryptionOrchestrator::test_encrypt_with_aes_key(key, data).unwrap();
         let encrypted_data = &encrypted[12..encrypted.len() - 16];
 
         assert_ne!(encrypted_data, data);
 
         let decrypted =
-            ContentEncryptionOrchestrator::decrypt_with_aes_key(key, &encrypted).unwrap();
+            ContentEncryptionOrchestrator::test_decrypt_with_aes_key(key, &encrypted).unwrap();
 
         assert_eq!(decrypted, data);
     }
