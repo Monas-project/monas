@@ -126,19 +126,17 @@ mod tests {
         let (account_private_key, _account_public_key) = generate_test_account_key_pair();
         let content_key_pair = ContentKeyPair::generate();
 
-        let shared_secret = ContentEncryptionOrchestrator::generate_shared_secret(
-            &account_private_key,
-            content_key_pair.public_key(),
-        )
-        .unwrap();
+        // SharedSecretオブジェクトを生成
+        let shared_secret = SharedSecret::new(&account_private_key, content_key_pair.public_key())
+            .map_err(|e| format!("Failed to generate shared secret: {}", e))
+            .unwrap();
 
-        let aes_key = ContentEncryptionOrchestrator::derive_encryption_key(
+        // SharedSecretから直接AES鍵を導出
+        let aes_key1 = ContentEncryptionOrchestrator::derive_encryption_key(
             &shared_secret,
-            Some(b"test context"),
+            Some(b"test context"), // コンテキスト情報
         )
         .unwrap();
-
-        assert_eq!(aes_key.len(), 32);
 
         let aes_key2 = ContentEncryptionOrchestrator::derive_encryption_key(
             &shared_secret,
@@ -146,14 +144,19 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(aes_key, aes_key2);
+        assert_eq!(aes_key1.len(), 32);
+        assert_eq!(aes_key2.len(), 32);
+
+        // 同じコンテキスト情報で導出した鍵は同一になることを確認する
+        assert_eq!(aes_key1, aes_key2);
     }
 
     #[test]
     fn test_aes_encryption() {
         let key = [1u8; 32];
         let data = b"Test data for AES encryption";
-        let encrypted = ContentEncryptionOrchestrator::encrypt_with_aes_key(key, data).unwrap();
+        let encrypted =
+            ContentEncryptionOrchestrator::encrypt_with_aes_key(key, data).unwrap();
         let encrypted_data = &encrypted[12..encrypted.len() - 16];
 
         assert_ne!(encrypted_data, data);
