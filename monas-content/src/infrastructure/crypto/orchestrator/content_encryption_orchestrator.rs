@@ -104,6 +104,29 @@ impl ContentEncryptionOrchestrator {
 mod tests {
     use super::*;
 
+    impl ContentEncryptionOrchestrator {
+        pub fn test_encrypt_with_aes_key(
+            aes_key: [u8; 32],
+            data: &[u8],
+        ) -> Result<Vec<u8>, String> {
+            Self::encrypt_with_aes_key(aes_key, data)
+        }
+
+        pub fn test_decrypt_with_aes_key(
+            aes_key: [u8; 32],
+            encrypted_data: &[u8],
+        ) -> Result<Vec<u8>, String> {
+            Self::decrypt_with_aes_key(aes_key, encrypted_data)
+        }
+
+        pub fn test_derive_encryption_key(
+            shared_secret: &SharedSecret,
+            context_info: Option<&[u8]>,
+        ) -> Result<[u8; 32], String> {
+            Self::derive_encryption_key(shared_secret, context_info)
+        }
+    }
+
     fn generate_test_account_key_pair() -> (SigningKey, VerifyingKey) {
         let private_key = SigningKey::random(&mut OsRng);
         let public_key = VerifyingKey::from(&private_key);
