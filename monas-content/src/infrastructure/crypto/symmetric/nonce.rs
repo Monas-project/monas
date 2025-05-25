@@ -1,4 +1,4 @@
-use rand::{thread_rng, RngCore};
+use rand::{rng, RngCore};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -15,6 +15,12 @@ pub struct NonceGenerator {
     // storage: Option<Box<dyn CounterStorage>>, // カウンター値を永続化するためのストレージインターフェース
     // last_saved_counter: AtomicU64, // 最後に保存したカウンター値
     // save_interval: Duration, // ウンター値を保存する間隔
+}
+
+impl Default for NonceGenerator {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl NonceGenerator {
@@ -39,7 +45,7 @@ impl NonceGenerator {
         let counter = self.counter.fetch_add(1, Ordering::SeqCst);
 
         // TODO: ランダムネスの保証
-        let mut rng = thread_rng();
+        let mut rng = rng();
         let mut random_bytes = [0u8; 4];
         rng.fill_bytes(&mut random_bytes);
 
