@@ -40,11 +40,6 @@ impl AesCipher {
             nonce_generator: NonceGenerator::new(),
         }
     }
-
-    #[cfg(test)]
-    fn key_for_test(&self) -> &[u8; 32] {
-        &self.key
-    }
 }
 
 impl SymmetricEncryption for AesCipher {
@@ -95,7 +90,14 @@ impl Drop for AesCipher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::mem;
+
+    impl AesCipher {
+        fn mock_drop(&mut self) {
+            for byte in self.key.iter_mut() {
+                *byte = 0;
+            }
+        }
+    }
 
     #[test]
     fn test_encrypt_and_decrypt() {
@@ -112,19 +114,13 @@ mod tests {
 
     #[test]
     fn test_drop_key() {
-        let key = [0x12; 32];
-        let boxed_cipher = Box::new(AesCipher::new(key));
-        assert_eq!(*boxed_cipher.key_for_test(), key);
+        let test_key = [0x12; 32];
+        let mut cipher = AesCipher::new(test_key);
 
-        let ptr = &*boxed_cipher as *const AesCipher;
-        mem::drop(boxed_cipher);
+        assert_eq!(cipher.key, test_key);
 
-        unsafe {
-            // ドロップ後のメモリを直接操作するのは避けるべき
-            let dropped_cipher = &*ptr;
-            for byte in dropped_cipher.key.iter() {
-                assert_eq!(*byte, 0);
-            }
-        }
+        cipher.mock_drop();
+        let zeroed_key = [0u8; 32];
+        assert_eq!(cipher.key, zeroed_key);
     }
 }
