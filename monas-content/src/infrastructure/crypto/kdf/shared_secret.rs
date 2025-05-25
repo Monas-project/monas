@@ -30,11 +30,14 @@ impl SharedSecret {
     ) -> Result<Self, SharedSecretError> {
         // TODO: monas-account/で実装された共有秘密生成ロジックを使用する
         let test_shared_secret = b"test_shared_secret";
-        if test_shared_secret.is_empty() {
-            return Err(SharedSecretError::Invalid(
-                "Shared secret cannot be empty".to_string(),
-            ));
-        }
+
+        // 現在はテスト用の固定値を使用しているため，空チェックは常にfalseになる
+        // 共有秘密生成ロジックの実装が完了したら，コメントアウトを外す
+        // if test_shared_secret.is_empty() {
+        //     return Err(SharedSecretError::Invalid(
+        //         "Shared secret cannot be empty".to_string(),
+        //     ));
+        // }
 
         Ok(Self {
             data: test_shared_secret.to_vec(),
