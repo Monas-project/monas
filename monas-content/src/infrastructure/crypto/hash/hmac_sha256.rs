@@ -56,35 +56,59 @@ impl HmacSha256 {
     }
 }
 
+pub struct HmacSha256Key {
+    key: Vec<u8>,
+}
+
+impl HmacSha256Key {
+    pub fn new(key: &[u8]) -> Self {
+        Self { key: key.to_vec() }
+    }
+
+    pub fn compute(&self, data: &[u8]) -> Result<Vec<u8>, HmacError> {
+        HmacSha256::compute(&self.key, data)
+    }
+
+    pub fn verify(&self, data: &[u8], expected_hash: &[u8]) -> Result<(), HmacError> {
+        HmacSha256::verify(&self.key, data, expected_hash)
+    }
+
+    pub fn is_verified(&self, data: &[u8], expected_hash: &[u8]) -> bool {
+        HmacSha256::is_verified(&self.key, data, expected_hash)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_hmac_compute_and_verify() {
-        let key = b"test key";
+        let key_bytes = b"test key";
         let data = b"test data";
 
-        let hmac = HmacSha256::compute(key, data).unwrap();
-        let hmac2 = HmacSha256::compute(key, data).unwrap();
+        let key = HmacSha256Key::new(key_bytes);
+        let hmac = key.compute(data).unwrap();
+        let hmac2 = key.compute(data).unwrap();
         assert_eq!(hmac, hmac2);
 
-        assert!(HmacSha256::verify(key, data, &hmac).is_ok());
-        assert!(HmacSha256::is_verified(key, data, &hmac));
+        assert!(key.verify(data, &hmac).is_ok());
+        assert!(key.is_verified(data, &hmac));
     }
 
     #[test]
     fn test_different_data_causes_verification_failure() {
-        let key = b"test key";
+        let key_bytes = b"test key";
         let data = b"test data";
-        let hmac = HmacSha256::compute(key, data).unwrap();
+        let key = HmacSha256Key::new(key_bytes);
+        let hmac = key.compute(data).unwrap();
 
         let different_data = b"different data";
-        let incorrect_hmac = HmacSha256::compute(key, different_data).unwrap();
+        let incorrect_hmac = key.compute(different_data).unwrap();
         assert_ne!(hmac, incorrect_hmac);
 
-        assert!(HmacSha256::verify(key, data, &incorrect_hmac).is_err());
-        assert!(!HmacSha256::is_verified(key, data, &incorrect_hmac));
+        assert!(key.verify(data, &incorrect_hmac).is_err());
+        assert!(!key.is_verified(data, &incorrect_hmac));
     }
 
     #[test]
@@ -93,8 +117,9 @@ mod tests {
         let key_lengths = vec![0, 1, 32, 64, 100];
 
         for length in key_lengths {
-            let key = vec![0u8; length];
-            let result = HmacSha256::compute(&key, data).unwrap();
+            let key_bytes = vec![0u8; length];
+            let key = HmacSha256Key::new(&key_bytes);
+            let result = key.compute(data).unwrap();
             assert_eq!(
                 result.len(),
                 32,
