@@ -1,4 +1,4 @@
-use crate::infrastructure::crypto::hash::hmac_sha256::{HmacSha256Key, HmacError};
+use crate::infrastructure::crypto::hash::hmac_sha256::{HmacError, HmacSha256Key};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
