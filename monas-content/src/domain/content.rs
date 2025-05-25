@@ -1,4 +1,5 @@
 use crate::domain::metadata::Metadata;
+use dyn_clone::DynClone;
 use std::fmt::Debug;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,20 +25,14 @@ pub enum ContentEvent {
     Deleted,
 }
 
-pub trait ContentKeyPair: Debug + Send + Sync {
+pub trait ContentKeyPair: Debug + Send + Sync + DynClone {
     fn encrypt(&self, data: &[u8]) -> Vec<u8>;
     fn decrypt(&self, data: &[u8]) -> Vec<u8>;
     fn public_key(&self) -> String;
-    fn clone_box(&self) -> Box<dyn ContentKeyPair>;
 }
+dyn_clone::clone_trait_object!(ContentKeyPair);
 
-impl Clone for Box<dyn ContentKeyPair> {
-    fn clone(&self) -> Self {
-        self.clone_box()
-    }
-}
-
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Content {
     metadata: Metadata,
     raw_content: Option<Vec<u8>>,
@@ -174,19 +169,6 @@ impl Content {
     }
 }
 
-impl Clone for Content {
-    fn clone(&self) -> Self {
-        Self {
-            metadata: self.metadata.clone(),
-            raw_content: self.raw_content.clone(),
-            encrypted_content: self.encrypted_content.clone(),
-            key_pair: self.key_pair.clone(),
-            is_deleted: self.is_deleted,
-            content_status: self.content_status.clone(),
-        }
-    }
-}
-
 #[cfg(test)]
 mod mock {
     use super::*;
@@ -217,10 +199,6 @@ mod mock {
 
         fn public_key(&self) -> String {
             format!("mock_public_key_{}", self.id)
-        }
-
-        fn clone_box(&self) -> Box<dyn ContentKeyPair> {
-            Box::new(self.clone())
         }
     }
 }
