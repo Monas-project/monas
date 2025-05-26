@@ -262,11 +262,7 @@ pub mod tests {
 
     // Helper function to create a test Content
     fn create_test_content(name: &str, path: &str, content: &[u8]) -> Content {
-        let metadata = Metadata::new(
-            name.to_string(),
-            content,
-            path.to_string(),
-        );
+        let metadata = Metadata::new(name.to_string(), content, path.to_string());
 
         Content::new(
             metadata,
