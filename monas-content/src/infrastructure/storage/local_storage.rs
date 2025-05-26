@@ -201,7 +201,7 @@ pub fn create_local_storage(base_path: String) -> Result<impl Storage, StorageEr
 /// does not store the actual content data. It is specialized for metadata management.
 ///
 /// # Notes
-/// * The `load` method always returns an error (as content data is not stored)
+/// * The `read` method always returns an error (as content data is not stored)
 /// * The `save` and `delete` methods operate only on metadata files
 impl Storage for ContentLocalStorage {
     fn save(&self, content: &Content) -> Result<(), StorageError> {
