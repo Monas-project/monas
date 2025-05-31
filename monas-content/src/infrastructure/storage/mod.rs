@@ -1,2 +1,4 @@
 pub mod local_storage;
-pub mod storage;
+mod traits;
+
+pub use traits::{Storage, StorageError};
