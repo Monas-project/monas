@@ -1,6 +1,6 @@
 use crate::domain::content::Content;
 use crate::domain::metadata::Metadata;
-use crate::infrastructure::storage::{Storage, StorageError};
+use crate::infrastructure::storage::storage::{Storage, StorageError};
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::fs;
