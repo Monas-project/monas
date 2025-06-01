@@ -1,0 +1,10 @@
+[package]
+name = "monas-state-node"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+dyn-clone = "1.0"
+async-trait = "0.1"
+tokio = { version = "1.0", features = ["full"] }
