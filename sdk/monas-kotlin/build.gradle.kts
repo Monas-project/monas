@@ -31,7 +31,7 @@ val copyWasmModule by tasks.registering(Copy::class) {
     dependsOn(cargoBuild)
 }
 
-tasks.named("compileKotlin") {
+tasks.named("processResources") {
     dependsOn(copyWasmModule)
 }
 
