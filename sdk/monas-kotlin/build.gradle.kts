@@ -38,7 +38,7 @@ tasks.named("processResources") {
 tasks.test {
     useJUnitPlatform()
 }
-// Kotlin のコンパイル前に cargoBuild を実行
+
 kotlin {
     jvmToolchain(21)
 }
