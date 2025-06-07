@@ -3,7 +3,7 @@ plugins {
 }
 
 group = "com.github.monas"
-version = "0.1-SNAPSHOT"
+version = "1.0-SNAPSHOT"
 
 repositories {
     mavenCentral()
