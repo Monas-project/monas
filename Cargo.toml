@@ -1,5 +1,5 @@
 [workspace]
-members = ["monas-account", "monas-content"]
+members = ["monas-account", "monas-content", "wasm-module-proto"]
 resolver = "2"
 
 [workspace.package]
