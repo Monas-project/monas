@@ -26,4 +26,25 @@ impl ContentNetworkRepository for ContentNetworkRepositoryImpl {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::application_service::state_node_service::ContentNetworkRepository as RepoTrait;
+    use std::collections::BTreeSet;
 
+    #[test]
+    fn find_assignable_and_roundtrip_network() {
+        let mut repo = ContentNetworkRepositoryImpl::default();
+        repo.cids_by_required_capacity.push((300, "cid-1".into()));
+        let cids = repo.find_assignable_cids(400);
+        assert_eq!(cids, vec!["cid-1".to_string()]);
+
+        let net = ContentNetwork {
+            content_id: "cid-1".into(),
+            managing_nodes: BTreeSet::new(),
+        };
+        repo.save_content_network(net);
+        let got = repo.get_content_network("cid-1");
+        assert!(got.is_some());
+    }
+}

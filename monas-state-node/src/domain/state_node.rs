@@ -1,5 +1,5 @@
+use super::events::{current_timestamp, Event};
 use serde::{Deserialize, Serialize};
-use super::events::{Event, current_timestamp};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NodeSnapshot {
@@ -77,4 +77,61 @@ pub fn decide_assignment(
     (response, events)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
 
+    #[test]
+    fn create_node_emits_event() {
+        let (snap, events) = create_node("node-A".into(), 500);
+        assert_eq!(snap.node_id, "node-A");
+        assert_eq!(snap.total_capacity, 500);
+        assert_eq!(snap.available_capacity, 500);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            Event::NodeCreated {
+                node_id,
+                total_capacity,
+                available_capacity,
+                ..
+            } => {
+                assert_eq!(node_id, "node-A");
+                assert_eq!(*total_capacity, 500);
+                assert_eq!(*available_capacity, 500);
+            }
+            _ => panic!("expected NodeCreated"),
+        }
+    }
+
+    #[test]
+    fn build_assignment_request_uses_snapshot_values() {
+        let (snap, _) = create_node("node-A".into(), 700);
+        let req = build_assignment_request(&snap);
+        assert_eq!(req.requesting_node_id, "node-A");
+        assert_eq!(req.available_capacity, 700);
+    }
+
+    #[test]
+    fn decide_assignment_with_single_candidate() {
+        let (snap, _) = create_node("node-A".into(), 700);
+        let req = build_assignment_request(&snap);
+        let candidates = vec!["cid-1".to_string()];
+        let (resp, events) = decide_assignment("node-B", &req, &candidates);
+        assert_eq!(resp.assigning_node_id, "node-B");
+        assert_eq!(resp.assigned_content_network, Some("cn::cid-1".to_string()));
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            Event::AssignmentDecided {
+                assigning_node_id,
+                assigned_node_id,
+                content_id,
+                ..
+            } => {
+                assert_eq!(assigning_node_id, "node-B");
+                assert_eq!(assigned_node_id, "node-A");
+                assert_eq!(content_id, "cid-1");
+            }
+            _ => panic!("expected AssignmentDecided"),
+        }
+    }
+}

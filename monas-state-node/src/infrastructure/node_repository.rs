@@ -15,4 +15,21 @@ impl NodeRegistry for NodeRegistryImpl {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::application_service::state_node_service::NodeRegistry;
 
+    #[test]
+    fn upsert_and_get_capacity() {
+        let mut repo = NodeRegistryImpl::default();
+        let snap = NodeSnapshot {
+            node_id: "node-A".into(),
+            total_capacity: 1000,
+            available_capacity: 800,
+        };
+        repo.upsert_node(&snap);
+        assert_eq!(repo.get_available_capacity("node-A"), Some(800));
+        assert_eq!(repo.get_available_capacity("node-X"), None);
+    }
+}
