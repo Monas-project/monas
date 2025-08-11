@@ -18,8 +18,6 @@ pub trait PeerNetwork {
     fn query_assignable_cids(&self, capacity: u64) -> Vec<String>;
 }
 
-// 具体実装は infrastructure 層へ。ここではポートのみ定義します。
-
 #[derive(Default)]
 pub struct InMemoryContentDirectory {
     pub cids_by_required_capacity: Vec<(u64, String)>,

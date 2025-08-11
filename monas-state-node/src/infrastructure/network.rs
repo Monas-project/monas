@@ -1,6 +1,5 @@
 use crate::application_service::state_node_service::PeerNetwork;
 
-// ひとまず最小限のスタブ実装。後続でlibp2pのKademlia/Gossipsub連携を拡張可能。
 pub struct Libp2pNetwork;
 
 impl Libp2pNetwork {
