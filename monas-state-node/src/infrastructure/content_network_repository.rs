@@ -41,7 +41,7 @@ mod tests {
 
         let net = ContentNetwork {
             content_id: "cid-1".into(),
-            managing_nodes: BTreeSet::new(),
+            member_nodes: BTreeSet::new(),
         };
         repo.save_content_network(net);
         let got = repo.get_content_network("cid-1");

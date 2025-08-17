@@ -82,7 +82,7 @@ pub fn add_manager(
         .get_content_network(content_id)
         .unwrap_or_else(|| ContentNetwork {
             content_id: content_id.to_string(),
-            managing_nodes: BTreeSet::new(),
+            member_nodes: BTreeSet::new(),
         });
     let (updated, events) = content_network::add_manager(base, added_node_id.to_string());
     content_repo.save_content_network(updated);
@@ -167,6 +167,6 @@ mod tests {
         let net = contents
             .get_content_network("cid-2")
             .expect("network saved");
-        assert!(net.managing_nodes.contains("node-A"));
+        assert!(net.member_nodes.contains("node-A"));
     }
 }

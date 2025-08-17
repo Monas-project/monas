@@ -17,7 +17,7 @@ pub enum Event {
     ContentNetworkManagerAdded {
         content_id: String,
         added_node_id: String,
-        managing_nodes: Vec<String>,
+        member_nodes: Vec<String>,
         timestamp: u64,
     },
 }
