@@ -57,15 +57,15 @@ pub fn handle_assignment_request(
     requesting_node: &NodeSnapshot,
 ) -> (AssignmentRequest, AssignmentResponse, Vec<Event>) {
     let request: AssignmentRequest = state_node::build_assignment_request(requesting_node);
-    let a_capacity = node_registry
+    let capacity = node_registry
         .get_available_capacity(&request.requesting_node_id)
         .or_else(|| peer_network.and_then(|n| n.query_node_capacity(&request.requesting_node_id)))
         .unwrap_or(request.available_capacity);
 
-    let mut candidate_cids = content_repo.find_assignable_cids(a_capacity);
+    let mut candidate_cids = content_repo.find_assignable_cids(capacity);
     if candidate_cids.is_empty() {
         if let Some(net) = peer_network {
-            candidate_cids = net.query_assignable_cids(a_capacity);
+            candidate_cids = net.query_assignable_cids(capacity);
         }
     }
     let (response, events) =
