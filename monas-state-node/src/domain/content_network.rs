@@ -8,7 +8,7 @@ pub struct ContentNetwork {
     pub member_nodes: BTreeSet<String>,
 }
 
-pub fn add_manager(
+pub fn add_member_node(
     mut network: ContentNetwork,
     added_node_id: String,
 ) -> (ContentNetwork, Vec<Event>) {
@@ -27,12 +27,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn add_manager_emits_event_and_updates_set() {
+    fn add_member_node_emits_event_and_updates_set() {
         let net = ContentNetwork {
             content_id: "cid-1".into(),
             member_nodes: BTreeSet::new(),
         };
-        let (net, events) = add_manager(net, "node-A".into());
+        let (net, events) = add_member_node(net, "node-A".into());
         assert!(net.member_nodes.contains("node-A"));
         assert_eq!(events.len(), 1);
         match &events[0] {

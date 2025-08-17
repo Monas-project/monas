@@ -73,7 +73,7 @@ pub fn handle_assignment_request(
     (request, response, events)
 }
 
-pub fn add_manager(
+pub fn add_member_node(
     content_repo: &mut dyn ContentNetworkRepository,
     content_id: &str,
     added_node_id: &str,
@@ -84,7 +84,7 @@ pub fn add_manager(
             content_id: content_id.to_string(),
             member_nodes: BTreeSet::new(),
         });
-    let (updated, events) = content_network::add_manager(base, added_node_id.to_string());
+    let (updated, events) = content_network::add_member_node(base, added_node_id.to_string());
     content_repo.save_content_network(updated);
     events
 }
@@ -159,9 +159,9 @@ mod tests {
     }
 
     #[test]
-    fn add_manager_updates_repo_and_emits_event() {
+    fn add_member_node_updates_repo_and_emits_event() {
         let mut contents = ContentNetworkRepositoryImpl::default();
-        let events = add_manager(&mut contents, "cid-2", "node-A");
+        let events = add_member_node(&mut contents, "cid-2", "node-A");
 
         assert_eq!(events.len(), 1);
         let net = contents
