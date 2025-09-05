@@ -16,9 +16,8 @@ single_line_if_else_max_width = 50
 single_line_let_else_max_width = 50
 
 # Comment formatting
-wrap_comments = true
-format_code_in_doc_comments = true
-doc_comment_code_block_width = 100
+wrap_comments = false
+format_code_in_doc_comments = false
 
 # Import formatting
 reorder_imports = true
@@ -26,28 +25,14 @@ reorder_modules = true
 
 # Control flow formatting
 remove_nested_parens = true
-combine_control_expr = true
 short_array_element_width_threshold = 10
 
 # Match formatting
-match_arm_blocks = true
 match_arm_leading_pipes = "Never"
 match_block_trailing_comma = false
 
 # Function formatting
 fn_params_layout = "Tall"
-
-# Brace style
-brace_style = "SameLineWhere"
-control_brace_style = "AlwaysSameLine"
-
-# Trailing punctuation
-trailing_semicolon = true
-trailing_comma = "Vertical"
-
-# Blank lines
-blank_lines_upper_bound = 1
-blank_lines_lower_bound = 0
 
 # Edition
 edition = "2021"
@@ -57,4 +42,3 @@ merge_derives = true
 use_try_shorthand = false
 use_field_init_shorthand = false
 force_explicit_abi = true
-color = "Auto"

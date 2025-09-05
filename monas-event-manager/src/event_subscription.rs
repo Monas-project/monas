@@ -23,10 +23,7 @@ type DeadLetterCallback = Arc<Mutex<Option<Arc<dyn Fn(&EventMessage) + Send + Sy
 
 type EventTypeRegistry = Arc<
     RwLock<
-        HashMap<
-            String,
-            Box<dyn Fn(&str) -> Option<Arc<dyn Event + Send + Sync>> + Send + Sync>,
-        >,
+        HashMap<String, Box<dyn Fn(&str) -> Option<Arc<dyn Event + Send + Sync>> + Send + Sync>>,
     >,
 >;
 
@@ -280,9 +277,7 @@ impl Subscriber {
 
         let initial_queue_size = queue.len();
         if initial_queue_size > 0 {
-            eprintln!(
-                "Processing retry queue with {initial_queue_size} messages"
-            );
+            eprintln!("Processing retry queue with {initial_queue_size} messages");
         }
 
         while let Some(message) = queue.pop_front() {
@@ -326,9 +321,7 @@ impl Subscriber {
 
         let final_queue_size = queue.len();
         if final_queue_size != initial_queue_size {
-            eprintln!(
-                "Retry queue size changed from {initial_queue_size} to {final_queue_size}"
-            );
+            eprintln!("Retry queue size changed from {initial_queue_size} to {final_queue_size}");
         }
     }
 
@@ -733,9 +726,7 @@ impl EventRestorer for DefaultEventRestorer {
             }
             restored
         } else {
-            println!(
-                "[DEBUG] DefaultEventRestorer: unknown event_type={event_type}"
-            );
+            println!("[DEBUG] DefaultEventRestorer: unknown event_type={event_type}");
             None
         }
     }
@@ -909,8 +900,7 @@ mod event_subscription_tests {
         let message_count = stats["message_count"];
         assert!(
             message_count == 0 || message_count == 1,
-            "Expected message_count to be 0 or 1, got {}",
-            message_count
+            "Expected message_count to be 0 or 1, got {message_count}"
         );
     }
 
@@ -996,7 +986,7 @@ mod event_subscription_tests {
 
         // Publish multiple events
         for i in 0..5 {
-            let event = Arc::new(TestEvent::new(&format!("multiple_event_{}", i)));
+            let event = Arc::new(TestEvent::new(&format!("multiple_event_{i}")));
             subscriptions.publish(event).await.unwrap();
         }
 
@@ -1150,7 +1140,7 @@ mod event_subscription_tests {
         // Publish multiple events
         for i in 0..10 {
             let event = Arc::new(TestEvent {
-                data: format!("compaction_event_{}", i),
+                data: format!("compaction_event_{i}"),
             });
             subscriptions.publish(event).await.unwrap();
         }
@@ -1169,8 +1159,7 @@ mod event_subscription_tests {
         let message_count = stats["message_count"];
         assert!(
             message_count == 0 || message_count == 10,
-            "Expected message_count to be 0 or 10, got {}",
-            message_count
+            "Expected message_count to be 0 or 10, got {message_count}"
         );
     }
 
@@ -1218,11 +1207,9 @@ mod event_subscription_tests {
         });
 
         // Wait for both processes to complete
-        let (restore_result, publish_result) = futures::join!(restore_handle, publish_handle);
+        let (_restore_result, _publish_result) = futures::join!(restore_handle, publish_handle);
 
-        // spawn return value is () so no need for is_ok()
-        assert_eq!(restore_result, ());
-        assert_eq!(publish_result, ());
+        // Both processes completed without panicking
     }
 
     #[async_std::test]
@@ -1539,7 +1526,7 @@ mod event_subscription_tests {
         assert!(any_ref.downcast_ref::<DummyEvent>().is_some());
 
         // Test Debug implementation
-        let debug_str = format!("{:?}", dummy);
+        let debug_str = format!("{dummy:?}");
         assert_eq!(debug_str, "DummyEvent");
     }
 }

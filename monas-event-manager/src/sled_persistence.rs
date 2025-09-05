@@ -165,7 +165,7 @@ mod sled_persistence_tests {
     use crate::event_subscription::SerializableEvent;
     use std::any::Any;
     use std::sync::Arc;
-    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant};
     use tempfile::TempDir;
 
     // Define test event types inline for testing
@@ -331,7 +331,7 @@ mod sled_persistence_tests {
         // Save multiple messages
         for i in 0..3 {
             let message = EventMessage {
-                id: format!("test_id_{}", i),
+                id: format!("test_id_{i}"),
                 event: event.clone(),
                 event_type: TestEvent::event_type().to_string(),
                 event_data: serde_json::to_string(&*event).unwrap_or_default(),
@@ -516,7 +516,7 @@ mod sled_persistence_tests {
         // Save multiple messages
         for i in 0..5 {
             let message = EventMessage {
-                id: format!("test_id_{}", i),
+                id: format!("test_id_{i}"),
                 event: event.clone(),
                 event_type: TestEvent::event_type().to_string(),
                 event_data: serde_json::to_string(&*event).unwrap_or_default(),
@@ -540,9 +540,9 @@ mod sled_persistence_tests {
 
         // Save multiple messages
         for i in 0..10 {
-            let event = Arc::new(TestEvent::new(&format!("compact_test_{}", i)));
+            let event = Arc::new(TestEvent::new(&format!("compact_test_{i}")));
             let message = EventMessage {
-                id: format!("compact_id_{}", i),
+                id: format!("compact_id_{i}"),
                 event: event.clone(),
                 event_type: TestEvent::event_type().to_string(),
                 event_data: serde_json::to_string(&*event).unwrap_or_default(),
@@ -600,9 +600,9 @@ mod sled_persistence_tests {
 
         // Save multiple dead letters
         for i in 0..5 {
-            let event = Arc::new(TestEvent::new(&format!("dead_letter_{}", i)));
+            let event = Arc::new(TestEvent::new(&format!("dead_letter_{i}")));
             let message = EventMessage {
-                id: format!("dead_letter_id_{}", i),
+                id: format!("dead_letter_id_{i}"),
                 event: event.clone(),
                 event_type: TestEvent::event_type().to_string(),
                 event_data: serde_json::to_string(&*event).unwrap_or_default(),
@@ -620,7 +620,7 @@ mod sled_persistence_tests {
 
         // Check the state of each message
         for (i, message) in restored_messages.iter().enumerate() {
-            assert_eq!(message.id, format!("dead_letter_id_{}", i));
+            assert_eq!(message.id, format!("dead_letter_id_{i}"));
             assert_eq!(message.status, DeliveryStatus::Failed);
             assert_eq!(message.retry_count, 3);
         }
@@ -770,9 +770,9 @@ mod sled_persistence_tests {
 
         // Save multiple dead letters
         for i in 0..10 {
-            let event = Arc::new(TestEvent::new(&format!("stats_test_{}", i)));
+            let event = Arc::new(TestEvent::new(&format!("stats_test_{i}")));
             let message = EventMessage {
-                id: format!("stats_id_{}", i),
+                id: format!("stats_id_{i}"),
                 event: event.clone(),
                 event_type: TestEvent::event_type().to_string(),
                 event_data: serde_json::to_string(&*event).unwrap_or_default(),
@@ -806,9 +806,9 @@ mod sled_persistence_tests {
         for i in 0..5 {
             let manager_clone = manager.clone();
             let handle = std::thread::spawn(move || {
-                let event = Arc::new(TestEvent::new(&format!("concurrent_test_{}", i)));
+                let event = Arc::new(TestEvent::new(&format!("concurrent_test_{i}")));
                 let message = EventMessage {
-                    id: format!("concurrent_id_{}", i),
+                    id: format!("concurrent_id_{i}"),
                     event: event.clone(),
                     event_type: TestEvent::event_type().to_string(),
                     event_data: serde_json::to_string(&*event).unwrap_or_default(),

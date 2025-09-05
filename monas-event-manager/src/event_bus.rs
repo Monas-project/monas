@@ -527,7 +527,7 @@ mod event_bus_tests {
         let mut handles = Vec::new();
         for i in 0..10 {
             let event_bus = event_bus.clone();
-            let event = Arc::new(TestEvent::new(&format!("concurrent_{}", i)));
+            let event = Arc::new(TestEvent::new(&format!("concurrent_{i}")));
 
             let handle = async_std::task::spawn(async move {
                 event_bus.publish(event).await.unwrap();
@@ -574,7 +574,7 @@ mod event_bus_tests {
     #[async_std::test]
     async fn test_restore_and_retry_dead_letters() {
         let temp_dir = TempDir::new().unwrap();
-        let persistence_manager =
+        let _persistence_manager =
             SledPersistenceManager::new(temp_dir.path().to_str().unwrap()).unwrap();
         let event_bus = EventBus::new();
 
@@ -661,7 +661,7 @@ mod event_bus_tests {
 
         // Publish multiple events
         for i in 0..5 {
-            let event = Arc::new(TestEvent::new(&format!("multiple_event_{}", i)));
+            let event = Arc::new(TestEvent::new(&format!("multiple_event_{i}")));
             event_bus.publish(event).await.unwrap();
         }
 
@@ -744,7 +744,7 @@ mod event_bus_tests {
     #[async_std::test]
     async fn test_database_compaction_after_restoration() {
         let temp_dir = TempDir::new().unwrap();
-        let persistence_manager =
+        let _persistence_manager =
             SledPersistenceManager::new(temp_dir.path().to_str().unwrap()).unwrap();
         let event_bus = EventBus::new();
 
@@ -771,7 +771,7 @@ mod event_bus_tests {
 
         // Publish multiple events
         for i in 0..10 {
-            let event = Arc::new(TestEvent::new(&format!("compaction_restore_event_{}", i)));
+            let event = Arc::new(TestEvent::new(&format!("compaction_restore_event_{i}")));
             event_bus.publish(event).await.unwrap();
         }
 
@@ -789,15 +789,14 @@ mod event_bus_tests {
         let message_count = stats["message_count"];
         assert!(
             message_count == 0 || message_count == 10,
-            "Expected message_count to be 0 or 10, got {}",
-            message_count
+            "Expected message_count to be 0 or 10, got {message_count}"
         );
     }
 
     #[async_std::test]
     async fn test_concurrent_restoration_and_publishing() {
         let temp_dir = TempDir::new().unwrap();
-        let persistence_manager =
+        let _persistence_manager =
             SledPersistenceManager::new(temp_dir.path().to_str().unwrap()).unwrap();
         let event_bus = EventBus::new();
 
@@ -836,8 +835,7 @@ mod event_bus_tests {
             let event_bus = event_bus.clone();
             async move {
                 for i in 0..5 {
-                    let event =
-                        Arc::new(TestEvent::new(&format!("concurrent_restore_event_{}", i)));
+                    let event = Arc::new(TestEvent::new(&format!("concurrent_restore_event_{i}")));
                     event_bus.publish(event).await.unwrap();
                     sleep(Duration::from_millis(10)).await;
                 }
@@ -866,7 +864,7 @@ mod event_bus_tests {
         event_bus.register_event_type::<TestEvent>().await;
 
         // Confirm registration succeeded (no errors expected)
-        assert!(true);
+        // Registration completed without panicking
     }
 
     #[async_std::test]

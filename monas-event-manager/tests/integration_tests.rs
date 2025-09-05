@@ -5,12 +5,8 @@ use async_std::task::sleep;
 use monas_event_manager::config::SubscriberConfig;
 use monas_event_manager::event_bus::Event;
 use monas_event_manager::event_bus::EventBus;
-use monas_event_manager::event_subscription::{
-    make_subscriber, make_subscriber_with_config, DefaultEventRestorer, SerializableEvent,
-    Subscriber,
-};
+use monas_event_manager::event_subscription::{make_subscriber_with_config, DefaultEventRestorer};
 use monas_event_manager::sled_persistence::SledPersistenceManager;
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -82,8 +78,8 @@ async fn test_complete_dead_letter_workflow() {
     // Publish multiple events (will fail)
     for i in 0..3 {
         let event = Arc::new(IntegrationTestEvent {
-            id: format!("event_{}", i),
-            data: format!("test_data_{}", i),
+            id: format!("event_{i}"),
+            data: format!("test_data_{i}"),
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -194,8 +190,8 @@ async fn test_partial_success_restoration() {
     // Publish 5 events
     for i in 0..5 {
         let event = Arc::new(IntegrationTestEvent {
-            id: format!("partial_event_{}", i),
-            data: format!("partial_data_{}", i),
+            id: format!("partial_event_{i}"),
+            data: format!("partial_data_{i}"),
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -220,8 +216,7 @@ async fn test_partial_success_restoration() {
     let message_count = stats["message_count"];
     assert!(
         message_count == 0 || message_count == 3,
-        "Expected message_count to be 0 or 3, got {}",
-        message_count
+        "Expected message_count to be 0 or 3, got {message_count}"
     );
 }
 
@@ -299,13 +294,13 @@ async fn test_restoration_with_multiple_event_types() {
     // Publish both event types
     for i in 0..3 {
         let event_a = Arc::new(TypeAEvent {
-            value: format!("type_a_{}", i),
+            value: format!("type_a_{i}"),
         });
         event_bus.publish(event_a.clone()).await.unwrap();
 
         let event_b = Arc::new(TypeBEvent {
-            id: format!("type_b_{}", i),
-            text: format!("text_{}", i),
+            id: format!("type_b_{i}"),
+            text: format!("text_{i}"),
         });
         event_bus.publish(event_b.clone()).await.unwrap();
     }
@@ -318,8 +313,7 @@ async fn test_restoration_with_multiple_event_types() {
     let message_count = stats["message_count"];
     assert!(
         message_count == 0 || message_count == 6,
-        "Expected message_count to be 0 or 6, got {}",
-        message_count
+        "Expected message_count to be 0 or 6, got {message_count}"
     );
 
     // Restore dead letters
@@ -333,19 +327,19 @@ async fn test_restoration_with_multiple_event_types() {
 
     // Ensure restored events are processed
     assert!(
-        type_a_results.len() >= 0,
+        !type_a_results.is_empty(),
         "TypeA events should be processed"
     );
     assert!(
-        type_b_results.len() >= 0,
+        !type_b_results.is_empty(),
         "TypeB events should be processed"
     );
 
     // Check if expected event IDs are included
     for i in 0..3 {
         assert!(
-            type_a_results.contains(&format!("type_a_{}", i))
-                || type_b_results.contains(&format!("type_b_{}", i))
+            type_a_results.contains(&format!("type_a_{i}"))
+                || type_b_results.contains(&format!("type_b_{i}"))
         );
     }
 }
@@ -396,8 +390,8 @@ async fn test_restoration_performance() {
 
     for i in 0..100 {
         let event = Arc::new(IntegrationTestEvent {
-            id: format!("perf_event_{}", i),
-            data: format!("perf_data_{}", i),
+            id: format!("perf_event_{i}"),
+            data: format!("perf_data_{i}"),
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -424,7 +418,7 @@ async fn test_restoration_performance() {
     // Check performance (completed within 1 second)
     assert!(duration.as_secs() < 1);
 
-    println!("Processed {} events in {:?}", processed, duration);
+    println!("Processed {processed} events in {duration:?}");
 }
 
 #[async_std::test]
