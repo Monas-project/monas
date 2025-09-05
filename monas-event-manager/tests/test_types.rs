@@ -55,4 +55,4 @@ impl SerializableEvent for TypeBEvent {
     fn event_type() -> &'static str {
         "TypeBEvent"
     }
-} 
+}

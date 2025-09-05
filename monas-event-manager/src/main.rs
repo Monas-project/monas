@@ -11,9 +11,9 @@ use std::sync::Arc;
 /// In a real application, define domain-specific event types
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct UserCreatedEvent {
-    user_id: String,    // User ID
-    username: String,   // Username
-    email: String,      // Email address
+    user_id: String,  // User ID
+    username: String, // Username
+    email: String,    // Email address
 }
 
 /// Implementation of the `Event` trait
@@ -59,12 +59,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Restore dead letters and retry (startup recovery step)
     if let Err(e) = event_bus.restore_and_retry_dead_letters().await {
-        eprintln!("Failed to restore and retry dead letters: {}", e);
+        eprintln!("Failed to restore and retry dead letters: {e}");
     }
 
     // Get persistence stats (useful for monitoring)
     if let Ok(stats) = event_bus.get_persistence_stats() {
-        println!("Database stats: {:?}", stats);
+        println!("Database stats: {stats:?}");
     }
 
     // Clean up old in-memory messages (periodic maintenance)

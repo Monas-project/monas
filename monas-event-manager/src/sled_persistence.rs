@@ -1,4 +1,4 @@
-use crate::event_subscription::{EventMessage, DeliveryStatus};
+use crate::event_subscription::{DeliveryStatus, EventMessage};
 use serde::{Deserialize, Serialize};
 use sled;
 use std::collections::HashMap;
@@ -23,7 +23,7 @@ pub struct SledPersistenceManager {
 
 impl SledPersistenceManager {
     pub fn new(path: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let db = sled::open(path).map_err(|e| format!("Failed to open sled database: {}", e))?;
+        let db = sled::open(path).map_err(|e| format!("Failed to open sled database: {e}"))?;
         Ok(Self { db: Arc::new(db) })
     }
 
@@ -50,13 +50,13 @@ impl SledPersistenceManager {
 
         let key = format!("event_message_{}", message.id);
         let value = serde_json::to_vec(&persistent_msg)
-            .map_err(|e| format!("Failed to serialize message: {}", e))?;
+            .map_err(|e| format!("Failed to serialize message: {e}"))?;
         self.db
             .insert(key, value)
-            .map_err(|e| format!("Failed to insert message: {}", e))?;
+            .map_err(|e| format!("Failed to insert message: {e}"))?;
         self.db
             .flush()
-            .map_err(|e| format!("Failed to flush database: {}", e))?;
+            .map_err(|e| format!("Failed to flush database: {e}"))?;
         Ok(())
     }
 
@@ -67,14 +67,14 @@ impl SledPersistenceManager {
         let mut messages = Vec::new();
 
         for result in self.db.iter() {
-            let (key, value) = result.map_err(|e| format!("Failed to iterate database: {}", e))?;
+            let (key, value) = result.map_err(|e| format!("Failed to iterate database: {e}"))?;
             let key_str = String::from_utf8(key.to_vec())
-                .map_err(|e| format!("Failed to decode key: {}", e))?;
+                .map_err(|e| format!("Failed to decode key: {e}"))?;
 
             if key_str.starts_with("event_message_") {
                 if let Ok(message) = serde_json::from_slice::<PersistentMessage>(&value) {
-            messages.push(message);
-        }
+                    messages.push(message);
+                }
             }
         }
 
@@ -86,13 +86,13 @@ impl SledPersistenceManager {
         &self,
         message_id: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let key = format!("event_message_{}", message_id);
+        let key = format!("event_message_{message_id}");
         self.db
             .remove(key)
-            .map_err(|e| format!("Failed to delete message: {}", e))?;
+            .map_err(|e| format!("Failed to delete message: {e}"))?;
         self.db
             .flush()
-            .map_err(|e| format!("Failed to flush database: {}", e))?;
+            .map_err(|e| format!("Failed to flush database: {e}"))?;
         Ok(())
     }
 
@@ -110,7 +110,7 @@ impl SledPersistenceManager {
         for message in messages {
             if now - message.timestamp > max_age_secs {
                 self.delete_message(&message.id)?;
-        }
+            }
         }
         Ok(())
     }
@@ -124,9 +124,9 @@ impl SledPersistenceManager {
         let mut total_size = 0;
 
         for result in self.db.iter() {
-            let (key, value) = result.map_err(|e| format!("Failed to iterate database: {}", e))?;
+            let (key, value) = result.map_err(|e| format!("Failed to iterate database: {e}"))?;
             let key_str = String::from_utf8(key.to_vec())
-                .map_err(|e| format!("Failed to decode key: {}", e))?;
+                .map_err(|e| format!("Failed to decode key: {e}"))?;
 
             if key_str.starts_with("event_message_") {
                 message_count += 1;
@@ -144,7 +144,7 @@ impl SledPersistenceManager {
     pub fn compact(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.db
             .flush()
-            .map_err(|e| format!("Failed to flush database: {}", e))?;
+            .map_err(|e| format!("Failed to flush database: {e}"))?;
         // sled runs background compaction automatically
         Ok(())
     }
@@ -153,7 +153,7 @@ impl SledPersistenceManager {
 impl Drop for SledPersistenceManager {
     fn drop(&mut self) {
         if let Err(e) = self.db.flush() {
-            eprintln!("Failed to flush sled database: {}", e);
+            eprintln!("Failed to flush sled database: {e}");
         }
     }
 }

@@ -21,7 +21,9 @@ impl EventBus {
         persistence_manager: crate::sled_persistence::SledPersistenceManager,
     ) -> Self {
         Self {
-            event_subscriptions: crate::event_subscription::EventSubscriptions::with_persistence(persistence_manager),
+            event_subscriptions: crate::event_subscription::EventSubscriptions::with_persistence(
+                persistence_manager,
+            ),
         }
     }
 
@@ -311,7 +313,9 @@ mod event_bus_tests {
         }
 
         impl crate::event_subscription::SerializableEvent for EventType1 {
-            fn event_type() -> &'static str { "EventType1" }
+            fn event_type() -> &'static str {
+                "EventType1"
+            }
         }
 
         #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -326,7 +330,9 @@ mod event_bus_tests {
         }
 
         impl crate::event_subscription::SerializableEvent for EventType2 {
-            fn event_type() -> &'static str { "EventType2" }
+            fn event_type() -> &'static str {
+                "EventType2"
+            }
         }
 
         let received_type1 = Arc::new(AsyncMutex::new(Vec::new()));

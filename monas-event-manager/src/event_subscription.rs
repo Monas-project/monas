@@ -12,6 +12,24 @@ use crate::config::SubscriberConfig;
 use crate::event_bus::Event;
 use crate::sled_persistence::SledPersistenceManager;
 
+// Type aliases for complex types
+type EventHandler = Arc<
+    dyn Fn(&dyn Event) -> BoxFuture<'static, Result<(), Box<dyn std::error::Error + Send + Sync>>>
+        + Send
+        + Sync,
+>;
+
+type DeadLetterCallback = Arc<Mutex<Option<Arc<dyn Fn(&EventMessage) + Send + Sync>>>>;
+
+type EventTypeRegistry = Arc<
+    RwLock<
+        HashMap<
+            String,
+            Box<dyn Fn(&str) -> Option<Arc<dyn Event + Send + Sync>> + Send + Sync>,
+        >,
+    >,
+>;
+
 #[derive(Debug, Clone)]
 pub struct DummyEvent;
 
@@ -82,7 +100,7 @@ impl<'de> serde::Deserialize<'de> for DeliveryStatus {
                     "delivered" => Ok(DeliveryStatus::Delivered),
                     "failed" => Ok(DeliveryStatus::Failed),
                     "retrying" => Ok(DeliveryStatus::Retrying),
-                    _ => Err(E::custom(format!("unknown delivery status: {}", value))),
+                    _ => Err(E::custom(format!("unknown delivery status: {value}"))),
                 }
             }
         }
@@ -126,20 +144,13 @@ pub enum ConnectionStatus {
 
 pub struct Subscriber {
     id: String,
-    handler: Arc<
-        dyn Fn(
-                &dyn Event,
-            )
-                -> BoxFuture<'static, Result<(), Box<dyn std::error::Error + Send + Sync>>>
-            + Send
-            + Sync,
-    >,
+    handler: EventHandler,
     config: SubscriberConfig,
     status: Arc<RwLock<ConnectionStatus>>,
     last_heartbeat: Arc<Mutex<Instant>>,
     message_queue: Arc<Mutex<VecDeque<EventMessage>>>,
     failed_messages: Arc<Mutex<Vec<EventMessage>>>,
-    dead_letter_callback: Arc<Mutex<Option<Arc<dyn Fn(&EventMessage) + Send + Sync>>>>,
+    dead_letter_callback: DeadLetterCallback,
 }
 
 impl Subscriber {
@@ -230,7 +241,7 @@ impl Subscriber {
                     "Event {} processed successfully, updating heartbeat",
                     message.id
                 );
-        self.update_heartbeat().await;
+                self.update_heartbeat().await;
                 Ok(())
             }
             Err(e) => {
@@ -270,13 +281,12 @@ impl Subscriber {
         let initial_queue_size = queue.len();
         if initial_queue_size > 0 {
             eprintln!(
-                "Processing retry queue with {} messages",
-                initial_queue_size
+                "Processing retry queue with {initial_queue_size} messages"
             );
         }
 
         while let Some(message) = queue.pop_front() {
-                let result = self.process_event(&message).await;
+            let result = self.process_event(&message).await;
             if let Err(e) = result {
                 eprintln!("Message {} failed with error: {}", message.id, e);
                 // Increment retry count and add back to queue on retry failure
@@ -304,7 +314,7 @@ impl Subscriber {
                 // Remove from persistence store as well
                 if let Some(persistence) = persistence {
                     if let Err(e) = persistence.delete_message(&message.id) {
-                        eprintln!("Failed to delete message from persistence: {}", e);
+                        eprintln!("Failed to delete message from persistence: {e}");
                     }
                 }
             }
@@ -317,10 +327,9 @@ impl Subscriber {
         let final_queue_size = queue.len();
         if final_queue_size != initial_queue_size {
             eprintln!(
-                "Retry queue size changed from {} to {}",
-                initial_queue_size, final_queue_size
+                "Retry queue size changed from {initial_queue_size} to {final_queue_size}"
             );
-    }
+        }
     }
 
     pub async fn get_failed_messages(&self) -> Vec<EventMessage> {
@@ -388,7 +397,7 @@ impl EventSubscriptions {
     {
         let type_id = TypeId::of::<T>();
         let mut subscriptions = self.subscriptions.write().await;
-        
+
         // Set dead letter callback
         let dead_letter_manager = self.dead_letter_manager.clone();
         subscriber
@@ -397,7 +406,7 @@ impl EventSubscriptions {
                     let mut dead_letter_message = message.clone();
                     dead_letter_message.status = DeliveryStatus::Failed;
                     if let Err(e) = persistence.save_message(&dead_letter_message) {
-                        eprintln!("Failed to persist dead letter: {}", e);
+                        eprintln!("Failed to persist dead letter: {e}");
                     }
                 }
             })
@@ -407,7 +416,7 @@ impl EventSubscriptions {
             .entry(type_id)
             .or_insert_with(Vec::new)
             .push(subscriber);
-        
+
         Ok(())
     }
 
@@ -421,14 +430,14 @@ impl EventSubscriptions {
     {
         let type_id = TypeId::of::<T>();
         let mut subscriptions = self.subscriptions.write().await;
-        
+
         if let Some(subscribers) = subscriptions.get_mut(&type_id) {
             subscribers.retain(|sub| sub.id() != subscriber_id);
             if subscribers.is_empty() {
                 subscriptions.remove(&type_id);
             }
         }
-        
+
         Ok(())
     }
 
@@ -464,17 +473,17 @@ impl EventSubscriptions {
                     .lock()
                     .await
                     .insert(message_id.clone(), message.clone());
-                
+
                 let result = subscriber.process_event(&message).await;
                 if let Err(e) = result {
-                    eprintln!("Error processing event: {}", e);
+                    eprintln!("Error processing event: {e}");
                     // Add failed message to retry queue
                     let mut failed_message = message.clone();
                     failed_message.status = DeliveryStatus::Retrying;
                     subscriber.add_to_retry_queue(failed_message).await;
-                    }
                 }
             }
+        }
         Ok(())
     }
 
@@ -482,7 +491,7 @@ impl EventSubscriptions {
     pub async fn health_check(&self) -> HashMap<String, ConnectionStatus> {
         let subscriptions = self.subscriptions.read().await;
         let mut health_status = HashMap::new();
-        
+
         for (_, subscribers) in subscriptions.iter() {
             for subscriber in subscribers {
                 let status = if subscriber.is_healthy().await {
@@ -493,7 +502,7 @@ impl EventSubscriptions {
                 health_status.insert(subscriber.id().to_string(), status);
             }
         }
-        
+
         health_status
     }
 
@@ -520,7 +529,7 @@ impl EventSubscriptions {
     pub async fn cleanup_old_messages(&self, max_age: Duration) {
         let mut store = self.message_store.lock().await;
         let now = Instant::now();
-        
+
         store.retain(|_, message| now.duration_since(message.timestamp) < max_age);
     }
 
@@ -575,7 +584,7 @@ impl EventSubscriptions {
     /// Add dead letter to retry queue
     async fn add_dead_letter_to_retry_queue(&self, message: EventMessage) {
         let subscriptions = self.subscriptions.read().await;
-        
+
         // Add to retry queue of all subscribers
         for (_, subscribers) in subscriptions.iter() {
             for subscriber in subscribers {
@@ -588,7 +597,7 @@ impl EventSubscriptions {
     fn persist_dead_letter(&self, message: &EventMessage) {
         if let Some(persistence) = &self.dead_letter_manager {
             if let Err(e) = persistence.save_message(message) {
-                eprintln!("Failed to persist dead letter: {}", e);
+                eprintln!("Failed to persist dead letter: {e}");
             }
         }
     }
@@ -672,14 +681,13 @@ where
 
 // Default event restorer
 pub struct DefaultEventRestorer {
-    event_types: Arc<
-        RwLock<
-            HashMap<
-                String,
-                Box<dyn Fn(&str) -> Option<Arc<dyn Event + Send + Sync>> + Send + Sync>,
-            >,
-        >,
-    >,
+    event_types: EventTypeRegistry,
+}
+
+impl Default for DefaultEventRestorer {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DefaultEventRestorer {
@@ -718,17 +726,15 @@ impl EventRestorer for DefaultEventRestorer {
                     event_type,
                     event.as_any().type_id()
                 );
-        } else {
+            } else {
                 println!(
-                    "[DEBUG] DefaultEventRestorer: failed to deserialize event_type={}",
-                    event_type
+                    "[DEBUG] DefaultEventRestorer: failed to deserialize event_type={event_type}"
                 );
             }
             restored
         } else {
             println!(
-                "[DEBUG] DefaultEventRestorer: unknown event_type={}",
-                event_type
+                "[DEBUG] DefaultEventRestorer: unknown event_type={event_type}"
             );
             None
         }
