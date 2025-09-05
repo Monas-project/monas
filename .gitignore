@@ -23,7 +23,7 @@ target/
 # Added by cargo
 /target
 
-# テスト用DBファイル・ディレクトリ（monas-event-manager）
+# Test DB files/directories (monas-event-manager)
 monas-event-manager/*_db/
 monas-event-manager/*_db
 monas-event-manager/*.db/
@@ -36,14 +36,14 @@ monas-event-manager/test_*.db/
 monas-event-manager/test_*.db
 monas-event-manager/event_queue.db/
 
-# カバレッジ測定ファイル
+# Coverage measurement files
 cargo-test-*.profraw
 *.profraw
 coverage/
 
-# macOS固有ファイル
+# macOS specific files
 .DS_Store
 **/.DS_Store
 
-# カバレッジレポート
+# Coverage reports
 tarpaulin-report.html
