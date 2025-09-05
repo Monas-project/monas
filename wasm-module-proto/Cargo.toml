@@ -1,8 +1,11 @@
 [package]
-name = "monas-contents"
+name = "wasm-module-proto"
 authors.workspace = true
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
 
 [dependencies]

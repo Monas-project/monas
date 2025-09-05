@@ -43,7 +43,7 @@ jobs:
           shared-key: "all-targets-profile-test"
           save-if: false # Restore only
       - name: Run clippy
-        run: cargo clippy --workspace --all-targets --no-deps -- --deny warnings
+        run: cargo clippy --workspace --all-targets --profile test --no-deps -- --deny warnings
 
   test:
     needs: build
@@ -57,4 +57,4 @@ jobs:
           shared-key: "all-targets-profile-test"
           save-if: false # Restore only
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo test --workspace --profile test
