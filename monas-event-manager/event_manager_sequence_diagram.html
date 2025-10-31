@@ -1,0 +1,434 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Monas Event Manager - Sequence Diagram</title>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            line-height: 1.6;
+            margin: 0;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            background-color: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #2c3e50;
+            text-align: center;
+            border-bottom: 3px solid #3498db;
+            padding-bottom: 10px;
+            margin-bottom: 30px;
+        }
+        h2 {
+            color: #34495e;
+            margin-top: 30px;
+            margin-bottom: 15px;
+        }
+        h3 {
+            color: #7f8c8d;
+            margin-top: 25px;
+            margin-bottom: 10px;
+        }
+        .diagram-container {
+            margin: 30px 0;
+            padding: 20px;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            background-color: #fafafa;
+        }
+        .mermaid {
+            text-align: center;
+        }
+        .feature-list {
+            background-color: #ecf0f1;
+            padding: 20px;
+            border-radius: 8px;
+            margin: 20px 0;
+        }
+        .feature-list ul {
+            margin: 0;
+            padding-left: 20px;
+        }
+        .feature-list li {
+            margin-bottom: 8px;
+        }
+        .config-section {
+            background-color: #e8f4f8;
+            padding: 20px;
+            border-radius: 8px;
+            margin: 20px 0;
+        }
+        .performance-section {
+            background-color: #f0f8e8;
+            padding: 20px;
+            border-radius: 8px;
+            margin: 20px 0;
+        }
+        .note {
+            background-color: #fff3cd;
+            border: 1px solid #ffeaa7;
+            padding: 15px;
+            border-radius: 5px;
+            margin: 15px 0;
+        }
+        code {
+            background-color: #f1f2f6;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-family: 'Courier New', monospace;
+        }
+        .toc {
+            background-color: #f8f9fa;
+            padding: 20px;
+            border-radius: 8px;
+            margin: 20px 0;
+        }
+        .toc ul {
+            margin: 0;
+            padding-left: 20px;
+        }
+        .toc a {
+            text-decoration: none;
+            color: #3498db;
+        }
+        .toc a:hover {
+            text-decoration: underline;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Monas Event Manager - Sequence Diagram</h1>
+        
+
+
+        <h2 id="sequence-diagram">Sequence Diagram</h2>
+        
+        <div class="diagram-container">
+            <div class="mermaid">
+sequenceDiagram
+    participant App as Application
+    participant Publisher as Publisher
+    participant EventBus as EventBus
+    participant EventSubs as EventSubscriptions
+    participant Subscriber as Subscriber
+    participant MsgStore as MessageStore
+    participant RetryQueue as RetryQueue
+    participant Persistence as SledPersistenceManager
+    participant HealthMon as HealthMonitor
+    participant EventRestorer as EventRestorer
+
+    Note over App, EventRestorer: 1. System Initialization
+
+    App->>EventBus: new() or with_persistence()
+    EventBus->>EventSubs: new() or with_persistence()
+    EventSubs->>MsgStore: initialize()
+    EventSubs->>RetryQueue: initialize()
+    EventSubs->>Persistence: initialize() (if persistence enabled)
+
+    App->>EventBus: set_event_restorer(restorer)
+    EventBus->>EventSubs: set_event_restorer(restorer)
+    EventSubs->>EventRestorer: store reference
+
+    App->>EventBus: register_event_type()
+    EventBus->>EventSubs: register_event_type()
+    EventSubs->>EventRestorer: register_event_type()
+
+    App->>EventBus: subscribe(subscriber)
+    EventBus->>EventSubs: subscribe(subscriber)
+    EventSubs->>Subscriber: store in subscriptions map
+
+    Note over App, EventRestorer: 2. Startup Recovery
+
+    App->>EventBus: restore_and_retry_dead_letters()
+    EventBus->>EventSubs: restore_messages()
+    EventSubs->>Persistence: load_messages()
+    Persistence-->>EventSubs: persistent_messages[]
+    
+    loop For each dead letter
+        EventSubs->>EventRestorer: restore_event(type, data)
+        EventRestorer-->>EventSubs: restored_event
+        EventSubs->>MsgStore: store(message)
+        EventSubs->>RetryQueue: add_to_retry_queue(message)
+    end
+
+    EventBus->>EventSubs: retry_failed_messages()
+    EventSubs->>RetryQueue: process_retry_queue()
+
+    Note over App, EventRestorer: 3. Event Publishing Flow
+
+    Publisher->>EventBus: publish(event)
+    EventBus->>EventSubs: publish(event)
+    
+    EventSubs->>EventSubs: create EventMessage for each subscriber
+    EventSubs->>MsgStore: store(message)
+    
+    loop For each subscriber
+        EventSubs->>Subscriber: process_event(message)
+        
+        alt Event processing successful
+            Subscriber-->>EventSubs: Ok()
+            EventSubs->>MsgStore: remove(message)
+            EventSubs->>Subscriber: update_heartbeat()
+        else Event processing failed
+            Subscriber-->>EventSubs: Err()
+            EventSubs->>RetryQueue: add_to_retry_queue(message)
+        end
+    end
+
+    EventSubs-->>EventBus: Result
+    EventBus-->>Publisher: Result
+
+    Note over App, EventRestorer: 4. Retry Processing Flow
+
+    App->>EventBus: retry_failed_messages()
+    EventBus->>EventSubs: retry_failed_messages()
+    
+    loop For each subscriber
+        EventSubs->>Subscriber: process_retry_queue()
+        Subscriber->>RetryQueue: get_retry_messages()
+        RetryQueue-->>Subscriber: messages[]
+        
+        loop For each retry message
+            Subscriber->>Subscriber: process_event(message)
+            
+            alt Retry successful
+                Subscriber-->>Subscriber: Ok()
+                Subscriber->>MsgStore: remove(message)
+                Subscriber->>RetryQueue: remove_from_queue(message)
+            else Retry failed (under max retries)
+                Subscriber-->>Subscriber: Err()
+                Subscriber->>RetryQueue: update_retry_count(message)
+            else Retry failed (max retries reached)
+                Subscriber-->>Subscriber: Err()
+                Subscriber->>Persistence: save_message(message)
+                Subscriber->>MsgStore: remove(message)
+                Subscriber->>RetryQueue: remove_from_queue(message)
+            end
+        end
+    end
+
+    Note over App, EventRestorer: 5. Health Check Flow
+
+    App->>EventBus: health_check()
+    EventBus->>EventSubs: health_check()
+    
+    loop For each subscriber
+        EventSubs->>Subscriber: is_healthy()
+        Subscriber-->>EventSubs: health_status
+        
+        alt Subscriber healthy
+            EventSubs->>EventSubs: status = Connected
+        else Subscriber unhealthy
+            EventSubs->>EventSubs: status = Disconnected
+            EventSubs->>RetryQueue: move_to_retry(failed_messages)
+        end
+    end
+    
+    EventSubs-->>EventBus: health_status_map
+    EventBus-->>App: health_status_map
+
+    Note over App, EventRestorer: 6. Dead Letter Management
+
+    App->>EventBus: get_persistence_stats()
+    EventBus->>EventSubs: get_persistence_stats()
+    EventSubs->>Persistence: get_stats()
+    Persistence-->>EventSubs: stats
+    EventSubs-->>EventBus: stats
+    EventBus-->>App: stats
+
+    App->>EventBus: compact_database()
+    EventBus->>EventSubs: compact_database()
+    EventSubs->>Persistence: compact()
+    Persistence-->>EventSubs: Result
+    EventSubs-->>EventBus: Result
+    EventBus-->>App: Result
+
+    Note over App, EventRestorer: 7. Cleanup and Maintenance
+
+    App->>EventBus: cleanup_old_messages(max_age)
+    EventBus->>EventSubs: cleanup_old_messages(max_age)
+    EventSubs->>MsgStore: cleanup_old_messages(max_age)
+    MsgStore-->>EventSubs: cleanup_complete
+
+    App->>EventBus: unsubscribe(subscriber_id)
+    EventBus->>EventSubs: unsubscribe(subscriber_id)
+    EventSubs->>EventSubs: remove from subscriptions
+    EventSubs-->>EventBus: Result
+    EventBus-->>App: Result
+
+    Note over App, EventRestorer: 8. Error Handling and Recovery
+
+    alt Subscriber becomes unhealthy
+        HealthMon->>Subscriber: health_check()
+        Subscriber-->>HealthMon: Unhealthy
+        HealthMon->>EventSubs: update_status(unhealthy)
+        EventSubs->>RetryQueue: move_to_retry(messages)
+    end
+
+    alt Database error
+        Persistence->>EventSubs: database_error
+        EventSubs->>EventSubs: fallback_to_memory_mode
+        EventSubs-->>EventBus: error_notification
+    end
+
+    alt Event restoration failure
+        EventSubs->>EventRestorer: restore_event(type, data)
+        EventRestorer-->>EventSubs: restore_failed
+        EventSubs->>EventSubs: use_dummy_event
+    end
+
+    Note over App, EventRestorer: 9. Concurrent Operations
+
+    Publisher->>EventBus: publish(event1)
+    EventBus->>EventSubs: publish(event1)
+    Publisher->>EventBus: publish(event2)
+    EventBus->>EventSubs: publish(event2)
+    App->>EventBus: health_check()
+    EventBus->>EventSubs: health_check()
+
+    Note over App, EventRestorer: 10. System Shutdown
+
+    App->>EventBus: cleanup_old_messages(immediate)
+    EventBus->>EventSubs: cleanup_old_messages(immediate)
+    EventSubs->>MsgStore: clear_all()
+    EventSubs->>RetryQueue: clear_all()
+    
+    App->>EventBus: compact_database()
+    EventBus->>EventSubs: compact_database()
+    EventSubs->>Persistence: compact()
+    Persistence-->>EventSubs: Result
+    
+    EventSubs->>Persistence: flush()
+    Persistence-->>EventSubs: Result
+            </div>
+        </div>
+
+        <h2 id="key-features">Key Features Details</h2>
+
+        <h3>1. Initialization and Setup</h3>
+        <div class="feature-list">
+            <ul>
+                <li>EventBus creation with or without persistence</li>
+                <li>Event type registration</li>
+                <li>Subscriber registration</li>
+                <li>Event restorer configuration</li>
+            </ul>
+        </div>
+
+        <h3>2. Event Publishing</h3>
+        <div class="feature-list">
+            <ul>
+                <li>Event creation and serialization</li>
+                <li>In-memory message storage</li>
+                <li>Concurrent subscriber processing</li>
+                <li>Error handling and retry queue management</li>
+            </ul>
+        </div>
+
+        <h3>3. Retry Mechanism</h3>
+        <div class="feature-list">
+            <ul>
+                <li>Automatic retry of failed messages</li>
+                <li>Configurable retry limits and delays</li>
+                <li>Dead letter queue for permanently failed messages</li>
+            </ul>
+        </div>
+
+        <h3>4. Health Monitoring</h3>
+        <div class="feature-list">
+            <ul>
+                <li>Continuous health checks</li>
+                <li>Automatic recovery of unhealthy subscribers</li>
+                <li>Status reporting and monitoring</li>
+            </ul>
+        </div>
+
+        <h3>5. Persistence and Recovery</h3>
+        <div class="feature-list">
+            <ul>
+                <li>Dead letter persistence using Sled database</li>
+                <li>Event restoration on startup</li>
+                <li>Database compaction and maintenance</li>
+            </ul>
+        </div>
+
+        <h3>6. Error Handling</h3>
+        <div class="feature-list">
+            <ul>
+                <li>Graceful degradation on failures</li>
+                <li>Fallback mechanisms</li>
+                <li>Comprehensive error reporting</li>
+            </ul>
+        </div>
+
+        <h3>7. Concurrent Operations</h3>
+        <div class="feature-list">
+            <ul>
+                <li>Concurrent event processing</li>
+                <li>Thread-safe operations</li>
+                <li>Asynchronous message handling</li>
+            </ul>
+        </div>
+
+        <h3>8. Maintenance Operations</h3>
+        <div class="feature-list">
+            <ul>
+                <li>Old message cleanup</li>
+                <li>Database optimization</li>
+                <li>Resource management</li>
+            </ul>
+        </div>
+
+        <h2 id="configuration">Configuration Options</h2>
+        
+        <div class="config-section">
+            <p>The system supports various configuration options through <code>SubscriberConfig</code>:</p>
+            <ul>
+                <li><strong>max_retries</strong>: Maximum number of retry attempts</li>
+                <li><strong>retry_delay_secs</strong>: Delay between retry attempts</li>
+                <li><strong>connection_timeout_secs</strong>: Subscriber connection timeout</li>
+                <li><strong>heartbeat_interval_secs</strong>: Health check interval</li>
+            </ul>
+        </div>
+
+
+    </div>
+
+    <script>
+        mermaid.initialize({
+            startOnLoad: true,
+            theme: 'default',
+            flowchart: {
+                useMaxWidth: true,
+                htmlLabels: true
+            },
+            sequence: {
+                diagramMarginX: 50,
+                diagramMarginY: 10,
+                actorMargin: 50,
+                width: 150,
+                height: 65,
+                boxMargin: 10,
+                boxTextMargin: 5,
+                noteMargin: 10,
+                messageMargin: 35,
+                mirrorActors: true,
+                bottomMarginAdj: 1,
+                useMaxWidth: true,
+                rightAngles: false,
+                showSequenceNumbers: false
+            }
+        });
+    </script>
+</body>
+</html>

@@ -20,7 +20,30 @@ target/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 .idea/
 
-
 # Added by cargo
-
 /target
+
+# Test DB files/directories (monas-event-manager)
+monas-event-manager/*_db/
+monas-event-manager/*_db
+monas-event-manager/*.db/
+monas-event-manager/*.db
+monas-event-manager/blobs/
+monas-event-manager/conf/
+monas-event-manager/db/
+monas-event-manager/snap.*
+monas-event-manager/test_*.db/
+monas-event-manager/test_*.db
+monas-event-manager/event_queue.db/
+
+# Coverage measurement files
+cargo-test-*.profraw
+*.profraw
+coverage/
+
+# macOS specific files
+.DS_Store
+**/.DS_Store
+
+# Coverage reports
+tarpaulin-report.html
