@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     application_service::content_service::{
-        ContentService, CreateContentCommand, CreateContentResult, UpdateContentCommand,
+        ContentService, CreateContentCommand, CreateContentResult, DeleteContentCommand,
+        UpdateContentCommand,
     },
     domain::content_id::ContentId,
     infrastructure::{
@@ -45,7 +46,6 @@ pub struct CreateContentRequest {
 #[derive(Serialize)]
 pub struct CreateContentResponse {
     pub content_id: String,
-    pub hash: String,
     pub name: String,
     pub path: String,
     pub status: String,
@@ -93,7 +93,6 @@ fn to_response(result: CreateContentResult) -> CreateContentResponse {
     let metadata = &result.metadata;
     CreateContentResponse {
         content_id: result.content_id.as_str().to_string(),
-        hash: result.content_id.as_str().to_string(),
         name: metadata.name().to_string(),
         path: metadata.path().to_string(),
         status: format!("{:?}", crate::domain::content::ContentStatus::Active),
@@ -142,15 +141,29 @@ async fn update_content(
         .update(cmd)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
-    // レスポンススキーマは作成時と同じ形を使う
     let metadata = &result.metadata;
     Ok(Json(CreateContentResponse {
         content_id: result.content_id.as_str().to_string(),
-        hash: result.content_id.as_str().to_string(),
         name: metadata.name().to_string(),
         path: metadata.path().to_string(),
         status: format!("{:?}", crate::domain::content::ContentStatus::Active),
     }))
+}
+
+async fn delete_content(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let content_id = ContentId::new(id);
+
+    let cmd = DeleteContentCommand { content_id };
+
+    state
+        .content_service
+        .delete(cmd)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 pub fn create_router() -> Router {
@@ -169,6 +182,6 @@ pub fn create_router() -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/contents", post(create_content))
-        .route("/contents/{id}", patch(update_content))
+        .route("/contents/{id}", patch(update_content).delete(delete_content))
         .with_state(state)
 }

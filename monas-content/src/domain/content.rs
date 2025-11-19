@@ -160,9 +160,12 @@ impl Content {
             return Err(ContentError::AlreadyDeleted);
         }
 
+        // 削除操作も更新の一種なので updated_at を進める
+        let new_metadata = self.metadata.touch();
+
         let content = Self {
             id: self.id.clone(),
-            metadata: self.metadata.clone(),
+            metadata: new_metadata,
             raw_content: None,
             encrypted_content: None,
             is_deleted: true,
@@ -362,12 +365,14 @@ mod tests {
         )
         .unwrap();
 
+        let before_updated_at = content.metadata().updated_at();
         let (deleted_content, event) = content.delete().unwrap();
 
         assert!(deleted_content.is_deleted());
         assert!(deleted_content.raw_content().is_none());
         assert!(deleted_content.encrypted_content().is_none());
         assert_eq!(event, ContentEvent::Deleted);
+        assert!(deleted_content.metadata().updated_at() >= before_updated_at);
     }
 
     #[test]

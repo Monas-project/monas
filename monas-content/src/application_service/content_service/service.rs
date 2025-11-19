@@ -1,75 +1,15 @@
 use crate::domain::{
     content::{Content, ContentError},
-    content_id::{ContentId, ContentIdGenerator},
+    content_id::ContentIdGenerator,
     encryption::{ContentEncryption, ContentEncryptionKeyGenerator},
-    metadata::Metadata,
 };
 
-/// コンテンツ作成ユースケースの入力。
-pub struct CreateContentCommand {
-    pub name: String,
-    pub path: String,
-    pub raw_content: Vec<u8>,
-}
-
-/// コンテンツ作成ユースケースの出力。
-pub struct CreateContentResult {
-    pub content_id: ContentId,
-    pub metadata: Metadata,
-    /// コンテンツ暗号化に用いた鍵から導出される公開情報など。
-    /// 具体的な意味づけは後続の設計で決める。
-    pub public_key: String,
-}
-
-/// コンテンツ更新ユースケースの入力。
-pub struct UpdateContentCommand {
-    pub content_id: ContentId,
-    pub new_name: Option<String>,
-    pub new_raw_content: Option<Vec<u8>>,
-}
-
-/// コンテンツ更新ユースケースの出力。
-pub struct UpdateContentResult {
-    pub content_id: ContentId,
-    pub metadata: Metadata,
-}
-
-/// コンテンツを永続化するポート。
-pub trait ContentRepository {
-    fn save(&self, content_id: &ContentId, content: &Content)
-        -> Result<(), ContentRepositoryError>;
-    fn find_by_id(&self, content_id: &ContentId)
-        -> Result<Option<Content>, ContentRepositoryError>;
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum ContentRepositoryError {
-    #[error("storage error: {0}")]
-    Storage(String),
-}
-
-/// state-node へ Operation を送信するポート。
-pub trait StateNodeClient {
-    fn send_content_created(
-        &self,
-        operation: &ContentCreatedOperation,
-    ) -> Result<(), StateNodeClientError>;
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum StateNodeClientError {
-    #[error("network error: {0}")]
-    Network(String),
-}
-
-/// state-node に送る「コンテンツ作成」Operation のDTO（アプリケーション層側の表現）。
-pub struct ContentCreatedOperation {
-    pub content_id: ContentId,
-    pub hash: String,
-    pub path: String,
-    pub public_key: String,
-    // TODO: 必要に応じて nodes や license などを追加。
-}
+use super::{
+    ContentCreatedOperation, ContentDeletedOperation, ContentRepository, ContentRepositoryError,
+    ContentUpdatedOperation, CreateContentCommand, CreateContentResult, DeleteContentCommand,
+    DeleteContentResult, StateNodeClient, StateNodeClientError, UpdateContentCommand,
+    UpdateContentResult,
+};
 
 /// コンテンツ作成ユースケースのアプリケーションサービス。
 pub struct ContentService<G, R, C, K, E> {
@@ -196,11 +136,74 @@ where
             .save(content.id(), &content)
             .map_err(UpdateError::Repository)?;
 
+        // state-node に送る更新 Operation を組み立て
+        let metadata = content.metadata().clone();
+        let content_id = content.id().clone();
+        let operation = ContentUpdatedOperation {
+            content_id: content_id.clone(),
+            hash: content_id.as_str().to_string(),
+            path: metadata.path().to_string(),
+        };
+
+        // state-node へ通知
+        self.state_node_client
+            .send_content_updated(&operation)
+            .map_err(UpdateError::StateNode)?;
+
         Ok(UpdateContentResult {
-            content_id: content.id().clone(),
-            metadata: content.metadata().clone(),
+            content_id,
+            metadata,
         })
     }
+
+    /// コンテンツ削除ユースケース。
+    ///
+    /// - 物理削除ではなく、ドメインオブジェクト上で `is_deleted` フラグとバッファをクリアして保存する「論理削除」
+    pub fn delete(&self, cmd: DeleteContentCommand) -> Result<DeleteContentResult, DeleteError> {
+        // 既存コンテンツの取得
+        let content = self
+            .content_repository
+            .find_by_id(&cmd.content_id)
+            .map_err(DeleteError::Repository)?
+            .ok_or(DeleteError::NotFound)?;
+
+        // ドメインの削除処理（状態遷移とバリデーション）
+        let (deleted_content, _event) = content.delete().map_err(DeleteError::Domain)?;
+
+        // 論理削除済みの状態を保存
+        self.content_repository
+            .save(deleted_content.id(), &deleted_content)
+            .map_err(DeleteError::Repository)?;
+
+        // state-node に送る削除 Operation を組み立て
+        let metadata = deleted_content.metadata().clone();
+        let content_id = deleted_content.id().clone();
+        let operation = ContentDeletedOperation {
+            content_id: content_id.clone(),
+            path: metadata.path().to_string(),
+        };
+
+        // state-node へ通知
+        self.state_node_client
+            .send_content_deleted(&operation)
+            .map_err(DeleteError::StateNode)?;
+
+        Ok(DeleteContentResult {
+            content_id,
+        })
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum DeleteError {
+    #[error("content not found")]
+    NotFound,
+    #[error("domain error: {0:?}")]
+    Domain(ContentError),
+    #[error("repository error: {0}")]
+    Repository(ContentRepositoryError),
+    #[error("state-node error: {0}")]
+    StateNode(StateNodeClientError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -225,4 +228,8 @@ pub enum UpdateError {
     Domain(ContentError),
     #[error("repository error: {0}")]
     Repository(ContentRepositoryError),
+    #[error("state-node error: {0}")]
+    StateNode(StateNodeClientError),
 }
+
+
