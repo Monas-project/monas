@@ -36,6 +36,21 @@ impl Metadata {
         }
     }
 
+    /// 新しい ContentId に差し替えつつ、`updated_at` を現在時刻に更新した Metadata を返す。
+    ///
+    /// - name / path / created_at は維持する。
+    /// - id のみ新しい値に更新する。
+    pub fn with_new_id(&self, new_id: ContentId) -> Self {
+        let now = Utc::now();
+        Self {
+            name: self.name.clone(),
+            path: self.path.clone(),
+            created_at: self.created_at,
+            updated_at: now,
+            id: new_id,
+        }
+    }
+
     /// 名前を変更し、`updated_at` を更新した新しい Metadata を返す。
     pub fn rename(&self, new_name: String) -> Self {
         let now = Utc::now();

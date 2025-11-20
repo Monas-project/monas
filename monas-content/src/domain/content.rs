@@ -28,6 +28,7 @@ pub enum ContentEvent {
 #[derive(Debug, Clone)]
 pub struct Content {
     id: ContentId,
+    series_id: ContentId,
     metadata: Metadata,
     raw_content: Option<Vec<u8>>,
     encrypted_content: Option<Vec<u8>>,
@@ -38,6 +39,7 @@ pub struct Content {
 }
 
 impl Content {
+    #[cfg(test)]
     pub(crate) fn new(
         id: ContentId,
         metadata: Metadata,
@@ -48,7 +50,8 @@ impl Content {
         // TODO: 事前条件を追加する
 
         Self {
-            id,
+            id: id.clone(),
+            series_id: id,
             metadata,
             raw_content,
             encrypted_content,
@@ -81,7 +84,8 @@ impl Content {
         let encrypted_content = encryption.encrypt(key, &raw_content)?;
 
         let content = Self {
-            id: cid,
+            id: cid.clone(),
+            series_id: cid,
             metadata,
             raw_content: Some(raw_content),
             encrypted_content: Some(encrypted_content),
@@ -94,15 +98,18 @@ impl Content {
 
     /// コンテンツ本体（バイナリ）のみを更新する。
     ///
-    /// - name / path / id は変更しない
+    /// - name / path / series_id は変更しない
+    /// - `id` は新しいバイナリから再計算される（コンテンツアドレス化）
     /// - `metadata.updated_at` は現在時刻に更新される
-    pub fn update_content<E>(
+    pub fn update_content<G, E>(
         &self,
         raw_content: Vec<u8>,
+        id_generator: &G,
         key: &ContentEncryptionKey,
         encryption: &E,
     ) -> Result<(Self, ContentEvent), ContentError>
     where
+        G: ContentIdGenerator,
         E: ContentEncryption,
     {
         if self.is_deleted {
@@ -117,10 +124,15 @@ impl Content {
 
         let encrypted_content = encryption.encrypt(key, &raw_content)?;
 
-        let new_metadata = self.metadata.touch();
+        // 新しいコンテンツ本体に対して ContentId を再計算する。
+        let new_id = id_generator.generate(&raw_content);
+
+        // 現在の ID を新しい ID に差し替えつつ、updated_at を更新する。
+        let new_metadata = self.metadata.with_new_id(new_id.clone());
 
         let content = Self {
-            id: self.id.clone(),
+            id: new_id,
+            series_id: self.series_id.clone(),
             metadata: new_metadata,
             raw_content: Some(raw_content),
             encrypted_content: Some(encrypted_content),
@@ -144,6 +156,7 @@ impl Content {
 
         let content = Self {
             id: self.id.clone(),
+            series_id: self.series_id.clone(),
             metadata: new_metadata,
             raw_content: self.raw_content.clone(),
             encrypted_content: self.encrypted_content.clone(),
@@ -165,6 +178,7 @@ impl Content {
 
         let content = Self {
             id: self.id.clone(),
+            series_id: self.series_id.clone(),
             metadata: new_metadata,
             raw_content: None,
             encrypted_content: None,
@@ -207,6 +221,10 @@ impl Content {
 
     pub fn id(&self) -> &ContentId {
         &self.id
+    }
+
+    pub fn series_id(&self) -> &ContentId {
+        &self.series_id
     }
 
     pub fn raw_content(&self) -> Option<&Vec<u8>> {
@@ -271,8 +289,9 @@ mod tests {
     struct MockIdGenerator;
 
     impl ContentIdGenerator for MockIdGenerator {
-        fn generate(&self, _raw_content: &[u8]) -> ContentId {
-            ContentId::new("test-content-id".to_string())
+        fn generate(&self, raw_content: &[u8]) -> ContentId {
+            // テスト用の単純な ID 生成: 長さに応じて異なる ID を返す。
+            ContentId::new(format!("test-content-id-{}", raw_content.len()))
         }
     }
 
@@ -302,7 +321,8 @@ mod tests {
         assert_eq!(content.content_status(), &ContentStatus::Active);
         assert_eq!(event, ContentEvent::Created);
         assert!(content.encrypted_content().is_some());
-        assert_eq!(content.id().as_str(), "test-content-id");
+        assert!(content.id().as_str().starts_with("test-content-id-"));
+        assert_eq!(content.id(), content.series_id());
     }
 
     #[test]
@@ -322,12 +342,14 @@ mod tests {
 
         let updated_data = b"Updated content".to_vec();
         let (updated_content, event) = content
-            .update_content(updated_data.clone(), &key, &encryption)
+            .update_content(updated_data.clone(), &id_gen, &key, &encryption)
             .unwrap();
 
         assert_eq!(updated_content.raw_content().unwrap(), &updated_data);
         assert_eq!(event, ContentEvent::Updated);
         assert_eq!(updated_content.metadata().path(), content.metadata().path());
+        assert_ne!(updated_content.id(), content.id());
+        assert_eq!(updated_content.series_id(), content.series_id());
     }
 
     #[test]
@@ -401,8 +423,10 @@ mod tests {
             true,
         );
         let (key, encryption) = test_key_and_cipher();
+        let id_gen = MockIdGenerator;
 
-        let result = deleted_content.update_content(b"New data".to_vec(), &key, &encryption);
+        let result =
+            deleted_content.update_content(b"New data".to_vec(), &id_gen, &key, &encryption);
         assert!(matches!(result, Err(ContentError::AlreadyDeleted)));
     }
 

@@ -13,14 +13,17 @@ use crate::{
         ContentService, CreateContentCommand, CreateContentResult, DeleteContentCommand,
         UpdateContentCommand,
     },
-    domain::content_id::ContentId,
+    domain::{content::ContentStatus, content_id::ContentId},
     infrastructure::{
         content_id::Sha256ContentIdGenerator,
         encryption::{Aes256CtrContentEncryption, OsRngContentEncryptionKeyGenerator},
+        key_store::InMemoryContentEncryptionKeyStore,
         repository::InMemoryContentRepository,
         state_node_client::NoopStateNodeClient,
     },
 };
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine;
 
 #[derive(Clone)]
 struct AppState {
@@ -31,6 +34,7 @@ struct AppState {
             NoopStateNodeClient,
             OsRngContentEncryptionKeyGenerator,
             Aes256CtrContentEncryption,
+            InMemoryContentEncryptionKeyStore,
         >,
     >,
 }
@@ -65,7 +69,7 @@ async fn create_content(
     State(state): State<AppState>,
     Json(req): Json<CreateContentRequest>,
 ) -> Result<Json<CreateContentResponse>, (StatusCode, String)> {
-    let raw = match base64::decode(&req.content_base64) {
+    let raw = match BASE64_STANDARD.decode(&req.content_base64) {
         Ok(bytes) => bytes,
         Err(e) => {
             return Err((
@@ -108,7 +112,7 @@ async fn update_content(
 
     // content_base64 が指定されている場合のみデコード
     let raw_opt = if let Some(b64) = req.content_base64 {
-        let bytes = match base64::decode(&b64) {
+        let bytes = match BASE64_STANDARD.decode(&b64) {
             Ok(bytes) => bytes,
             Err(e) => {
                 return Err((
@@ -166,13 +170,58 @@ async fn delete_content(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[derive(Serialize)]
+pub struct FetchContentResponse {
+    pub content_id: String,
+    pub series_id: String,
+    pub name: String,
+    pub path: String,
+    pub status: String,
+    /// Base64でエンコードされた復号済みコンテンツバイナリ。
+    pub content_base64: String,
+}
+
+async fn fetch_content(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<FetchContentResponse>, (StatusCode, String)> {
+    let content_id = ContentId::new(id);
+
+    let result = state.content_service.fetch(content_id).map_err(|e| {
+        // とりあえず NotFound 系は 404、それ以外は 400 として扱う。
+        let status = match e {
+            crate::application_service::content_service::FetchError::NotFound
+            | crate::application_service::content_service::FetchError::Deleted => {
+                StatusCode::NOT_FOUND
+            }
+            _ => StatusCode::BAD_REQUEST,
+        };
+        (status, e.to_string())
+    })?;
+
+    let metadata = &result.metadata;
+    let status = format!("{:?}", ContentStatus::Active);
+
+    let content_base64 = BASE64_STANDARD.encode(&result.raw_content);
+
+    Ok(Json(FetchContentResponse {
+        content_id: result.content_id.as_str().to_string(),
+        series_id: result.series_id.as_str().to_string(),
+        name: metadata.name().to_string(),
+        path: metadata.path().to_string(),
+        status,
+        content_base64,
+    }))
+}
+
 pub fn create_router() -> Router {
     let service = ContentService {
         content_id_generator: Sha256ContentIdGenerator,
         content_repository: InMemoryContentRepository::default(),
-        state_node_client: NoopStateNodeClient::default(),
+        state_node_client: NoopStateNodeClient,
         key_generator: OsRngContentEncryptionKeyGenerator,
         encryptor: Aes256CtrContentEncryption,
+        cek_store: InMemoryContentEncryptionKeyStore::default(),
     };
 
     let state = AppState {
@@ -186,5 +235,6 @@ pub fn create_router() -> Router {
             "/contents/{id}",
             patch(update_content).delete(delete_content),
         )
+        .route("/contents/{id}/fetch", get(fetch_content))
         .with_state(state)
 }

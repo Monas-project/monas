@@ -44,3 +44,16 @@ pub struct DeleteContentCommand {
 pub struct DeleteContentResult {
     pub content_id: ContentId,
 }
+
+/// コンテンツ取得（fetch）ユースケースの出力。
+///
+/// - `content_id` は現在のコンテンツ本体を識別する ID（コンテンツアドレス）を表す。
+/// - `series_id` は論理的に同一なコンテンツ系列を識別する ID を表す。
+/// - `raw_content` は復号済みのコンテンツバイト列を表す。
+#[derive(Debug)]
+pub struct FetchContentResult {
+    pub content_id: ContentId,
+    pub series_id: ContentId,
+    pub metadata: Metadata,
+    pub raw_content: Vec<u8>,
+}

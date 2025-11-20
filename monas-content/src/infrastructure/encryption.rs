@@ -31,7 +31,6 @@ impl ContentEncryptionKeyGenerator for OsRngContentEncryptionKeyGenerator {
 /// - Decryption: splits the first 16 bytes as the IV and uses the remaining bytes as the ciphertext for AES-CTR.
 /// - Provides confidentiality only; no integrity/authentication (no MAC or AEAD).
 ///   In the future this may be replaced with an AEAD scheme such as AES-GCM to add integrity protection.
-
 pub struct Aes256CtrContentEncryption;
 
 const IV_LEN: usize = 16;

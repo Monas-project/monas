@@ -1,4 +1,4 @@
-use crate::domain::{content::Content, content_id::ContentId};
+use crate::domain::{content::Content, content_id::ContentId, encryption::ContentEncryptionKey};
 
 /// コンテンツを永続化するポート。
 pub trait ContentRepository {
@@ -10,6 +10,31 @@ pub trait ContentRepository {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ContentRepositoryError {
+    #[error("storage error: {0}")]
+    Storage(String),
+}
+
+/// CEK（コンテンツ暗号化鍵）を保存・取得・削除するためのポート。
+///
+/// - 実装は infra 層（インメモリ / sled / その他のKVS など）に置く。
+/// - application 層では、このポート越しにのみ CEK にアクセスする。
+pub trait ContentEncryptionKeyStore {
+    fn save(
+        &self,
+        content_id: &ContentId,
+        key: &ContentEncryptionKey,
+    ) -> Result<(), ContentEncryptionKeyStoreError>;
+
+    fn load(
+        &self,
+        content_id: &ContentId,
+    ) -> Result<Option<ContentEncryptionKey>, ContentEncryptionKeyStoreError>;
+
+    fn delete(&self, content_id: &ContentId) -> Result<(), ContentEncryptionKeyStoreError>;
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ContentEncryptionKeyStoreError {
     #[error("storage error: {0}")]
     Storage(String),
 }
