@@ -16,7 +16,7 @@ use crate::{
     domain::content_id::ContentId,
     infrastructure::{
         content_id::Sha256ContentIdGenerator,
-        encryption::{SimpleContentEncryption, SimpleContentEncryptionKeyGenerator},
+        encryption::{Aes256CtrContentEncryption, OsRngContentEncryptionKeyGenerator},
         repository::InMemoryContentRepository,
         state_node_client::NoopStateNodeClient,
     },
@@ -29,8 +29,8 @@ struct AppState {
             Sha256ContentIdGenerator,
             InMemoryContentRepository,
             NoopStateNodeClient,
-            SimpleContentEncryptionKeyGenerator,
-            SimpleContentEncryption,
+            OsRngContentEncryptionKeyGenerator,
+            Aes256CtrContentEncryption,
         >,
     >,
 }
@@ -171,8 +171,8 @@ pub fn create_router() -> Router {
         content_id_generator: Sha256ContentIdGenerator,
         content_repository: InMemoryContentRepository::default(),
         state_node_client: NoopStateNodeClient::default(),
-        key_generator: SimpleContentEncryptionKeyGenerator,
-        encryptor: SimpleContentEncryption,
+        key_generator: OsRngContentEncryptionKeyGenerator,
+        encryptor: Aes256CtrContentEncryption,
     };
 
     let state = AppState {
@@ -182,6 +182,9 @@ pub fn create_router() -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/contents", post(create_content))
-        .route("/contents/{id}", patch(update_content).delete(delete_content))
+        .route(
+            "/contents/{id}",
+            patch(update_content).delete(delete_content),
+        )
         .with_state(state)
 }

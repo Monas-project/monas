@@ -3,6 +3,7 @@ use sha2::{Digest, Sha256};
 
 /// シンプルな ContentIdGenerator 実装。
 /// v1 では raw_content の SHA-256 ハッシュをそのまま ContentId にする。
+/// todo: crslのcid生成を使用する
 pub struct Sha256ContentIdGenerator;
 
 impl ContentIdGenerator for Sha256ContentIdGenerator {

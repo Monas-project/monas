@@ -1,9 +1,7 @@
-use crate::domain::{
-    content_id::ContentId,
-    metadata::Metadata,
-};
+use crate::domain::{content_id::ContentId, metadata::Metadata};
 
 /// コンテンツ作成ユースケースの入力。
+#[derive(Debug)]
 pub struct CreateContentCommand {
     pub name: String,
     pub path: String,
@@ -11,6 +9,7 @@ pub struct CreateContentCommand {
 }
 
 /// コンテンツ作成ユースケースの出力。
+#[derive(Debug)]
 pub struct CreateContentResult {
     pub content_id: ContentId,
     pub metadata: Metadata,
@@ -20,6 +19,7 @@ pub struct CreateContentResult {
 }
 
 /// コンテンツ更新ユースケースの入力。
+#[derive(Debug)]
 pub struct UpdateContentCommand {
     pub content_id: ContentId,
     pub new_name: Option<String>,
@@ -27,19 +27,20 @@ pub struct UpdateContentCommand {
 }
 
 /// コンテンツ更新ユースケースの出力。
+#[derive(Debug)]
 pub struct UpdateContentResult {
     pub content_id: ContentId,
     pub metadata: Metadata,
 }
 
 /// コンテンツ削除ユースケースの入力。
+#[derive(Debug)]
 pub struct DeleteContentCommand {
     pub content_id: ContentId,
 }
 
 /// コンテンツ削除ユースケースの出力。
+#[derive(Debug)]
 pub struct DeleteContentResult {
     pub content_id: ContentId,
 }
-
-

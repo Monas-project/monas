@@ -10,6 +10,9 @@ path = "src/lib.rs"
 
 [dependencies]
 aes-gcm = "0.10.3"
+aes = "0.8"
+ctr = "0.9"
+rand_core = { version = "0.9", features = ["std"] }
 chrono = "0.4.40"
 hex = "0.4.3"
 hkdf = "0.12.4"

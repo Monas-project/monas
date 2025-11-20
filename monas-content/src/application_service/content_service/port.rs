@@ -1,7 +1,4 @@
-use crate::domain::{
-    content::Content,
-    content_id::ContentId,
-};
+use crate::domain::{content::Content, content_id::ContentId};
 
 /// コンテンツを永続化するポート。
 pub trait ContentRepository {
@@ -60,5 +57,3 @@ pub struct ContentUpdatedOperation {
     pub hash: String,
     pub path: String,
 }
-
-
