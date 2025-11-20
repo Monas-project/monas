@@ -47,3 +47,4 @@ coverage/
 
 # Coverage reports
 tarpaulin-report.html
+/docs
