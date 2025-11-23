@@ -1,7 +1,7 @@
 use crate::domain::{
     content::{Content, ContentError},
     content_id::{ContentId, ContentIdGenerator},
-    encryption::{ContentEncryption, ContentEncryptionKeyGenerator},
+    content::encryption::{ContentEncryption, ContentEncryptionKeyGenerator},
 };
 
 use super::{
@@ -322,7 +322,7 @@ mod tests {
     use crate::domain::{
         content::ContentStatus,
         content_id::{ContentId, ContentIdGenerator},
-        encryption::{ContentEncryptionKey, ContentEncryptionKeyGenerator},
+        content::encryption::{ContentEncryptionKey, ContentEncryptionKeyGenerator},
     };
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};

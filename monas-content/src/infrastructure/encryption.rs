@@ -1,5 +1,5 @@
 use crate::domain::content::ContentError;
-use crate::domain::encryption::{
+use crate::domain::content::encryption::{
     ContentEncryption, ContentEncryptionKey, ContentEncryptionKeyGenerator,
 };
 

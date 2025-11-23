@@ -1,6 +1,6 @@
 use crate::domain::content_id::{ContentId, ContentIdGenerator};
-use crate::domain::encryption::{ContentEncryption, ContentEncryptionKey};
-use crate::domain::metadata::Metadata;
+use crate::domain::content::encryption::{ContentEncryption, ContentEncryptionKey};
+use crate::domain::content::Metadata;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContentStatus {
@@ -248,7 +248,7 @@ impl Content {
 mod tests {
     use super::*;
     use crate::domain::content_id::{ContentId, ContentIdGenerator};
-    use crate::domain::encryption::{ContentEncryption, ContentEncryptionKey};
+    use crate::domain::content::encryption::{ContentEncryption, ContentEncryptionKey};
 
     /// テスト用の単純な暗号化実装。
     /// encrypt: 各バイトに +1, decrypt: 各バイトに -1。
@@ -499,3 +499,5 @@ mod tests {
         assert!(matches!(result, Err(ContentError::DecryptionError(_))));
     }
 }
+
+

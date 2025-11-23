@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use crate::application_service::content_service::{
     ContentEncryptionKeyStore, ContentEncryptionKeyStoreError,
 };
-use crate::domain::{content_id::ContentId, encryption::ContentEncryptionKey};
+use crate::domain::{content::encryption::ContentEncryptionKey, content_id::ContentId};
 
 /// プロセス内の `HashMap` に CEK を保存するインメモリ実装。
 ///

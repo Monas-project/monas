@@ -13,7 +13,7 @@ pub trait ContentEncryptionKeyGenerator {
 
 /// CEK を用いてコンテンツを暗号化/復号するためのポート。
 ///
-/// 実装は AES-GCM などの暗号アルゴリズムを用いる infra 層に置く想定。
+/// 実装は AES-CTR などの暗号アルゴリズムを用いる infra 層に置く想定。
 pub trait ContentEncryption {
     fn encrypt(
         &self,
@@ -27,3 +27,5 @@ pub trait ContentEncryption {
         ciphertext: &[u8],
     ) -> Result<Vec<u8>, ContentError>;
 }
+
+
