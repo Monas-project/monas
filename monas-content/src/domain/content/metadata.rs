@@ -110,5 +110,3 @@ mod tests {
         assert_eq!(metadata.id(), &cid);
     }
 }
-
-

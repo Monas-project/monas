@@ -104,10 +104,7 @@ impl Share {
     /// Read 権限の付与。
     ///
     /// - 既に同じ KeyId の受信者が存在する場合は `AlreadyShared` を返す。
-    pub fn grant_read(
-        &mut self,
-        key_id: KeyId,
-    ) -> Result<ShareEvent, ShareError> {
+    pub fn grant_read(&mut self, key_id: KeyId) -> Result<ShareEvent, ShareError> {
         if self.recipients.contains_key(&key_id) {
             return Err(ShareError::AlreadyShared);
         }
@@ -127,10 +124,7 @@ impl Share {
     ///
     /// - `Write` は `Read` を内包する前提のため、ドメイン上は `Write` のみを持たせる。
     /// - 既に同じ KeyId の受信者が存在する場合は `AlreadyShared` を返す。
-    pub fn grant_write(
-        &mut self,
-        key_id: KeyId,
-    ) -> Result<ShareEvent, ShareError> {
+    pub fn grant_write(&mut self, key_id: KeyId) -> Result<ShareEvent, ShareError> {
         if self.recipients.contains_key(&key_id) {
             return Err(ShareError::AlreadyShared);
         }
@@ -204,10 +198,7 @@ mod tests {
             .grant_read(kid.clone())
             .expect("grant_read should succeed");
 
-        assert!(matches!(
-            event,
-            ShareEvent::RecipientGranted { .. }
-        ));
+        assert!(matches!(event, ShareEvent::RecipientGranted { .. }));
         let recipient = share.recipient(&kid).expect("recipient should exist");
         assert_eq!(recipient.key_id(), &kid);
         assert_eq!(recipient.permissions(), &[Permission::Read]);
@@ -222,10 +213,7 @@ mod tests {
             .grant_write(kid.clone())
             .expect("grant_write should succeed");
 
-        assert!(matches!(
-            event,
-            ShareEvent::RecipientGranted { .. }
-        ));
+        assert!(matches!(event, ShareEvent::RecipientGranted { .. }));
         let recipient = share.recipient(&kid).expect("recipient should exist");
         assert_eq!(recipient.permissions(), &[Permission::Write]);
         assert!(Permission::can_read(recipient.permissions()));
@@ -257,10 +245,7 @@ mod tests {
             .expect("grant_read should succeed");
         let event = share.revoke(&kid).expect("revoke should succeed");
 
-        assert!(matches!(
-            event,
-            ShareEvent::RecipientRevoked { .. }
-        ));
+        assert!(matches!(event, ShareEvent::RecipientRevoked { .. }));
         assert!(share.recipient(&kid).is_none());
         assert!(share.is_empty());
     }
@@ -274,5 +259,3 @@ mod tests {
         assert!(matches!(err, ShareError::RecipientNotFound));
     }
 }
-
-

@@ -27,5 +27,3 @@ pub trait ContentEncryption {
         ciphertext: &[u8],
     ) -> Result<Vec<u8>, ContentError>;
 }
-
-

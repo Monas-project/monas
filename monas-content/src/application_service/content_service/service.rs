@@ -1,7 +1,7 @@
 use crate::domain::{
+    content::encryption::{ContentEncryption, ContentEncryptionKeyGenerator},
     content::{Content, ContentError},
     content_id::{ContentId, ContentIdGenerator},
-    content::encryption::{ContentEncryption, ContentEncryptionKeyGenerator},
 };
 
 use super::{
@@ -320,9 +320,9 @@ pub enum FetchError {
 mod tests {
     use super::*;
     use crate::domain::{
+        content::encryption::{ContentEncryptionKey, ContentEncryptionKeyGenerator},
         content::ContentStatus,
         content_id::{ContentId, ContentIdGenerator},
-        content::encryption::{ContentEncryptionKey, ContentEncryptionKeyGenerator},
     };
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};

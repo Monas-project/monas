@@ -1,4 +1,6 @@
-use crate::domain::{content::Content, content::encryption::ContentEncryptionKey, content_id::ContentId};
+use crate::domain::{
+    content::encryption::ContentEncryptionKey, content::Content, content_id::ContentId,
+};
 
 /// コンテンツを永続化するポート。
 pub trait ContentRepository {

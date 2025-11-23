@@ -29,5 +29,3 @@ pub trait KeyWrapping {
         content_id: &ContentId,
     ) -> Result<(Vec<u8>, Vec<u8>), KeyWrappingError>;
 }
-
-

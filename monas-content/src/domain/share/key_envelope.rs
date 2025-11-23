@@ -119,13 +119,8 @@ mod tests {
             vec![0xAA, 0xBB],
         );
 
-        assert!(matches!(
-            env.key_wrap_algorithm(),
-            KeyWrapAlgorithm::HpkeV1
-        ));
+        assert!(matches!(env.key_wrap_algorithm(), KeyWrapAlgorithm::HpkeV1));
         assert_eq!(env.recipient().key_id().as_bytes(), &[4, 5, 6]);
         assert_eq!(env.ciphertext(), &[0xAA, 0xBB]);
     }
 }
-
-

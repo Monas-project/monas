@@ -1,12 +1,12 @@
-use crate::domain::content::ContentError;
 use crate::domain::content::encryption::{
     ContentEncryption, ContentEncryptionKey, ContentEncryptionKeyGenerator,
 };
+use crate::domain::content::ContentError;
 
 use aes::Aes256;
 use ctr::cipher::{KeyIvInit, StreamCipher};
 use ctr::Ctr128BE;
-use rand_core::{OsRng, TryRngCore};
+use rand_core::{OsRng, RngCore};
 
 type Aes256Ctr = Ctr128BE<Aes256>;
 
@@ -19,8 +19,7 @@ impl ContentEncryptionKeyGenerator for OsRngContentEncryptionKeyGenerator {
     fn generate(&self) -> ContentEncryptionKey {
         let mut key_bytes = [0u8; 32];
         let mut rng = OsRng;
-        rng.try_fill_bytes(&mut key_bytes)
-            .expect("failed to obtain randomness from OS");
+        rng.fill_bytes(&mut key_bytes);
         ContentEncryptionKey(key_bytes.to_vec())
     }
 }
@@ -48,8 +47,7 @@ impl ContentEncryption for Aes256CtrContentEncryption {
         }
         let mut iv = [0u8; IV_LEN];
         let mut rng = OsRng;
-        rng.try_fill_bytes(&mut iv)
-            .expect("failed to obtain randomness from OS");
+        rng.fill_bytes(&mut iv);
 
         let mut buffer = plaintext.to_vec();
         let mut cipher = Aes256Ctr::new_from_slices(key.0.as_slice(), &iv).map_err(|_| {
