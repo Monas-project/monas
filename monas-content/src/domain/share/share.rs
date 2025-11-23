@@ -105,19 +105,7 @@ impl Share {
     ///
     /// - 既に同じ KeyId の受信者が存在する場合は `AlreadyShared` を返す。
     pub fn grant_read(&mut self, key_id: KeyId) -> Result<ShareEvent, ShareError> {
-        if self.recipients.contains_key(&key_id) {
-            return Err(ShareError::AlreadyShared);
-        }
-
-        let permissions = vec![Permission::Read];
-        let recipient = ShareRecipient::new(key_id.clone(), permissions.clone());
-        self.recipients.insert(key_id.clone(), recipient);
-
-        Ok(ShareEvent::RecipientGranted {
-            content_id: self.content_id.clone(),
-            key_id,
-            permissions,
-        })
+        self.grant_with_permissions(key_id, vec![Permission::Read])
     }
 
     /// Write 権限の付与。
@@ -125,11 +113,22 @@ impl Share {
     /// - `Write` は `Read` を内包する前提のため、ドメイン上は `Write` のみを持たせる。
     /// - 既に同じ KeyId の受信者が存在する場合は `AlreadyShared` を返す。
     pub fn grant_write(&mut self, key_id: KeyId) -> Result<ShareEvent, ShareError> {
+        self.grant_with_permissions(key_id, vec![Permission::Write])
+    }
+
+    /// 共通の権限付与ロジック。
+    ///
+    /// - 既に同じ KeyId の受信者が存在する場合は `AlreadyShared` を返す。
+    /// - 新しい `ShareRecipient` を追加し、`RecipientGranted` イベントを返す。
+    fn grant_with_permissions(
+        &mut self,
+        key_id: KeyId,
+        permissions: Vec<Permission>,
+    ) -> Result<ShareEvent, ShareError> {
         if self.recipients.contains_key(&key_id) {
             return Err(ShareError::AlreadyShared);
         }
 
-        let permissions = vec![Permission::Write];
         let recipient = ShareRecipient::new(key_id.clone(), permissions.clone());
         self.recipients.insert(key_id.clone(), recipient);
 

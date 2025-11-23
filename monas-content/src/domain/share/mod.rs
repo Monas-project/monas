@@ -1,6 +1,7 @@
 pub mod encryption;
 pub mod key_envelope;
 pub mod key_id;
+#[allow(clippy::module_inception)]
 pub mod share;
 
 pub use encryption::{KeyWrapping, KeyWrappingError};

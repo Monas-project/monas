@@ -33,6 +33,7 @@ impl ContentEncryptionKeyGenerator for OsRngContentEncryptionKeyGenerator {
 pub struct Aes256CtrContentEncryption;
 
 const IV_LEN: usize = 16;
+const KEY_LEN: usize = 32;
 
 impl ContentEncryption for Aes256CtrContentEncryption {
     fn encrypt(
@@ -40,10 +41,12 @@ impl ContentEncryption for Aes256CtrContentEncryption {
         key: &ContentEncryptionKey,
         plaintext: &[u8],
     ) -> Result<Vec<u8>, ContentError> {
-        if key.0.len() != 32 {
-            return Err(ContentError::EncryptionError(
-                "Invalid content encryption key length; expected 32 bytes".into(),
-            ));
+        if key.0.len() != KEY_LEN {
+            return Err(ContentError::EncryptionError(format!(
+                "Invalid content encryption key length; expected {} bytes, got {} bytes",
+                KEY_LEN,
+                key.0.len()
+            )));
         }
         let mut iv = [0u8; IV_LEN];
         let mut rng = OsRng;
@@ -64,9 +67,10 @@ impl ContentEncryption for Aes256CtrContentEncryption {
     }
 
     fn decrypt(&self, key: &ContentEncryptionKey, data: &[u8]) -> Result<Vec<u8>, ContentError> {
-        if key.0.len() != 32 {
+        if key.0.len() != KEY_LEN {
             return Err(ContentError::DecryptionError(format!(
-                "Invalid content encryption key length; expected 32 bytes, got {} bytes",
+                "Invalid content encryption key length; expected {} bytes, got {} bytes",
+                KEY_LEN,
                 key.0.len()
             )));
         }

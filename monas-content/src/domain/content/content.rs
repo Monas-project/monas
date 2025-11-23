@@ -47,8 +47,6 @@ impl Content {
         encrypted_content: Option<Vec<u8>>,
         is_deleted: bool,
     ) -> Self {
-        // TODO: 事前条件を追加する
-
         Self {
             id: id.clone(),
             series_id: id,
@@ -112,9 +110,7 @@ impl Content {
         G: ContentIdGenerator,
         E: ContentEncryption,
     {
-        if self.is_deleted {
-            return Err(ContentError::AlreadyDeleted);
-        }
+        self.ensure_not_deleted()?;
 
         if key.0.is_empty() {
             return Err(ContentError::EncryptionError(
@@ -124,10 +120,8 @@ impl Content {
 
         let encrypted_content = encryption.encrypt(key, &raw_content)?;
 
-        // 新しいコンテンツ本体に対して ContentId を再計算する。
         let new_id = id_generator.generate(&raw_content);
 
-        // 現在の ID を新しい ID に差し替えつつ、updated_at を更新する。
         let new_metadata = self.metadata.with_new_id(new_id.clone());
 
         let content = Self {
@@ -148,9 +142,7 @@ impl Content {
     /// - バイナリや暗号化データは変更しない
     /// - `metadata.updated_at` は現在時刻に更新される
     pub fn rename(&self, new_name: String) -> Result<(Self, ContentEvent), ContentError> {
-        if self.is_deleted {
-            return Err(ContentError::AlreadyDeleted);
-        }
+        self.ensure_not_deleted()?;
 
         let new_metadata = self.metadata.rename(new_name);
 
@@ -169,9 +161,7 @@ impl Content {
 
     // 複数のノードでのコンセンサスやキャンセル可能性が必要な場合は段階的な削除処理が必要
     pub fn delete(&self) -> Result<(Self, ContentEvent), ContentError> {
-        if self.is_deleted {
-            return Err(ContentError::AlreadyDeleted);
-        }
+        self.ensure_not_deleted()?;
 
         // 削除操作も更新の一種なので updated_at を進める
         let new_metadata = self.metadata.touch();
@@ -197,9 +187,7 @@ impl Content {
     where
         E: ContentEncryption,
     {
-        if self.is_deleted {
-            return Err(ContentError::AlreadyDeleted);
-        }
+        self.ensure_not_deleted()?;
 
         if self.encrypted_content.is_none() {
             Err(ContentError::DecryptionError(
@@ -212,6 +200,15 @@ impl Content {
         } else {
             let encrypted = self.encrypted_content.as_ref().unwrap();
             encryption.decrypt(key, encrypted)
+        }
+    }
+
+    /// - `is_deleted == true` の場合は `ContentError::AlreadyDeleted` を返す。
+    fn ensure_not_deleted(&self) -> Result<(), ContentError> {
+        if self.is_deleted {
+            Err(ContentError::AlreadyDeleted)
+        } else {
+            Ok(())
         }
     }
 

@@ -33,17 +33,7 @@ where
 {
     pub fn create(&self, cmd: CreateContentCommand) -> Result<CreateContentResult, CreateError> {
         // 簡易バリデーション
-        if cmd.name.trim().is_empty() {
-            return Err(CreateError::Validation("name must not be empty".into()));
-        }
-        if cmd.path.trim().is_empty() {
-            return Err(CreateError::Validation("path must not be empty".into()));
-        }
-        if cmd.raw_content.is_empty() {
-            return Err(CreateError::Validation(
-                "raw_content must not be empty".into(),
-            ));
-        }
+        Self::validate_create_command(&cmd)?;
 
         // CEK の生成
         let key = self.key_generator.generate();
@@ -93,29 +83,29 @@ where
         })
     }
 
+    /// CreateContentCommand の簡易バリデーション。
+    fn validate_create_command(cmd: &CreateContentCommand) -> Result<(), CreateError> {
+        if cmd.name.trim().is_empty() {
+            return Err(CreateError::Validation("name must not be empty".into()));
+        }
+        if cmd.path.trim().is_empty() {
+            return Err(CreateError::Validation("path must not be empty".into()));
+        }
+        if cmd.raw_content.is_empty() {
+            return Err(CreateError::Validation(
+                "raw_content must not be empty".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// コンテンツ更新ユースケース。
     ///
     /// - `new_name` と `new_raw_content` はどちらか片方だけ、あるいは両方指定可能
     /// - どちらも `None` の場合は Validation エラーとする
     pub fn update(&self, cmd: UpdateContentCommand) -> Result<UpdateContentResult, UpdateError> {
         // 簡易バリデーション
-        if cmd.new_name.as_ref().is_none() && cmd.new_raw_content.as_ref().is_none() {
-            return Err(UpdateError::Validation(
-                "at least one of new_name or new_raw_content must be provided".into(),
-            ));
-        }
-        if let Some(name) = &cmd.new_name {
-            if name.trim().is_empty() {
-                return Err(UpdateError::Validation("name must not be empty".into()));
-            }
-        }
-        if let Some(raw) = &cmd.new_raw_content {
-            if raw.is_empty() {
-                return Err(UpdateError::Validation(
-                    "new_raw_content must not be empty when provided".into(),
-                ));
-            }
-        }
+        Self::validate_update_command(&cmd)?;
 
         // 既存コンテンツの取得
         let mut content = self
@@ -178,6 +168,31 @@ where
             content_id,
             metadata,
         })
+    }
+
+    /// UpdateContentCommand の簡易バリデーション。
+    ///
+    /// - `new_name` / `new_raw_content` のいずれか一方以上が指定されていること。
+    /// - 指定されている場合、それぞれの値が妥当であること。
+    fn validate_update_command(cmd: &UpdateContentCommand) -> Result<(), UpdateError> {
+        if cmd.new_name.as_ref().is_none() && cmd.new_raw_content.as_ref().is_none() {
+            return Err(UpdateError::Validation(
+                "at least one of new_name or new_raw_content must be provided".into(),
+            ));
+        }
+        if let Some(name) = &cmd.new_name {
+            if name.trim().is_empty() {
+                return Err(UpdateError::Validation("name must not be empty".into()));
+            }
+        }
+        if let Some(raw) = &cmd.new_raw_content {
+            if raw.is_empty() {
+                return Err(UpdateError::Validation(
+                    "new_raw_content must not be empty when provided".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// コンテンツ本体を復号して取得するユースケース（fetch）。

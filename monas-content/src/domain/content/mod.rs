@@ -1,3 +1,4 @@
+#[allow(clippy::module_inception)]
 pub mod content;
 pub mod encryption;
 pub mod metadata;

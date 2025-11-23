@@ -7,7 +7,7 @@ use rand_core::OsRng;
 /// 受信者用の P-256 鍵ペアを生成し、
 /// - 公開鍵: uncompressed form (0x04 || X || Y, 65バイト) を base64 化
 /// - 秘密鍵: 32バイトスカラーを base64 化
-/// として標準出力に出すスクリプト。
+///   として標準出力に出すスクリプト。
 ///
 /// サーバ側の `HpkeV1KeyWrapping` は「受信者公開鍵 = P-256 uncompressed」としているので、
 /// `recipient_public_key_base64` をそのまま `recipient_public_key_base64` に渡せば OK。
