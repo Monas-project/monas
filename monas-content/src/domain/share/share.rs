@@ -6,7 +6,7 @@ use crate::domain::KeyId;
 /// コンテンツに対するアクセス権限。
 ///
 /// - `Write` は常に `Read` を内包するものとして扱う。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Permission {
     Read,
     Write,
@@ -27,7 +27,7 @@ impl Permission {
 }
 
 /// 1 人の受信者に対する共有情報。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ShareRecipient {
     key_id: KeyId,
     permissions: Vec<Permission>,
@@ -83,7 +83,10 @@ pub enum ShareEvent {
 }
 
 /// 1 つのコンテンツに対する共有状態（ACL）。
-#[derive(Debug, Clone)]
+///
+/// - `serde` によるシリアライズ/デシリアライズをサポートしており、
+///   sled などの KVS に JSON 形式で保存できる。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Share {
     content_id: ContentId,
     /// key = KeyId

@@ -2,7 +2,7 @@
 ///
 /// - 実体は公開鍵バイト列のハッシュ先頭 N バイトなどから生成される想定。
 /// - 生成ロジック自体は infra 側に委譲し、ドメインでは「不透明な ID」としてのみ扱う。
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct KeyId(Vec<u8>);
 
 impl KeyId {

@@ -56,11 +56,14 @@ impl ContentEncryptionKeyStore for InMemoryContentEncryptionKeyStore {
 
 /// sled を用いた CEK ストア実装。
 ///
-/// - キー: `content_id.as_str()`（UTF-8 文字列）
+/// - キー: `"cek:{content_id.as_str()}"`（UTF-8 文字列）
 /// - 値: CEK のバイト列（`ContentEncryptionKey.0`）
-//
-// NOTE: sled 実装はあくまでローカル用の暫定実装であり、
-//       本番環境では別の KVS / ストレージに置き換える可能性がある。
+///
+/// NOTE:
+/// - 他の sled ベースのストア（例: `SledShareRepository`）と
+///   同じ DB ファイルを共有しても、プレフィックスによりキー空間が分離される。
+/// - sled 実装はあくまでローカル用の暫定実装であり、
+///   本番環境では別の KVS / ストレージに置き換える可能性がある。
 pub struct SledContentEncryptionKeyStore {
     db: sled::Db,
 }
@@ -79,8 +82,9 @@ impl ContentEncryptionKeyStore for SledContentEncryptionKeyStore {
         content_id: &ContentId,
         key: &ContentEncryptionKey,
     ) -> Result<(), ContentEncryptionKeyStoreError> {
+        let sled_key = format!("cek:{}", content_id.as_str());
         self.db
-            .insert(content_id.as_str(), key.0.clone())
+            .insert(sled_key, key.0.clone())
             .map_err(|e| ContentEncryptionKeyStoreError::Storage(e.to_string()))?;
         self.db
             .flush()
@@ -92,17 +96,19 @@ impl ContentEncryptionKeyStore for SledContentEncryptionKeyStore {
         &self,
         content_id: &ContentId,
     ) -> Result<Option<ContentEncryptionKey>, ContentEncryptionKeyStoreError> {
+        let sled_key = format!("cek:{}", content_id.as_str());
         let opt = self
             .db
-            .get(content_id.as_str())
+            .get(sled_key)
             .map_err(|e| ContentEncryptionKeyStoreError::Storage(e.to_string()))?;
 
         Ok(opt.map(|ivec| ContentEncryptionKey(ivec.to_vec())))
     }
 
     fn delete(&self, content_id: &ContentId) -> Result<(), ContentEncryptionKeyStoreError> {
+        let sled_key = format!("cek:{}", content_id.as_str());
         self.db
-            .remove(content_id.as_str())
+            .remove(sled_key)
             .map_err(|e| ContentEncryptionKeyStoreError::Storage(e.to_string()))?;
         self.db
             .flush()
