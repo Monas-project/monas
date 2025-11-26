@@ -195,4 +195,73 @@ mod tests {
 
         assert_eq!(decrypted, plaintext);
     }
+
+    /// **Security vulnerability test**: This test passing demonstrates lack of integrity verification
+    ///
+    /// In AES-CTR mode, decryption succeeds even when ciphertext is tampered with.
+    /// Tampering goes undetected and incorrect data is returned.
+    ///
+    /// **Expected behavior (ideal)**: Tampered ciphertext should be detected and decryption should fail
+    /// **Current behavior (problem)**: Test passes = tampering undetected = security vulnerability
+    #[test]
+    fn tampered_ciphertext_decrypts_successfully_but_returns_wrong_data() {
+        let key = ContentEncryptionKey(vec![42u8; 32]);
+        let encryptor = Aes256CtrContentEncryption;
+        let plaintext = b"Secret message that should not be tampered with!";
+
+        println!("\n========== TEST 1: Tampered Ciphertext ==========");
+        println!("Original Plaintext: {:?}", String::from_utf8_lossy(plaintext));
+        println!("Plaintext (hex):    {}", hex::encode(plaintext));
+        println!("Plaintext length:   {} bytes", plaintext.len());
+
+        // Encrypt normally
+        let mut ciphertext = encryptor
+            .encrypt(&key, plaintext)
+            .expect("encryption should succeed");
+
+        println!("\n--- After Encryption ---");
+        println!("Ciphertext length:  {} bytes (IV: {} + data: {})",
+            ciphertext.len(), IV_LEN, ciphertext.len() - IV_LEN);
+        println!("IV (first 16 bytes):       {}", hex::encode(&ciphertext[0..IV_LEN]));
+        println!("Encrypted data (hex):      {}", hex::encode(&ciphertext[IV_LEN..]));
+
+        // Tamper with part of the ciphertext (modify the first byte after IV)
+        let original_byte = ciphertext[IV_LEN];
+        println!("\n--- Before Tampering ---");
+        println!("Byte at position [IV_LEN=16]: 0x{:02x} ({})", original_byte, original_byte);
+
+        ciphertext[IV_LEN] ^= 0x11; // Tampering by bit flipping
+        println!("\n--- After Tampering ---");
+        println!("Byte at position [IV_LEN=16]: 0x{:02x} ({}) ← TAMPERED!", ciphertext[IV_LEN], ciphertext[IV_LEN]);
+        println!("Modified ciphertext (hex):     {}", hex::encode(&ciphertext[IV_LEN..]));
+
+        // Problem: Decryption "succeeds" even with tampered ciphertext
+        let decrypted = encryptor
+            .decrypt(&key, &ciphertext)
+            .expect("decryption 'succeeds' even with tampered data - THIS IS THE PROBLEM!");
+
+        println!("\n--- Decryption of Tampered Data ---");
+        println!("WARNING: Decryption SUCCEEDED (this is the problem!)");
+        println!("Decrypted text:  {:?}", String::from_utf8_lossy(&decrypted));
+        println!("Decrypted (hex): {}", hex::encode(&decrypted));
+
+        // Due to tampering, the decrypted result differs from the original first byte
+        println!("\n--- Verification ---");
+        println!("Original 1st byte:  0x{:02x} ({})", plaintext[0], plaintext[0] as char);
+        println!("Decrypted 1st byte: 0x{:02x} ({})", decrypted[0], decrypted[0] as char);
+        assert_ne!(decrypted[0], plaintext[0]);
+        assert_ne!(&decrypted[..], &plaintext[..]);
+        println!("OK: Decrypted data DIFFERS from original (as expected from tampering)");
+
+        // Restoring the original byte allows correct decryption (proof that tampering was the cause)
+        println!("\n--- Restoring Original Ciphertext ---");
+        ciphertext[IV_LEN] = original_byte;
+        let restored = encryptor
+            .decrypt(&key, &ciphertext)
+            .expect("should decrypt");
+        println!("Restored text: {:?}", String::from_utf8_lossy(&restored));
+        assert_eq!(&restored[..], &plaintext[..]);
+        println!("OK: After restoring byte, plaintext matches original");
+        println!("========== END TEST 1 ==========\n");
+    }
 }
