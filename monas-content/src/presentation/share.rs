@@ -12,7 +12,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     application_service::share_service::{GrantShareCommand, RevokeShareCommand},
-    domain::share::KeyId,
+    domain::share::{
+        key_envelope::{KeyEnvelope, KeyWrapAlgorithm, WrappedRecipientKey},
+        KeyId,
+    },
     domain::{content_id::ContentId, share::Permission},
 };
 
@@ -20,13 +23,9 @@ use super::AppState;
 
 #[derive(Deserialize)]
 pub struct GrantShareRequest {
-    /// 対象コンテンツの ID。
     pub content_id: String,
-    /// Base64 エンコードされた送信者の KeyId（任意のバイト列）。
     pub sender_key_id_base64: String,
-    /// Base64 エンコードされた受信者の HPKE 公開鍵バイト列。
     pub recipient_public_key_base64: String,
-    /// "read" または "write"
     pub permission: String,
 }
 
@@ -39,6 +38,22 @@ pub struct GrantShareResponse {
     pub enc_base64: String,
     pub wrapped_cek_base64: String,
     pub ciphertext_base64: String,
+}
+
+#[derive(Deserialize)]
+pub struct UnwrapCekRequest {
+    pub content_id: String,
+    pub sender_key_id_base64: String,
+    pub recipient_key_id_base64: String,
+    pub enc_base64: String,
+    pub wrapped_cek_base64: String,
+    pub ciphertext_base64: String,
+    pub recipient_private_key_base64: String,
+}
+
+#[derive(Serialize)]
+pub struct UnwrapCekResponse {
+    pub cek_base64: String,
 }
 
 #[derive(Serialize)]
@@ -62,6 +77,7 @@ pub struct GetShareResponse {
 pub fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/shares", post(grant_share))
+        .route("/shares/unwrap", post(unwrap_cek))
         .route(
             "/shares/{content_id}/{recipient_key_id}",
             delete(revoke_share),
@@ -134,6 +150,81 @@ async fn grant_share(
         wrapped_cek_base64: wrapped_cek_b64,
         ciphertext_base64: ciphertext_b64,
     }))
+}
+
+async fn unwrap_cek(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<UnwrapCekRequest>,
+) -> Result<Json<UnwrapCekResponse>, (StatusCode, String)> {
+    let content_id = ContentId::new(req.content_id.clone());
+
+    let sender_key_bytes = BASE64_STANDARD
+        .decode(&req.sender_key_id_base64)
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("invalid sender_key_id_base64: {e}"),
+            )
+        })?;
+    let sender_key_id = KeyId::new(sender_key_bytes);
+
+    let recipient_key_bytes = BASE64_STANDARD
+        .decode(&req.recipient_key_id_base64)
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("invalid recipient_key_id_base64: {e}"),
+            )
+        })?;
+    let recipient_key_id = KeyId::new(recipient_key_bytes);
+
+    let enc = BASE64_STANDARD
+        .decode(&req.enc_base64)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid enc_base64: {e}")))?;
+
+    let wrapped_cek = BASE64_STANDARD
+        .decode(&req.wrapped_cek_base64)
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("invalid wrapped_cek_base64: {e}"),
+            )
+        })?;
+
+    let ciphertext = BASE64_STANDARD
+        .decode(&req.ciphertext_base64)
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("invalid ciphertext_base64: {e}"),
+            )
+        })?;
+
+    let recipient_private_key = BASE64_STANDARD
+        .decode(&req.recipient_private_key_base64)
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("invalid recipient_private_key_base64: {e}"),
+            )
+        })?;
+
+    let recipient = WrappedRecipientKey::new(recipient_key_id, enc, wrapped_cek);
+    let envelope = KeyEnvelope::new(
+        content_id,
+        KeyWrapAlgorithm::HpkeV1,
+        sender_key_id,
+        recipient,
+        ciphertext,
+    );
+
+    let cek = state
+        .share_service
+        .unwrap_cek_from_envelope(&envelope, &recipient_private_key)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let cek_base64 = BASE64_STANDARD.encode(&cek.0);
+
+    Ok(Json(UnwrapCekResponse { cek_base64 }))
 }
 
 async fn revoke_share(

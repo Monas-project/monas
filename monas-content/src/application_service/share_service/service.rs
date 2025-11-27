@@ -1,5 +1,8 @@
 use crate::application_service::content_service::{ContentEncryptionKeyStore, ContentRepository};
-use crate::domain::share::{encryption::KeyWrapping, KeyEnvelope, Share};
+use crate::domain::content::encryption::ContentEncryptionKey;
+use crate::domain::share::{
+    encryption::KeyWrapping, key_envelope::KeyWrapAlgorithm, KeyEnvelope, Share,
+};
 
 use super::{
     GrantShareCommand, GrantShareResult, PublicKeyDirectory, RevokeShareCommand, RevokeShareResult,
@@ -8,7 +11,7 @@ use super::{
 
 /// コンテンツ共有ユースケースのアプリケーションサービス。
 ///
-/// - ContentService とは独立に、「共有（ACL と KeyEnvelope 生成）」に責務を限定する。
+/// - ContentService とは独立に、「共有（ACL と KeyEnvelope 生成 / CEK 復号）」に責務を限定する。
 pub struct ShareService<SR, CR, KS, KD, KW> {
     pub share_repository: SR,
     pub content_repository: CR,
@@ -145,6 +148,30 @@ where
             recipient_key_id: cmd.recipient_key_id,
         })
     }
+
+    /// KeyEnvelope と受信者の秘密鍵バイト列から CEK を復号（アンラップ）する。
+    ///
+    /// - monas-account など別サービスが秘密鍵を管理し、このサービスにはバイト列として渡ってくる前提。
+    /// - 現時点では HpkeV1 のみをサポートする。
+    pub fn unwrap_cek_from_envelope(
+        &self,
+        envelope: &KeyEnvelope,
+        recipient_private_key: &[u8],
+    ) -> Result<ContentEncryptionKey, ShareApplicationError> {
+        match envelope.key_wrap_algorithm() {
+            KeyWrapAlgorithm::HpkeV1 => {
+                let recipient = envelope.recipient();
+                self.key_wrapper
+                    .unwrap_cek(
+                        recipient.enc(),
+                        recipient.wrapped_cek(),
+                        recipient_private_key,
+                        envelope.content_id(),
+                    )
+                    .map_err(|e| ShareApplicationError::KeyWrapping(format!("{e:?}")))
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -161,7 +188,12 @@ mod tests {
     use crate::domain::{
         content::{Content, ContentEncryptionKey, Metadata},
         content_id::ContentId,
-        share::{encryption::KeyWrapping, share::ShareError, Permission, Share},
+        share::{
+            encryption::KeyWrapping,
+            key_envelope::{KeyEnvelope, KeyWrapAlgorithm, WrappedRecipientKey},
+            share::ShareError,
+            Permission, Share,
+        },
         KeyId,
     };
     use std::collections::HashMap;
@@ -348,6 +380,17 @@ mod tests {
         {
             Ok((vec![0xAA, 0xBB], vec![0x11, 0x22, 0x33]))
         }
+
+        fn unwrap_cek(
+            &self,
+            _enc: &[u8],
+            wrapped_cek: &[u8],
+            _recipient_private_key: &[u8],
+            _content_id: &ContentId,
+        ) -> Result<ContentEncryptionKey, crate::domain::share::encryption::KeyWrappingError>
+        {
+            Ok(ContentEncryptionKey(wrapped_cek.to_vec()))
+        }
     }
 
     #[derive(Clone)]
@@ -363,6 +406,19 @@ mod tests {
         {
             Err(crate::domain::share::encryption::KeyWrappingError::Other(
                 "wrap failed (test)".into(),
+            ))
+        }
+
+        fn unwrap_cek(
+            &self,
+            _enc: &[u8],
+            _wrapped_cek: &[u8],
+            _recipient_private_key: &[u8],
+            _content_id: &ContentId,
+        ) -> Result<ContentEncryptionKey, crate::domain::share::encryption::KeyWrappingError>
+        {
+            Err(crate::domain::share::encryption::KeyWrappingError::Other(
+                "unwrap failed (test)".into(),
             ))
         }
     }
@@ -421,6 +477,84 @@ mod tests {
             public_key_directory: public_key_dir,
             key_wrapper,
         }
+    }
+
+    #[test]
+    fn unwrap_cek_from_envelope_success() {
+        let (share_repo, _share_storage) = TestShareRepository::new();
+        let (content_repo, _content_storage) = TestContentRepository::new();
+        let (key_store, _key_storage) = TestKeyStore::new();
+        let public_key_dir = TestPublicKeyDirectory::default();
+        let key_wrapper = TestKeyWrapper;
+
+        let service = build_service(
+            share_repo,
+            content_repo,
+            key_store,
+            public_key_dir,
+            key_wrapper,
+        );
+
+        let cid = cid();
+        let recipient_key_id = sender_key_id();
+        let wrapped_cek_bytes = vec![0x11, 0x22, 0x33];
+        let recipient = WrappedRecipientKey::new(
+            recipient_key_id,
+            vec![0xAA, 0xBB],
+            wrapped_cek_bytes.clone(),
+        );
+        let envelope = KeyEnvelope::new(
+            cid.clone(),
+            KeyWrapAlgorithm::HpkeV1,
+            sender_key_id(),
+            recipient,
+            encrypted(),
+        );
+
+        let recipient_private_key = vec![0x99, 0x88];
+
+        let result = service
+            .unwrap_cek_from_envelope(&envelope, &recipient_private_key)
+            .expect("unwrap_cek_from_envelope should succeed");
+
+        assert_eq!(result.0, wrapped_cek_bytes);
+    }
+
+    #[test]
+    fn unwrap_cek_from_envelope_propagates_key_wrapper_error() {
+        let (share_repo, _share_storage) = TestShareRepository::new();
+        let (content_repo, _content_storage) = TestContentRepository::new();
+        let (key_store, _key_storage) = TestKeyStore::new();
+        let public_key_dir = TestPublicKeyDirectory::default();
+        let key_wrapper = FailingKeyWrapper;
+
+        let service = build_service(
+            share_repo,
+            content_repo,
+            key_store,
+            public_key_dir,
+            key_wrapper,
+        );
+
+        let cid = cid();
+        let recipient_key_id = sender_key_id();
+        let recipient =
+            WrappedRecipientKey::new(recipient_key_id, vec![0xAA, 0xBB], vec![0x11, 0x22, 0x33]);
+        let envelope = KeyEnvelope::new(
+            cid.clone(),
+            KeyWrapAlgorithm::HpkeV1,
+            sender_key_id(),
+            recipient,
+            encrypted(),
+        );
+
+        let recipient_private_key = vec![0x99, 0x88];
+
+        let err = service
+            .unwrap_cek_from_envelope(&envelope, &recipient_private_key)
+            .expect_err("unwrap_cek_from_envelope should propagate key wrapper error");
+
+        assert!(matches!(err, ShareApplicationError::KeyWrapping(_)));
     }
 
     #[test]

@@ -12,9 +12,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     application_service::content_service::{
-        CreateContentCommand, CreateContentResult, DeleteContentCommand, UpdateContentCommand,
+        CreateContentCommand, CreateContentResult, DecryptWithCekError, DeleteContentCommand,
+        UpdateContentCommand,
     },
-    domain::{content::ContentStatus, content_id::ContentId},
+    domain::{
+        content::encryption::ContentEncryptionKey, content::ContentStatus, content_id::ContentId,
+    },
 };
 
 use super::AppState;
@@ -48,6 +51,7 @@ pub fn routes() -> Router<Arc<AppState>> {
             patch(update_content).delete(delete_content),
         )
         .route("/contents/{id}/fetch", get(fetch_content))
+        .route("/contents/{id}/decrypt", post(decrypt_with_cek))
 }
 
 async fn create_content(
@@ -197,4 +201,52 @@ async fn fetch_content(
         status,
         content_base64,
     }))
+}
+
+#[derive(Deserialize)]
+pub struct DecryptWithCekRequest {
+    pub cek_base64: String,
+    pub ciphertext_base64: String,
+}
+
+#[derive(Serialize)]
+pub struct DecryptWithCekResponse {
+    pub content_base64: String,
+}
+
+async fn decrypt_with_cek(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<DecryptWithCekRequest>,
+) -> Result<Json<DecryptWithCekResponse>, (StatusCode, String)> {
+    let content_id = ContentId::new(id);
+
+    let cek_bytes = BASE64_STANDARD
+        .decode(&req.cek_base64)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid cek_base64: {e}")))?;
+    let cek = ContentEncryptionKey(cek_bytes);
+
+    let ciphertext = BASE64_STANDARD
+        .decode(&req.ciphertext_base64)
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("invalid ciphertext_base64: {e}"),
+            )
+        })?;
+
+    let plaintext = state
+        .content_service
+        .decrypt_with_cek(content_id, cek, ciphertext)
+        .map_err(|e| {
+            let status = match e {
+                DecryptWithCekError::ContentIdMismatch { .. } => StatusCode::BAD_REQUEST,
+                DecryptWithCekError::Domain(_) => StatusCode::BAD_REQUEST,
+            };
+            (status, e.to_string())
+        })?;
+
+    let content_base64 = BASE64_STANDARD.encode(&plaintext);
+
+    Ok(Json(DecryptWithCekResponse { content_base64 }))
 }

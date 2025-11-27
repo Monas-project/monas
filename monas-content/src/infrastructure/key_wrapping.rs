@@ -51,6 +51,34 @@ impl KeyWrapping for HpkeV1KeyWrapping {
 
         Ok((enc, wrapped_cek))
     }
+
+    fn unwrap_cek(
+        &self,
+        enc: &[u8],
+        wrapped_cek: &[u8],
+        recipient_private_key: &[u8],
+        content_id: &ContentId,
+    ) -> Result<ContentEncryptionKey, KeyWrappingError> {
+        let (mode, kem, kdf, aead) = Self::hpke_config();
+        let hpke = Hpke::<HpkeRustCrypto>::new(mode, kem, kdf, aead);
+
+        let sk_r = HpkePrivateKey::from(recipient_private_key.to_vec());
+
+        let info = content_id.as_str().as_bytes();
+        let aad = info;
+
+        let mut ctx = hpke
+            .setup_receiver(enc, &sk_r, info, None, None, None)
+            .map_err(|e| {
+                KeyWrappingError::CryptoError(format!("hpke setup_receiver failed: {e:?}"))
+            })?;
+
+        let cek_bytes = ctx
+            .open(aad, wrapped_cek)
+            .map_err(|e| KeyWrappingError::CryptoError(format!("hpke open failed: {e:?}")))?;
+
+        Ok(ContentEncryptionKey(cek_bytes))
+    }
 }
 
 #[cfg(test)]
@@ -161,6 +189,63 @@ mod tests {
         assert!(
             matches!(result, Err(KeyWrappingError::CryptoError(_))),
             "expected CryptoError for invalid public key bytes"
+        );
+    }
+
+    #[test]
+    fn unwrap_cek_roundtrip_with_valid_private_key_bytes() {
+        let wrapper = HpkeV1KeyWrapping;
+        let cek = ContentEncryptionKey((0u8..32).collect());
+        let cid = ContentId::new("unwrap-roundtrip".into());
+
+        let (mode, kem, kdf, aead) = HpkeV1KeyWrapping::hpke_config();
+        let mut hpke = Hpke::<HpkeRustCrypto>::new(mode, kem, kdf, aead);
+
+        let keypair = hpke
+            .generate_key_pair()
+            .expect("failed to generate HPKE key pair");
+        let pk_r = keypair.public_key();
+        let sk_r = keypair.private_key();
+
+        let pk_bytes = pk_r.as_slice().to_vec();
+        let sk_bytes = sk_r.as_slice().to_vec();
+
+        let (enc, wrapped) = wrapper
+            .wrap_cek(&cek, &pk_bytes, &cid)
+            .expect("hpke wrap_cek should succeed");
+
+        let decrypted = wrapper
+            .unwrap_cek(&enc, &wrapped, &sk_bytes, &cid)
+            .expect("hpke unwrap_cek should succeed");
+
+        assert_eq!(decrypted.0, cek.0);
+    }
+
+    #[test]
+    fn unwrap_cek_fails_with_invalid_private_key_bytes() {
+        let wrapper = HpkeV1KeyWrapping;
+        let cek = ContentEncryptionKey(vec![0x33; 32]);
+        let cid = ContentId::new("invalid-sk-test".into());
+
+        let (mode, kem, kdf, aead) = HpkeV1KeyWrapping::hpke_config();
+        let mut hpke = Hpke::<HpkeRustCrypto>::new(mode, kem, kdf, aead);
+        let keypair = hpke
+            .generate_key_pair()
+            .expect("failed to generate HPKE key pair");
+        let pk_r = keypair.public_key();
+        let pk_bytes = pk_r.as_slice().to_vec();
+
+        let (enc, wrapped) = wrapper
+            .wrap_cek(&cek, &pk_bytes, &cid)
+            .expect("hpke wrap_cek should succeed");
+
+        let invalid_sk_bytes = vec![0u8; 10];
+
+        let result = wrapper.unwrap_cek(&enc, &wrapped, &invalid_sk_bytes, &cid);
+
+        assert!(
+            matches!(result, Err(KeyWrappingError::CryptoError(_))),
+            "expected CryptoError for invalid private key bytes"
         );
     }
 }

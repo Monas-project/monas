@@ -52,8 +52,7 @@ pub struct SledShareRepository {
 impl SledShareRepository {
     /// 指定されたパスに sled DB を開く。
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, ShareRepositoryError> {
-        let db =
-            sled::open(path).map_err(|e| ShareRepositoryError::Storage(e.to_string()))?;
+        let db = sled::open(path).map_err(|e| ShareRepositoryError::Storage(e.to_string()))?;
         Ok(Self { db })
     }
 }
@@ -77,8 +76,8 @@ impl ShareRepository for SledShareRepository {
 
     fn save(&self, share: &Share) -> Result<(), ShareRepositoryError> {
         let key = format!("share:{}", share.content_id().as_str());
-        let value = serde_json::to_vec(share)
-            .map_err(|e| ShareRepositoryError::Storage(e.to_string()))?;
+        let value =
+            serde_json::to_vec(share).map_err(|e| ShareRepositoryError::Storage(e.to_string()))?;
 
         self.db
             .insert(key, value)

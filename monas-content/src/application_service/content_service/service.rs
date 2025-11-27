@@ -1,5 +1,5 @@
 use crate::domain::{
-    content::encryption::{ContentEncryption, ContentEncryptionKeyGenerator},
+    content::encryption::{ContentEncryption, ContentEncryptionKey, ContentEncryptionKeyGenerator},
     content::{Content, ContentError},
     content_id::{ContentId, ContentIdGenerator},
 };
@@ -230,6 +230,34 @@ where
         })
     }
 
+    /// 外部でアンラップされた CEK と暗号化済みコンテンツを用いて復号するユースケース。
+    ///
+    /// - 共有フロー（Share）で KeyEnvelope から CEK を取り出した後の復号処理を想定。
+    /// - 復号結果のバイト列から ContentId を再計算し、引数の `content_id` と一致することを検証する。
+    ///   （コンテンツアドレス化に基づく整合性チェック）
+    pub fn decrypt_with_cek(
+        &self,
+        expected_content_id: ContentId,
+        key: ContentEncryptionKey,
+        ciphertext: Vec<u8>,
+    ) -> Result<Vec<u8>, DecryptWithCekError> {
+        let plaintext = self
+            .encryptor
+            .decrypt(&key, &ciphertext)
+            .map_err(DecryptWithCekError::Domain)?;
+
+        // 復号したプレーンテキストから ContentId を再生成し、期待される ID と一致するか確認する。
+        let actual_id = self.content_id_generator.generate(&plaintext);
+        if actual_id != expected_content_id {
+            return Err(DecryptWithCekError::ContentIdMismatch {
+                expected: expected_content_id.as_str().to_string(),
+                actual: actual_id.as_str().to_string(),
+            });
+        }
+
+        Ok(plaintext)
+    }
+
     /// コンテンツ削除ユースケース。
     ///
     /// - 物理削除ではなく、ドメインオブジェクト上で `is_deleted` フラグとバッファをクリアして保存する「論理削除」
@@ -329,6 +357,14 @@ pub enum FetchError {
     Repository(ContentRepositoryError),
     #[error("key-store error: {0}")]
     KeyStore(ContentEncryptionKeyStoreError),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum DecryptWithCekError {
+    #[error("content id mismatch: expected {expected}, actual {actual}")]
+    ContentIdMismatch { expected: String, actual: String },
+    #[error("domain error: {0:?}")]
+    Domain(ContentError),
 }
 
 #[cfg(test)]
@@ -976,5 +1012,52 @@ mod tests {
             Ok(_) => panic!("expected missing-key error but got Ok"),
         };
         assert!(matches!(err, FetchError::MissingKey));
+    }
+
+    #[test]
+    fn decrypt_with_cek_success_when_content_id_matches() {
+        let (repo, _storage) = TestContentRepository::new(false);
+        let client = TestStateNodeClient::default();
+        let (key_store, _key_storage) = TestKeyStore::new(false, false);
+        let service = build_service(repo, client, TestKeyGenerator, TestEncryptor, key_store);
+
+        let plaintext = b"decrypt-cek-success".to_vec();
+        let expected_cid = service.content_id_generator.generate(&plaintext);
+
+        let key = ContentEncryptionKey(vec![1, 2, 3]);
+        let ciphertext = plaintext.clone();
+
+        let result = service
+            .decrypt_with_cek(expected_cid.clone(), key, ciphertext)
+            .expect("decrypt_with_cek should succeed when content_id matches");
+
+        assert_eq!(result, plaintext);
+    }
+
+    #[test]
+    fn decrypt_with_cek_returns_mismatch_error_when_content_id_differs() {
+        let (repo, _storage) = TestContentRepository::new(false);
+        let client = TestStateNodeClient::default();
+        let (key_store, _key_storage) = TestKeyStore::new(false, false);
+        let service = build_service(repo, client, TestKeyGenerator, TestEncryptor, key_store);
+
+        let plaintext = b"decrypt-cek-mismatch".to_vec();
+        let actual_cid = service.content_id_generator.generate(&plaintext);
+        let expected_cid = ContentId::new("some-other-id".into());
+
+        let key = ContentEncryptionKey(vec![9, 9, 9]);
+        let ciphertext = plaintext.clone();
+
+        let err = service
+            .decrypt_with_cek(expected_cid.clone(), key, ciphertext)
+            .expect_err("decrypt_with_cek should fail when content_id mismatches");
+
+        match err {
+            DecryptWithCekError::ContentIdMismatch { expected, actual } => {
+                assert_eq!(expected, expected_cid.as_str());
+                assert_eq!(actual, actual_cid.as_str());
+            }
+            other => panic!("unexpected error variant: {:?}", other),
+        }
     }
 }
