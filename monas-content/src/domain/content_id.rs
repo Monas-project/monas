@@ -2,7 +2,7 @@
 ///
 /// 実際の生成ロジックやフォーマット（ハッシュ・CID 等）は別ライブラリ/infra 側で実装し、
 /// ドメイン側では「ContentId という概念」と最小限の操作だけを提供する。
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ContentId(String);
 
 impl ContentId {
