@@ -28,7 +28,10 @@ impl P256KeyPair {
     }
 
     /// 永続化された鍵バイト列から P256KeyPair を復元する。
-    pub fn from_key_bytes(public_key: &[u8], secret_key_bytes: &[u8]) -> Result<Self, KeyPairError> {
+    pub fn from_key_bytes(
+        public_key: &[u8],
+        secret_key_bytes: &[u8],
+    ) -> Result<Self, KeyPairError> {
         if public_key.len() != 65 {
             return Err(KeyPairError::InvalidSecretKey(format!(
                 "expected 65 bytes public key, got {}",
@@ -42,7 +45,7 @@ impl P256KeyPair {
             )));
         }
         let field = FieldBytes::from_slice(secret_key_bytes);
-        let secret_key = SigningKey::from_bytes(&field)
+        let secret_key = SigningKey::from_bytes(field)
             .map_err(|e| KeyPairError::InvalidSecretKey(e.to_string()))?;
         let public_key_point = EncodedPoint::from_bytes(public_key)
             .map_err(|e| KeyPairError::InvalidSecretKey(e.to_string()))?;

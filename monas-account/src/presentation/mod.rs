@@ -1,6 +1,6 @@
-use std::sync::Arc;
-use axum::Router;
 use crate::infrastructure::key_store::InMemoryAccountKeyStore;
+use axum::Router;
+use std::sync::Arc;
 
 pub mod account;
 
@@ -14,7 +14,5 @@ pub fn create_router() -> Router {
         key_store: InMemoryAccountKeyStore::default(),
     });
 
-    Router::new()
-        .merge(account::routes())
-        .with_state(state)
+    Router::new().merge(account::routes()).with_state(state)
 }

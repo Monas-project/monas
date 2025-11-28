@@ -28,7 +28,10 @@ impl K256KeyPair {
     }
 
     /// 永続化された鍵バイト列から K256KeyPair を復元する。
-    pub fn from_key_bytes(public_key: &[u8], secret_key_bytes: &[u8]) -> Result<Self, KeyPairError> {
+    pub fn from_key_bytes(
+        public_key: &[u8],
+        secret_key_bytes: &[u8],
+    ) -> Result<Self, KeyPairError> {
         if public_key.len() != 65 {
             return Err(KeyPairError::InvalidSecretKey(format!(
                 "expected 65 bytes public key, got {}",

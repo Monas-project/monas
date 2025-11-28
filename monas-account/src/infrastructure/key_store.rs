@@ -55,8 +55,7 @@ pub struct SledAccountKeyStore {
 
 impl SledAccountKeyStore {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, AccountKeyStoreError> {
-        let db =
-            sled::open(path).map_err(|e| AccountKeyStoreError::Storage(e.to_string()))?;
+        let db = sled::open(path).map_err(|e| AccountKeyStoreError::Storage(e.to_string()))?;
         Ok(Self { db })
     }
 
@@ -156,7 +155,7 @@ mod tests {
         let stored = StoredAccountKey {
             algorithm: KeyAlgorithm::K256,
             public_key: vec![0; 65],
-            secret_key: vec![1, 2, 3, 4],
+            secret_key: vec![1; 32],
         };
 
         // save
@@ -181,7 +180,8 @@ mod tests {
         let stored = StoredAccountKey {
             algorithm: KeyAlgorithm::P256,
             public_key: vec![0; 65],
-            secret_key: vec![10, 20, 30, 40],
+            // 実際の鍵サイズ(32バイト)に合わせてテストデータを用意する
+            secret_key: vec![2; 32],
         };
 
         // save
@@ -197,5 +197,3 @@ mod tests {
         assert!(store.load().unwrap().is_none());
     }
 }
-
-

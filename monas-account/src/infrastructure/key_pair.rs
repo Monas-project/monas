@@ -38,12 +38,10 @@ impl KeyPairGenerateFactory {
     ) -> Result<Box<dyn AccountKeyPair>, KeyPairError> {
         match key_type {
             KeyAlgorithm::K256 => Ok(Box::new(K256KeyPair::from_key_bytes(
-                public_key,
-                secret_key,
+                public_key, secret_key,
             )?)),
             KeyAlgorithm::P256 => Ok(Box::new(P256KeyPair::from_key_bytes(
-                public_key,
-                secret_key,
+                public_key, secret_key,
             )?)),
         }
     }

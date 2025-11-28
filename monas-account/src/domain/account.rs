@@ -5,7 +5,6 @@ pub struct Account {
 /// アカウント = 鍵ペアという前提のシンプルなドメインモデル。
 /// 永続化や削除（ストレージから鍵を消す）はインフラ層の責務とし、
 /// ドメインでは「署名できること」と「鍵素材へのアクセス」に集中する。
-
 impl Account {
     /// 既に生成済みの鍵ペアからアカウントを構築する。
     pub fn new(key_pair: Box<dyn AccountKeyPair>) -> Self {
