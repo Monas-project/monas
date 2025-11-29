@@ -13,7 +13,7 @@ use crate::infrastructure::network::{Libp2pNetwork, Libp2pNetworkConfig};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::infrastructure::persistence::{SledContentNetworkRepository, SledNodeRegistry};
 #[cfg(not(target_arch = "wasm32"))]
-use crate::port::content_crdt::ContentRepository;
+use crate::port::content_repository::ContentRepository;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::port::peer_network::PeerNetwork;
 #[cfg(not(target_arch = "wasm32"))]

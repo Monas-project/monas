@@ -4,7 +4,8 @@ use crate::domain::events::Event;
 use crate::port::event_publisher::EventPublisher;
 use anyhow::Result;
 use async_trait::async_trait;
-use monas_event_manager::EventBus;
+use futures::FutureExt;
+use monas_event_manager::{make_subscriber, EventBus};
 use std::sync::Arc;
 
 /// EventBus-based implementation of EventPublisher.
@@ -66,14 +67,35 @@ impl EventPublisher for EventBusPublisher {
         Ok(())
     }
 
-    async fn subscribe<F>(&self, _event_type: &str, _handler: F) -> Result<()>
+    async fn subscribe<F>(&self, event_type: &str, handler: F) -> Result<()>
     where
         F: Fn(Event) -> futures::future::BoxFuture<'static, Result<()>> + Send + Sync + 'static,
     {
-        // Note: The monas-event-manager uses a different subscription model.
-        // This would need to be adapted to use make_subscriber.
-        // For now, we provide a stub implementation.
-        Ok(())
+        let event_type_filter = event_type.to_string();
+        let handler = Arc::new(handler);
+
+        let subscriber = make_subscriber::<Event, _, _>(
+            format!("subscriber-{}", event_type_filter),
+            move |event: Arc<Event>| {
+                let handler = handler.clone();
+                let event_type_filter = event_type_filter.clone();
+                async move {
+                    if event.event_type() == event_type_filter {
+                        handler((*event).clone()).await.map_err(|e| {
+                            Box::<dyn std::error::Error + Send + Sync>::from(e.to_string())
+                        })
+                    } else {
+                        Ok(())
+                    }
+                }
+                .boxed()
+            },
+        );
+
+        self.event_bus
+            .subscribe::<Event>(subscriber)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to subscribe: {}", e))
     }
 }
 

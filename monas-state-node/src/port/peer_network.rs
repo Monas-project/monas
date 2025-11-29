@@ -1,6 +1,6 @@
 //! PeerNetwork trait - Abstract interface for P2P network operations
 
-use crate::port::content_crdt::SerializedOperation;
+use crate::port::content_repository::SerializedOperation;
 use anyhow::Result;
 use async_trait::async_trait;
 use std::collections::HashMap;

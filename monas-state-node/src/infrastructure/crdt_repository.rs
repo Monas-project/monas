@@ -3,7 +3,7 @@
 //! This module provides an implementation of ContentRepository
 //! using crsl-lib for CRDT-based content versioning.
 
-use crate::port::content_crdt::{CommitResult, ContentRepository, SerializedOperation};
+use crate::port::content_repository::{CommitResult, ContentRepository, SerializedOperation};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;

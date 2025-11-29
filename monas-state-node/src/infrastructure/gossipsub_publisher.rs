@@ -135,7 +135,7 @@ impl<P: PeerNetwork + 'static> EventPublisher for GossipsubEventPublisher<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::port::content_crdt::SerializedOperation;
+    use crate::port::content_repository::SerializedOperation;
     use std::collections::HashMap;
 
     /// Mock PeerNetwork for testing.

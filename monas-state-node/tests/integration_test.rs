@@ -11,7 +11,7 @@ use monas_state_node::infrastructure::network::{Libp2pNetwork, Libp2pNetworkConf
 use monas_state_node::infrastructure::persistence::{
     SledContentNetworkRepository, SledNodeRegistry,
 };
-use monas_state_node::port::content_crdt::ContentRepository;
+use monas_state_node::port::content_repository::ContentRepository;
 use monas_state_node::port::peer_network::PeerNetwork;
 use std::sync::Arc;
 use tempfile::TempDir;

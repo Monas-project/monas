@@ -12,7 +12,7 @@ use super::protocol::{ContentRequest, ContentResponse};
 use super::transport;
 use crate::domain::events::Event;
 use crate::infrastructure::disk_capacity;
-use crate::port::content_crdt::{ContentRepository, SerializedOperation};
+use crate::port::content_repository::{ContentRepository, SerializedOperation};
 use crate::port::peer_network::PeerNetwork;
 
 use anyhow::{Context, Result};
@@ -88,6 +88,7 @@ impl Default for Libp2pNetworkConfig {
 enum SwarmCommand {
     FindClosestPeers {
         key: Vec<u8>,
+        #[allow(dead_code)]
         k: usize,
         reply: oneshot::Sender<Result<Vec<PeerId>>>,
     },
@@ -161,12 +162,15 @@ pub struct Libp2pNetwork {
     local_peer_id: PeerId,
     command_tx: mpsc::Sender<SwarmCommand>,
     /// Connected peers and their addresses.
+    #[allow(dead_code)]
     connected_peers: Arc<RwLock<HashMap<PeerId, Vec<Multiaddr>>>>,
     /// Broadcast channel for received Gossipsub events.
     event_rx: broadcast::Sender<ReceivedEvent>,
     /// Content repository for content storage.
+    #[allow(dead_code)]
     crdt_repo: Arc<dyn ContentRepository>,
     /// Data directory for disk capacity queries.
+    #[allow(dead_code)]
     data_dir: PathBuf,
 }
 
