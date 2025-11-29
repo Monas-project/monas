@@ -3,8 +3,6 @@ name = "monas-state-node"
 version = "0.1.0"
 edition = "2021"
 
-[workspace]
-
 [[bin]]
 name = "state-node"
 path = "src/bin/state_node.rs"
