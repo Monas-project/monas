@@ -52,9 +52,9 @@ pub fn decide_assignment(
     request: &AssignmentRequest,
     candidate_cids: &[String],
 ) -> (AssignmentResponse, Vec<Event>) {
-    use rand::prelude::IndexedRandom;
+    use rand::seq::SliceRandom;
     let chosen = {
-        let mut rng = rand::rng();
+        let mut rng = rand::thread_rng();
         candidate_cids.choose(&mut rng).cloned()
     };
 

@@ -13,6 +13,10 @@ impl NodeRegistry for NodeRegistryImpl {
     fn get_available_capacity(&self, node_id: &str) -> Option<u64> {
         self.0.get(node_id).map(|n| n.available_capacity)
     }
+
+    fn list_nodes(&self) -> Vec<String> {
+        self.0.keys().cloned().collect()
+    }
 }
 
 #[cfg(test)]
