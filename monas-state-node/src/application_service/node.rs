@@ -134,6 +134,29 @@ impl StateNode {
         &self.crdt_repo
     }
 
+    /// Get a reference to the network.
+    pub fn network(&self) -> &Arc<Libp2pNetwork> {
+        &self.network
+    }
+
+    /// Connect to another node at the given multiaddr.
+    pub async fn dial(&self, addr: &str) -> Result<()> {
+        let multiaddr: libp2p::Multiaddr = addr
+            .parse()
+            .context("Invalid multiaddr")?;
+        self.network.dial(multiaddr).await
+    }
+
+    /// Get the addresses this node is listening on.
+    pub async fn listen_addrs(&self) -> Vec<String> {
+        self.network
+            .listen_addrs()
+            .await
+            .into_iter()
+            .map(|a| a.to_string())
+            .collect()
+    }
+
     /// Run the node (HTTP server and event handler).
     pub async fn run(&self) -> Result<()> {
         let router = create_router(self.service.clone());

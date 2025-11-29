@@ -115,6 +115,13 @@ enum SwarmCommand {
         peer_id: PeerId,
         addr: Multiaddr,
     },
+    Dial {
+        addr: Multiaddr,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    GetListenAddrs {
+        reply: oneshot::Sender<Vec<Multiaddr>>,
+    },
     // ========== CRDT Sync Commands ==========
     FetchOperations {
         peer_id: PeerId,
@@ -275,6 +282,32 @@ impl Libp2pNetwork {
         self.event_rx.subscribe()
     }
 
+    /// Dial a peer at the given multiaddr.
+    ///
+    /// This initiates a connection to the peer.
+    pub async fn dial(&self, addr: Multiaddr) -> Result<()> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.command_tx
+            .send(SwarmCommand::Dial { addr, reply: reply_tx })
+            .await
+            .map_err(|_| anyhow::anyhow!("Failed to send dial command"))?;
+        reply_rx.await.map_err(|_| anyhow::anyhow!("Dial response channel closed"))?
+    }
+
+    /// Get the addresses this node is listening on.
+    pub async fn listen_addrs(&self) -> Vec<Multiaddr> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self
+            .command_tx
+            .send(SwarmCommand::GetListenAddrs { reply: reply_tx })
+            .await
+            .is_err()
+        {
+            return vec![];
+        }
+        reply_rx.await.unwrap_or_default()
+    }
+
     /// Run the swarm event loop.
     async fn run_swarm_loop(
         mut swarm: Swarm<NodeBehaviour>,
@@ -347,6 +380,16 @@ impl Libp2pNetwork {
             }
             SwarmCommand::AddAddress { peer_id, addr } => {
                 swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
+            }
+            SwarmCommand::Dial { addr, reply } => {
+                let result = swarm
+                    .dial(addr.clone())
+                    .map_err(|e| anyhow::anyhow!("Failed to dial {}: {:?}", addr, e));
+                let _ = reply.send(result);
+            }
+            SwarmCommand::GetListenAddrs { reply } => {
+                let addrs: Vec<Multiaddr> = swarm.listeners().cloned().collect();
+                let _ = reply.send(addrs);
             }
             SwarmCommand::FetchOperations {
                 peer_id,
