@@ -8,7 +8,7 @@ pub mod event_publisher;
 pub mod peer_network;
 pub mod persistence;
 
-pub use content_crdt::{CommitResult, ContentCrdtRepository, SerializedOperation};
+pub use content_crdt::{CommitResult, ContentRepository, SerializedOperation};
 pub use event_publisher::EventPublisher;
 pub use peer_network::PeerNetwork;
 pub use persistence::{PersistentContentRepository, PersistentNodeRegistry};

@@ -1,7 +1,7 @@
-//! ContentCrdtRepository trait - Abstract interface for CRDT-based content storage.
+//! ContentRepository trait - Abstract interface for versioned content storage.
 //!
 //! This module defines the interface for storing and synchronizing content
-//! using CRDT (Conflict-free Replicated Data Types) via crsl-lib.
+//! with version history and multi-node synchronization support.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -31,14 +31,14 @@ pub struct CommitResult {
     pub is_new: bool,
 }
 
-/// Abstract interface for CRDT-based content storage.
+/// Abstract interface for versioned content storage.
 ///
 /// This trait provides methods for:
-/// - Creating and updating content with CRDT operations
+/// - Creating and updating content with version tracking
 /// - Fetching content and its history
 /// - Synchronizing operations between nodes
 #[async_trait]
-pub trait ContentCrdtRepository: Send + Sync {
+pub trait ContentRepository: Send + Sync {
     /// Create new content and return the genesis CID.
     ///
     /// # Arguments

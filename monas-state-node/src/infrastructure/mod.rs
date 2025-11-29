@@ -1,5 +1,4 @@
 pub mod content_network_repository;
-pub mod content_storage_repository;
 pub mod crdt_repository;
 pub mod disk_capacity;
 pub mod event_adapters;

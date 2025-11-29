@@ -13,7 +13,7 @@ use crate::infrastructure::network::{Libp2pNetwork, Libp2pNetworkConfig};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::infrastructure::persistence::{SledContentNetworkRepository, SledNodeRegistry};
 #[cfg(not(target_arch = "wasm32"))]
-use crate::port::content_crdt::ContentCrdtRepository;
+use crate::port::content_crdt::ContentRepository;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::port::peer_network::PeerNetwork;
 #[cfg(not(target_arch = "wasm32"))]
@@ -58,7 +58,7 @@ pub struct StateNode {
     service: AppState,
     network: Arc<Libp2pNetwork>,
     /// CRDT repository for content storage.
-    crdt_repo: Arc<dyn ContentCrdtRepository>,
+    crdt_repo: Arc<dyn ContentRepository>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -76,7 +76,7 @@ impl StateNode {
             .context("Failed to open content repository")?;
 
         // Initialize CRDT repository
-        let crdt_repo: Arc<dyn ContentCrdtRepository> = Arc::new(
+        let crdt_repo: Arc<dyn ContentRepository> = Arc::new(
             CrslCrdtRepository::open(config.data_dir.join("crdt"))
                 .context("Failed to open CRDT repository")?,
         );
@@ -130,7 +130,7 @@ impl StateNode {
     }
 
     /// Get a reference to the CRDT repository.
-    pub fn crdt_repo(&self) -> &Arc<dyn ContentCrdtRepository> {
+    pub fn crdt_repo(&self) -> &Arc<dyn ContentRepository> {
         &self.crdt_repo
     }
 

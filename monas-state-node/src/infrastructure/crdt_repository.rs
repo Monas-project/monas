@@ -1,9 +1,9 @@
 //! CRDT Repository implementation using crsl-lib.
 //!
-//! This module provides an implementation of ContentCrdtRepository
+//! This module provides an implementation of ContentRepository
 //! using crsl-lib for CRDT-based content versioning.
 
-use crate::port::content_crdt::{CommitResult, ContentCrdtRepository, SerializedOperation};
+use crate::port::content_crdt::{CommitResult, ContentRepository, SerializedOperation};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -78,7 +78,7 @@ impl CrslCrdtRepository {
 }
 
 #[async_trait]
-impl ContentCrdtRepository for CrslCrdtRepository {
+impl ContentRepository for CrslCrdtRepository {
     async fn create_content(&self, data: &[u8], author: &str) -> Result<CommitResult> {
         let placeholder = Self::generate_placeholder_cid(data);
         let payload = ContentPayload(data.to_vec());

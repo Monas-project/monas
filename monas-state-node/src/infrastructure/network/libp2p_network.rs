@@ -12,7 +12,7 @@ use super::protocol::{ContentRequest, ContentResponse};
 use super::transport;
 use crate::domain::events::Event;
 use crate::infrastructure::disk_capacity;
-use crate::port::content_crdt::{ContentCrdtRepository, SerializedOperation};
+use crate::port::content_crdt::{ContentRepository, SerializedOperation};
 use crate::port::peer_network::PeerNetwork;
 
 use anyhow::{Context, Result};
@@ -164,8 +164,8 @@ pub struct Libp2pNetwork {
     connected_peers: Arc<RwLock<HashMap<PeerId, Vec<Multiaddr>>>>,
     /// Broadcast channel for received Gossipsub events.
     event_rx: broadcast::Sender<ReceivedEvent>,
-    /// CRDT repository for content storage.
-    crdt_repo: Arc<dyn ContentCrdtRepository>,
+    /// Content repository for content storage.
+    crdt_repo: Arc<dyn ContentRepository>,
     /// Data directory for disk capacity queries.
     data_dir: PathBuf,
 }
@@ -174,7 +174,7 @@ impl Libp2pNetwork {
     /// Create a new libp2p network with the given configuration.
     pub async fn new(
         config: Libp2pNetworkConfig,
-        crdt_repo: Arc<dyn ContentCrdtRepository>,
+        crdt_repo: Arc<dyn ContentRepository>,
         data_dir: PathBuf,
     ) -> Result<Self> {
         let keypair = libp2p::identity::Keypair::generate_ed25519();
@@ -277,7 +277,7 @@ impl Libp2pNetwork {
         mut command_rx: mpsc::Receiver<SwarmCommand>,
         connected_peers: Arc<RwLock<HashMap<PeerId, Vec<Multiaddr>>>>,
         event_tx: broadcast::Sender<ReceivedEvent>,
-        crdt_repo: Arc<dyn ContentCrdtRepository>,
+        crdt_repo: Arc<dyn ContentRepository>,
         data_dir: PathBuf,
     ) {
         let mut pending = PendingRequests::default();
@@ -399,7 +399,7 @@ impl Libp2pNetwork {
         pending: &mut PendingRequests,
         connected_peers: &Arc<RwLock<HashMap<PeerId, Vec<Multiaddr>>>>,
         event_tx: &broadcast::Sender<ReceivedEvent>,
-        crdt_repo: &Arc<dyn ContentCrdtRepository>,
+        crdt_repo: &Arc<dyn ContentRepository>,
         data_dir: &PathBuf,
         event: SwarmEvent<NodeBehaviourEvent>,
     ) {
@@ -537,7 +537,7 @@ impl Libp2pNetwork {
     async fn handle_request_response_event(
         swarm: &mut Swarm<NodeBehaviour>,
         pending: &mut PendingRequests,
-        crdt_repo: &Arc<dyn ContentCrdtRepository>,
+        crdt_repo: &Arc<dyn ContentRepository>,
         data_dir: &PathBuf,
         event: request_response::Event<ContentRequest, ContentResponse>,
     ) {
@@ -571,7 +571,7 @@ impl Libp2pNetwork {
         peer: PeerId,
         request: ContentRequest,
         channel: ResponseChannel<ContentResponse>,
-        crdt_repo: &Arc<dyn ContentCrdtRepository>,
+        crdt_repo: &Arc<dyn ContentRepository>,
         data_dir: &PathBuf,
     ) {
         debug!("Received request from {}: {:?}", peer, request);
@@ -970,7 +970,7 @@ mod tests {
 
         // Create a temporary directory for the CRDT repository
         let tmp_dir = tempdir().unwrap();
-        let crdt_repo: Arc<dyn ContentCrdtRepository> = Arc::new(
+        let crdt_repo: Arc<dyn ContentRepository> = Arc::new(
             CrslCrdtRepository::open(tmp_dir.path().join("crdt")).unwrap()
         );
         let data_dir = tmp_dir.path().to_path_buf();

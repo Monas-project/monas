@@ -11,7 +11,7 @@ use monas_state_node::infrastructure::network::{Libp2pNetwork, Libp2pNetworkConf
 use monas_state_node::infrastructure::persistence::{
     SledContentNetworkRepository, SledNodeRegistry,
 };
-use monas_state_node::port::content_crdt::ContentCrdtRepository;
+use monas_state_node::port::content_crdt::ContentRepository;
 use monas_state_node::port::peer_network::PeerNetwork;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -27,7 +27,7 @@ async fn create_test_service() -> (
     let content_repo = SledContentNetworkRepository::open(temp_dir.path().join("content")).unwrap();
     
     // Create CRDT repository for the network
-    let crdt_repo: Arc<dyn ContentCrdtRepository> = Arc::new(
+    let crdt_repo: Arc<dyn ContentRepository> = Arc::new(
         CrslCrdtRepository::open(temp_dir.path().join("crdt")).unwrap()
     );
     let data_dir = temp_dir.path().to_path_buf();
