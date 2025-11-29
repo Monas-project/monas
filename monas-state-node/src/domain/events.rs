@@ -1,5 +1,4 @@
 use serde::{Deserialize, Serialize};
-use std::any::Any;
 
 /// Domain events for the state node system.
 ///
@@ -105,19 +104,6 @@ impl Event {
     }
 }
 
-// Implement monas_event_manager::event_bus::Event trait for integration
-impl monas_event_manager::event_bus::Event for Event {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-}
-
-// Implement SerializableEvent for monas-event-manager compatibility
-impl monas_event_manager::SerializableEvent for Event {
-    fn event_type() -> &'static str {
-        "StateNodeEvent"
-    }
-}
 
 /// Get the current timestamp in seconds since UNIX epoch.
 pub fn current_timestamp() -> u64 {

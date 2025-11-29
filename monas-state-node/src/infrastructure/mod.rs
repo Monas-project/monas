@@ -1,9 +1,11 @@
 pub mod content_network_repository;
 pub mod content_storage_repository;
 pub mod crdt_repository;
+pub mod event_adapters;
 pub mod event_bus_publisher;
 pub mod event_handlers;
 pub mod http_api;
 pub mod network;
 pub mod node_repository;
 pub mod persistence;
+pub mod placement;
