@@ -9,7 +9,8 @@ use crate::port::event_publisher::EventPublisher;
 use crate::port::peer_network::PeerNetwork;
 use anyhow::Result;
 use async_trait::async_trait;
-use monas_event_manager::EventBus;
+use futures::FutureExt;
+use monas_event_manager::{make_subscriber, EventBus};
 use std::sync::Arc;
 
 /// Default Gossipsub topic for state node events.
@@ -97,14 +98,37 @@ impl<P: PeerNetwork + 'static> EventPublisher for GossipsubEventPublisher<P> {
             .map_err(|e| anyhow::anyhow!("Failed to publish event to network: {}", e))
     }
 
-    async fn subscribe<F>(&self, _event_type: &str, _handler: F) -> Result<()>
+    async fn subscribe<F>(&self, event_type: &str, handler: F) -> Result<()>
     where
         F: Fn(Event) -> futures::future::BoxFuture<'static, Result<()>> + Send + Sync + 'static,
     {
-        // Note: The monas-event-manager uses a different subscription model.
-        // Network subscriptions are handled via Gossipsub in libp2p_network.
-        // For now, we provide a stub implementation.
-        Ok(())
+        let event_type_filter = event_type.to_string();
+        let handler = Arc::new(handler);
+
+        // Create a subscriber that filters by event_type
+        let subscriber = make_subscriber::<Event, _, _>(
+            format!("subscriber-{}", event_type_filter),
+            move |event: Arc<Event>| {
+                let handler = handler.clone();
+                let event_type_filter = event_type_filter.clone();
+                async move {
+                    // Filter events by type
+                    if event.event_type() == event_type_filter {
+                        handler((*event).clone()).await.map_err(|e| {
+                            Box::<dyn std::error::Error + Send + Sync>::from(e.to_string())
+                        })
+                    } else {
+                        Ok(())
+                    }
+                }
+                .boxed()
+            },
+        );
+
+        self.local_bus
+            .subscribe::<Event>(subscriber)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to subscribe: {}", e))
     }
 }
 

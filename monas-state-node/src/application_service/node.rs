@@ -3,6 +3,8 @@
 #[cfg(not(target_arch = "wasm32"))]
 use crate::application_service::state_node_service::StateNodeService;
 #[cfg(not(target_arch = "wasm32"))]
+use crate::infrastructure::crdt_repository::CrslCrdtRepository;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::infrastructure::gossipsub_publisher::GossipsubEventPublisher;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::infrastructure::http_api::{create_router, AppState};
@@ -10,6 +12,8 @@ use crate::infrastructure::http_api::{create_router, AppState};
 use crate::infrastructure::network::{Libp2pNetwork, Libp2pNetworkConfig};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::infrastructure::persistence::{SledContentNetworkRepository, SledNodeRegistry};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::port::content_crdt::ContentCrdtRepository;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::port::peer_network::PeerNetwork;
 #[cfg(not(target_arch = "wasm32"))]
@@ -53,6 +57,8 @@ pub struct StateNode {
     config: StateNodeConfig,
     service: AppState,
     network: Arc<Libp2pNetwork>,
+    /// CRDT repository for content storage.
+    crdt_repo: Arc<dyn ContentCrdtRepository>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -69,11 +75,21 @@ impl StateNode {
         let content_repo = SledContentNetworkRepository::open(config.data_dir.join("content"))
             .context("Failed to open content repository")?;
 
-        // Initialize network
+        // Initialize CRDT repository
+        let crdt_repo: Arc<dyn ContentCrdtRepository> = Arc::new(
+            CrslCrdtRepository::open(config.data_dir.join("crdt"))
+                .context("Failed to open CRDT repository")?,
+        );
+
+        // Initialize network with CRDT repository
         let network = Arc::new(
-            Libp2pNetwork::new(config.network_config.clone())
-                .await
-                .context("Failed to create network")?,
+            Libp2pNetwork::new(
+                config.network_config.clone(),
+                crdt_repo.clone(),
+                config.data_dir.clone(),
+            )
+            .await
+            .context("Failed to create network")?,
         );
 
         // Initialize event publisher with Gossipsub support
@@ -99,6 +115,7 @@ impl StateNode {
             config,
             service,
             network,
+            crdt_repo,
         })
     }
 
@@ -110,6 +127,11 @@ impl StateNode {
     /// Get a reference to the service.
     pub fn service(&self) -> &AppState {
         &self.service
+    }
+
+    /// Get a reference to the CRDT repository.
+    pub fn crdt_repo(&self) -> &Arc<dyn ContentCrdtRepository> {
+        &self.crdt_repo
     }
 
     /// Run the node (HTTP server and event handler).

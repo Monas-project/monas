@@ -11,7 +11,8 @@ use super::behaviour::{BehaviourConfig, NodeBehaviour, NodeBehaviourEvent};
 use super::protocol::{ContentRequest, ContentResponse};
 use super::transport;
 use crate::domain::events::Event;
-use crate::port::content_crdt::SerializedOperation;
+use crate::infrastructure::disk_capacity;
+use crate::port::content_crdt::{ContentCrdtRepository, SerializedOperation};
 use crate::port::peer_network::PeerNetwork;
 
 use anyhow::{Context, Result};
@@ -25,6 +26,7 @@ use libp2p::{
     Multiaddr, PeerId, Swarm,
 };
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -162,11 +164,19 @@ pub struct Libp2pNetwork {
     connected_peers: Arc<RwLock<HashMap<PeerId, Vec<Multiaddr>>>>,
     /// Broadcast channel for received Gossipsub events.
     event_rx: broadcast::Sender<ReceivedEvent>,
+    /// CRDT repository for content storage.
+    crdt_repo: Arc<dyn ContentCrdtRepository>,
+    /// Data directory for disk capacity queries.
+    data_dir: PathBuf,
 }
 
 impl Libp2pNetwork {
     /// Create a new libp2p network with the given configuration.
-    pub async fn new(config: Libp2pNetworkConfig) -> Result<Self> {
+    pub async fn new(
+        config: Libp2pNetworkConfig,
+        crdt_repo: Arc<dyn ContentCrdtRepository>,
+        data_dir: PathBuf,
+    ) -> Result<Self> {
         let keypair = libp2p::identity::Keypair::generate_ed25519();
         let local_peer_id = PeerId::from(keypair.public());
 
@@ -230,12 +240,18 @@ impl Libp2pNetwork {
         let (event_tx, _) = broadcast::channel(256);
         let event_tx_clone = event_tx.clone();
 
+        // Clone for swarm loop
+        let crdt_repo_clone = crdt_repo.clone();
+        let data_dir_clone = data_dir.clone();
+
         // Spawn swarm event loop
         tokio::spawn(Self::run_swarm_loop(
             swarm,
             command_rx,
             connected_peers_clone,
             event_tx_clone,
+            crdt_repo_clone,
+            data_dir_clone,
         ));
 
         Ok(Self {
@@ -243,6 +259,8 @@ impl Libp2pNetwork {
             command_tx,
             connected_peers,
             event_rx: event_tx,
+            crdt_repo,
+            data_dir,
         })
     }
 
@@ -259,6 +277,8 @@ impl Libp2pNetwork {
         mut command_rx: mpsc::Receiver<SwarmCommand>,
         connected_peers: Arc<RwLock<HashMap<PeerId, Vec<Multiaddr>>>>,
         event_tx: broadcast::Sender<ReceivedEvent>,
+        crdt_repo: Arc<dyn ContentCrdtRepository>,
+        data_dir: PathBuf,
     ) {
         let mut pending = PendingRequests::default();
 
@@ -270,7 +290,7 @@ impl Libp2pNetwork {
                 }
                 // Handle swarm events
                 event = swarm.select_next_some() => {
-                    Self::handle_swarm_event(&mut swarm, &mut pending, &connected_peers, &event_tx, event).await;
+                    Self::handle_swarm_event(&mut swarm, &mut pending, &connected_peers, &event_tx, &crdt_repo, &data_dir, event).await;
                 }
             }
         }
@@ -379,6 +399,8 @@ impl Libp2pNetwork {
         pending: &mut PendingRequests,
         connected_peers: &Arc<RwLock<HashMap<PeerId, Vec<Multiaddr>>>>,
         event_tx: &broadcast::Sender<ReceivedEvent>,
+        crdt_repo: &Arc<dyn ContentCrdtRepository>,
+        data_dir: &PathBuf,
         event: SwarmEvent<NodeBehaviourEvent>,
     ) {
         match event {
@@ -389,7 +411,7 @@ impl Libp2pNetwork {
                 Self::handle_gossipsub_event(event_tx, gossip_event).await;
             }
             SwarmEvent::Behaviour(NodeBehaviourEvent::RequestResponse(rr_event)) => {
-                Self::handle_request_response_event(swarm, pending, rr_event).await;
+                Self::handle_request_response_event(swarm, pending, crdt_repo, data_dir, rr_event).await;
             }
             SwarmEvent::Behaviour(NodeBehaviourEvent::Identify(identify_event)) => {
                 Self::handle_identify_event(swarm, identify_event).await;
@@ -515,13 +537,15 @@ impl Libp2pNetwork {
     async fn handle_request_response_event(
         swarm: &mut Swarm<NodeBehaviour>,
         pending: &mut PendingRequests,
+        crdt_repo: &Arc<dyn ContentCrdtRepository>,
+        data_dir: &PathBuf,
         event: request_response::Event<ContentRequest, ContentResponse>,
     ) {
         match event {
             request_response::Event::Message { peer, message, .. } => {
                 match message {
                     request_response::Message::Request { request, channel, .. } => {
-                        Self::handle_incoming_request(swarm, peer, request, channel).await;
+                        Self::handle_incoming_request(swarm, peer, request, channel, crdt_repo, data_dir).await;
                     }
                     request_response::Message::Response { request_id, response } => {
                         Self::handle_response(pending, request_id, response).await;
@@ -547,39 +571,83 @@ impl Libp2pNetwork {
         peer: PeerId,
         request: ContentRequest,
         channel: ResponseChannel<ContentResponse>,
+        crdt_repo: &Arc<dyn ContentCrdtRepository>,
+        data_dir: &PathBuf,
     ) {
         debug!("Received request from {}: {:?}", peer, request);
 
         let response = match request {
             ContentRequest::CapacityQuery => {
-                // TODO: Get actual capacity from storage
-                ContentResponse::CapacityResponse {
-                    total_capacity: 1_000_000_000, // 1GB placeholder
-                    available_capacity: 500_000_000, // 500MB placeholder
+                match disk_capacity::get_disk_capacity(data_dir) {
+                    Ok((total, available)) => ContentResponse::CapacityResponse {
+                        total_capacity: total,
+                        available_capacity: available,
+                    },
+                    Err(e) => ContentResponse::Error {
+                        message: format!("Failed to get disk capacity: {}", e),
+                    },
                 }
             }
             ContentRequest::FetchContent { content_id } => {
-                // TODO: Fetch from content storage
-                ContentResponse::NotFound { content_id }
+                match crdt_repo.get_latest(&content_id).await {
+                    Ok(Some(data)) => ContentResponse::ContentData {
+                        content_id,
+                        data,
+                        version: String::new(), // TODO: Include actual version
+                    },
+                    Ok(None) => ContentResponse::NotFound { content_id },
+                    Err(e) => ContentResponse::Error {
+                        message: format!("Failed to fetch content: {}", e),
+                    },
+                }
             }
             ContentRequest::SyncContent { content_id, .. } => {
-                // TODO: Implement sync
-                ContentResponse::NotFound { content_id }
+                // SyncContent returns the same as FetchContent (latest data)
+                match crdt_repo.get_latest(&content_id).await {
+                    Ok(Some(data)) => ContentResponse::ContentData {
+                        content_id,
+                        data,
+                        version: String::new(),
+                    },
+                    Ok(None) => ContentResponse::NotFound { content_id },
+                    Err(e) => ContentResponse::Error {
+                        message: format!("Failed to sync content: {}", e),
+                    },
+                }
             }
-            ContentRequest::FetchOperations { genesis_cid, .. } => {
-                // TODO: Fetch CRDT operations from local storage
-                ContentResponse::OperationsData {
-                    genesis_cid,
-                    operations: vec![],
+            ContentRequest::FetchOperations { genesis_cid, since_version } => {
+                match crdt_repo.get_operations(&genesis_cid, since_version.as_deref()).await {
+                    Ok(ops) => {
+                        // Serialize operations for network transfer
+                        let operations: Vec<Vec<u8>> = ops
+                            .iter()
+                            .filter_map(|op| serde_json::to_vec(op).ok())
+                            .collect();
+                        ContentResponse::OperationsData {
+                            genesis_cid,
+                            operations,
+                        }
+                    }
+                    Err(e) => ContentResponse::Error {
+                        message: format!("Failed to fetch operations: {}", e),
+                    },
                 }
             }
             ContentRequest::PushOperations { genesis_cid, operations } => {
-                // TODO: Apply operations to local CRDT storage
-                // For now, accept all operations
-                let accepted_count = operations.len();
-                ContentResponse::PushResult {
-                    genesis_cid,
-                    accepted_count,
+                // Deserialize operations from wire format
+                let ops: Vec<SerializedOperation> = operations
+                    .iter()
+                    .filter_map(|bytes| serde_json::from_slice(bytes).ok())
+                    .collect();
+
+                match crdt_repo.apply_operations(&ops).await {
+                    Ok(count) => ContentResponse::PushResult {
+                        genesis_cid,
+                        accepted_count: count,
+                    },
+                    Err(e) => ContentResponse::Error {
+                        message: format!("Failed to apply operations: {}", e),
+                    },
                 }
             }
         };
@@ -632,7 +700,7 @@ impl Libp2pNetwork {
         // Handle operation fetch response
         if let Some(reply) = pending.operation_fetches.remove(&request_id) {
             match response {
-                ContentResponse::OperationsData { operations, genesis_cid } => {
+                ContentResponse::OperationsData { operations, genesis_cid: _ } => {
                     // Deserialize operations from wire format
                     let ops: Vec<SerializedOperation> = operations
                         .iter()
@@ -888,6 +956,8 @@ impl PeerNetwork for Libp2pNetwork {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::infrastructure::crdt_repository::CrslCrdtRepository;
+    use tempfile::tempdir;
 
     #[tokio::test]
     async fn test_network_creation() {
@@ -898,7 +968,14 @@ mod tests {
             gossipsub_topics: vec!["test".to_string()],
         };
 
-        let network = Libp2pNetwork::new(config).await;
+        // Create a temporary directory for the CRDT repository
+        let tmp_dir = tempdir().unwrap();
+        let crdt_repo: Arc<dyn ContentCrdtRepository> = Arc::new(
+            CrslCrdtRepository::open(tmp_dir.path().join("crdt")).unwrap()
+        );
+        let data_dir = tmp_dir.path().to_path_buf();
+
+        let network = Libp2pNetwork::new(config, crdt_repo, data_dir).await;
         assert!(network.is_ok());
 
         let network = network.unwrap();

@@ -2646,6 +2646,7 @@ dependencies = [
  "cid",
  "clap",
  "crsl-lib",
+ "fs2",
  "futures",
  "hex",
  "libp2p",

@@ -39,6 +39,10 @@ crsl-lib = { git = "https://github.com/Monas-project/crsl-lib", branch = "fix/th
 # sled for persistence
 sled = "0.34"
 
+# fs2 for disk capacity queries (native only)
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+fs2 = "0.4"
+
 # HTTP API
 axum = "0.7"
 

@@ -5,11 +5,13 @@
 
 use monas_state_node::application_service::state_node_service::StateNodeService;
 use monas_state_node::domain::events::Event;
+use monas_state_node::infrastructure::crdt_repository::CrslCrdtRepository;
 use monas_state_node::infrastructure::event_bus_publisher::EventBusPublisher;
 use monas_state_node::infrastructure::network::{Libp2pNetwork, Libp2pNetworkConfig};
 use monas_state_node::infrastructure::persistence::{
     SledContentNetworkRepository, SledNodeRegistry,
 };
+use monas_state_node::port::content_crdt::ContentCrdtRepository;
 use monas_state_node::port::peer_network::PeerNetwork;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -24,6 +26,12 @@ async fn create_test_service() -> (
     let node_registry = SledNodeRegistry::open(temp_dir.path().join("nodes")).unwrap();
     let content_repo = SledContentNetworkRepository::open(temp_dir.path().join("content")).unwrap();
     
+    // Create CRDT repository for the network
+    let crdt_repo: Arc<dyn ContentCrdtRepository> = Arc::new(
+        CrslCrdtRepository::open(temp_dir.path().join("crdt")).unwrap()
+    );
+    let data_dir = temp_dir.path().to_path_buf();
+    
     // Use minimal network config for testing (localhost only, no mDNS to avoid interference)
     let network_config = Libp2pNetworkConfig {
         listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
@@ -32,7 +40,7 @@ async fn create_test_service() -> (
         gossipsub_topics: vec!["test-events".to_string()],
     };
     
-    let network = Arc::new(Libp2pNetwork::new(network_config).await.unwrap());
+    let network = Arc::new(Libp2pNetwork::new(network_config, crdt_repo, data_dir).await.unwrap());
     
     let event_publisher = EventBusPublisher::new();
     event_publisher.register_event_type().await;
@@ -74,25 +82,33 @@ async fn test_create_content() {
     // First register the local node so it can be assigned content
     service.register_node(10000).await.unwrap();
     
-    // Create some content
+    // In isolated test environment, create_content will fail because no other peers are available.
+    // This is expected behavior - content creation requires at least one other node to store the content.
     let data = b"Hello, World!";
-    let event = service.create_content(data).await.unwrap();
+    let result = service.create_content(data).await;
     
-    // Verify the event
-    if let Event::ContentCreated { content_id, member_nodes, content_size, .. } = &event {
-        assert!(!content_id.is_empty());
-        assert_eq!(content_size, &(data.len() as u64));
-        // In isolated test environment, member_nodes might be empty if no peers are found
-        // The important thing is that the content network was created
-        
-        // Verify the content network was persisted
-        let network = service.get_content_network(content_id).await.unwrap();
-        assert!(network.is_some());
-        let network = network.unwrap();
-        assert_eq!(network.content_id, *content_id);
-    } else {
-        panic!("Expected ContentCreated event");
-    }
+    // Verify that it fails with the expected error in isolated environment
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(err.to_string().contains("no available member nodes found"));
+    
+    // Instead, test content network creation via sync event (simulating receiving from another node)
+    let event = Event::ContentCreated {
+        content_id: "test-content-id".to_string(),
+        creator_node_id: "external-node".to_string(),
+        content_size: data.len() as u64,
+        member_nodes: vec!["node-a".to_string(), "node-b".to_string()],
+        timestamp: 12345,
+    };
+    
+    let outcome = service.handle_sync_event(&event).await.unwrap();
+    assert_eq!(outcome, monas_state_node::application_service::state_node_service::ApplyOutcome::Applied);
+    
+    // Verify the content network was persisted
+    let network = service.get_content_network("test-content-id").await.unwrap();
+    assert!(network.is_some());
+    let network = network.unwrap();
+    assert_eq!(network.content_id, "test-content-id");
 }
 
 #[tokio::test]
@@ -114,9 +130,26 @@ async fn test_list_content_networks() {
     // Register the local node first
     service.register_node(10000).await.unwrap();
     
-    // Create some content
-    service.create_content(b"Content 1").await.unwrap();
-    service.create_content(b"Content 2").await.unwrap();
+    // In isolated test environment, we can't use create_content directly
+    // because it requires other peers. Instead, use sync events to simulate
+    // receiving content network information from other nodes.
+    let event1 = Event::ContentCreated {
+        content_id: "content-1".to_string(),
+        creator_node_id: "external-node".to_string(),
+        content_size: 100,
+        member_nodes: vec!["node-a".to_string()],
+        timestamp: 12345,
+    };
+    let event2 = Event::ContentCreated {
+        content_id: "content-2".to_string(),
+        creator_node_id: "external-node".to_string(),
+        content_size: 200,
+        member_nodes: vec!["node-b".to_string()],
+        timestamp: 12346,
+    };
+    
+    service.handle_sync_event(&event1).await.unwrap();
+    service.handle_sync_event(&event2).await.unwrap();
     
     // List content networks
     let networks = service.list_content_networks().await.unwrap();
