@@ -60,6 +60,12 @@ impl EventPublisher for EventBusPublisher {
             .map_err(|e| anyhow::anyhow!("Failed to publish event: {}", e))
     }
 
+    async fn publish_to_network(&self, _event: &Event) -> Result<()> {
+        // EventBusPublisher is local-only, so network publishing is a no-op.
+        // Use GossipsubEventPublisher for network publishing.
+        Ok(())
+    }
+
     async fn subscribe<F>(&self, _event_type: &str, _handler: F) -> Result<()>
     where
         F: Fn(Event) -> futures::future::BoxFuture<'static, Result<()>> + Send + Sync + 'static,

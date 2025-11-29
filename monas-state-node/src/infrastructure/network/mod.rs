@@ -13,5 +13,5 @@ pub mod protocol;
 pub mod transport;
 
 pub use behaviour::{BehaviourConfig, NodeBehaviour, NodeBehaviourEvent};
-pub use libp2p_network::{Libp2pNetwork, Libp2pNetworkConfig};
+pub use libp2p_network::{GossipsubMessage, Libp2pNetwork, Libp2pNetworkConfig, ReceivedEvent};
 pub use protocol::{ContentCodec, ContentRequest, ContentResponse};

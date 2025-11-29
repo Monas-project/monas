@@ -32,7 +32,7 @@ async fn create_test_service() -> (
         gossipsub_topics: vec!["test-events".to_string()],
     };
     
-    let network = Libp2pNetwork::new(network_config).await.unwrap();
+    let network = Arc::new(Libp2pNetwork::new(network_config).await.unwrap());
     
     let event_publisher = EventBusPublisher::new();
     event_publisher.register_event_type().await;

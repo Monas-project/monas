@@ -111,7 +111,9 @@ impl NodeBehaviour {
         let mut kad_config = kad::Config::new(StreamProtocol::new("/monas/kad/1.0.0"));
         kad_config.set_query_timeout(Duration::from_secs(60));
         let store = kad::store::MemoryStore::new(local_peer_id);
-        let kademlia = kad::Behaviour::with_config(local_peer_id, store, kad_config);
+        let mut kademlia = kad::Behaviour::with_config(local_peer_id, store, kad_config);
+        // Enable server mode so this node responds to Kademlia queries from other peers
+        kademlia.set_mode(Some(kad::Mode::Server));
 
         // Gossipsub configuration
         let gossipsub_config = gossipsub::ConfigBuilder::default()
@@ -164,7 +166,9 @@ impl NodeBehaviour {
         let mut kad_config = kad::Config::new(StreamProtocol::new("/monas/kad/1.0.0"));
         kad_config.set_query_timeout(Duration::from_secs(60));
         let store = kad::store::MemoryStore::new(local_peer_id);
-        let kademlia = kad::Behaviour::with_config(local_peer_id, store, kad_config);
+        let mut kademlia = kad::Behaviour::with_config(local_peer_id, store, kad_config);
+        // Enable server mode so this node responds to Kademlia queries from other peers
+        kademlia.set_mode(Some(kad::Mode::Server));
 
         // Gossipsub configuration
         let gossipsub_config = gossipsub::ConfigBuilder::default()

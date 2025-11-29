@@ -1,7 +1,7 @@
 //! HTTP API for the state node.
 
 use crate::application_service::state_node_service::StateNodeService;
-use crate::infrastructure::event_bus_publisher::EventBusPublisher;
+use crate::infrastructure::gossipsub_publisher::GossipsubEventPublisher;
 use crate::infrastructure::network::Libp2pNetwork;
 use crate::infrastructure::persistence::{SledContentNetworkRepository, SledNodeRegistry};
 use axum::{
@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 /// Application state shared across handlers.
 pub type AppState = Arc<
-    StateNodeService<SledNodeRegistry, SledContentNetworkRepository, Libp2pNetwork, EventBusPublisher>,
+    StateNodeService<SledNodeRegistry, SledContentNetworkRepository, Libp2pNetwork, GossipsubEventPublisher<Libp2pNetwork>>,
 >;
 
 /// Create the API router.

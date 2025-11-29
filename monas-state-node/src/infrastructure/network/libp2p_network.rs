@@ -10,6 +10,7 @@
 use super::behaviour::{BehaviourConfig, NodeBehaviour, NodeBehaviourEvent};
 use super::protocol::{ContentRequest, ContentResponse};
 use super::transport;
+use crate::domain::events::Event;
 use crate::port::content_crdt::SerializedOperation;
 use crate::port::peer_network::PeerNetwork;
 
@@ -27,8 +28,28 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot, RwLock};
+use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
 use tracing::{debug, error, info, warn};
+
+/// Gossipsub message received from the network.
+#[derive(Debug, Clone)]
+pub struct GossipsubMessage {
+    /// The topic the message was received on.
+    pub topic: String,
+    /// The peer that propagated the message.
+    pub source: String,
+    /// The raw message data.
+    pub data: Vec<u8>,
+}
+
+/// Parsed domain event received from Gossipsub.
+#[derive(Debug, Clone)]
+pub struct ReceivedEvent {
+    /// The source peer ID.
+    pub source: String,
+    /// The parsed domain event.
+    pub event: Event,
+}
 
 /// Configuration for the libp2p network.
 #[derive(Debug, Clone)]
@@ -139,6 +160,8 @@ pub struct Libp2pNetwork {
     command_tx: mpsc::Sender<SwarmCommand>,
     /// Connected peers and their addresses.
     connected_peers: Arc<RwLock<HashMap<PeerId, Vec<Multiaddr>>>>,
+    /// Broadcast channel for received Gossipsub events.
+    event_rx: broadcast::Sender<ReceivedEvent>,
 }
 
 impl Libp2pNetwork {
@@ -203,18 +226,31 @@ impl Libp2pNetwork {
         // Create command channel
         let (command_tx, command_rx) = mpsc::channel(256);
 
+        // Create broadcast channel for received events
+        let (event_tx, _) = broadcast::channel(256);
+        let event_tx_clone = event_tx.clone();
+
         // Spawn swarm event loop
         tokio::spawn(Self::run_swarm_loop(
             swarm,
             command_rx,
             connected_peers_clone,
+            event_tx_clone,
         ));
 
         Ok(Self {
             local_peer_id,
             command_tx,
             connected_peers,
+            event_rx: event_tx,
         })
+    }
+
+    /// Subscribe to received Gossipsub events.
+    ///
+    /// Returns a receiver that will receive all domain events from other nodes.
+    pub fn subscribe_events(&self) -> broadcast::Receiver<ReceivedEvent> {
+        self.event_rx.subscribe()
     }
 
     /// Run the swarm event loop.
@@ -222,6 +258,7 @@ impl Libp2pNetwork {
         mut swarm: Swarm<NodeBehaviour>,
         mut command_rx: mpsc::Receiver<SwarmCommand>,
         connected_peers: Arc<RwLock<HashMap<PeerId, Vec<Multiaddr>>>>,
+        event_tx: broadcast::Sender<ReceivedEvent>,
     ) {
         let mut pending = PendingRequests::default();
 
@@ -233,7 +270,7 @@ impl Libp2pNetwork {
                 }
                 // Handle swarm events
                 event = swarm.select_next_some() => {
-                    Self::handle_swarm_event(&mut swarm, &mut pending, &connected_peers, event).await;
+                    Self::handle_swarm_event(&mut swarm, &mut pending, &connected_peers, &event_tx, event).await;
                 }
             }
         }
@@ -341,6 +378,7 @@ impl Libp2pNetwork {
         swarm: &mut Swarm<NodeBehaviour>,
         pending: &mut PendingRequests,
         connected_peers: &Arc<RwLock<HashMap<PeerId, Vec<Multiaddr>>>>,
+        event_tx: &broadcast::Sender<ReceivedEvent>,
         event: SwarmEvent<NodeBehaviourEvent>,
     ) {
         match event {
@@ -348,7 +386,7 @@ impl Libp2pNetwork {
                 Self::handle_kademlia_event(pending, kad_event).await;
             }
             SwarmEvent::Behaviour(NodeBehaviourEvent::Gossipsub(gossip_event)) => {
-                Self::handle_gossipsub_event(gossip_event).await;
+                Self::handle_gossipsub_event(event_tx, gossip_event).await;
             }
             SwarmEvent::Behaviour(NodeBehaviourEvent::RequestResponse(rr_event)) => {
                 Self::handle_request_response_event(swarm, pending, rr_event).await;
@@ -424,7 +462,10 @@ impl Libp2pNetwork {
         }
     }
 
-    async fn handle_gossipsub_event(event: gossipsub::Event) {
+    async fn handle_gossipsub_event(
+        event_tx: &broadcast::Sender<ReceivedEvent>,
+        event: gossipsub::Event,
+    ) {
         match event {
             gossipsub::Event::Message { propagation_source, message, .. } => {
                 debug!(
@@ -432,7 +473,34 @@ impl Libp2pNetwork {
                     propagation_source,
                     message.data.len()
                 );
-                // TODO: Forward to event handlers
+
+                // Try to deserialize as a domain Event
+                match serde_json::from_slice::<Event>(&message.data) {
+                    Ok(domain_event) => {
+                        info!(
+                            "Received domain event from {}: {:?}",
+                            propagation_source,
+                            domain_event.event_type()
+                        );
+
+                        let received = ReceivedEvent {
+                            source: propagation_source.to_string(),
+                            event: domain_event,
+                        };
+
+                        // Broadcast to all subscribers
+                        if let Err(e) = event_tx.send(received) {
+                            debug!("No subscribers for received event: {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        // Not a domain event, might be a CRDT operation or other message
+                        debug!(
+                            "Failed to deserialize gossipsub message as Event: {}",
+                            e
+                        );
+                    }
+                }
             }
             gossipsub::Event::Subscribed { peer_id, topic } => {
                 debug!("Peer {} subscribed to {}", peer_id, topic);
@@ -604,15 +672,23 @@ impl Libp2pNetwork {
     async fn handle_identify_event(swarm: &mut Swarm<NodeBehaviour>, event: identify::Event) {
         match event {
             identify::Event::Received { peer_id, info, .. } => {
-                debug!(
+                info!(
                     "Identified peer {}: {} with {} addresses",
                     peer_id,
                     info.agent_version,
                     info.listen_addrs.len()
                 );
                 // Add peer's addresses to Kademlia
-                for addr in info.listen_addrs {
-                    swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
+                for addr in &info.listen_addrs {
+                    swarm.behaviour_mut().kademlia.add_address(&peer_id, addr.clone());
+                }
+                
+                // Try to bootstrap Kademlia now that we have a peer
+                // This is important for the first node to populate its routing table
+                if let Err(e) = swarm.behaviour_mut().kademlia.bootstrap() {
+                    debug!("Kademlia bootstrap attempt: {:?}", e);
+                } else {
+                    info!("Triggered Kademlia bootstrap after identifying peer {}", peer_id);
                 }
             }
             _ => {}

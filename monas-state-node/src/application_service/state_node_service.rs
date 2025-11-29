@@ -50,17 +50,20 @@ where
     E: EventPublisher,
 {
     /// Create a new StateNodeService.
+    ///
+    /// The `peer_network` is passed as an `Arc` to allow sharing with other components
+    /// (e.g., GossipsubEventPublisher).
     pub fn new(
         node_registry: N,
         content_repo: C,
-        peer_network: P,
+        peer_network: Arc<P>,
         event_publisher: E,
         local_node_id: String,
     ) -> Self {
         Self {
             node_registry: Arc::new(tokio::sync::RwLock::new(node_registry)),
             content_repo: Arc::new(tokio::sync::RwLock::new(content_repo)),
-            peer_network: Arc::new(peer_network),
+            peer_network,
             event_publisher: Arc::new(event_publisher),
             local_node_id,
         }
@@ -72,19 +75,25 @@ where
     }
 
     /// Register a new node.
+    ///
+    /// This publishes the NodeCreated event both locally and to the network.
     pub async fn register_node(&self, total_capacity: u64) -> Result<(NodeSnapshot, Vec<Event>)> {
         let (snapshot, events) = state_node::create_node(self.local_node_id.clone(), total_capacity);
         
         self.node_registry.write().await.upsert_node(&snapshot).await?;
         
+        // Publish events both locally and to the network
         for event in &events {
-            self.event_publisher.publish(event).await?;
+            self.event_publisher.publish_all(event).await?;
         }
         
         Ok((snapshot, events))
     }
 
     /// Create new content and assign it to nodes.
+    ///
+    /// The content will be assigned to other nodes in the network (not the creator).
+    /// At least one member node must be available for the content to be created.
     pub async fn create_content(&self, data: &[u8]) -> Result<Event> {
         // Generate CID from content
         let mh = Code::Sha2_256.digest(data);
@@ -97,13 +106,22 @@ where
         let closest = self.peer_network.find_closest_peers(key, k).await?;
         let caps = self.peer_network.query_node_capacity_batch(&closest).await?;
 
-        // Select nodes with highest capacity
+        // Select nodes with highest capacity, excluding the creator
         let mut scored: Vec<(u64, String)> = closest
             .into_iter()
+            .filter(|peer| peer != &self.local_node_id) // Exclude creator
             .map(|peer| (caps.get(&peer).cloned().unwrap_or(0), peer))
             .collect();
         scored.sort_by(|a, b| b.0.cmp(&a.0));
         let selected: Vec<String> = scored.into_iter().take(k).map(|(_, pid)| pid).collect();
+
+        // Validate that we have at least one member node
+        if selected.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Cannot create content: no available member nodes found. \
+                 At least one other registered node is required to store the content."
+            ));
+        }
 
         // Create content network
         let network = ContentNetwork {
@@ -112,7 +130,7 @@ where
         };
         self.content_repo.write().await.save_content_network(network).await?;
 
-        // Create and publish event
+        // Create and publish event both locally and to the network
         let event = Event::ContentCreated {
             content_id,
             creator_node_id: self.local_node_id.clone(),
@@ -121,7 +139,7 @@ where
             timestamp: current_timestamp(),
         };
 
-        self.event_publisher.publish(&event).await?;
+        self.event_publisher.publish_all(&event).await?;
 
         Ok(event)
     }
@@ -145,14 +163,14 @@ where
             ));
         }
 
-        // Create and publish update event
+        // Create and publish update event both locally and to the network
         let event = Event::ContentUpdated {
             content_id: content_id.to_string(),
             updated_node_id: self.local_node_id.clone(),
             timestamp: current_timestamp(),
         };
 
-        self.event_publisher.publish(&event).await?;
+        self.event_publisher.publish_all(&event).await?;
 
         Ok(event)
     }
