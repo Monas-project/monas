@@ -82,7 +82,9 @@ where
         let providers = match self.peer_network.find_content_providers(genesis_cid).await {
             Ok(p) => p,
             Err(e) => {
-                result.errors.push(format!("Failed to find providers: {}", e));
+                result
+                    .errors
+                    .push(format!("Failed to find providers: {}", e));
                 return Ok(result);
             }
         };
@@ -130,9 +132,10 @@ where
                             );
                         }
                         Err(e) => {
-                            result
-                                .errors
-                                .push(format!("Failed to apply operations from {}: {}", provider, e));
+                            result.errors.push(format!(
+                                "Failed to apply operations from {}: {}",
+                                provider, e
+                            ));
                         }
                     }
                 }
@@ -300,4 +303,3 @@ where
 mod tests {
     // Tests would go here with mock implementations
 }
-

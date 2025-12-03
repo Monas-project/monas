@@ -98,8 +98,7 @@ impl<P: PeerNetwork> ReliableEventPublisher<P> {
         let event_id = self.outbox.save_pending_event(event, target_nodes)?;
 
         // 2. Attempt delivery
-        self.try_deliver_event(&event_id, event, target_nodes)
-            .await;
+        self.try_deliver_event(&event_id, event, target_nodes).await;
 
         Ok(event_id)
     }
@@ -197,7 +196,11 @@ impl<P: PeerNetwork> ReliableEventPublisher<P> {
     /// Process a received event (inbox side).
     ///
     /// Returns whether the event should be processed or was already processed.
-    pub fn process_received(&self, event_id: &str, source_node: Option<&str>) -> Result<ProcessResult> {
+    pub fn process_received(
+        &self,
+        event_id: &str,
+        source_node: Option<&str>,
+    ) -> Result<ProcessResult> {
         // Check if already processed
         if self.inbox.is_processed(event_id)? {
             return Ok(ProcessResult::AlreadyProcessed);
@@ -221,27 +224,49 @@ impl<P: PeerNetwork> ReliableEventPublisher<P> {
 
         // Hash event-specific fields
         match event {
-            Event::NodeCreated { node_id, timestamp, .. } => {
+            Event::NodeCreated {
+                node_id, timestamp, ..
+            } => {
                 node_id.hash(&mut hasher);
                 timestamp.hash(&mut hasher);
             }
-            Event::ContentCreated { content_id, timestamp, .. } => {
+            Event::ContentCreated {
+                content_id,
+                timestamp,
+                ..
+            } => {
                 content_id.hash(&mut hasher);
                 timestamp.hash(&mut hasher);
             }
-            Event::ContentUpdated { content_id, timestamp, .. } => {
+            Event::ContentUpdated {
+                content_id,
+                timestamp,
+                ..
+            } => {
                 content_id.hash(&mut hasher);
                 timestamp.hash(&mut hasher);
             }
-            Event::AssignmentDecided { content_id, timestamp, .. } => {
+            Event::AssignmentDecided {
+                content_id,
+                timestamp,
+                ..
+            } => {
                 content_id.hash(&mut hasher);
                 timestamp.hash(&mut hasher);
             }
-            Event::ContentNetworkManagerAdded { content_id, timestamp, .. } => {
+            Event::ContentNetworkManagerAdded {
+                content_id,
+                timestamp,
+                ..
+            } => {
                 content_id.hash(&mut hasher);
                 timestamp.hash(&mut hasher);
             }
-            Event::ContentSyncRequested { content_id, timestamp, .. } => {
+            Event::ContentSyncRequested {
+                content_id,
+                timestamp,
+                ..
+            } => {
                 content_id.hash(&mut hasher);
                 timestamp.hash(&mut hasher);
             }
@@ -252,8 +277,12 @@ impl<P: PeerNetwork> ReliableEventPublisher<P> {
 
     /// Cleanup old records from both outbox and inbox.
     pub fn cleanup(&self) -> Result<(usize, usize)> {
-        let outbox_cleaned = self.outbox.cleanup_old_events(self.config.delivered_retention)?;
-        let inbox_cleaned = self.inbox.cleanup_old_records(self.config.inbox_retention)?;
+        let outbox_cleaned = self
+            .outbox
+            .cleanup_old_events(self.config.delivered_retention)?;
+        let inbox_cleaned = self
+            .inbox
+            .cleanup_old_records(self.config.inbox_retention)?;
         Ok((outbox_cleaned, inbox_cleaned))
     }
 
@@ -323,4 +352,3 @@ mod tests {
         assert_ne!(id1, id2);
     }
 }
-

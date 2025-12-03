@@ -32,9 +32,7 @@ pub struct SledInboxPersistence {
 impl SledInboxPersistence {
     /// Open or create an inbox persistence at the given path.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let db = Arc::new(
-            sled::open(path.as_ref()).context("Failed to open inbox database")?,
-        );
+        let db = Arc::new(sled::open(path.as_ref()).context("Failed to open inbox database")?);
         let processed_tree = db
             .open_tree("processed")
             .context("Failed to open processed tree")?;
@@ -67,8 +65,8 @@ impl SledInboxPersistence {
             source_node: source_node.map(|s| s.to_string()),
         };
 
-        let serialized = serde_json::to_vec(&record)
-            .context("Failed to serialize processed record")?;
+        let serialized =
+            serde_json::to_vec(&record).context("Failed to serialize processed record")?;
 
         self.processed_tree
             .insert(event_id.as_bytes(), serialized)
@@ -84,8 +82,8 @@ impl SledInboxPersistence {
             .get(event_id.as_bytes())
             .context("Failed to get processed record")?
         {
-            let record: ProcessedEventRecord = serde_json::from_slice(&data)
-                .context("Failed to deserialize processed record")?;
+            let record: ProcessedEventRecord =
+                serde_json::from_slice(&data).context("Failed to deserialize processed record")?;
             Ok(Some(record))
         } else {
             Ok(None)
@@ -105,8 +103,8 @@ impl SledInboxPersistence {
 
         for result in self.processed_tree.iter() {
             let (key, value) = result.context("Failed to iterate processed records")?;
-            let record: ProcessedEventRecord = serde_json::from_slice(&value)
-                .context("Failed to deserialize processed record")?;
+            let record: ProcessedEventRecord =
+                serde_json::from_slice(&value).context("Failed to deserialize processed record")?;
 
             if now.saturating_sub(record.processed_at) > max_age_ms {
                 to_remove.push(key.to_vec());
@@ -207,4 +205,3 @@ mod tests {
         assert_eq!(inbox.count(), 2);
     }
 }
-

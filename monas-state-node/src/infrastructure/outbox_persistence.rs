@@ -41,9 +41,7 @@ pub struct SledOutboxPersistence {
 impl SledOutboxPersistence {
     /// Open or create an outbox persistence at the given path.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let db = Arc::new(
-            sled::open(path.as_ref()).context("Failed to open outbox database")?,
-        );
+        let db = Arc::new(sled::open(path.as_ref()).context("Failed to open outbox database")?);
         let pending_tree = db
             .open_tree("pending")
             .context("Failed to open pending tree")?;
@@ -62,17 +60,17 @@ impl SledOutboxPersistence {
     fn generate_event_id(event: &Event) -> String {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        
+
         // Hash event type and timestamp
         event.event_type().hash(&mut hasher);
-        
+
         // Add current time for uniqueness
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
         now.hash(&mut hasher);
-        
+
         format!("{:016x}", hasher.finish())
     }
 
@@ -89,7 +87,7 @@ impl SledOutboxPersistence {
     /// Returns the event ID.
     pub fn save_pending_event(&self, event: &Event, target_nodes: &[String]) -> Result<String> {
         let event_id = Self::generate_event_id(event);
-        
+
         let pending = PendingEvent {
             id: event_id.clone(),
             event: event.clone(),
@@ -99,8 +97,8 @@ impl SledOutboxPersistence {
             last_attempt_at: None,
         };
 
-        let serialized = serde_json::to_vec(&pending)
-            .context("Failed to serialize pending event")?;
+        let serialized =
+            serde_json::to_vec(&pending).context("Failed to serialize pending event")?;
 
         self.pending_tree
             .insert(event_id.as_bytes(), serialized)
@@ -115,9 +113,13 @@ impl SledOutboxPersistence {
     pub fn mark_delivered(&self, event_id: &str, node_id: &str) -> Result<()> {
         let key = event_id.as_bytes();
 
-        if let Some(data) = self.pending_tree.get(key).context("Failed to get pending event")? {
-            let mut pending: PendingEvent = serde_json::from_slice(&data)
-                .context("Failed to deserialize pending event")?;
+        if let Some(data) = self
+            .pending_tree
+            .get(key)
+            .context("Failed to get pending event")?
+        {
+            let mut pending: PendingEvent =
+                serde_json::from_slice(&data).context("Failed to deserialize pending event")?;
 
             // Remove the node from remaining targets
             pending.remaining_targets.retain(|n| n != node_id);
@@ -128,15 +130,15 @@ impl SledOutboxPersistence {
                     .remove(key)
                     .context("Failed to remove from pending")?;
 
-                let serialized = serde_json::to_vec(&pending)
-                    .context("Failed to serialize delivered event")?;
+                let serialized =
+                    serde_json::to_vec(&pending).context("Failed to serialize delivered event")?;
                 self.delivered_tree
                     .insert(key, serialized)
                     .context("Failed to save to delivered")?;
             } else {
                 // Update remaining targets
-                let serialized = serde_json::to_vec(&pending)
-                    .context("Failed to serialize pending event")?;
+                let serialized =
+                    serde_json::to_vec(&pending).context("Failed to serialize pending event")?;
                 self.pending_tree
                     .insert(key, serialized)
                     .context("Failed to update pending event")?;
@@ -150,15 +152,19 @@ impl SledOutboxPersistence {
     pub fn mark_retry_attempt(&self, event_id: &str) -> Result<()> {
         let key = event_id.as_bytes();
 
-        if let Some(data) = self.pending_tree.get(key).context("Failed to get pending event")? {
-            let mut pending: PendingEvent = serde_json::from_slice(&data)
-                .context("Failed to deserialize pending event")?;
+        if let Some(data) = self
+            .pending_tree
+            .get(key)
+            .context("Failed to get pending event")?
+        {
+            let mut pending: PendingEvent =
+                serde_json::from_slice(&data).context("Failed to deserialize pending event")?;
 
             pending.retry_count += 1;
             pending.last_attempt_at = Some(Self::current_timestamp());
 
-            let serialized = serde_json::to_vec(&pending)
-                .context("Failed to serialize pending event")?;
+            let serialized =
+                serde_json::to_vec(&pending).context("Failed to serialize pending event")?;
             self.pending_tree
                 .insert(key, serialized)
                 .context("Failed to update pending event")?;
@@ -176,8 +182,8 @@ impl SledOutboxPersistence {
 
         for result in self.pending_tree.iter() {
             let (_, value) = result.context("Failed to iterate pending events")?;
-            let pending: PendingEvent = serde_json::from_slice(&value)
-                .context("Failed to deserialize pending event")?;
+            let pending: PendingEvent =
+                serde_json::from_slice(&value).context("Failed to deserialize pending event")?;
 
             // Filter by age if specified
             if let Some(min_age) = min_age_ms {
@@ -195,12 +201,13 @@ impl SledOutboxPersistence {
 
     /// Get a specific pending event by ID.
     pub fn get_pending_event(&self, event_id: &str) -> Result<Option<PendingEvent>> {
-        if let Some(data) = self.pending_tree
+        if let Some(data) = self
+            .pending_tree
             .get(event_id.as_bytes())
             .context("Failed to get pending event")?
         {
-            let pending: PendingEvent = serde_json::from_slice(&data)
-                .context("Failed to deserialize pending event")?;
+            let pending: PendingEvent =
+                serde_json::from_slice(&data).context("Failed to deserialize pending event")?;
             Ok(Some(pending))
         } else {
             Ok(None)
@@ -227,8 +234,8 @@ impl SledOutboxPersistence {
 
         for result in self.delivered_tree.iter() {
             let (key, value) = result.context("Failed to iterate delivered events")?;
-            let event: PendingEvent = serde_json::from_slice(&value)
-                .context("Failed to deserialize delivered event")?;
+            let event: PendingEvent =
+                serde_json::from_slice(&value).context("Failed to deserialize delivered event")?;
 
             if now.saturating_sub(event.created_at) > max_age_ms {
                 to_remove.push(key.to_vec());
@@ -334,8 +341,12 @@ mod tests {
             timestamp: current_timestamp(),
         };
 
-        outbox.save_pending_event(&event1, &["node1".to_string()]).unwrap();
-        outbox.save_pending_event(&event2, &["node2".to_string()]).unwrap();
+        outbox
+            .save_pending_event(&event1, &["node1".to_string()])
+            .unwrap();
+        outbox
+            .save_pending_event(&event2, &["node2".to_string()])
+            .unwrap();
 
         let pending = outbox.get_pending_events(None).unwrap();
         assert_eq!(pending.len(), 2);
@@ -347,7 +358,9 @@ mod tests {
         let outbox = SledOutboxPersistence::open(tmp.path()).unwrap();
 
         let event = create_test_event();
-        let event_id = outbox.save_pending_event(&event, &["node1".to_string()]).unwrap();
+        let event_id = outbox
+            .save_pending_event(&event, &["node1".to_string()])
+            .unwrap();
 
         outbox.mark_retry_attempt(&event_id).unwrap();
         outbox.mark_retry_attempt(&event_id).unwrap();
@@ -357,4 +370,3 @@ mod tests {
         assert!(pending.last_attempt_at.is_some());
     }
 }
-
