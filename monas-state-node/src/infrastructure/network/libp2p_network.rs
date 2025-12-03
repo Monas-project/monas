@@ -111,10 +111,7 @@ enum SwarmCommand {
         reply: oneshot::Sender<Result<()>>,
     },
     #[allow(dead_code)]
-    AddAddress {
-        peer_id: PeerId,
-        addr: Multiaddr,
-    },
+    AddAddress { peer_id: PeerId, addr: Multiaddr },
     Dial {
         addr: Multiaddr,
         reply: oneshot::Sender<Result<()>>,
@@ -147,7 +144,8 @@ struct PendingRequests {
     content_fetches: HashMap<OutboundRequestId, oneshot::Sender<Result<Vec<u8>>>>,
     kad_queries: HashMap<kad::QueryId, oneshot::Sender<Result<Vec<PeerId>>>>,
     kad_provider_queries: HashMap<kad::QueryId, oneshot::Sender<Result<Vec<PeerId>>>>,
-    operation_fetches: HashMap<OutboundRequestId, oneshot::Sender<Result<Vec<SerializedOperation>>>>,
+    operation_fetches:
+        HashMap<OutboundRequestId, oneshot::Sender<Result<Vec<SerializedOperation>>>>,
     operation_pushes: HashMap<OutboundRequestId, oneshot::Sender<Result<usize>>>,
 }
 
@@ -194,15 +192,11 @@ impl Libp2pNetwork {
         info!("Local peer ID: {}", local_peer_id);
 
         // Build transport
-        let transport = transport::build_transport(&keypair)
-            .context("Failed to build transport")?;
+        let transport =
+            transport::build_transport(&keypair).context("Failed to build transport")?;
 
         // Build behaviour
-        let behaviour = NodeBehaviour::new(
-            local_peer_id,
-            &keypair,
-            BehaviourConfig::default(),
-        )?;
+        let behaviour = NodeBehaviour::new(local_peer_id, &keypair, BehaviourConfig::default())?;
 
         // Create swarm
         let swarm_config = libp2p::swarm::Config::with_tokio_executor()
@@ -230,7 +224,10 @@ impl Libp2pNetwork {
 
         // Add bootstrap nodes
         for (peer_id, addr) in &config.bootstrap_nodes {
-            swarm.behaviour_mut().kademlia.add_address(peer_id, addr.clone());
+            swarm
+                .behaviour_mut()
+                .kademlia
+                .add_address(peer_id, addr.clone());
             info!("Added bootstrap node: {} at {}", peer_id, addr);
         }
 
@@ -288,10 +285,15 @@ impl Libp2pNetwork {
     pub async fn dial(&self, addr: Multiaddr) -> Result<()> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.command_tx
-            .send(SwarmCommand::Dial { addr, reply: reply_tx })
+            .send(SwarmCommand::Dial {
+                addr,
+                reply: reply_tx,
+            })
             .await
             .map_err(|_| anyhow::anyhow!("Failed to send dial command"))?;
-        reply_rx.await.map_err(|_| anyhow::anyhow!("Dial response channel closed"))?
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("Dial response channel closed"))?
     }
 
     /// Get the addresses this node is listening on.
@@ -361,7 +363,11 @@ impl Libp2pNetwork {
                     .map_err(|e| anyhow::anyhow!("Failed to publish: {:?}", e));
                 let _ = reply.send(result);
             }
-            SwarmCommand::FetchContent { peer_id, content_id, reply } => {
+            SwarmCommand::FetchContent {
+                peer_id,
+                content_id,
+                reply,
+            } => {
                 let request_id = swarm
                     .behaviour_mut()
                     .request_response
@@ -397,16 +403,13 @@ impl Libp2pNetwork {
                 since_version,
                 reply,
             } => {
-                let request_id = swarm
-                    .behaviour_mut()
-                    .request_response
-                    .send_request(
-                        &peer_id,
-                        ContentRequest::FetchOperations {
-                            genesis_cid,
-                            since_version,
-                        },
-                    );
+                let request_id = swarm.behaviour_mut().request_response.send_request(
+                    &peer_id,
+                    ContentRequest::FetchOperations {
+                        genesis_cid,
+                        since_version,
+                    },
+                );
                 pending.operation_fetches.insert(request_id, reply);
             }
             SwarmCommand::PushOperations {
@@ -420,16 +423,13 @@ impl Libp2pNetwork {
                     .iter()
                     .filter_map(|op| serde_json::to_vec(op).ok())
                     .collect();
-                let request_id = swarm
-                    .behaviour_mut()
-                    .request_response
-                    .send_request(
-                        &peer_id,
-                        ContentRequest::PushOperations {
-                            genesis_cid,
-                            operations: wire_ops,
-                        },
-                    );
+                let request_id = swarm.behaviour_mut().request_response.send_request(
+                    &peer_id,
+                    ContentRequest::PushOperations {
+                        genesis_cid,
+                        operations: wire_ops,
+                    },
+                );
                 pending.operation_pushes.insert(request_id, reply);
             }
             SwarmCommand::GetProviders { key, reply } => {
@@ -458,7 +458,8 @@ impl Libp2pNetwork {
                 Self::handle_gossipsub_event(event_tx, gossip_event).await;
             }
             SwarmEvent::Behaviour(NodeBehaviourEvent::RequestResponse(rr_event)) => {
-                Self::handle_request_response_event(swarm, pending, crdt_repo, data_dir, rr_event).await;
+                Self::handle_request_response_event(swarm, pending, crdt_repo, data_dir, rr_event)
+                    .await;
             }
             SwarmEvent::Behaviour(NodeBehaviourEvent::Identify(identify_event)) => {
                 Self::handle_identify_event(swarm, identify_event).await;
@@ -467,10 +468,14 @@ impl Libp2pNetwork {
             SwarmEvent::Behaviour(NodeBehaviourEvent::Mdns(mdns_event)) => {
                 Self::handle_mdns_event(swarm, connected_peers, mdns_event).await;
             }
-            SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+            SwarmEvent::ConnectionEstablished {
+                peer_id, endpoint, ..
+            } => {
                 let addr = endpoint.get_remote_address().clone();
                 info!("Connection established with {} at {}", peer_id, addr);
-                connected_peers.write().await
+                connected_peers
+                    .write()
+                    .await
                     .entry(peer_id)
                     .or_insert_with(Vec::new)
                     .push(addr);
@@ -492,12 +497,14 @@ impl Libp2pNetwork {
                 match result {
                     kad::QueryResult::GetClosestPeers(Ok(ok)) => {
                         if let Some(reply) = pending.kad_queries.remove(&id) {
-                            let _ = reply.send(Ok(ok.peers.into_iter().map(|p| p.peer_id).collect()));
+                            let _ =
+                                reply.send(Ok(ok.peers.into_iter().map(|p| p.peer_id).collect()));
                         }
                     }
                     kad::QueryResult::GetClosestPeers(Err(e)) => {
                         if let Some(reply) = pending.kad_queries.remove(&id) {
-                            let _ = reply.send(Err(anyhow::anyhow!("Kademlia query failed: {:?}", e)));
+                            let _ =
+                                reply.send(Err(anyhow::anyhow!("Kademlia query failed: {:?}", e)));
                         }
                     }
                     kad::QueryResult::GetProviders(Ok(ok)) => {
@@ -518,7 +525,8 @@ impl Libp2pNetwork {
                     }
                     kad::QueryResult::GetProviders(Err(e)) => {
                         if let Some(reply) = pending.kad_provider_queries.remove(&id) {
-                            let _ = reply.send(Err(anyhow::anyhow!("Provider query failed: {:?}", e)));
+                            let _ =
+                                reply.send(Err(anyhow::anyhow!("Provider query failed: {:?}", e)));
                         }
                     }
                     _ => {}
@@ -536,7 +544,11 @@ impl Libp2pNetwork {
         event: gossipsub::Event,
     ) {
         match event {
-            gossipsub::Event::Message { propagation_source, message, .. } => {
+            gossipsub::Event::Message {
+                propagation_source,
+                message,
+                ..
+            } => {
                 debug!(
                     "Received gossipsub message from {}: {} bytes",
                     propagation_source,
@@ -564,10 +576,7 @@ impl Libp2pNetwork {
                     }
                     Err(e) => {
                         // Not a domain event, might be a CRDT operation or other message
-                        debug!(
-                            "Failed to deserialize gossipsub message as Event: {}",
-                            e
-                        );
+                        debug!("Failed to deserialize gossipsub message as Event: {}", e);
                     }
                 }
             }
@@ -589,17 +598,25 @@ impl Libp2pNetwork {
         event: request_response::Event<ContentRequest, ContentResponse>,
     ) {
         match event {
-            request_response::Event::Message { peer, message, .. } => {
-                match message {
-                    request_response::Message::Request { request, channel, .. } => {
-                        Self::handle_incoming_request(swarm, peer, request, channel, crdt_repo, data_dir).await;
-                    }
-                    request_response::Message::Response { request_id, response } => {
-                        Self::handle_response(pending, request_id, response).await;
-                    }
+            request_response::Event::Message { peer, message, .. } => match message {
+                request_response::Message::Request {
+                    request, channel, ..
+                } => {
+                    Self::handle_incoming_request(
+                        swarm, peer, request, channel, crdt_repo, data_dir,
+                    )
+                    .await;
                 }
-            }
-            request_response::Event::OutboundFailure { request_id, error, .. } => {
+                request_response::Message::Response {
+                    request_id,
+                    response,
+                } => {
+                    Self::handle_response(pending, request_id, response).await;
+                }
+            },
+            request_response::Event::OutboundFailure {
+                request_id, error, ..
+            } => {
                 error!("Outbound request failed: {:?}", error);
                 // Clean up pending requests
                 if let Some(reply) = pending.capacity_queries.remove(&request_id) {
@@ -624,17 +641,15 @@ impl Libp2pNetwork {
         debug!("Received request from {}: {:?}", peer, request);
 
         let response = match request {
-            ContentRequest::CapacityQuery => {
-                match disk_capacity::get_disk_capacity(data_dir) {
-                    Ok((total, available)) => ContentResponse::CapacityResponse {
-                        total_capacity: total,
-                        available_capacity: available,
-                    },
-                    Err(e) => ContentResponse::Error {
-                        message: format!("Failed to get disk capacity: {}", e),
-                    },
-                }
-            }
+            ContentRequest::CapacityQuery => match disk_capacity::get_disk_capacity(data_dir) {
+                Ok((total, available)) => ContentResponse::CapacityResponse {
+                    total_capacity: total,
+                    available_capacity: available,
+                },
+                Err(e) => ContentResponse::Error {
+                    message: format!("Failed to get disk capacity: {}", e),
+                },
+            },
             ContentRequest::FetchContent { content_id } => {
                 match crdt_repo.get_latest(&content_id).await {
                     Ok(Some(data)) => ContentResponse::ContentData {
@@ -662,8 +677,14 @@ impl Libp2pNetwork {
                     },
                 }
             }
-            ContentRequest::FetchOperations { genesis_cid, since_version } => {
-                match crdt_repo.get_operations(&genesis_cid, since_version.as_deref()).await {
+            ContentRequest::FetchOperations {
+                genesis_cid,
+                since_version,
+            } => {
+                match crdt_repo
+                    .get_operations(&genesis_cid, since_version.as_deref())
+                    .await
+                {
                     Ok(ops) => {
                         // Serialize operations for network transfer
                         let operations: Vec<Vec<u8>> = ops
@@ -680,7 +701,10 @@ impl Libp2pNetwork {
                     },
                 }
             }
-            ContentRequest::PushOperations { genesis_cid, operations } => {
+            ContentRequest::PushOperations {
+                genesis_cid,
+                operations,
+            } => {
                 // Deserialize operations from wire format
                 let ops: Vec<SerializedOperation> = operations
                     .iter()
@@ -699,7 +723,11 @@ impl Libp2pNetwork {
             }
         };
 
-        if let Err(e) = swarm.behaviour_mut().request_response.send_response(channel, response) {
+        if let Err(e) = swarm
+            .behaviour_mut()
+            .request_response
+            .send_response(channel, response)
+        {
             error!("Failed to send response: {:?}", e);
         }
     }
@@ -712,7 +740,10 @@ impl Libp2pNetwork {
         // Handle capacity query response
         if let Some(reply) = pending.capacity_queries.remove(&request_id) {
             match response {
-                ContentResponse::CapacityResponse { total_capacity, available_capacity } => {
+                ContentResponse::CapacityResponse {
+                    total_capacity,
+                    available_capacity,
+                } => {
                     let _ = reply.send(Ok((total_capacity, available_capacity)));
                 }
                 ContentResponse::Error { message } => {
@@ -747,7 +778,10 @@ impl Libp2pNetwork {
         // Handle operation fetch response
         if let Some(reply) = pending.operation_fetches.remove(&request_id) {
             match response {
-                ContentResponse::OperationsData { operations, genesis_cid: _ } => {
+                ContentResponse::OperationsData {
+                    operations,
+                    genesis_cid: _,
+                } => {
                     // Deserialize operations from wire format
                     let ops: Vec<SerializedOperation> = operations
                         .iter()
@@ -795,15 +829,21 @@ impl Libp2pNetwork {
                 );
                 // Add peer's addresses to Kademlia
                 for addr in &info.listen_addrs {
-                    swarm.behaviour_mut().kademlia.add_address(&peer_id, addr.clone());
+                    swarm
+                        .behaviour_mut()
+                        .kademlia
+                        .add_address(&peer_id, addr.clone());
                 }
-                
+
                 // Try to bootstrap Kademlia now that we have a peer
                 // This is important for the first node to populate its routing table
                 if let Err(e) = swarm.behaviour_mut().kademlia.bootstrap() {
                     debug!("Kademlia bootstrap attempt: {:?}", e);
                 } else {
-                    info!("Triggered Kademlia bootstrap after identifying peer {}", peer_id);
+                    info!(
+                        "Triggered Kademlia bootstrap after identifying peer {}",
+                        peer_id
+                    );
                 }
             }
             _ => {}
@@ -820,8 +860,13 @@ impl Libp2pNetwork {
             libp2p::mdns::Event::Discovered(peers) => {
                 for (peer_id, addr) in peers {
                     info!("mDNS discovered peer {} at {}", peer_id, addr);
-                    swarm.behaviour_mut().kademlia.add_address(&peer_id, addr.clone());
-                    connected_peers.write().await
+                    swarm
+                        .behaviour_mut()
+                        .kademlia
+                        .add_address(&peer_id, addr.clone());
+                    connected_peers
+                        .write()
+                        .await
                         .entry(peer_id)
                         .or_insert_with(Vec::new)
                         .push(addr);
@@ -845,14 +890,13 @@ impl PeerNetwork for Libp2pNetwork {
             .await
             .map_err(|_| anyhow::anyhow!("Failed to send command"))?;
 
-        let peers = rx.await.map_err(|_| anyhow::anyhow!("Failed to receive response"))??;
+        let peers = rx
+            .await
+            .map_err(|_| anyhow::anyhow!("Failed to receive response"))??;
         Ok(peers.into_iter().map(|p| p.to_string()).collect())
     }
 
-    async fn query_node_capacity_batch(
-        &self,
-        peer_ids: &[String],
-    ) -> Result<HashMap<String, u64>> {
+    async fn query_node_capacity_batch(&self, peer_ids: &[String]) -> Result<HashMap<String, u64>> {
         let mut results = HashMap::new();
 
         for peer_id_str in peer_ids {
@@ -862,7 +906,8 @@ impl PeerNetwork for Libp2pNetwork {
             };
 
             let (tx, rx) = oneshot::channel();
-            if self.command_tx
+            if self
+                .command_tx
                 .send(SwarmCommand::QueryCapacity { peer_id, reply: tx })
                 .await
                 .is_err()
@@ -889,7 +934,8 @@ impl PeerNetwork for Libp2pNetwork {
             .await
             .map_err(|_| anyhow::anyhow!("Failed to send command"))?;
 
-        rx.await.map_err(|_| anyhow::anyhow!("Failed to receive response"))?
+        rx.await
+            .map_err(|_| anyhow::anyhow!("Failed to receive response"))?
     }
 
     async fn fetch_content(&self, peer_id: &str, content_id: &str) -> Result<Vec<u8>> {
@@ -906,7 +952,8 @@ impl PeerNetwork for Libp2pNetwork {
             .await
             .map_err(|_| anyhow::anyhow!("Failed to send command"))?;
 
-        rx.await.map_err(|_| anyhow::anyhow!("Failed to receive response"))?
+        rx.await
+            .map_err(|_| anyhow::anyhow!("Failed to receive response"))?
     }
 
     async fn publish_provider(&self, key: Vec<u8>) -> Result<()> {
@@ -916,7 +963,8 @@ impl PeerNetwork for Libp2pNetwork {
             .await
             .map_err(|_| anyhow::anyhow!("Failed to send command"))?;
 
-        rx.await.map_err(|_| anyhow::anyhow!("Failed to receive response"))?
+        rx.await
+            .map_err(|_| anyhow::anyhow!("Failed to receive response"))?
     }
 
     fn local_peer_id(&self) -> String {
@@ -943,7 +991,8 @@ impl PeerNetwork for Libp2pNetwork {
             .await
             .map_err(|_| anyhow::anyhow!("Failed to send command"))?;
 
-        rx.await.map_err(|_| anyhow::anyhow!("Failed to receive response"))?
+        rx.await
+            .map_err(|_| anyhow::anyhow!("Failed to receive response"))?
     }
 
     async fn push_operations(
@@ -966,7 +1015,8 @@ impl PeerNetwork for Libp2pNetwork {
             .await
             .map_err(|_| anyhow::anyhow!("Failed to send command"))?;
 
-        rx.await.map_err(|_| anyhow::anyhow!("Failed to receive response"))?
+        rx.await
+            .map_err(|_| anyhow::anyhow!("Failed to receive response"))?
     }
 
     async fn broadcast_operation(
@@ -995,7 +1045,9 @@ impl PeerNetwork for Libp2pNetwork {
             .await
             .map_err(|_| anyhow::anyhow!("Failed to send command"))?;
 
-        let peers = rx.await.map_err(|_| anyhow::anyhow!("Failed to receive response"))??;
+        let peers = rx
+            .await
+            .map_err(|_| anyhow::anyhow!("Failed to receive response"))??;
         Ok(peers.into_iter().map(|p| p.to_string()).collect())
     }
 }
@@ -1017,9 +1069,8 @@ mod tests {
 
         // Create a temporary directory for the CRDT repository
         let tmp_dir = tempdir().unwrap();
-        let crdt_repo: Arc<dyn ContentRepository> = Arc::new(
-            CrslCrdtRepository::open(tmp_dir.path().join("crdt")).unwrap()
-        );
+        let crdt_repo: Arc<dyn ContentRepository> =
+            Arc::new(CrslCrdtRepository::open(tmp_dir.path().join("crdt")).unwrap());
         let data_dir = tmp_dir.path().to_path_buf();
 
         let network = Libp2pNetwork::new(config, crdt_repo, data_dir).await;
@@ -1029,4 +1080,3 @@ mod tests {
         assert!(!network.local_peer_id().is_empty());
     }
 }
-

@@ -66,8 +66,7 @@ impl StateNode {
     /// Create a new StateNode with the given configuration.
     pub async fn new(config: StateNodeConfig) -> Result<Self> {
         // Ensure data directory exists
-        std::fs::create_dir_all(&config.data_dir)
-            .context("Failed to create data directory")?;
+        std::fs::create_dir_all(&config.data_dir).context("Failed to create data directory")?;
 
         // Initialize persistence
         let node_registry = SledNodeRegistry::open(config.data_dir.join("nodes"))
@@ -141,9 +140,7 @@ impl StateNode {
 
     /// Connect to another node at the given multiaddr.
     pub async fn dial(&self, addr: &str) -> Result<()> {
-        let multiaddr: libp2p::Multiaddr = addr
-            .parse()
-            .context("Invalid multiaddr")?;
+        let multiaddr: libp2p::Multiaddr = addr.parse().context("Invalid multiaddr")?;
         self.network.dial(multiaddr).await
     }
 
@@ -186,16 +183,10 @@ impl StateNode {
                         // Forward to service for processing
                         match service.handle_sync_event(&received.event).await {
                             Ok(outcome) => {
-                                tracing::debug!(
-                                    "Processed sync event: {:?}",
-                                    outcome
-                                );
+                                tracing::debug!("Processed sync event: {:?}", outcome);
                             }
                             Err(e) => {
-                                tracing::error!(
-                                    "Failed to process sync event: {}",
-                                    e
-                                );
+                                tracing::error!("Failed to process sync event: {}", e);
                             }
                         }
                     }
@@ -221,4 +212,3 @@ impl StateNode {
         Ok(())
     }
 }
-

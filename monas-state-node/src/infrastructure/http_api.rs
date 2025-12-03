@@ -16,7 +16,12 @@ use std::sync::Arc;
 
 /// Application state shared across handlers.
 pub type AppState = Arc<
-    StateNodeService<SledNodeRegistry, SledContentNetworkRepository, Libp2pNetwork, GossipsubEventPublisher<Libp2pNetwork>>,
+    StateNodeService<
+        SledNodeRegistry,
+        SledContentNetworkRepository,
+        Libp2pNetwork,
+        GossipsubEventPublisher<Libp2pNetwork>,
+    >,
 >;
 
 /// Create the API router.
@@ -110,7 +115,7 @@ async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
 /// Get node info.
 async fn node_info(State(state): State<AppState>) -> impl IntoResponse {
     let node_id = state.local_node_id().to_string();
-    
+
     match state.get_node(&node_id).await {
         Ok(Some(node)) => Json(NodeInfoResponse {
             node_id: node.node_id,
@@ -176,7 +181,7 @@ async fn create_content(
     Json(req): Json<CreateContentRequest>,
 ) -> impl IntoResponse {
     use base64::Engine;
-    
+
     let data = match base64::engine::general_purpose::STANDARD.decode(&req.data) {
         Ok(d) => d,
         Err(e) => {
@@ -258,7 +263,7 @@ async fn update_content(
     Json(req): Json<UpdateContentRequest>,
 ) -> impl IntoResponse {
     use base64::Engine;
-    
+
     let data = match base64::engine::general_purpose::STANDARD.decode(&req.data) {
         Ok(d) => d,
         Err(e) => {
@@ -301,4 +306,3 @@ async fn list_contents(State(state): State<AppState>) -> impl IntoResponse {
             .into_response(),
     }
 }
-

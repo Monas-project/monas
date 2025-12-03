@@ -78,15 +78,20 @@ where
     ///
     /// This publishes the NodeCreated event both locally and to the network.
     pub async fn register_node(&self, total_capacity: u64) -> Result<(NodeSnapshot, Vec<Event>)> {
-        let (snapshot, events) = state_node::create_node(self.local_node_id.clone(), total_capacity);
-        
-        self.node_registry.write().await.upsert_node(&snapshot).await?;
-        
+        let (snapshot, events) =
+            state_node::create_node(self.local_node_id.clone(), total_capacity);
+
+        self.node_registry
+            .write()
+            .await
+            .upsert_node(&snapshot)
+            .await?;
+
         // Publish events both locally and to the network
         for event in &events {
             self.event_publisher.publish_all(event).await?;
         }
-        
+
         Ok((snapshot, events))
     }
 
@@ -104,7 +109,10 @@ where
         let key = compute_dht_key(&content_id);
         let k = 3usize;
         let closest = self.peer_network.find_closest_peers(key, k).await?;
-        let caps = self.peer_network.query_node_capacity_batch(&closest).await?;
+        let caps = self
+            .peer_network
+            .query_node_capacity_batch(&closest)
+            .await?;
 
         // Select nodes with highest capacity, excluding the creator
         let mut scored: Vec<(u64, String)> = closest
@@ -128,7 +136,11 @@ where
             content_id: content_id.clone(),
             member_nodes: selected.iter().cloned().collect(),
         };
-        self.content_repo.write().await.save_content_network(network).await?;
+        self.content_repo
+            .write()
+            .await
+            .save_content_network(network)
+            .await?;
 
         // Create and publish event both locally and to the network
         let event = Event::ContentCreated {
@@ -147,7 +159,8 @@ where
     /// Update existing content.
     pub async fn update_content(&self, content_id: &str, _data: &[u8]) -> Result<Event> {
         // Verify content network exists
-        let network = self.content_repo
+        let network = self
+            .content_repo
             .read()
             .await
             .get_content_network(content_id)
@@ -180,7 +193,8 @@ where
         match event {
             Event::ContentUpdated { content_id, .. } => {
                 // Ensure content network exists
-                let exists = self.content_repo
+                let exists = self
+                    .content_repo
                     .read()
                     .await
                     .get_content_network(content_id)
@@ -192,7 +206,11 @@ where
                         content_id: content_id.clone(),
                         member_nodes: BTreeSet::new(),
                     };
-                    self.content_repo.write().await.save_content_network(network).await?;
+                    self.content_repo
+                        .write()
+                        .await
+                        .save_content_network(network)
+                        .await?;
                 }
 
                 Ok(ApplyOutcome::Applied)
@@ -207,7 +225,11 @@ where
                     content_id: content_id.clone(),
                     member_nodes: member_nodes.iter().cloned().collect(),
                 };
-                self.content_repo.write().await.save_content_network(network).await?;
+                self.content_repo
+                    .write()
+                    .await
+                    .save_content_network(network)
+                    .await?;
                 Ok(ApplyOutcome::Applied)
             }
 
@@ -220,7 +242,11 @@ where
                     content_id: content_id.clone(),
                     member_nodes: member_nodes.iter().cloned().collect(),
                 };
-                self.content_repo.write().await.save_content_network(network).await?;
+                self.content_repo
+                    .write()
+                    .await
+                    .save_content_network(network)
+                    .await?;
                 Ok(ApplyOutcome::Applied)
             }
 
@@ -235,7 +261,11 @@ where
                     total_capacity: *total_capacity,
                     available_capacity: *available_capacity,
                 };
-                self.node_registry.write().await.upsert_node(&snapshot).await?;
+                self.node_registry
+                    .write()
+                    .await
+                    .upsert_node(&snapshot)
+                    .await?;
                 Ok(ApplyOutcome::Applied)
             }
 
@@ -245,7 +275,11 @@ where
 
     /// Get content network info.
     pub async fn get_content_network(&self, content_id: &str) -> Result<Option<ContentNetwork>> {
-        self.content_repo.read().await.get_content_network(content_id).await
+        self.content_repo
+            .read()
+            .await
+            .get_content_network(content_id)
+            .await
     }
 
     /// Get node info.

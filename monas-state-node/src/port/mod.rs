@@ -12,4 +12,3 @@ pub use content_repository::{CommitResult, ContentRepository, SerializedOperatio
 pub use event_publisher::EventPublisher;
 pub use peer_network::PeerNetwork;
 pub use persistence::{PersistentContentRepository, PersistentNodeRegistry};
-

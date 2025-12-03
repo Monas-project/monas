@@ -104,7 +104,6 @@ impl Event {
     }
 }
 
-
 /// Get the current timestamp in seconds since UNIX epoch.
 pub fn current_timestamp() -> u64 {
     std::time::SystemTime::now()

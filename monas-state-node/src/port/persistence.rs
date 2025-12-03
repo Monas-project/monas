@@ -78,4 +78,3 @@ pub trait PersistentContentStorage: Send + Sync {
     /// Flush pending writes to disk.
     async fn flush(&self) -> Result<()>;
 }
-

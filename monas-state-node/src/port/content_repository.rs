@@ -130,4 +130,3 @@ pub trait ContentRepository: Send + Sync {
     /// List of all genesis CIDs in the repository.
     async fn list_contents(&self) -> Result<Vec<String>>;
 }
-

@@ -90,7 +90,10 @@ impl PersistentNodeRegistry for SledNodeRegistry {
     }
 
     async fn flush(&self) -> Result<()> {
-        self.db.flush_async().await.context("Failed to flush database")?;
+        self.db
+            .flush_async()
+            .await
+            .context("Failed to flush database")?;
         Ok(())
     }
 }

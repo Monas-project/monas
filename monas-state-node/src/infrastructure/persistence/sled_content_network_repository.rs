@@ -102,8 +102,7 @@ impl PersistentContentRepository for SledContentNetworkRepository {
 
     async fn save_content_network(&self, net: ContentNetwork) -> Result<()> {
         let tree = self.content_tree()?;
-        let value =
-            serde_json::to_vec(&net).context("Failed to serialize content network")?;
+        let value = serde_json::to_vec(&net).context("Failed to serialize content network")?;
         tree.insert(net.content_id.as_bytes(), value)
             .context("Failed to insert content network")?;
         Ok(())
@@ -129,7 +128,10 @@ impl PersistentContentRepository for SledContentNetworkRepository {
     }
 
     async fn flush(&self) -> Result<()> {
-        self.db.flush_async().await.context("Failed to flush database")?;
+        self.db
+            .flush_async()
+            .await
+            .context("Failed to flush database")?;
         Ok(())
     }
 }

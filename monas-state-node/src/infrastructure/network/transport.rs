@@ -7,8 +7,9 @@
 
 use libp2p::{
     core::{muxing::StreamMuxerBox, transport::Boxed, upgrade},
-    dns, identity::Keypair, noise, quic, tcp,
-    yamux, PeerId, Transport,
+    dns,
+    identity::Keypair,
+    noise, quic, tcp, yamux, PeerId, Transport,
 };
 
 /// Build the transport layer for native platforms.
@@ -17,9 +18,7 @@ use libp2p::{
 /// - TCP: Traditional transport with Noise + Yamux
 /// - QUIC: Modern, efficient transport with built-in encryption
 /// - WebRTC: Required for browser communication (future)
-pub fn build_transport(
-    keypair: &Keypair,
-) -> anyhow::Result<Boxed<(PeerId, StreamMuxerBox)>> {
+pub fn build_transport(keypair: &Keypair) -> anyhow::Result<Boxed<(PeerId, StreamMuxerBox)>> {
     use rand::rngs::OsRng;
 
     // TCP transport with DNS resolution
@@ -46,13 +45,19 @@ pub fn build_transport(
     let transport = tcp_upgraded
         .or_transport(quic_transport)
         .map(|either, _| match either {
-            futures::future::Either::Left((peer_id, muxer)) => (peer_id, StreamMuxerBox::new(muxer)),
-            futures::future::Either::Right((peer_id, muxer)) => (peer_id, StreamMuxerBox::new(muxer)),
+            futures::future::Either::Left((peer_id, muxer)) => {
+                (peer_id, StreamMuxerBox::new(muxer))
+            }
+            futures::future::Either::Right((peer_id, muxer)) => {
+                (peer_id, StreamMuxerBox::new(muxer))
+            }
         })
         .or_transport(webrtc_transport)
         .map(|either, _| match either {
             futures::future::Either::Left((peer_id, muxer)) => (peer_id, muxer),
-            futures::future::Either::Right((peer_id, muxer)) => (peer_id, StreamMuxerBox::new(muxer)),
+            futures::future::Either::Right((peer_id, muxer)) => {
+                (peer_id, StreamMuxerBox::new(muxer))
+            }
         })
         .boxed();
 
@@ -60,9 +65,7 @@ pub fn build_transport(
 }
 
 /// Build a TCP-only transport for testing or simpler setups.
-pub fn build_tcp_transport(
-    keypair: &Keypair,
-) -> anyhow::Result<Boxed<(PeerId, StreamMuxerBox)>> {
+pub fn build_tcp_transport(keypair: &Keypair) -> anyhow::Result<Boxed<(PeerId, StreamMuxerBox)>> {
     let tcp_transport = tcp::tokio::Transport::new(tcp::Config::default().nodelay(true));
     let dns_tcp = dns::tokio::Transport::system(tcp_transport)?;
 
@@ -77,9 +80,7 @@ pub fn build_tcp_transport(
 }
 
 /// Build a QUIC-only transport.
-pub fn build_quic_transport(
-    keypair: &Keypair,
-) -> anyhow::Result<Boxed<(PeerId, StreamMuxerBox)>> {
+pub fn build_quic_transport(keypair: &Keypair) -> anyhow::Result<Boxed<(PeerId, StreamMuxerBox)>> {
     let quic_transport = quic::tokio::Transport::new(quic::Config::new(keypair));
     let transport = quic_transport
         .map(|(peer_id, muxer), _| (peer_id, StreamMuxerBox::new(muxer)))
@@ -144,4 +145,3 @@ mod tests {
         assert!(result.is_ok());
     }
 }
-

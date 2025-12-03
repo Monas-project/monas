@@ -290,8 +290,7 @@ mod tests {
     async fn test_custom_topic() {
         let network = Arc::new(MockPeerNetwork::new());
         let custom_topic = "custom-events".to_string();
-        let publisher =
-            GossipsubEventPublisher::new(network.clone(), Some(custom_topic.clone()));
+        let publisher = GossipsubEventPublisher::new(network.clone(), Some(custom_topic.clone()));
 
         assert_eq!(publisher.topic(), custom_topic);
 
@@ -308,4 +307,3 @@ mod tests {
         assert_eq!(published[0].0, custom_topic);
     }
 }
-

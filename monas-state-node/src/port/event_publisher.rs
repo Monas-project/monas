@@ -49,4 +49,3 @@ impl EventType for Event {
         "StateNodeEvent"
     }
 }
-

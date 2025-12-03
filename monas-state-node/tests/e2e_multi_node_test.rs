@@ -52,12 +52,19 @@ async fn test_two_nodes_can_connect() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let node1_addrs = node1.listen_addrs().await;
-    assert!(!node1_addrs.is_empty(), "Node1 should have listen addresses");
+    assert!(
+        !node1_addrs.is_empty(),
+        "Node1 should have listen addresses"
+    );
 
     // Node2 connects to Node1
     let addr = &node1_addrs[0];
     let result = node2.dial(addr).await;
-    assert!(result.is_ok(), "Node2 should connect to Node1: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "Node2 should connect to Node1: {:?}",
+        result
+    );
 
     // Allow connection to establish
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -221,7 +228,10 @@ async fn test_handle_sync_event_across_nodes() {
     .await;
 
     assert!(handle_result.is_ok(), "Should receive and handle event");
-    assert!(handle_result.unwrap().is_ok(), "Event handling should succeed");
+    assert!(
+        handle_result.unwrap().is_ok(),
+        "Event handling should succeed"
+    );
 
     // Verify node2 now knows about node1
     let node1_on_node2 = node2.service().get_node(node1.node_id()).await.unwrap();

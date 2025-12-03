@@ -83,7 +83,11 @@ impl ContentRepository for CrslCrdtRepository {
         let placeholder = Self::generate_placeholder_cid(data);
         let payload = ContentPayload(data.to_vec());
 
-        let op = Operation::new(placeholder, OperationType::Create(payload), author.to_string());
+        let op = Operation::new(
+            placeholder,
+            OperationType::Create(payload),
+            author.to_string(),
+        );
 
         let genesis_cid = {
             let mut repo = self
@@ -393,7 +397,10 @@ mod tests {
         let data = b"Test content";
         let result = repo.create_content(data, "author").await.unwrap();
 
-        let operations = repo.get_operations(&result.genesis_cid, None).await.unwrap();
+        let operations = repo
+            .get_operations(&result.genesis_cid, None)
+            .await
+            .unwrap();
         assert!(!operations.is_empty());
         assert_eq!(operations[0].genesis_cid, result.genesis_cid);
     }

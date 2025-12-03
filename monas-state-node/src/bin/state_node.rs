@@ -44,8 +44,7 @@ async fn main() -> Result<()> {
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new(&args.log_level)),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level)),
         )
         .init();
 
@@ -54,12 +53,13 @@ async fn main() -> Result<()> {
     tracing::info!("HTTP listen address: {}", args.listen);
 
     // Build configuration
-    let mut network_config = monas_state_node::infrastructure::network::Libp2pNetworkConfig::default();
-    
+    let mut network_config =
+        monas_state_node::infrastructure::network::Libp2pNetworkConfig::default();
+
     // Parse and add bootstrap addresses
     for addr_str in &args.bootstrap {
         tracing::info!("Bootstrap address: {}", addr_str);
-        
+
         // Parse multiaddr and extract peer ID
         if let Ok(addr) = Multiaddr::from_str(addr_str) {
             // Extract peer ID from the multiaddr (last component should be /p2p/<peer_id>)
@@ -69,7 +69,9 @@ async fn main() -> Result<()> {
                     .iter()
                     .filter(|p| !matches!(p, libp2p::multiaddr::Protocol::P2p(_)))
                     .collect();
-                network_config.bootstrap_nodes.push((peer_id, addr_without_p2p));
+                network_config
+                    .bootstrap_nodes
+                    .push((peer_id, addr_without_p2p));
                 tracing::info!("Added bootstrap peer: {}", peer_id);
             } else {
                 tracing::warn!("Bootstrap address missing peer ID: {}", addr_str);
@@ -98,4 +100,3 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
-
