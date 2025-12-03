@@ -106,7 +106,7 @@ impl SledInboxPersistence {
             let record: ProcessedEventRecord =
                 serde_json::from_slice(&value).context("Failed to deserialize processed record")?;
 
-            if now.saturating_sub(record.processed_at) > max_age_ms {
+            if now.saturating_sub(record.processed_at) >= max_age_ms {
                 to_remove.push(key.to_vec());
             }
         }

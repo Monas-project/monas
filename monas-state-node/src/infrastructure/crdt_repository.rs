@@ -15,6 +15,7 @@ use crsl_lib::crdt::storage::LeveldbStorage;
 use crsl_lib::graph::dag::DagGraph;
 use crsl_lib::graph::storage::{LeveldbNodeStorage, NodeStorage};
 use crsl_lib::repo::Repo;
+use crsl_lib::storage::SharedLeveldb;
 use multihash_codetable::{Code, MultihashDigest};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -49,9 +50,13 @@ impl CrslCrdtRepository {
         let base = base_path.as_ref();
         std::fs::create_dir_all(base).context("Failed to create CRDT storage directory")?;
 
-        let op_storage = LeveldbStorage::open(base.join("operations"))
-            .map_err(|e| anyhow::anyhow!("Failed to open operation storage: {}", e))?;
-        let node_storage = LeveldbNodeStorage::open(base.join("dag_nodes"));
+        // Use a single shared LevelDB instance for both operation and node storage
+        // This is required for transactions to work correctly
+        let shared_db = SharedLeveldb::open(base.join("crdt_db"))
+            .map_err(|e| anyhow::anyhow!("Failed to open shared LevelDB: {}", e))?;
+
+        let op_storage = LeveldbStorage::new(shared_db.clone());
+        let node_storage = LeveldbNodeStorage::new(shared_db);
 
         let state = CrdtState::new(op_storage);
         let dag = DagGraph::new(node_storage);
@@ -202,24 +207,47 @@ impl ContentRepository for CrslCrdtRepository {
             .map_err(|e| anyhow::anyhow!("Failed to get operations: {}", e))?;
 
         // Filter by since_version if provided
-        let since_timestamp = if let Some(since) = since_version {
+        // Find the index of the operation corresponding to since_version
+        let since_index = if let Some(since) = since_version {
             let since_cid = Self::parse_cid(since)?;
-            // Get the timestamp from the DAG node
-            if let Ok(Some(since_node)) = repo.dag.get_node(&since_cid) {
-                Some(since_node.timestamp())
+
+            // If since_version is the genesis CID, skip the first operation (Create)
+            if since_cid == genesis {
+                Some(1) // Skip index 1 (the Create operation)
             } else {
-                // If the node doesn't exist, return all operations
-                None
+                // Find the operation index by matching the DAG node timestamp
+                match repo.dag.get_node(&since_cid) {
+                    Ok(Some(since_node)) => {
+                        let since_ts = since_node.timestamp();
+                        // DAG node timestamps may be in seconds while operation timestamps are in nanoseconds
+                        // Convert to nanoseconds if the timestamp appears to be in seconds
+                        // Use the end of the second to include all operations within that second
+                        let since_ts_nanos = if since_ts < 1_000_000_000_000 {
+                            // Likely in seconds, convert to nanoseconds (end of that second)
+                            since_ts * 1_000_000_000 + 999_999_999
+                        } else {
+                            since_ts
+                        };
+                        // Find the operation with the closest timestamp <= since_ts
+                        indexed_ops
+                            .iter()
+                            .filter(|(_, op)| op.timestamp <= since_ts_nanos)
+                            .map(|(idx, _)| *idx)
+                            .max()
+                    }
+                    Ok(None) => None,
+                    Err(_) => None,
+                }
             }
         } else {
             None
         };
 
         let mut operations = Vec::new();
-        for (_, op) in indexed_ops {
-            // Skip operations at or before the since_version timestamp
-            if let Some(since_ts) = since_timestamp {
-                if op.timestamp <= since_ts {
+        for (idx, op) in indexed_ops {
+            // Skip operations at or before the since_version index
+            if let Some(since_idx) = since_index {
+                if idx <= since_idx {
                     continue;
                 }
             }
