@@ -5,4 +5,3 @@ pub mod key_wrapping;
 pub mod public_key_directory;
 pub mod repository;
 pub mod share_repository;
-pub mod state_node_client;

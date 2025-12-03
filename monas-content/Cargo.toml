@@ -8,10 +8,6 @@ rust-version.workspace = true
 [lib]
 path = "src/lib.rs"
 
-[[bin]]
-name = "generate_hpke_recipient_key"
-path = "src/bin/generate_hpke_recipient_key.rs"
-
 [dependencies]
 aes-gcm = "0.10.3"
 aes = "0.8"
