@@ -10,8 +10,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     application_service::content_service::{
-        ContentService, CreateContentCommand, CreateContentResult, DeleteContentCommand,
-        UpdateContentCommand,
+        ContentCreatedOperation, ContentDeletedOperation, ContentService, ContentUpdatedOperation,
+        CreateContentCommand, CreateContentResult, DeleteContentCommand, StateNodeClient,
+        StateNodeClientError, UpdateContentCommand,
     },
     domain::{content::ContentStatus, content_id::ContentId},
     infrastructure::{
@@ -19,11 +20,41 @@ use crate::{
         encryption::{Aes256CtrContentEncryption, OsRngContentEncryptionKeyGenerator},
         key_store::InMemoryContentEncryptionKeyStore,
         repository::InMemoryContentRepository,
-        state_node_client::NoopStateNodeClient,
     },
 };
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
+
+/// v1 用のダミー `StateNodeClient` 実装。
+/// 実際には何も送信せず、ログ出力だけ行う想定のため、ここでは単に `Ok(())` を返す。
+#[derive(Clone, Default)]
+struct NoopStateNodeClient;
+
+impl StateNodeClient for NoopStateNodeClient {
+    fn send_content_created(
+        &self,
+        _operation: &ContentCreatedOperation,
+    ) -> Result<(), StateNodeClientError> {
+        // TODO: 将来的にHTTPクライアントでstate-nodeのAPIを呼ぶ実装に差し替える。
+        Ok(())
+    }
+
+    fn send_content_updated(
+        &self,
+        _operation: &ContentUpdatedOperation,
+    ) -> Result<(), StateNodeClientError> {
+        // TODO: 将来的にHTTPクライアントでstate-nodeのAPIを呼ぶ実装に差し替える。
+        Ok(())
+    }
+
+    fn send_content_deleted(
+        &self,
+        _operation: &ContentDeletedOperation,
+    ) -> Result<(), StateNodeClientError> {
+        // TODO: 将来的にHTTPクライアントでstate-nodeのAPIを呼ぶ実装に差し替える。
+        Ok(())
+    }
+}
 
 #[derive(Clone)]
 struct AppState {

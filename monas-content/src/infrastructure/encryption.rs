@@ -210,7 +210,10 @@ mod tests {
         let plaintext = b"Secret message that should not be tampered with!";
 
         println!("\n========== TEST 1: Tampered Ciphertext ==========");
-        println!("Original Plaintext: {:?}", String::from_utf8_lossy(plaintext));
+        println!(
+            "Original Plaintext: {:?}",
+            String::from_utf8_lossy(plaintext)
+        );
         println!("Plaintext (hex):    {}", hex::encode(plaintext));
         println!("Plaintext length:   {} bytes", plaintext.len());
 
@@ -220,20 +223,39 @@ mod tests {
             .expect("encryption should succeed");
 
         println!("\n--- After Encryption ---");
-        println!("Ciphertext length:  {} bytes (IV: {} + data: {})",
-            ciphertext.len(), IV_LEN, ciphertext.len() - IV_LEN);
-        println!("IV (first 16 bytes):       {}", hex::encode(&ciphertext[0..IV_LEN]));
-        println!("Encrypted data (hex):      {}", hex::encode(&ciphertext[IV_LEN..]));
+        println!(
+            "Ciphertext length:  {} bytes (IV: {} + data: {})",
+            ciphertext.len(),
+            IV_LEN,
+            ciphertext.len() - IV_LEN
+        );
+        println!(
+            "IV (first 16 bytes):       {}",
+            hex::encode(&ciphertext[0..IV_LEN])
+        );
+        println!(
+            "Encrypted data (hex):      {}",
+            hex::encode(&ciphertext[IV_LEN..])
+        );
 
         // Tamper with part of the ciphertext (modify the first byte after IV)
         let original_byte = ciphertext[IV_LEN];
         println!("\n--- Before Tampering ---");
-        println!("Byte at position [IV_LEN=16]: 0x{:02x} ({})", original_byte, original_byte);
+        println!(
+            "Byte at position [IV_LEN=16]: 0x{:02x} ({})",
+            original_byte, original_byte
+        );
 
         ciphertext[IV_LEN] ^= 0x11; // Tampering by bit flipping
         println!("\n--- After Tampering ---");
-        println!("Byte at position [IV_LEN=16]: 0x{:02x} ({}) ← TAMPERED!", ciphertext[IV_LEN], ciphertext[IV_LEN]);
-        println!("Modified ciphertext (hex):     {}", hex::encode(&ciphertext[IV_LEN..]));
+        println!(
+            "Byte at position [IV_LEN=16]: 0x{:02x} ({}) ← TAMPERED!",
+            ciphertext[IV_LEN], ciphertext[IV_LEN]
+        );
+        println!(
+            "Modified ciphertext (hex):     {}",
+            hex::encode(&ciphertext[IV_LEN..])
+        );
 
         // Problem: Decryption "succeeds" even with tampered ciphertext
         let decrypted = encryptor
@@ -247,8 +269,14 @@ mod tests {
 
         // Due to tampering, the decrypted result differs from the original first byte
         println!("\n--- Verification ---");
-        println!("Original 1st byte:  0x{:02x} ({})", plaintext[0], plaintext[0] as char);
-        println!("Decrypted 1st byte: 0x{:02x} ({})", decrypted[0], decrypted[0] as char);
+        println!(
+            "Original 1st byte:  0x{:02x} ({})",
+            plaintext[0], plaintext[0] as char
+        );
+        println!(
+            "Decrypted 1st byte: 0x{:02x} ({})",
+            decrypted[0], decrypted[0] as char
+        );
         assert_ne!(decrypted[0], plaintext[0]);
         assert_ne!(&decrypted[..], &plaintext[..]);
         println!("OK: Decrypted data DIFFERS from original (as expected from tampering)");
