@@ -166,4 +166,3 @@ mod tests {
         assert!(registry.get_node("node-1").await.unwrap().is_none());
     }
 }
-

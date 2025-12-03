@@ -20,4 +20,3 @@ impl monas_event_manager::SerializableEvent for Event {
         "StateNodeEvent"
     }
 }
-
