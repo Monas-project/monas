@@ -139,6 +139,7 @@ enum SwarmCommand {
 }
 
 /// Pending requests tracking.
+#[derive(Default)]
 struct PendingRequests {
     capacity_queries: HashMap<OutboundRequestId, oneshot::Sender<Result<(u64, u64)>>>,
     content_fetches: HashMap<OutboundRequestId, oneshot::Sender<Result<Vec<u8>>>>,
@@ -147,19 +148,6 @@ struct PendingRequests {
     operation_fetches:
         HashMap<OutboundRequestId, oneshot::Sender<Result<Vec<SerializedOperation>>>>,
     operation_pushes: HashMap<OutboundRequestId, oneshot::Sender<Result<usize>>>,
-}
-
-impl Default for PendingRequests {
-    fn default() -> Self {
-        Self {
-            capacity_queries: HashMap::new(),
-            content_fetches: HashMap::new(),
-            kad_queries: HashMap::new(),
-            kad_provider_queries: HashMap::new(),
-            operation_fetches: HashMap::new(),
-            operation_pushes: HashMap::new(),
-        }
-    }
 }
 
 /// libp2p-based network implementation.
@@ -447,7 +435,7 @@ impl Libp2pNetwork {
         connected_peers: &Arc<RwLock<HashMap<PeerId, Vec<Multiaddr>>>>,
         event_tx: &broadcast::Sender<ReceivedEvent>,
         crdt_repo: &Arc<dyn ContentRepository>,
-        data_dir: &PathBuf,
+        data_dir: &std::path::Path,
         event: SwarmEvent<NodeBehaviourEvent>,
     ) {
         match event {
@@ -455,14 +443,14 @@ impl Libp2pNetwork {
                 Self::handle_kademlia_event(pending, kad_event).await;
             }
             SwarmEvent::Behaviour(NodeBehaviourEvent::Gossipsub(gossip_event)) => {
-                Self::handle_gossipsub_event(event_tx, gossip_event).await;
+                Self::handle_gossipsub_event(event_tx, *gossip_event).await;
             }
             SwarmEvent::Behaviour(NodeBehaviourEvent::RequestResponse(rr_event)) => {
                 Self::handle_request_response_event(swarm, pending, crdt_repo, data_dir, rr_event)
                     .await;
             }
             SwarmEvent::Behaviour(NodeBehaviourEvent::Identify(identify_event)) => {
-                Self::handle_identify_event(swarm, identify_event).await;
+                Self::handle_identify_event(swarm, *identify_event).await;
             }
             #[cfg(not(target_arch = "wasm32"))]
             SwarmEvent::Behaviour(NodeBehaviourEvent::Mdns(mdns_event)) => {
@@ -594,7 +582,7 @@ impl Libp2pNetwork {
         swarm: &mut Swarm<NodeBehaviour>,
         pending: &mut PendingRequests,
         crdt_repo: &Arc<dyn ContentRepository>,
-        data_dir: &PathBuf,
+        data_dir: &std::path::Path,
         event: request_response::Event<ContentRequest, ContentResponse>,
     ) {
         match event {
@@ -636,7 +624,7 @@ impl Libp2pNetwork {
         request: ContentRequest,
         channel: ResponseChannel<ContentResponse>,
         crdt_repo: &Arc<dyn ContentRepository>,
-        data_dir: &PathBuf,
+        data_dir: &std::path::Path,
     ) {
         debug!("Received request from {}: {:?}", peer, request);
 
@@ -819,34 +807,31 @@ impl Libp2pNetwork {
     }
 
     async fn handle_identify_event(swarm: &mut Swarm<NodeBehaviour>, event: identify::Event) {
-        match event {
-            identify::Event::Received { peer_id, info, .. } => {
-                info!(
-                    "Identified peer {}: {} with {} addresses",
-                    peer_id,
-                    info.agent_version,
-                    info.listen_addrs.len()
-                );
-                // Add peer's addresses to Kademlia
-                for addr in &info.listen_addrs {
-                    swarm
-                        .behaviour_mut()
-                        .kademlia
-                        .add_address(&peer_id, addr.clone());
-                }
-
-                // Try to bootstrap Kademlia now that we have a peer
-                // This is important for the first node to populate its routing table
-                if let Err(e) = swarm.behaviour_mut().kademlia.bootstrap() {
-                    debug!("Kademlia bootstrap attempt: {:?}", e);
-                } else {
-                    info!(
-                        "Triggered Kademlia bootstrap after identifying peer {}",
-                        peer_id
-                    );
-                }
+        if let identify::Event::Received { peer_id, info, .. } = event {
+            info!(
+                "Identified peer {}: {} with {} addresses",
+                peer_id,
+                info.agent_version,
+                info.listen_addrs.len()
+            );
+            // Add peer's addresses to Kademlia
+            for addr in &info.listen_addrs {
+                swarm
+                    .behaviour_mut()
+                    .kademlia
+                    .add_address(&peer_id, addr.clone());
             }
-            _ => {}
+
+            // Try to bootstrap Kademlia now that we have a peer
+            // This is important for the first node to populate its routing table
+            if let Err(e) = swarm.behaviour_mut().kademlia.bootstrap() {
+                debug!("Kademlia bootstrap attempt: {:?}", e);
+            } else {
+                info!(
+                    "Triggered Kademlia bootstrap after identifying peer {}",
+                    peer_id
+                );
+            }
         }
     }
 

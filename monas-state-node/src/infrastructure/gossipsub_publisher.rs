@@ -139,6 +139,7 @@ mod tests {
     use std::collections::HashMap;
 
     /// Mock PeerNetwork for testing.
+    #[allow(clippy::type_complexity)]
     struct MockPeerNetwork {
         published_events: Arc<tokio::sync::Mutex<Vec<(String, Vec<u8>)>>>,
     }

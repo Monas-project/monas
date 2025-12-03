@@ -4,12 +4,11 @@ use crate::domain::content_network::ContentNetwork;
 use crate::domain::events::{current_timestamp, Event};
 use crate::domain::state_node::{self, NodeSnapshot};
 use crate::infrastructure::placement::compute_dht_key;
+use crate::port::content_repository::ContentRepository;
 use crate::port::event_publisher::EventPublisher;
 use crate::port::peer_network::PeerNetwork;
 use crate::port::persistence::{PersistentContentRepository, PersistentNodeRegistry};
 use anyhow::Result;
-use cid::Cid;
-use multihash_codetable::{Code, MultihashDigest};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -28,45 +27,61 @@ pub enum ApplyOutcome {
 ///
 /// This service provides high-level operations for managing state nodes,
 /// content networks, and event publishing.
-pub struct StateNodeService<N, C, P, E>
+pub struct StateNodeService<N, C, P, E, R>
 where
     N: PersistentNodeRegistry,
     C: PersistentContentRepository,
     P: PeerNetwork,
     E: EventPublisher,
+    R: ContentRepository,
 {
     node_registry: Arc<tokio::sync::RwLock<N>>,
     content_repo: Arc<tokio::sync::RwLock<C>>,
     peer_network: Arc<P>,
     event_publisher: Arc<E>,
+    crdt_repo: Arc<R>,
     local_node_id: String,
 }
 
-impl<N, C, P, E> StateNodeService<N, C, P, E>
+impl<N, C, P, E, R> StateNodeService<N, C, P, E, R>
 where
     N: PersistentNodeRegistry,
     C: PersistentContentRepository,
     P: PeerNetwork,
     E: EventPublisher,
+    R: ContentRepository,
 {
     /// Create a new StateNodeService.
     ///
     /// The `peer_network` is passed as an `Arc` to allow sharing with other components
     /// (e.g., GossipsubEventPublisher).
+    /// The `content_repo` is passed as `Arc<RwLock<C>>` to allow sharing with ContentSyncService.
     pub fn new(
         node_registry: N,
-        content_repo: C,
+        content_repo: Arc<tokio::sync::RwLock<C>>,
         peer_network: Arc<P>,
         event_publisher: E,
+        crdt_repo: Arc<R>,
         local_node_id: String,
     ) -> Self {
         Self {
             node_registry: Arc::new(tokio::sync::RwLock::new(node_registry)),
-            content_repo: Arc::new(tokio::sync::RwLock::new(content_repo)),
+            content_repo,
             peer_network,
             event_publisher: Arc::new(event_publisher),
+            crdt_repo,
             local_node_id,
         }
+    }
+
+    /// Get the content network repository.
+    pub fn content_repo(&self) -> &Arc<tokio::sync::RwLock<C>> {
+        &self.content_repo
+    }
+
+    /// Get the CRDT repository.
+    pub fn crdt_repo(&self) -> &Arc<R> {
+        &self.crdt_repo
     }
 
     /// Get the local node ID.
@@ -100,12 +115,14 @@ where
     /// The content will be assigned to other nodes in the network (not the creator).
     /// At least one member node must be available for the content to be created.
     pub async fn create_content(&self, data: &[u8]) -> Result<Event> {
-        // Generate CID from content
-        let mh = Code::Sha2_256.digest(data);
-        let cid = Cid::new_v1(0x55, mh);
-        let content_id = cid.to_string();
+        // 1. Save content to CRDT repository first
+        let commit_result = self
+            .crdt_repo
+            .create_content(data, &self.local_node_id)
+            .await?;
+        let content_id = commit_result.genesis_cid;
 
-        // Find closest peers for content placement
+        // 2. Find closest peers for content placement
         let key = compute_dht_key(&content_id);
         let k = 3usize;
         let closest = self.peer_network.find_closest_peers(key, k).await?;
@@ -131,7 +148,7 @@ where
             ));
         }
 
-        // Create content network
+        // 3. Create content network
         let network = ContentNetwork {
             content_id: content_id.clone(),
             member_nodes: selected.iter().cloned().collect(),
@@ -142,7 +159,7 @@ where
             .save_content_network(network)
             .await?;
 
-        // Create and publish event both locally and to the network
+        // 4. Create and publish event both locally and to the network
         let event = Event::ContentCreated {
             content_id,
             creator_node_id: self.local_node_id.clone(),
@@ -157,8 +174,8 @@ where
     }
 
     /// Update existing content.
-    pub async fn update_content(&self, content_id: &str, _data: &[u8]) -> Result<Event> {
-        // Verify content network exists
+    pub async fn update_content(&self, content_id: &str, data: &[u8]) -> Result<Event> {
+        // 1. Verify content network exists
         let network = self
             .content_repo
             .read()
@@ -167,7 +184,7 @@ where
             .await?
             .ok_or_else(|| anyhow::anyhow!("Content network not found: {}", content_id))?;
 
-        // Verify local node is a member
+        // 2. Verify local node is a member
         if !network.member_nodes.contains(&self.local_node_id) {
             return Err(anyhow::anyhow!(
                 "Local node {} is not a member of content network {}",
@@ -176,7 +193,12 @@ where
             ));
         }
 
-        // Create and publish update event both locally and to the network
+        // 3. Update content in CRDT repository
+        self.crdt_repo
+            .update_content(content_id, data, &self.local_node_id)
+            .await?;
+
+        // 4. Create and publish update event both locally and to the network
         let event = Event::ContentUpdated {
             content_id: content_id.to_string(),
             updated_node_id: self.local_node_id.clone(),

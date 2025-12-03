@@ -86,6 +86,8 @@ async fn main() -> Result<()> {
         http_addr: args.listen,
         network_config,
         node_id: args.node_id,
+        sync_interval_secs: 30,
+        outbox_retry_interval_secs: 10,
     };
 
     // Create and run the node

@@ -15,27 +15,29 @@ use monas_state_node::port::content_repository::ContentRepository;
 use monas_state_node::port::peer_network::PeerNetwork;
 use std::sync::Arc;
 use tempfile::TempDir;
+use tokio::sync::RwLock;
+
+/// Type alias for the test service.
+type TestService = StateNodeService<
+    SledNodeRegistry,
+    SledContentNetworkRepository,
+    Libp2pNetwork,
+    EventBusPublisher,
+    CrslCrdtRepository,
+>;
 
 /// Create a test service with temporary storage and real libp2p network.
-async fn create_test_service() -> (
-    Arc<
-        StateNodeService<
-            SledNodeRegistry,
-            SledContentNetworkRepository,
-            Libp2pNetwork,
-            EventBusPublisher,
-        >,
-    >,
-    TempDir,
-) {
+async fn create_test_service() -> (Arc<TestService>, Arc<CrslCrdtRepository>, TempDir) {
     let temp_dir = TempDir::new().unwrap();
 
     let node_registry = SledNodeRegistry::open(temp_dir.path().join("nodes")).unwrap();
-    let content_repo = SledContentNetworkRepository::open(temp_dir.path().join("content")).unwrap();
+    let content_repo = Arc::new(RwLock::new(
+        SledContentNetworkRepository::open(temp_dir.path().join("content")).unwrap(),
+    ));
 
-    // Create CRDT repository for the network
-    let crdt_repo: Arc<dyn ContentRepository> =
-        Arc::new(CrslCrdtRepository::open(temp_dir.path().join("crdt")).unwrap());
+    // Create CRDT repository for the network and service
+    let crdt_repo = Arc::new(CrslCrdtRepository::open(temp_dir.path().join("crdt")).unwrap());
+    let crdt_repo_dyn: Arc<dyn ContentRepository> = crdt_repo.clone();
     let data_dir = temp_dir.path().to_path_buf();
 
     // Use minimal network config for testing (localhost only, no mDNS to avoid interference)
@@ -47,7 +49,7 @@ async fn create_test_service() -> (
     };
 
     let network = Arc::new(
-        Libp2pNetwork::new(network_config, crdt_repo, data_dir)
+        Libp2pNetwork::new(network_config, crdt_repo_dyn, data_dir)
             .await
             .unwrap(),
     );
@@ -62,15 +64,16 @@ async fn create_test_service() -> (
         content_repo,
         network,
         event_publisher,
+        crdt_repo.clone(),
         node_id,
     ));
 
-    (service, temp_dir)
+    (service, crdt_repo, temp_dir)
 }
 
 #[tokio::test]
 async fn test_register_node() {
-    let (service, _temp_dir) = create_test_service().await;
+    let (service, _crdt_repo, _temp_dir) = create_test_service().await;
 
     // Register the local node
     let (snapshot, events) = service.register_node(1000).await.unwrap();
@@ -87,7 +90,7 @@ async fn test_register_node() {
 
 #[tokio::test]
 async fn test_create_content() {
-    let (service, _temp_dir) = create_test_service().await;
+    let (service, _crdt_repo, _temp_dir) = create_test_service().await;
 
     // First register the local node so it can be assigned content
     service.register_node(10000).await.unwrap();
@@ -129,7 +132,7 @@ async fn test_create_content() {
 
 #[tokio::test]
 async fn test_list_nodes() {
-    let (service, _temp_dir) = create_test_service().await;
+    let (service, _crdt_repo, _temp_dir) = create_test_service().await;
 
     // Register some nodes
     service.register_node(1000).await.unwrap();
@@ -141,7 +144,7 @@ async fn test_list_nodes() {
 
 #[tokio::test]
 async fn test_list_content_networks() {
-    let (service, _temp_dir) = create_test_service().await;
+    let (service, _crdt_repo, _temp_dir) = create_test_service().await;
 
     // Register the local node first
     service.register_node(10000).await.unwrap();
@@ -174,7 +177,7 @@ async fn test_list_content_networks() {
 
 #[tokio::test]
 async fn test_handle_sync_event() {
-    let (service, _temp_dir) = create_test_service().await;
+    let (service, _crdt_repo, _temp_dir) = create_test_service().await;
 
     // Create a NodeCreated event
     let event = Event::NodeCreated {
@@ -199,7 +202,7 @@ async fn test_handle_sync_event() {
 
 #[tokio::test]
 async fn test_handle_content_created_sync() {
-    let (service, _temp_dir) = create_test_service().await;
+    let (service, _crdt_repo, _temp_dir) = create_test_service().await;
 
     // Create a ContentCreated event from another node
     let event = Event::ContentCreated {
@@ -226,4 +229,159 @@ async fn test_handle_content_created_sync() {
     let network = network.unwrap();
     assert!(network.member_nodes.contains("node-a"));
     assert!(network.member_nodes.contains("node-b"));
+}
+
+// ============================================================================
+// CRDT Integration Tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_crdt_create_and_get_content() {
+    let (_service, crdt_repo, _temp_dir) = create_test_service().await;
+
+    // Create content directly in CRDT repository
+    let data = b"Test CRDT content";
+    let result = crdt_repo.create_content(data, "test-author").await.unwrap();
+
+    assert!(result.is_new);
+    assert!(!result.genesis_cid.is_empty());
+
+    // Retrieve the content
+    let retrieved = crdt_repo.get_latest(&result.genesis_cid).await.unwrap();
+    assert_eq!(retrieved, Some(data.to_vec()));
+}
+
+#[tokio::test]
+async fn test_crdt_update_content() {
+    let (_service, crdt_repo, _temp_dir) = create_test_service().await;
+
+    // Create initial content
+    let initial_data = b"Initial content";
+    let result = crdt_repo
+        .create_content(initial_data, "author1")
+        .await
+        .unwrap();
+
+    // Update the content
+    let updated_data = b"Updated content";
+    let update_result = crdt_repo
+        .update_content(&result.genesis_cid, updated_data, "author1")
+        .await
+        .unwrap();
+
+    assert!(!update_result.is_new);
+    assert_eq!(update_result.genesis_cid, result.genesis_cid);
+
+    // Verify the update
+    let retrieved = crdt_repo.get_latest(&result.genesis_cid).await.unwrap();
+    assert_eq!(retrieved, Some(updated_data.to_vec()));
+}
+
+#[tokio::test]
+async fn test_crdt_version_history() {
+    let (_service, crdt_repo, _temp_dir) = create_test_service().await;
+
+    // Create content
+    let data1 = b"Version 1";
+    let result = crdt_repo.create_content(data1, "author").await.unwrap();
+
+    // Small delay to ensure different timestamps
+    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+    // Update content
+    let data2 = b"Version 2";
+    crdt_repo
+        .update_content(&result.genesis_cid, data2, "author")
+        .await
+        .unwrap();
+
+    // Get history
+    let history = crdt_repo.get_history(&result.genesis_cid).await.unwrap();
+    assert_eq!(history.len(), 2);
+}
+
+#[tokio::test]
+async fn test_crdt_get_operations() {
+    let (_service, crdt_repo, _temp_dir) = create_test_service().await;
+
+    // Create content
+    let data = b"Test content";
+    let result = crdt_repo.create_content(data, "author").await.unwrap();
+
+    // Get operations
+    let operations = crdt_repo
+        .get_operations(&result.genesis_cid, None)
+        .await
+        .unwrap();
+    assert!(!operations.is_empty());
+    assert_eq!(operations[0].genesis_cid, result.genesis_cid);
+}
+
+#[tokio::test]
+async fn test_crdt_apply_operations() {
+    let temp_dir1 = TempDir::new().unwrap();
+    let temp_dir2 = TempDir::new().unwrap();
+
+    // Create two separate CRDT repositories (simulating two nodes)
+    let repo1 = Arc::new(CrslCrdtRepository::open(temp_dir1.path().join("crdt")).unwrap());
+    let repo2 = Arc::new(CrslCrdtRepository::open(temp_dir2.path().join("crdt")).unwrap());
+
+    // Create content in repo1
+    let data = b"Shared content";
+    let result = repo1.create_content(data, "node1").await.unwrap();
+
+    // Get operations from repo1
+    let operations = repo1
+        .get_operations(&result.genesis_cid, None)
+        .await
+        .unwrap();
+
+    // Apply operations to repo2
+    let applied = repo2.apply_operations(&operations).await.unwrap();
+    assert_eq!(applied, 1);
+
+    // Verify content exists in repo2
+    let retrieved = repo2.get_latest(&result.genesis_cid).await.unwrap();
+    assert_eq!(retrieved, Some(data.to_vec()));
+}
+
+#[tokio::test]
+async fn test_crdt_since_version_filtering() {
+    let (_service, crdt_repo, _temp_dir) = create_test_service().await;
+
+    // Create content with multiple versions
+    let data1 = b"Version 1";
+    let result = crdt_repo.create_content(data1, "author").await.unwrap();
+    let first_version = result.version_cid.clone();
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+    let data2 = b"Version 2";
+    crdt_repo
+        .update_content(&result.genesis_cid, data2, "author")
+        .await
+        .unwrap();
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+    let data3 = b"Version 3";
+    crdt_repo
+        .update_content(&result.genesis_cid, data3, "author")
+        .await
+        .unwrap();
+
+    // Get all operations
+    let all_ops = crdt_repo
+        .get_operations(&result.genesis_cid, None)
+        .await
+        .unwrap();
+    assert_eq!(all_ops.len(), 3);
+
+    // Get operations since first version
+    let filtered_ops = crdt_repo
+        .get_operations(&result.genesis_cid, Some(&first_version))
+        .await
+        .unwrap();
+    // Should only include operations after the first version
+    assert_eq!(filtered_ops.len(), 2);
 }

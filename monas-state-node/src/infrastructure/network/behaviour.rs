@@ -43,9 +43,9 @@ pub struct NodeBehaviour {
 #[derive(Debug)]
 pub enum NodeBehaviourEvent {
     Kademlia(kad::Event),
-    Gossipsub(gossipsub::Event),
+    Gossipsub(Box<gossipsub::Event>),
     RequestResponse(request_response::Event<ContentRequest, ContentResponse>),
-    Identify(identify::Event),
+    Identify(Box<identify::Event>),
     #[cfg(not(target_arch = "wasm32"))]
     Mdns(mdns::Event),
 }
@@ -58,7 +58,7 @@ impl From<kad::Event> for NodeBehaviourEvent {
 
 impl From<gossipsub::Event> for NodeBehaviourEvent {
     fn from(event: gossipsub::Event) -> Self {
-        NodeBehaviourEvent::Gossipsub(event)
+        NodeBehaviourEvent::Gossipsub(Box::new(event))
     }
 }
 
@@ -70,7 +70,7 @@ impl From<request_response::Event<ContentRequest, ContentResponse>> for NodeBeha
 
 impl From<identify::Event> for NodeBehaviourEvent {
     fn from(event: identify::Event) -> Self {
-        NodeBehaviourEvent::Identify(event)
+        NodeBehaviourEvent::Identify(Box::new(event))
     }
 }
 

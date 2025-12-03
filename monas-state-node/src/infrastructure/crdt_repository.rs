@@ -188,7 +188,7 @@ impl ContentRepository for CrslCrdtRepository {
     async fn get_operations(
         &self,
         genesis_cid: &str,
-        _since_version: Option<&str>,
+        since_version: Option<&str>,
     ) -> Result<Vec<SerializedOperation>> {
         let genesis = Self::parse_cid(genesis_cid)?;
 
@@ -201,8 +201,29 @@ impl ContentRepository for CrslCrdtRepository {
             .get_operations_with_index(&genesis)
             .map_err(|e| anyhow::anyhow!("Failed to get operations: {}", e))?;
 
+        // Filter by since_version if provided
+        let since_timestamp = if let Some(since) = since_version {
+            let since_cid = Self::parse_cid(since)?;
+            // Get the timestamp from the DAG node
+            if let Ok(Some(since_node)) = repo.dag.get_node(&since_cid) {
+                Some(since_node.timestamp())
+            } else {
+                // If the node doesn't exist, return all operations
+                None
+            }
+        } else {
+            None
+        };
+
         let mut operations = Vec::new();
         for (_, op) in indexed_ops {
+            // Skip operations at or before the since_version timestamp
+            if let Some(since_ts) = since_timestamp {
+                if op.timestamp <= since_ts {
+                    continue;
+                }
+            }
+
             // Serialize the operation using serde_json for network transfer
             let serialized = serde_json::to_vec(&op)
                 .map_err(|e| anyhow::anyhow!("Failed to serialize operation: {}", e))?;
