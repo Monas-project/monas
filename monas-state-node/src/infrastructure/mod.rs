@@ -3,7 +3,6 @@ pub mod disk_capacity;
 pub mod event_adapters;
 pub mod event_bus_publisher;
 pub mod gossipsub_publisher;
-pub mod http_api;
 pub mod inbox_persistence;
 pub mod network;
 pub mod outbox_persistence;

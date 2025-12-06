@@ -9,8 +9,6 @@ use crate::infrastructure::crdt_repository::CrslCrdtRepository;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::infrastructure::gossipsub_publisher::GossipsubEventPublisher;
 #[cfg(not(target_arch = "wasm32"))]
-use crate::infrastructure::http_api::{create_router, AppState};
-#[cfg(not(target_arch = "wasm32"))]
 use crate::infrastructure::inbox_persistence::SledInboxPersistence;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::infrastructure::network::{Libp2pNetwork, Libp2pNetworkConfig};
@@ -24,6 +22,8 @@ use crate::infrastructure::reliable_event_publisher::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 use crate::port::peer_network::PeerNetwork;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::presentation::http_api::{create_router, AppState};
 #[cfg(not(target_arch = "wasm32"))]
 use anyhow::{Context, Result};
 #[cfg(not(target_arch = "wasm32"))]
