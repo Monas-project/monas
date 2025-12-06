@@ -1,6 +1,6 @@
+use crate::domain::content_id::{ContentId, ContentIdGenerator};
+use crate::domain::encryption::{ContentEncryption, ContentEncryptionKey};
 use crate::domain::metadata::Metadata;
-use dyn_clone::DynClone;
-use std::fmt::Debug;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContentStatus {
@@ -25,19 +25,13 @@ pub enum ContentEvent {
     Deleted,
 }
 
-pub trait ContentKeyPair: Debug + Send + Sync + DynClone {
-    fn encrypt(&self, data: &[u8]) -> Vec<u8>;
-    fn decrypt(&self, data: &[u8]) -> Vec<u8>;
-    fn public_key(&self) -> String;
-}
-dyn_clone::clone_trait_object!(ContentKeyPair);
-
 #[derive(Debug, Clone)]
 pub struct Content {
+    id: ContentId,
+    series_id: ContentId,
     metadata: Metadata,
     raw_content: Option<Vec<u8>>,
     encrypted_content: Option<Vec<u8>>,
-    key_pair: Option<Box<dyn ContentKeyPair>>,
     is_deleted: bool,
     content_status: ContentStatus,
     // TODO: 必要性があるかもしれないので追加した
@@ -45,40 +39,56 @@ pub struct Content {
 }
 
 impl Content {
-    pub fn new(
+    #[cfg(test)]
+    pub(crate) fn new(
+        id: ContentId,
         metadata: Metadata,
         raw_content: Option<Vec<u8>>,
         encrypted_content: Option<Vec<u8>>,
-        key_pair: Option<Box<dyn ContentKeyPair>>,
         is_deleted: bool,
     ) -> Self {
         // TODO: 事前条件を追加する
 
         Self {
+            id: id.clone(),
+            series_id: id,
             metadata,
             raw_content,
             encrypted_content,
-            key_pair,
             is_deleted,
             content_status: ContentStatus::Active,
         }
     }
 
-    pub fn create(
+    pub fn create<G, E>(
         name: String,
         raw_content: Vec<u8>,
         path: String,
-        key_pair: Box<dyn ContentKeyPair>,
-    ) -> Result<(Self, ContentEvent), ContentError> {
-        let metadata = Metadata::new(name, &raw_content, path);
+        id_generator: &G,
+        key: &ContentEncryptionKey,
+        encryption: &E,
+    ) -> Result<(Self, ContentEvent), ContentError>
+    where
+        G: ContentIdGenerator,
+        E: ContentEncryption,
+    {
+        let cid = id_generator.generate(&raw_content);
+        let metadata = Metadata::new(name, path, cid.clone());
 
-        let encrypted_content = key_pair.encrypt(&raw_content);
+        if key.0.is_empty() {
+            return Err(ContentError::EncryptionError(
+                "Missing content encryption key".to_string(),
+            ));
+        }
+
+        let encrypted_content = encryption.encrypt(key, &raw_content)?;
 
         let content = Self {
+            id: cid.clone(),
+            series_id: cid,
             metadata,
             raw_content: Some(raw_content),
             encrypted_content: Some(encrypted_content),
-            key_pair: Some(key_pair),
             is_deleted: false,
             content_status: ContentStatus::Active,
         };
@@ -86,27 +96,72 @@ impl Content {
         Ok((content, ContentEvent::Created))
     }
 
-    pub fn update(
+    /// コンテンツ本体（バイナリ）のみを更新する。
+    ///
+    /// - name / path / series_id は変更しない
+    /// - `id` は新しいバイナリから再計算される（コンテンツアドレス化）
+    /// - `metadata.updated_at` は現在時刻に更新される
+    pub fn update_content<G, E>(
         &self,
         raw_content: Vec<u8>,
-        key_pair: Option<Box<dyn ContentKeyPair>>,
-    ) -> Result<(Self, ContentEvent), ContentError> {
+        id_generator: &G,
+        key: &ContentEncryptionKey,
+        encryption: &E,
+    ) -> Result<(Self, ContentEvent), ContentError>
+    where
+        G: ContentIdGenerator,
+        E: ContentEncryption,
+    {
         if self.is_deleted {
             return Err(ContentError::AlreadyDeleted);
         }
 
-        let key_pair = key_pair.unwrap_or_else(|| self.key_pair.clone().unwrap());
-        let encrypted_content = key_pair.encrypt(&raw_content);
+        if key.0.is_empty() {
+            return Err(ContentError::EncryptionError(
+                "Missing content encryption key".to_string(),
+            ));
+        }
 
-        let new_metadata = self.metadata.clone();
+        let encrypted_content = encryption.encrypt(key, &raw_content)?;
+
+        // 新しいコンテンツ本体に対して ContentId を再計算する。
+        let new_id = id_generator.generate(&raw_content);
+
+        // 現在の ID を新しい ID に差し替えつつ、updated_at を更新する。
+        let new_metadata = self.metadata.with_new_id(new_id.clone());
 
         let content = Self {
+            id: new_id,
+            series_id: self.series_id.clone(),
             metadata: new_metadata,
             raw_content: Some(raw_content),
             encrypted_content: Some(encrypted_content),
-            key_pair: Some(key_pair),
             is_deleted: false,
             content_status: ContentStatus::Active,
+        };
+
+        Ok((content, ContentEvent::Updated))
+    }
+
+    /// コンテンツ名のみを変更する。
+    ///
+    /// - バイナリや暗号化データは変更しない
+    /// - `metadata.updated_at` は現在時刻に更新される
+    pub fn rename(&self, new_name: String) -> Result<(Self, ContentEvent), ContentError> {
+        if self.is_deleted {
+            return Err(ContentError::AlreadyDeleted);
+        }
+
+        let new_metadata = self.metadata.rename(new_name);
+
+        let content = Self {
+            id: self.id.clone(),
+            series_id: self.series_id.clone(),
+            metadata: new_metadata,
+            raw_content: self.raw_content.clone(),
+            encrypted_content: self.encrypted_content.clone(),
+            is_deleted: self.is_deleted,
+            content_status: self.content_status.clone(),
         };
 
         Ok((content, ContentEvent::Updated))
@@ -118,11 +173,15 @@ impl Content {
             return Err(ContentError::AlreadyDeleted);
         }
 
+        // 削除操作も更新の一種なので updated_at を進める
+        let new_metadata = self.metadata.touch();
+
         let content = Self {
-            metadata: self.metadata.clone(),
+            id: self.id.clone(),
+            series_id: self.series_id.clone(),
+            metadata: new_metadata,
             raw_content: None,
             encrypted_content: None,
-            key_pair: self.key_pair.clone(),
             is_deleted: true,
             content_status: ContentStatus::Deleted,
         };
@@ -130,22 +189,42 @@ impl Content {
         Ok((content, ContentEvent::Deleted))
     }
 
-    pub fn decrypt(&self) -> Result<Vec<u8>, ContentError> {
+    pub fn decrypt<E>(
+        &self,
+        key: &ContentEncryptionKey,
+        encryption: &E,
+    ) -> Result<Vec<u8>, ContentError>
+    where
+        E: ContentEncryption,
+    {
         if self.is_deleted {
             return Err(ContentError::AlreadyDeleted);
         }
 
-        if let (Some(encrypted), Some(key)) = (&self.encrypted_content, &self.key_pair) {
-            Ok(key.decrypt(encrypted))
-        } else {
+        if self.encrypted_content.is_none() {
             Err(ContentError::DecryptionError(
-                "Missing encrypted content or key pair".to_string(),
+                "Missing encrypted content".to_string(),
             ))
+        } else if key.0.is_empty() {
+            Err(ContentError::DecryptionError(
+                "Missing content encryption key".to_string(),
+            ))
+        } else {
+            let encrypted = self.encrypted_content.as_ref().unwrap();
+            encryption.decrypt(key, encrypted)
         }
     }
 
     pub fn metadata(&self) -> &Metadata {
         &self.metadata
+    }
+
+    pub fn id(&self) -> &ContentId {
+        &self.id
+    }
+
+    pub fn series_id(&self) -> &ContentId {
+        &self.series_id
     }
 
     pub fn raw_content(&self) -> Option<&Vec<u8>> {
@@ -154,10 +233,6 @@ impl Content {
 
     pub fn encrypted_content(&self) -> Option<&Vec<u8>> {
         self.encrypted_content.as_ref()
-    }
-
-    pub fn key_pair(&self) -> Option<&dyn ContentKeyPair> {
-        self.key_pair.as_deref()
     }
 
     pub fn is_deleted(&self) -> bool {
@@ -170,61 +245,74 @@ impl Content {
 }
 
 #[cfg(test)]
-mod mock {
-    use super::*;
-
-    pub struct MockContentKeyPairFactory;
-
-    impl MockContentKeyPairFactory {
-        pub fn create_key_pair(id: &str) -> Box<dyn ContentKeyPair> {
-            Box::new(MockKeyPair { id: id.to_string() })
-        }
-    }
-
-    #[derive(Debug, Clone)]
-    pub struct MockKeyPair {
-        pub id: String,
-    }
-
-    impl ContentKeyPair for MockKeyPair {
-        fn encrypt(&self, data: &[u8]) -> Vec<u8> {
-            // 簡易的な暗号化: データの各バイトに1を加算
-            data.iter().map(|b| b.wrapping_add(1)).collect()
-        }
-
-        fn decrypt(&self, data: &[u8]) -> Vec<u8> {
-            // 簡易的な復号化: データの各バイトから1を減算
-            data.iter().map(|b| b.wrapping_sub(1)).collect()
-        }
-
-        fn public_key(&self) -> String {
-            format!("mock_public_key_{}", self.id)
-        }
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::content_id::{ContentId, ContentIdGenerator};
+    use crate::domain::encryption::{ContentEncryption, ContentEncryptionKey};
+
+    /// テスト用の単純な暗号化実装。
+    /// encrypt: 各バイトに +1, decrypt: 各バイトに -1。
+    #[derive(Debug, Clone)]
+    struct MockEncryption;
+
+    impl ContentEncryption for MockEncryption {
+        fn encrypt(
+            &self,
+            _key: &ContentEncryptionKey,
+            plaintext: &[u8],
+        ) -> Result<Vec<u8>, ContentError> {
+            Ok(plaintext.iter().map(|b| b.wrapping_add(1)).collect())
+        }
+
+        fn decrypt(
+            &self,
+            _key: &ContentEncryptionKey,
+            ciphertext: &[u8],
+        ) -> Result<Vec<u8>, ContentError> {
+            Ok(ciphertext.iter().map(|b| b.wrapping_sub(1)).collect())
+        }
+    }
 
     fn create_test_metadata() -> Metadata {
         Metadata::new(
             "test_content".to_string(),
-            b"test content data",
             "test/path".to_string(),
+            ContentId::new("test-content-id".into()),
         )
     }
 
+    fn test_key_and_cipher() -> (ContentEncryptionKey, MockEncryption) {
+        (ContentEncryptionKey(vec![1, 2, 3]), MockEncryption)
+    }
+
+    #[derive(Debug, Clone)]
+    struct MockIdGenerator;
+
+    impl ContentIdGenerator for MockIdGenerator {
+        fn generate(&self, raw_content: &[u8]) -> ContentId {
+            // テスト用の単純な ID 生成: 長さに応じて異なる ID を返す。
+            ContentId::new(format!("test-content-id-{}", raw_content.len()))
+        }
+    }
+
     #[test]
-    fn test_content_lifecycle() {
-        // Test: Content::create()
+    fn create_sets_initial_state() {
+        let (key, encryption) = test_key_and_cipher();
+        let id_gen = MockIdGenerator;
+
         let name = "test document".to_string();
         let raw_data = b"This is test content".to_vec();
         let path = "documents/test.txt".to_string();
-        let key_pair = mock::MockContentKeyPairFactory::create_key_pair("test");
 
-        let (content, event) =
-            Content::create(name.clone(), raw_data.clone(), path.clone(), key_pair).unwrap();
+        let (content, event) = Content::create(
+            name.clone(),
+            raw_data.clone(),
+            path.clone(),
+            &id_gen,
+            &key,
+            &encryption,
+        )
+        .unwrap();
 
         assert_eq!(content.metadata().name(), &name);
         assert_eq!(content.metadata().path(), &path);
@@ -233,90 +321,181 @@ mod tests {
         assert_eq!(content.content_status(), &ContentStatus::Active);
         assert_eq!(event, ContentEvent::Created);
         assert!(content.encrypted_content().is_some());
+        assert!(content.id().as_str().starts_with("test-content-id-"));
+        assert_eq!(content.id(), content.series_id());
+    }
 
-        // Test: Content::update()
+    #[test]
+    fn update_changes_raw_content_and_keeps_path() {
+        let (key, encryption) = test_key_and_cipher();
+        let id_gen = MockIdGenerator;
+
+        let (content, _) = Content::create(
+            "test".to_string(),
+            b"old".to_vec(),
+            "path.txt".to_string(),
+            &id_gen,
+            &key,
+            &encryption,
+        )
+        .unwrap();
+
         let updated_data = b"Updated content".to_vec();
-        let (updated_content, event) = content.update(updated_data.clone(), None).unwrap();
+        let (updated_content, event) = content
+            .update_content(updated_data.clone(), &id_gen, &key, &encryption)
+            .unwrap();
 
         assert_eq!(updated_content.raw_content().unwrap(), &updated_data);
         assert_eq!(event, ContentEvent::Updated);
         assert_eq!(updated_content.metadata().path(), content.metadata().path());
+        assert_ne!(updated_content.id(), content.id());
+        assert_eq!(updated_content.series_id(), content.series_id());
+    }
 
-        // Test: Content::delete()
-        let (deleted_content, event) = updated_content.delete().unwrap();
+    #[test]
+    fn rename_updates_name_and_metadata_timestamp() {
+        let metadata = create_test_metadata();
+        let content = Content::new(
+            ContentId::new("test-content-id".into()),
+            metadata,
+            None,
+            None,
+            false,
+        );
+
+        let before_updated_at = content.metadata().updated_at();
+        let (renamed, event) = content.rename("new_name".to_string()).unwrap();
+
+        assert_eq!(event, ContentEvent::Updated);
+        assert_eq!(renamed.metadata().name(), "new_name");
+        assert_eq!(renamed.metadata().path(), content.metadata().path());
+        assert!(renamed.metadata().updated_at() >= before_updated_at);
+    }
+
+    #[test]
+    fn delete_marks_content_deleted_and_clears_buffers() {
+        let (key, encryption) = test_key_and_cipher();
+        let id_gen = MockIdGenerator;
+
+        let (content, _) = Content::create(
+            "test".to_string(),
+            b"data".to_vec(),
+            "path.txt".to_string(),
+            &id_gen,
+            &key,
+            &encryption,
+        )
+        .unwrap();
+
+        let before_updated_at = content.metadata().updated_at();
+        let (deleted_content, event) = content.delete().unwrap();
 
         assert!(deleted_content.is_deleted());
         assert!(deleted_content.raw_content().is_none());
         assert!(deleted_content.encrypted_content().is_none());
         assert_eq!(event, ContentEvent::Deleted);
+        assert!(deleted_content.metadata().updated_at() >= before_updated_at);
+    }
 
-        // Test: try to delete deleted content
+    #[test]
+    fn delete_on_already_deleted_returns_error() {
+        let metadata = create_test_metadata();
+        let deleted_content = Content::new(
+            ContentId::new("test-content-id".into()),
+            metadata,
+            None,
+            None,
+            true,
+        );
+
         let result = deleted_content.delete();
-        assert!(matches!(result, Err(ContentError::AlreadyDeleted)));
-
-        // Test: try to update deleted content
-        let result = deleted_content.update(b"New data".to_vec(), None);
         assert!(matches!(result, Err(ContentError::AlreadyDeleted)));
     }
 
     #[test]
-    fn test_decrypt_error_handling_for_missing_components() {
+    fn update_on_deleted_content_returns_error() {
+        let metadata = create_test_metadata();
+        let deleted_content = Content::new(
+            ContentId::new("test-content-id".into()),
+            metadata,
+            None,
+            None,
+            true,
+        );
+        let (key, encryption) = test_key_and_cipher();
+        let id_gen = MockIdGenerator;
+
+        let result =
+            deleted_content.update_content(b"New data".to_vec(), &id_gen, &key, &encryption);
+        assert!(matches!(result, Err(ContentError::AlreadyDeleted)));
+    }
+
+    #[test]
+    fn decrypt_on_deleted_content_returns_error() {
+        let metadata = create_test_metadata();
+        let deleted_content = Content::new(
+            ContentId::new("test-content-id".into()),
+            metadata,
+            None,
+            None,
+            true,
+        );
+        let (key, encryption) = test_key_and_cipher();
+
+        let result = deleted_content.decrypt(&key, &encryption);
+        assert!(matches!(result, Err(ContentError::AlreadyDeleted)));
+    }
+
+    #[test]
+    fn decrypt_success_with_valid_key_and_encrypted_content() {
+        let (key, encryption) = test_key_and_cipher();
+        let id_gen = MockIdGenerator;
+
         let name = "test file".to_string();
         let raw_data = b"Sensitive information".to_vec();
         let path = "documents/secrets.txt".to_string();
-        let key_pair = mock::MockContentKeyPairFactory::create_key_pair("test");
-        let (content, _) = Content::create(name, raw_data.clone(), path, key_pair).unwrap();
+
+        let (content, _) =
+            Content::create(name, raw_data.clone(), path, &id_gen, &key, &encryption).unwrap();
 
         assert!(content.encrypted_content().is_some());
 
-        let decrypted_data = content.decrypt().unwrap();
+        let decrypted_data = content.decrypt(&key, &encryption).unwrap();
         assert_eq!(decrypted_data, raw_data);
+    }
+
+    #[test]
+    fn decrypt_error_when_missing_encrypted_content() {
+        let (key, encryption) = test_key_and_cipher();
 
         let metadata = create_test_metadata();
         let content_missing_encrypted = Content::new(
-            metadata.clone(),
-            Some(b"Raw data".to_vec()),
-            None,
-            Some(mock::MockContentKeyPairFactory::create_key_pair("test")),
-            false,
-        );
-        // Test: try to decrypt content with missing encrypted data
-        let result = content_missing_encrypted.decrypt();
-        assert!(matches!(result, Err(ContentError::DecryptionError(_))));
-
-        let content_missing_key = Content::new(
+            ContentId::new("test-content-id".into()),
             metadata,
             Some(b"Raw data".to_vec()),
-            Some(b"Encrypted data".to_vec()),
             None,
             false,
         );
-        // Test: try to decrypt content with missing key pair
-        let result = content_missing_key.decrypt();
+
+        let result = content_missing_encrypted.decrypt(&key, &encryption);
         assert!(matches!(result, Err(ContentError::DecryptionError(_))));
     }
 
     #[test]
-    fn test_operations_on_deleted_content_return_already_deleted_error() {
+    fn decrypt_error_when_missing_key() {
         let metadata = create_test_metadata();
-
-        let deleted_content = Content::new(
+        let content_with_encrypted = Content::new(
+            ContentId::new("test-content-id".into()),
             metadata,
-            None,
-            None,
-            Some(mock::MockContentKeyPairFactory::create_key_pair("test")),
-            true,
+            Some(b"Raw data".to_vec()),
+            Some(b"Encrypted data".to_vec()),
+            false,
         );
-        // Test: try to delete deleted content
-        let result = deleted_content.delete();
-        assert!(matches!(result, Err(ContentError::AlreadyDeleted)));
 
-        // Test: try to update deleted content
-        let result = deleted_content.update(b"New data".to_vec(), None);
-        assert!(matches!(result, Err(ContentError::AlreadyDeleted)));
+        let empty_key = ContentEncryptionKey(vec![]);
+        let encryption = MockEncryption;
 
-        // Test: try to decrypt deleted content
-        let result = deleted_content.decrypt();
-        assert!(matches!(result, Err(ContentError::AlreadyDeleted)));
+        let result = content_with_encrypted.decrypt(&empty_key, &encryption);
+        assert!(matches!(result, Err(ContentError::DecryptionError(_))));
     }
 }
