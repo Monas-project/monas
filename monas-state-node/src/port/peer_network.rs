@@ -79,15 +79,3 @@ pub trait PeerNetwork: Send + Sync {
     /// Uses Kademlia's get_providers to find content providers.
     async fn find_content_providers(&self, genesis_cid: &str) -> Result<Vec<String>>;
 }
-
-/// Synchronous network operations for backward compatibility.
-///
-/// These methods are kept for compatibility with existing code
-/// and will be deprecated in favor of async methods.
-pub trait SyncPeerNetwork {
-    /// Query node capacity synchronously (deprecated, use async version).
-    fn query_node_capacity(&self, node_id: &str) -> Option<u64>;
-
-    /// Query assignable CIDs synchronously (deprecated, use async version).
-    fn query_assignable_cids(&self, capacity: u64) -> Vec<String>;
-}

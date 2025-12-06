@@ -160,6 +160,31 @@ impl ContentRepository for CrslCrdtRepository {
         }
     }
 
+    async fn get_latest_with_version(
+        &self,
+        genesis_cid: &str,
+    ) -> Result<Option<(Vec<u8>, String)>> {
+        let genesis = Self::parse_cid(genesis_cid)?;
+
+        let repo = self
+            .repo
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+
+        // Get the latest version CID
+        match repo.latest(&genesis) {
+            Some(latest_cid) => {
+                // Get the node to retrieve payload
+                match repo.dag.get_node(&latest_cid) {
+                    Ok(Some(node)) => Ok(Some((node.payload().0.clone(), latest_cid.to_string()))),
+                    Ok(None) => Ok(None),
+                    Err(e) => Err(anyhow::anyhow!("Failed to get node: {}", e)),
+                }
+            }
+            None => Ok(None),
+        }
+    }
+
     async fn get_version(&self, version_cid: &str) -> Result<Option<Vec<u8>>> {
         let cid = Self::parse_cid(version_cid)?;
 

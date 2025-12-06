@@ -110,8 +110,6 @@ enum SwarmCommand {
         key: Vec<u8>,
         reply: oneshot::Sender<Result<()>>,
     },
-    #[allow(dead_code)]
-    AddAddress { peer_id: PeerId, addr: Multiaddr },
     Dial {
         addr: Multiaddr,
         reply: oneshot::Sender<Result<()>>,
@@ -371,9 +369,6 @@ impl Libp2pNetwork {
                     .map(|_| ())
                     .map_err(|e| anyhow::anyhow!("Failed to start providing: {:?}", e));
                 let _ = reply.send(result);
-            }
-            SwarmCommand::AddAddress { peer_id, addr } => {
-                swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
             }
             SwarmCommand::Dial { addr, reply } => {
                 let result = swarm
@@ -639,11 +634,11 @@ impl Libp2pNetwork {
                 },
             },
             ContentRequest::FetchContent { content_id } => {
-                match crdt_repo.get_latest(&content_id).await {
-                    Ok(Some(data)) => ContentResponse::ContentData {
+                match crdt_repo.get_latest_with_version(&content_id).await {
+                    Ok(Some((data, version))) => ContentResponse::ContentData {
                         content_id,
                         data,
-                        version: String::new(), // TODO: Include actual version
+                        version,
                     },
                     Ok(None) => ContentResponse::NotFound { content_id },
                     Err(e) => ContentResponse::Error {
@@ -653,11 +648,11 @@ impl Libp2pNetwork {
             }
             ContentRequest::SyncContent { content_id, .. } => {
                 // SyncContent returns the same as FetchContent (latest data)
-                match crdt_repo.get_latest(&content_id).await {
-                    Ok(Some(data)) => ContentResponse::ContentData {
+                match crdt_repo.get_latest_with_version(&content_id).await {
+                    Ok(Some((data, version))) => ContentResponse::ContentData {
                         content_id,
                         data,
-                        version: String::new(),
+                        version,
                     },
                     Ok(None) => ContentResponse::NotFound { content_id },
                     Err(e) => ContentResponse::Error {

@@ -74,6 +74,16 @@ pub trait ContentRepository: Send + Sync {
     /// The latest content data, or None if not found.
     async fn get_latest(&self, genesis_cid: &str) -> Result<Option<Vec<u8>>>;
 
+    /// Get the latest version of content with its version CID.
+    ///
+    /// # Arguments
+    /// * `genesis_cid` - The genesis CID of the content
+    ///
+    /// # Returns
+    /// A tuple of (content data, version CID), or None if not found.
+    async fn get_latest_with_version(&self, genesis_cid: &str)
+        -> Result<Option<(Vec<u8>, String)>>;
+
     /// Get content at a specific version.
     ///
     /// # Arguments

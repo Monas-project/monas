@@ -262,6 +262,25 @@ impl ContentRepository for MockContentRepository {
         Ok(self.contents.lock().await.get(genesis_cid).cloned())
     }
 
+    async fn get_latest_with_version(
+        &self,
+        genesis_cid: &str,
+    ) -> Result<Option<(Vec<u8>, String)>> {
+        let contents = self.contents.lock().await;
+        let history = self.history.lock().await;
+
+        if let Some(data) = contents.get(genesis_cid) {
+            // Get the latest version CID from history
+            let version_cid = history
+                .get(genesis_cid)
+                .and_then(|h| h.last().cloned())
+                .unwrap_or_else(|| genesis_cid.to_string());
+            Ok(Some((data.clone(), version_cid)))
+        } else {
+            Ok(None)
+        }
+    }
+
     async fn get_version(&self, version_cid: &str) -> Result<Option<Vec<u8>>> {
         // For simplicity, return the first content that matches
         let contents = self.contents.lock().await;
