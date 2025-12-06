@@ -1,3 +1,11 @@
-pub mod content_network_repository;
+pub mod crdt_repository;
+pub mod disk_capacity;
+pub mod event_adapters;
+pub mod event_bus_publisher;
+pub mod gossipsub_publisher;
+pub mod inbox_persistence;
 pub mod network;
-pub mod node_repository;
+pub mod outbox_persistence;
+pub mod persistence;
+pub mod placement;
+pub mod reliable_event_publisher;
