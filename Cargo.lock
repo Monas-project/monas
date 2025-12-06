@@ -961,7 +961,7 @@ checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 [[package]]
 name = "crsl-lib"
 version = "0.1.0"
-source = "git+https://github.com/Monas-project/crsl-lib?branch=fix/thread-safe-storage#5ff3f253a49038c28f5abe960a54cb16f6b62ede"
+source = "git+https://github.com/Monas-project/crsl-lib#ae535853be664b844445928075fc2ddb945d0f94"
 dependencies = [
  "bincode 2.0.1",
  "cid",
