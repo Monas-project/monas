@@ -25,6 +25,9 @@ monas-state-node/
 │   │   ├── mod.rs
 │   │   ├── state_node_service.rs       # ユースケース実装
 │   │   └── node.rs                     # StateNode 統合構造体
+│   ├── presentation/
+│   │   ├── mod.rs
+│   │   └── http_api.rs                 # HTTP REST API (axum)
 │   └── infrastructure/
 │       ├── mod.rs
 │       ├── persistence/
@@ -41,7 +44,6 @@ monas-state-node/
 │       ├── gossipsub_publisher.rs          # Gossipsubイベント配信
 │       ├── event_bus_publisher.rs          # ローカルEventBus配信
 │       ├── event_adapters.rs               # イベントアダプタ
-│       ├── http_api.rs                     # HTTP REST API (axum)
 │       ├── disk_capacity.rs                # ディスク容量クエリ
 │       └── placement.rs                    # DHTキー計算
 ├── README.md
@@ -57,7 +59,8 @@ monas-state-node/
 | **domain** | エンティティ・値オブジェクト・ドメインイベント定義 |
 | **port** | 抽象インターフェース (トレイト) 定義 |
 | **application_service** | ユースケース実行・オーケストレーション |
-| **infrastructure** | portの具象実装 (libp2p, sled, axum等) |
+| **presentation** | 外部向けAPI (HTTP REST API等) |
+| **infrastructure** | portの具象実装 (libp2p, sled等) |
 
 ### 主要コンポーネント
 
@@ -100,6 +103,10 @@ monas-state-node/
 
 - **StateNode** - 統合構造体 (全コンポーネントの初期化・実行)
 
+#### プレゼンテーション層 (`src/presentation/`)
+
+- **http_api.rs** - axum REST API
+
 #### インフラ層 (`src/infrastructure/`)
 
 - **persistence/** - Sledベース永続化
@@ -111,7 +118,6 @@ monas-state-node/
   - TCP/QUIC トランスポート
 - **crdt_repository.rs** - crsl-libによるCRDT実装
 - **gossipsub_publisher.rs** - Gossipsubイベント配信
-- **http_api.rs** - axum REST API
 
 ## HTTP API
 
