@@ -342,3 +342,194 @@ impl StateNode {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[cfg(not(target_arch = "wasm32"))]
+mod tests {
+    use super::*;
+    use crate::port::content_repository::ContentRepository;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_state_node_config_default() {
+        let config = StateNodeConfig::default();
+
+        assert_eq!(config.data_dir, PathBuf::from("data"));
+        assert_eq!(config.http_addr.to_string(), "127.0.0.1:8080");
+        assert!(config.node_id.is_none());
+        assert_eq!(config.sync_interval_secs, 30);
+        assert_eq!(config.outbox_retry_interval_secs, 10);
+    }
+
+    #[test]
+    fn test_state_node_config_clone() {
+        let config = StateNodeConfig {
+            data_dir: PathBuf::from("/tmp/test"),
+            http_addr: "127.0.0.1:9090".parse().unwrap(),
+            network_config: Libp2pNetworkConfig::default(),
+            node_id: Some("test-node".to_string()),
+            sync_interval_secs: 60,
+            outbox_retry_interval_secs: 20,
+        };
+
+        let cloned = config.clone();
+
+        assert_eq!(cloned.data_dir, config.data_dir);
+        assert_eq!(cloned.http_addr, config.http_addr);
+        assert_eq!(cloned.node_id, config.node_id);
+        assert_eq!(cloned.sync_interval_secs, config.sync_interval_secs);
+        assert_eq!(
+            cloned.outbox_retry_interval_secs,
+            config.outbox_retry_interval_secs
+        );
+    }
+
+    #[test]
+    fn test_state_node_config_debug() {
+        let config = StateNodeConfig::default();
+        let debug_str = format!("{:?}", config);
+
+        assert!(debug_str.contains("StateNodeConfig"));
+        assert!(debug_str.contains("data_dir"));
+        assert!(debug_str.contains("http_addr"));
+    }
+
+    #[tokio::test]
+    async fn test_state_node_creation() {
+        let tmp_dir = tempdir().unwrap();
+
+        let config = StateNodeConfig {
+            data_dir: tmp_dir.path().to_path_buf(),
+            http_addr: "127.0.0.1:0".parse().unwrap(), // Use port 0 for random available port
+            network_config: Libp2pNetworkConfig {
+                listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
+                bootstrap_nodes: vec![],
+                enable_mdns: false,
+                gossipsub_topics: vec!["test".to_string()],
+            },
+            node_id: Some("test-node-id".to_string()),
+            sync_interval_secs: 30,
+            outbox_retry_interval_secs: 10,
+        };
+
+        let node = StateNode::new(config).await.unwrap();
+
+        // Test accessors
+        assert_eq!(node.node_id(), "test-node-id");
+        assert!(!node.service().local_node_id().is_empty());
+        assert!(node.crdt_repo().list_contents().await.unwrap().is_empty());
+        assert!(!node.network().local_peer_id().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_state_node_listen_addrs() {
+        let tmp_dir = tempdir().unwrap();
+
+        let config = StateNodeConfig {
+            data_dir: tmp_dir.path().to_path_buf(),
+            http_addr: "127.0.0.1:0".parse().unwrap(),
+            network_config: Libp2pNetworkConfig {
+                listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
+                bootstrap_nodes: vec![],
+                enable_mdns: false,
+                gossipsub_topics: vec!["test".to_string()],
+            },
+            node_id: None,
+            sync_interval_secs: 30,
+            outbox_retry_interval_secs: 10,
+        };
+
+        let node = StateNode::new(config).await.unwrap();
+
+        // Wait a bit for the network to start listening
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let addrs = node.listen_addrs().await;
+        // Should have at least one listening address
+        assert!(!addrs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_state_node_generated_node_id() {
+        let tmp_dir = tempdir().unwrap();
+
+        let config = StateNodeConfig {
+            data_dir: tmp_dir.path().to_path_buf(),
+            http_addr: "127.0.0.1:0".parse().unwrap(),
+            network_config: Libp2pNetworkConfig {
+                listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
+                bootstrap_nodes: vec![],
+                enable_mdns: false,
+                gossipsub_topics: vec!["test".to_string()],
+            },
+            node_id: None, // Will be auto-generated
+            sync_interval_secs: 30,
+            outbox_retry_interval_secs: 10,
+        };
+
+        let node = StateNode::new(config).await.unwrap();
+
+        // Node ID should be the peer ID when not explicitly set
+        let peer_id = node.network().local_peer_id();
+        assert_eq!(node.node_id(), peer_id);
+    }
+
+    #[tokio::test]
+    async fn test_state_node_dial_invalid_addr() {
+        let tmp_dir = tempdir().unwrap();
+
+        let config = StateNodeConfig {
+            data_dir: tmp_dir.path().to_path_buf(),
+            http_addr: "127.0.0.1:0".parse().unwrap(),
+            network_config: Libp2pNetworkConfig {
+                listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
+                bootstrap_nodes: vec![],
+                enable_mdns: false,
+                gossipsub_topics: vec!["test".to_string()],
+            },
+            node_id: None,
+            sync_interval_secs: 30,
+            outbox_retry_interval_secs: 10,
+        };
+
+        let node = StateNode::new(config).await.unwrap();
+
+        // Invalid multiaddr should return error
+        let result = node.dial("invalid-addr").await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid multiaddr"));
+    }
+
+    #[tokio::test]
+    async fn test_state_node_accessors() {
+        let tmp_dir = tempdir().unwrap();
+
+        let config = StateNodeConfig {
+            data_dir: tmp_dir.path().to_path_buf(),
+            http_addr: "127.0.0.1:0".parse().unwrap(),
+            network_config: Libp2pNetworkConfig {
+                listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
+                bootstrap_nodes: vec![],
+                enable_mdns: false,
+                gossipsub_topics: vec!["test".to_string()],
+            },
+            node_id: Some("test-node".to_string()),
+            sync_interval_secs: 30,
+            outbox_retry_interval_secs: 10,
+        };
+
+        let node = StateNode::new(config).await.unwrap();
+
+        // Verify all accessors return valid references
+        let _service = node.service();
+        let _crdt_repo = node.crdt_repo();
+        let _network = node.network();
+        let _sync_service = node.sync_service();
+        let _reliable_publisher = node.reliable_publisher();
+
+        // All should be accessible without panicking - verified by reaching this point
+    }
+}

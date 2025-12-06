@@ -206,3 +206,163 @@ impl NodeBehaviour {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use libp2p::identity::Keypair;
+
+    #[test]
+    fn test_content_protocol_name() {
+        assert_eq!(CONTENT_PROTOCOL_NAME, "/monas/content/1.0.0");
+    }
+
+    #[test]
+    fn test_behaviour_config_default() {
+        let config = BehaviourConfig::default();
+
+        assert_eq!(config.protocol_version, "/monas/1.0.0");
+        assert!(config.agent_version.starts_with("monas-state-node/"));
+    }
+
+    #[test]
+    fn test_behaviour_config_clone() {
+        let config = BehaviourConfig {
+            protocol_version: "/custom/1.0.0".to_string(),
+            agent_version: "custom-agent/1.0.0".to_string(),
+        };
+
+        let cloned = config.clone();
+
+        assert_eq!(cloned.protocol_version, "/custom/1.0.0");
+        assert_eq!(cloned.agent_version, "custom-agent/1.0.0");
+    }
+
+    #[test]
+    fn test_behaviour_config_debug() {
+        let config = BehaviourConfig::default();
+        let debug_str = format!("{:?}", config);
+
+        assert!(debug_str.contains("BehaviourConfig"));
+        assert!(debug_str.contains("protocol_version"));
+        assert!(debug_str.contains("agent_version"));
+    }
+
+    #[test]
+    fn test_node_behaviour_event_debug() {
+        // Test that NodeBehaviourEvent implements Debug
+        // We can't easily create kad::Event, gossipsub::Event, etc. in tests,
+        // but we can verify the enum variants exist and the type is Debug
+        fn assert_debug<T: std::fmt::Debug>() {}
+        assert_debug::<NodeBehaviourEvent>();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_node_behaviour_creation() {
+        let keypair = Keypair::generate_ed25519();
+        let local_peer_id = keypair.public().to_peer_id();
+        let config = BehaviourConfig::default();
+
+        let result = NodeBehaviour::new(local_peer_id, &keypair, config);
+
+        assert!(result.is_ok());
+        let behaviour = result.unwrap();
+
+        // Verify components are accessible
+        let _ = &behaviour.kademlia;
+        let _ = &behaviour.gossipsub;
+        let _ = &behaviour.request_response;
+        let _ = &behaviour.identify;
+        let _ = &behaviour.mdns;
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_node_behaviour_with_custom_config() {
+        let keypair = Keypair::generate_ed25519();
+        let local_peer_id = keypair.public().to_peer_id();
+        let config = BehaviourConfig {
+            protocol_version: "/test/1.0.0".to_string(),
+            agent_version: "test-agent/0.1.0".to_string(),
+        };
+
+        let result = NodeBehaviour::new(local_peer_id, &keypair, config);
+
+        assert!(result.is_ok());
+    }
+
+    // Test From implementations for NodeBehaviourEvent
+    // These test the event conversion traits
+
+    #[test]
+    fn test_from_kad_event() {
+        // Create a simple Kademlia event that we can construct
+        // kad::Event has several variants; RoutingUpdated is one that's relatively easy to reason about
+        // However, creating actual kad::Event instances requires complex setup,
+        // so we verify the From implementation exists by type checking
+        fn assert_from_impl<T, U>()
+        where
+            U: From<T>,
+        {
+        }
+        assert_from_impl::<kad::Event, NodeBehaviourEvent>();
+    }
+
+    #[test]
+    fn test_from_gossipsub_event() {
+        fn assert_from_impl<T, U>()
+        where
+            U: From<T>,
+        {
+        }
+        assert_from_impl::<gossipsub::Event, NodeBehaviourEvent>();
+    }
+
+    #[test]
+    fn test_from_request_response_event() {
+        fn assert_from_impl<T, U>()
+        where
+            U: From<T>,
+        {
+        }
+        assert_from_impl::<
+            request_response::Event<ContentRequest, ContentResponse>,
+            NodeBehaviourEvent,
+        >();
+    }
+
+    #[test]
+    fn test_from_identify_event() {
+        fn assert_from_impl<T, U>()
+        where
+            U: From<T>,
+        {
+        }
+        assert_from_impl::<identify::Event, NodeBehaviourEvent>();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_from_mdns_event() {
+        fn assert_from_impl<T, U>()
+        where
+            U: From<T>,
+        {
+        }
+        assert_from_impl::<mdns::Event, NodeBehaviourEvent>();
+    }
+
+    #[test]
+    fn test_agent_version_contains_package_version() {
+        let config = BehaviourConfig::default();
+        let pkg_version = env!("CARGO_PKG_VERSION");
+
+        assert!(
+            config.agent_version.contains(pkg_version),
+            "Agent version '{}' should contain package version '{}'",
+            config.agent_version,
+            pkg_version
+        );
+    }
+}

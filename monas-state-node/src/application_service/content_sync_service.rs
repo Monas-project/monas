@@ -301,5 +301,286 @@ where
 
 #[cfg(test)]
 mod tests {
-    // Tests would go here with mock implementations
+    use super::*;
+    use crate::test_utils::{
+        create_test_network, create_test_operation, MockContentNetworkRepository,
+        MockContentRepository, MockPeerNetwork,
+    };
+
+    type TestSyncService =
+        ContentSyncService<MockPeerNetwork, MockContentRepository, MockContentNetworkRepository>;
+
+    fn create_test_service(local_node_id: &str) -> TestSyncService {
+        let peer_network = Arc::new(MockPeerNetwork::new().with_local_peer_id(local_node_id));
+        let crdt_repo = Arc::new(MockContentRepository::new());
+        let content_network_repo = Arc::new(RwLock::new(MockContentNetworkRepository::new()));
+
+        ContentSyncService::new(
+            peer_network,
+            crdt_repo,
+            content_network_repo,
+            local_node_id.to_string(),
+        )
+    }
+
+    fn create_service_with_providers(
+        local_node_id: &str,
+        providers: Vec<String>,
+        operations: Vec<crate::port::content_repository::SerializedOperation>,
+    ) -> TestSyncService {
+        let peer_network = Arc::new(
+            MockPeerNetwork::new()
+                .with_local_peer_id(local_node_id)
+                .with_providers(providers)
+                .with_fetched_operations(operations),
+        );
+        let crdt_repo = Arc::new(MockContentRepository::new());
+        let content_network_repo = Arc::new(RwLock::new(MockContentNetworkRepository::new()));
+
+        ContentSyncService::new(
+            peer_network,
+            crdt_repo,
+            content_network_repo,
+            local_node_id.to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_sync_from_peers_no_providers() {
+        let service = create_test_service("node-1");
+
+        let result = service.sync_from_peers("content-1").await.unwrap();
+
+        assert_eq!(result.operations_applied, 0);
+        assert_eq!(result.providers_contacted, 0);
+        assert!(result.errors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_sync_from_peers_skips_self() {
+        let service = create_service_with_providers(
+            "node-1",
+            vec!["node-1".to_string()], // Only self as provider
+            vec![],
+        );
+
+        let result = service.sync_from_peers("content-1").await.unwrap();
+
+        assert_eq!(result.operations_applied, 0);
+        assert_eq!(result.providers_contacted, 0); // Self should be skipped
+    }
+
+    #[tokio::test]
+    async fn test_sync_from_peers_with_operations() {
+        let operations = vec![
+            create_test_operation("content-1", "node-2"),
+            create_test_operation("content-1", "node-2"),
+        ];
+
+        let service =
+            create_service_with_providers("node-1", vec!["node-2".to_string()], operations.clone());
+
+        let result = service.sync_from_peers("content-1").await.unwrap();
+
+        assert_eq!(result.operations_applied, 2);
+        assert_eq!(result.providers_contacted, 1);
+        assert!(result.errors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_sync_from_peers_with_multiple_providers() {
+        let operations = vec![create_test_operation("content-1", "node-2")];
+
+        let service = create_service_with_providers(
+            "node-1",
+            vec!["node-2".to_string(), "node-3".to_string()],
+            operations.clone(),
+        );
+
+        let result = service.sync_from_peers("content-1").await.unwrap();
+
+        // Both providers contacted (minus self), each returning the same operations
+        // which get applied (mock applies all)
+        assert_eq!(result.providers_contacted, 2);
+        assert!(result.errors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_push_to_peers_no_network() {
+        let service = create_test_service("node-1");
+
+        let result = service.push_to_peers("nonexistent").await.unwrap();
+
+        assert_eq!(result.nodes_pushed, 0);
+        assert_eq!(result.operations_sent, 0);
+        assert!(!result.errors.is_empty());
+        assert!(result.errors[0].contains("Content network not found"));
+    }
+
+    #[tokio::test]
+    async fn test_push_to_peers_with_network() {
+        let peer_network = Arc::new(MockPeerNetwork::new().with_local_peer_id("node-1"));
+        let crdt_repo = Arc::new(MockContentRepository::new());
+
+        // Add some operations to push
+        crdt_repo
+            .operations
+            .lock()
+            .await
+            .push(create_test_operation("content-1", "node-1"));
+
+        let content_network_repo = Arc::new(RwLock::new(
+            MockContentNetworkRepository::new()
+                .with_network(create_test_network("content-1", vec!["node-1", "node-2"])),
+        ));
+
+        let service = ContentSyncService::new(
+            peer_network,
+            crdt_repo,
+            content_network_repo,
+            "node-1".to_string(),
+        );
+
+        let result = service.push_to_peers("content-1").await.unwrap();
+
+        assert_eq!(result.nodes_pushed, 1); // node-2 (node-1 is self)
+        assert_eq!(result.operations_sent, 1);
+        assert!(result.errors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_push_to_peers_skips_self() {
+        let peer_network = Arc::new(MockPeerNetwork::new().with_local_peer_id("node-1"));
+        let crdt_repo = Arc::new(MockContentRepository::new());
+
+        crdt_repo
+            .operations
+            .lock()
+            .await
+            .push(create_test_operation("content-1", "node-1"));
+
+        // Only self in the network
+        let content_network_repo = Arc::new(RwLock::new(
+            MockContentNetworkRepository::new()
+                .with_network(create_test_network("content-1", vec!["node-1"])),
+        ));
+
+        let service = ContentSyncService::new(
+            peer_network,
+            crdt_repo,
+            content_network_repo,
+            "node-1".to_string(),
+        );
+
+        let result = service.push_to_peers("content-1").await.unwrap();
+
+        assert_eq!(result.nodes_pushed, 0);
+        assert_eq!(result.operations_sent, 0);
+    }
+
+    #[tokio::test]
+    async fn test_push_to_peers_no_operations() {
+        let peer_network = Arc::new(MockPeerNetwork::new().with_local_peer_id("node-1"));
+        let crdt_repo = Arc::new(MockContentRepository::new());
+        // No operations in crdt_repo
+
+        let content_network_repo = Arc::new(RwLock::new(
+            MockContentNetworkRepository::new()
+                .with_network(create_test_network("content-1", vec!["node-1", "node-2"])),
+        ));
+
+        let service = ContentSyncService::new(
+            peer_network,
+            crdt_repo,
+            content_network_repo,
+            "node-1".to_string(),
+        );
+
+        let result = service.push_to_peers("content-1").await.unwrap();
+
+        assert_eq!(result.nodes_pushed, 0);
+        assert_eq!(result.operations_sent, 0);
+    }
+
+    #[tokio::test]
+    async fn test_sync_all_content_empty() {
+        let service = create_test_service("node-1");
+
+        let results = service.sync_all_content().await.unwrap();
+
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_sync_all_content_with_membership() {
+        let peer_network = Arc::new(
+            MockPeerNetwork::new()
+                .with_local_peer_id("node-1")
+                .with_providers(vec!["node-2".to_string()])
+                .with_fetched_operations(vec![create_test_operation("content-1", "node-2")]),
+        );
+        let crdt_repo = Arc::new(MockContentRepository::new());
+
+        // Add content network where node-1 is a member
+        let content_network_repo = Arc::new(RwLock::new(
+            MockContentNetworkRepository::new()
+                .with_network(create_test_network("content-1", vec!["node-1", "node-2"])),
+        ));
+
+        let service = ContentSyncService::new(
+            peer_network,
+            crdt_repo,
+            content_network_repo,
+            "node-1".to_string(),
+        );
+
+        let results = service.sync_all_content().await.unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "content-1");
+        assert_eq!(results[0].1.operations_applied, 1);
+    }
+
+    #[tokio::test]
+    async fn test_sync_all_content_skips_non_member() {
+        let peer_network = Arc::new(MockPeerNetwork::new().with_local_peer_id("node-1"));
+        let crdt_repo = Arc::new(MockContentRepository::new());
+
+        // Add content network where node-1 is NOT a member
+        let content_network_repo = Arc::new(RwLock::new(
+            MockContentNetworkRepository::new()
+                .with_network(create_test_network("content-1", vec!["node-2", "node-3"])),
+        ));
+
+        let service = ContentSyncService::new(
+            peer_network,
+            crdt_repo,
+            content_network_repo,
+            "node-1".to_string(),
+        );
+
+        let results = service.sync_all_content().await.unwrap();
+
+        assert!(results.is_empty()); // Skipped because not a member
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_operation() {
+        let service = create_test_service("node-1");
+
+        let operation = create_test_operation("content-1", "node-1");
+
+        let result = service.broadcast_operation("content-1", &operation).await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_service_clone() {
+        let service = create_test_service("node-1");
+
+        let cloned = service.clone();
+
+        assert_eq!(cloned.local_node_id, "node-1");
+    }
 }

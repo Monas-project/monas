@@ -5,6 +5,9 @@ pub mod port;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod presentation;
 
+#[cfg(test)]
+pub mod test_utils;
+
 pub use domain::*;
 pub use port::*;
 

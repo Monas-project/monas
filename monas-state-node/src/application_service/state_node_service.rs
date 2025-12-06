@@ -319,3 +319,433 @@ where
         self.content_repo.read().await.list_content_networks().await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_utils::{
+        create_test_network, MockContentNetworkRepository, MockContentRepository,
+        MockEventPublisher, MockNodeRegistry, MockPeerNetwork,
+    };
+    use std::collections::HashMap;
+    use tokio::sync::RwLock;
+
+    type TestService = StateNodeService<
+        MockNodeRegistry,
+        MockContentNetworkRepository,
+        MockPeerNetwork,
+        MockEventPublisher,
+        MockContentRepository,
+    >;
+
+    fn create_test_service(local_node_id: &str) -> TestService {
+        let node_registry = MockNodeRegistry::new();
+        let content_repo = Arc::new(RwLock::new(MockContentNetworkRepository::new()));
+        let peer_network = Arc::new(MockPeerNetwork::new().with_local_peer_id(local_node_id));
+        let event_publisher = MockEventPublisher::new();
+        let crdt_repo = Arc::new(MockContentRepository::new());
+
+        StateNodeService::new(
+            node_registry,
+            content_repo,
+            peer_network,
+            event_publisher,
+            crdt_repo,
+            local_node_id.to_string(),
+        )
+    }
+
+    fn create_service_with_peers(
+        local_node_id: &str,
+        peers: Vec<String>,
+        capacities: HashMap<String, u64>,
+    ) -> TestService {
+        let node_registry = MockNodeRegistry::new();
+        let content_repo = Arc::new(RwLock::new(MockContentNetworkRepository::new()));
+        let peer_network = Arc::new(
+            MockPeerNetwork::new()
+                .with_local_peer_id(local_node_id)
+                .with_closest_peers(peers)
+                .with_capacities(capacities),
+        );
+        let event_publisher = MockEventPublisher::new();
+        let crdt_repo = Arc::new(MockContentRepository::new());
+
+        StateNodeService::new(
+            node_registry,
+            content_repo,
+            peer_network,
+            event_publisher,
+            crdt_repo,
+            local_node_id.to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_local_node_id() {
+        let service = create_test_service("node-1");
+        assert_eq!(service.local_node_id(), "node-1");
+    }
+
+    #[tokio::test]
+    async fn test_register_node() {
+        let service = create_test_service("node-1");
+
+        let (snapshot, events) = service.register_node(1000).await.unwrap();
+
+        assert_eq!(snapshot.node_id, "node-1");
+        assert_eq!(snapshot.total_capacity, 1000);
+        assert_eq!(snapshot.available_capacity, 1000);
+        assert_eq!(events.len(), 1);
+
+        // Verify node was stored
+        let stored_node = service.get_node("node-1").await.unwrap();
+        assert!(stored_node.is_some());
+        assert_eq!(stored_node.unwrap().total_capacity, 1000);
+    }
+
+    #[tokio::test]
+    async fn test_register_node_publishes_event() {
+        let service = create_test_service("node-1");
+
+        let (_, events) = service.register_node(1000).await.unwrap();
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            Event::NodeCreated {
+                node_id,
+                total_capacity,
+                available_capacity,
+                ..
+            } => {
+                assert_eq!(node_id, "node-1");
+                assert_eq!(*total_capacity, 1000);
+                assert_eq!(*available_capacity, 1000);
+            }
+            _ => panic!("Expected NodeCreated event"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_content_with_peers() {
+        let mut capacities = HashMap::new();
+        capacities.insert("peer-1".to_string(), 500);
+        capacities.insert("peer-2".to_string(), 1000);
+
+        let service = create_service_with_peers(
+            "node-1",
+            vec!["peer-1".to_string(), "peer-2".to_string()],
+            capacities,
+        );
+
+        let event = service.create_content(b"test data").await.unwrap();
+
+        match event {
+            Event::ContentCreated {
+                creator_node_id,
+                member_nodes,
+                content_size,
+                ..
+            } => {
+                assert_eq!(creator_node_id, "node-1");
+                assert!(!member_nodes.is_empty());
+                assert_eq!(content_size, 9); // "test data" length
+            }
+            _ => panic!("Expected ContentCreated event"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_content_excludes_creator() {
+        let mut capacities = HashMap::new();
+        capacities.insert("node-1".to_string(), 1000); // Creator
+        capacities.insert("peer-1".to_string(), 500);
+
+        let service = create_service_with_peers(
+            "node-1",
+            vec!["node-1".to_string(), "peer-1".to_string()],
+            capacities,
+        );
+
+        let event = service.create_content(b"test data").await.unwrap();
+
+        match event {
+            Event::ContentCreated { member_nodes, .. } => {
+                // Creator should be excluded from members
+                assert!(!member_nodes.contains(&"node-1".to_string()));
+                assert!(member_nodes.contains(&"peer-1".to_string()));
+            }
+            _ => panic!("Expected ContentCreated event"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_content_fails_without_peers() {
+        let service = create_test_service("node-1");
+
+        let result = service.create_content(b"test data").await;
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("no available member nodes"));
+    }
+
+    #[tokio::test]
+    async fn test_update_content_success() {
+        let node_registry = MockNodeRegistry::new();
+        let content_repo = Arc::new(RwLock::new(
+            MockContentNetworkRepository::new()
+                .with_network(create_test_network("content-1", vec!["node-1", "node-2"])),
+        ));
+        let peer_network = Arc::new(MockPeerNetwork::new().with_local_peer_id("node-1"));
+        let event_publisher = MockEventPublisher::new();
+        let crdt_repo = Arc::new(MockContentRepository::new());
+
+        // Pre-populate CRDT repo
+        crdt_repo
+            .contents
+            .lock()
+            .await
+            .insert("content-1".to_string(), b"old data".to_vec());
+
+        let service = StateNodeService::new(
+            node_registry,
+            content_repo,
+            peer_network,
+            event_publisher,
+            crdt_repo,
+            "node-1".to_string(),
+        );
+
+        let event = service
+            .update_content("content-1", b"new data")
+            .await
+            .unwrap();
+
+        match event {
+            Event::ContentUpdated {
+                content_id,
+                updated_node_id,
+                ..
+            } => {
+                assert_eq!(content_id, "content-1");
+                assert_eq!(updated_node_id, "node-1");
+            }
+            _ => panic!("Expected ContentUpdated event"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_content_fails_if_not_member() {
+        let node_registry = MockNodeRegistry::new();
+        let content_repo = Arc::new(RwLock::new(
+            MockContentNetworkRepository::new()
+                .with_network(create_test_network("content-1", vec!["node-2", "node-3"])),
+        ));
+        let peer_network = Arc::new(MockPeerNetwork::new().with_local_peer_id("node-1"));
+        let event_publisher = MockEventPublisher::new();
+        let crdt_repo = Arc::new(MockContentRepository::new());
+
+        let service = StateNodeService::new(
+            node_registry,
+            content_repo,
+            peer_network,
+            event_publisher,
+            crdt_repo,
+            "node-1".to_string(),
+        );
+
+        let result = service.update_content("content-1", b"new data").await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not a member"));
+    }
+
+    #[tokio::test]
+    async fn test_update_content_fails_if_network_not_found() {
+        let service = create_test_service("node-1");
+
+        let result = service.update_content("nonexistent", b"data").await;
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Content network not found"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_sync_event_node_created() {
+        let service = create_test_service("node-1");
+
+        let event = Event::NodeCreated {
+            node_id: "node-2".to_string(),
+            total_capacity: 2000,
+            available_capacity: 1500,
+            timestamp: 12345,
+        };
+
+        let outcome = service.handle_sync_event(&event).await.unwrap();
+        assert_eq!(outcome, ApplyOutcome::Applied);
+
+        // Verify node was stored
+        let stored = service.get_node("node-2").await.unwrap().unwrap();
+        assert_eq!(stored.total_capacity, 2000);
+        assert_eq!(stored.available_capacity, 1500);
+    }
+
+    #[tokio::test]
+    async fn test_handle_sync_event_content_created() {
+        let service = create_test_service("node-1");
+
+        let event = Event::ContentCreated {
+            content_id: "content-1".to_string(),
+            creator_node_id: "node-2".to_string(),
+            content_size: 100,
+            member_nodes: vec!["node-1".to_string(), "node-2".to_string()],
+            timestamp: 12345,
+        };
+
+        let outcome = service.handle_sync_event(&event).await.unwrap();
+        assert_eq!(outcome, ApplyOutcome::Applied);
+
+        // Verify content network was stored
+        let network = service
+            .get_content_network("content-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(network.member_nodes.contains("node-1"));
+        assert!(network.member_nodes.contains("node-2"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_sync_event_content_updated_creates_network() {
+        let service = create_test_service("node-1");
+
+        let event = Event::ContentUpdated {
+            content_id: "new-content".to_string(),
+            updated_node_id: "node-2".to_string(),
+            timestamp: 12345,
+        };
+
+        let outcome = service.handle_sync_event(&event).await.unwrap();
+        assert_eq!(outcome, ApplyOutcome::Applied);
+
+        // Verify network was created (empty members)
+        let network = service
+            .get_content_network("new-content")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(network.member_nodes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_handle_sync_event_content_network_manager_added() {
+        let service = create_test_service("node-1");
+
+        let event = Event::ContentNetworkManagerAdded {
+            content_id: "content-1".to_string(),
+            added_node_id: "node-3".to_string(),
+            member_nodes: vec![
+                "node-1".to_string(),
+                "node-2".to_string(),
+                "node-3".to_string(),
+            ],
+            timestamp: 12345,
+        };
+
+        let outcome = service.handle_sync_event(&event).await.unwrap();
+        assert_eq!(outcome, ApplyOutcome::Applied);
+
+        let network = service
+            .get_content_network("content-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(network.member_nodes.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_handle_sync_event_unknown_event_ignored() {
+        let service = create_test_service("node-1");
+
+        let event = Event::AssignmentDecided {
+            assigning_node_id: "node-1".to_string(),
+            assigned_node_id: "node-2".to_string(),
+            content_id: "content-1".to_string(),
+            timestamp: 12345,
+        };
+
+        let outcome = service.handle_sync_event(&event).await.unwrap();
+        assert_eq!(outcome, ApplyOutcome::Ignored);
+    }
+
+    #[tokio::test]
+    async fn test_list_nodes() {
+        let service = create_test_service("node-1");
+
+        // Register some nodes
+        service.register_node(1000).await.unwrap();
+
+        // Handle sync event to add another node
+        let event = Event::NodeCreated {
+            node_id: "node-2".to_string(),
+            total_capacity: 2000,
+            available_capacity: 2000,
+            timestamp: 12345,
+        };
+        service.handle_sync_event(&event).await.unwrap();
+
+        let nodes = service.list_nodes().await.unwrap();
+        assert!(nodes.contains(&"node-1".to_string()));
+        assert!(nodes.contains(&"node-2".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_list_content_networks() {
+        let service = create_test_service("node-1");
+
+        // Add content networks via sync events
+        let event1 = Event::ContentCreated {
+            content_id: "content-1".to_string(),
+            creator_node_id: "node-1".to_string(),
+            content_size: 100,
+            member_nodes: vec!["node-1".to_string()],
+            timestamp: 12345,
+        };
+        let event2 = Event::ContentCreated {
+            content_id: "content-2".to_string(),
+            creator_node_id: "node-1".to_string(),
+            content_size: 200,
+            member_nodes: vec!["node-1".to_string()],
+            timestamp: 12346,
+        };
+
+        service.handle_sync_event(&event1).await.unwrap();
+        service.handle_sync_event(&event2).await.unwrap();
+
+        let networks = service.list_content_networks().await.unwrap();
+        assert!(networks.contains(&"content-1".to_string()));
+        assert!(networks.contains(&"content-2".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_get_content_network_not_found() {
+        let service = create_test_service("node-1");
+
+        let result = service.get_content_network("nonexistent").await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_node_not_found() {
+        let service = create_test_service("node-1");
+
+        let result = service.get_node("nonexistent").await.unwrap();
+        assert!(result.is_none());
+    }
+}

@@ -433,3 +433,236 @@ async fn get_content_version(
             .into_response(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_health_response_serialization() {
+        let response = HealthResponse {
+            status: "ok".to_string(),
+            node_id: "node-1".to_string(),
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"status\":\"ok\""));
+        assert!(json.contains("\"node_id\":\"node-1\""));
+    }
+
+    #[test]
+    fn test_node_info_response_serialization() {
+        let response = NodeInfoResponse {
+            node_id: "node-1".to_string(),
+            total_capacity: Some(1000),
+            available_capacity: Some(800),
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"node_id\":\"node-1\""));
+        assert!(json.contains("\"total_capacity\":1000"));
+        assert!(json.contains("\"available_capacity\":800"));
+    }
+
+    #[test]
+    fn test_node_info_response_with_none() {
+        let response = NodeInfoResponse {
+            node_id: "node-1".to_string(),
+            total_capacity: None,
+            available_capacity: None,
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"node_id\":\"node-1\""));
+        assert!(json.contains("\"total_capacity\":null"));
+        assert!(json.contains("\"available_capacity\":null"));
+    }
+
+    #[test]
+    fn test_register_node_request_deserialization() {
+        let json = r#"{"total_capacity": 1000}"#;
+        let request: RegisterNodeRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(request.total_capacity, 1000);
+    }
+
+    #[test]
+    fn test_register_node_response_serialization() {
+        let response = RegisterNodeResponse {
+            node_id: "node-1".to_string(),
+            total_capacity: 1000,
+            available_capacity: 1000,
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"node_id\":\"node-1\""));
+        assert!(json.contains("\"total_capacity\":1000"));
+        assert!(json.contains("\"available_capacity\":1000"));
+    }
+
+    #[test]
+    fn test_create_content_request_deserialization() {
+        let json = r#"{"data": "SGVsbG8gV29ybGQ="}"#;
+        let request: CreateContentRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(request.data, "SGVsbG8gV29ybGQ=");
+
+        // Verify base64 decoding
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&request.data)
+            .unwrap();
+        assert_eq!(decoded, b"Hello World");
+    }
+
+    #[test]
+    fn test_create_content_response_serialization() {
+        let response = CreateContentResponse {
+            content_id: "cid-1".to_string(),
+            member_nodes: vec!["node-1".to_string(), "node-2".to_string()],
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"content_id\":\"cid-1\""));
+        assert!(json.contains("\"member_nodes\""));
+        assert!(json.contains("\"node-1\""));
+        assert!(json.contains("\"node-2\""));
+    }
+
+    #[test]
+    fn test_content_response_serialization() {
+        let response = ContentResponse {
+            content_id: "cid-1".to_string(),
+            member_nodes: vec!["node-1".to_string()],
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"content_id\":\"cid-1\""));
+        assert!(json.contains("\"member_nodes\""));
+    }
+
+    #[test]
+    fn test_update_content_request_deserialization() {
+        let json = r#"{"data": "dXBkYXRlZA=="}"#;
+        let request: UpdateContentRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(request.data, "dXBkYXRlZA==");
+
+        // Verify base64 decoding
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&request.data)
+            .unwrap();
+        assert_eq!(decoded, b"updated");
+    }
+
+    #[test]
+    fn test_update_content_response_serialization() {
+        let response = UpdateContentResponse {
+            content_id: "cid-1".to_string(),
+            updated: true,
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"content_id\":\"cid-1\""));
+        assert!(json.contains("\"updated\":true"));
+    }
+
+    #[test]
+    fn test_error_response_serialization() {
+        let response = ErrorResponse {
+            error: "Something went wrong".to_string(),
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"error\":\"Something went wrong\""));
+    }
+
+    #[test]
+    fn test_content_data_response_serialization() {
+        let response = ContentDataResponse {
+            content_id: "cid-1".to_string(),
+            data: "SGVsbG8=".to_string(),
+            version: Some("v1".to_string()),
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"content_id\":\"cid-1\""));
+        assert!(json.contains("\"data\":\"SGVsbG8=\""));
+        assert!(json.contains("\"version\":\"v1\""));
+    }
+
+    #[test]
+    fn test_content_data_response_without_version() {
+        let response = ContentDataResponse {
+            content_id: "cid-1".to_string(),
+            data: "SGVsbG8=".to_string(),
+            version: None,
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"version\":null"));
+    }
+
+    #[test]
+    fn test_content_history_response_serialization() {
+        let response = ContentHistoryResponse {
+            content_id: "cid-1".to_string(),
+            versions: vec!["v1".to_string(), "v2".to_string(), "v3".to_string()],
+        };
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"content_id\":\"cid-1\""));
+        assert!(json.contains("\"versions\""));
+        assert!(json.contains("\"v1\""));
+        assert!(json.contains("\"v2\""));
+        assert!(json.contains("\"v3\""));
+    }
+
+    #[test]
+    fn test_version_query_deserialization() {
+        // With version
+        let json = r#"{"version": "v1"}"#;
+        let query: VersionQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(query.version, Some("v1".to_string()));
+
+        // Without version (empty object)
+        let json = r#"{}"#;
+        let query: VersionQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(query.version, None);
+    }
+
+    #[test]
+    fn test_base64_encoding_roundtrip() {
+        let original = b"Hello, World! This is test data.";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(original);
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&encoded)
+            .unwrap();
+        assert_eq!(original.to_vec(), decoded);
+    }
+
+    #[test]
+    fn test_invalid_base64_data() {
+        let invalid = "not-valid-base64!!!";
+        let result = base64::engine::general_purpose::STANDARD.decode(invalid);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_response_types_are_debug() {
+        // Ensure all response types implement Debug
+        let health = HealthResponse {
+            status: "ok".to_string(),
+            node_id: "n1".to_string(),
+        };
+        let _ = format!("{:?}", health);
+
+        let node_info = NodeInfoResponse {
+            node_id: "n1".to_string(),
+            total_capacity: Some(100),
+            available_capacity: None,
+        };
+        let _ = format!("{:?}", node_info);
+
+        let error = ErrorResponse {
+            error: "err".to_string(),
+        };
+        let _ = format!("{:?}", error);
+    }
+}
