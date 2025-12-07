@@ -1,65 +1,108 @@
-use crate::application_service::account_service::{
-    AccountService, AccountServiceError, KeyTypeMapper,
+use std::sync::Arc;
+
+use axum::{
+    extract::{Json, State},
+    http::StatusCode,
+    routing::post,
+    Router,
 };
-use crate::domain::account::Account;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine;
+use serde::{Deserialize, Serialize};
 
-pub struct ReqArguments {
-    pub generating_key_type: KeyTypeMapper,
+use crate::application_service::account_service::{AccountService, SignError};
+
+use super::AppState;
+
+#[derive(Deserialize)]
+pub struct CreateAccountRequest {
+    pub key_type: String,
 }
 
-pub struct Response {
-    pub generated_key_pair: GeneratedKeyPair,
+#[derive(Serialize)]
+pub struct CreateAccountResponse {
+    pub algorithm: String,
+    pub public_key_base64: String,
+    pub secret_key_base64: String,
 }
 
-pub struct GeneratedKeyPair {
-    pub public_key: Vec<u8>,
-    pub secret_key: Vec<u8>,
+#[derive(Deserialize)]
+pub struct SignRequest {
+    pub message_base64: String,
 }
 
-impl GeneratedKeyPair {
-    pub fn new(public_key: Vec<u8>, secret_key: Vec<u8>) -> Self {
-        Self {
-            public_key,
-            secret_key,
-        }
+#[derive(Serialize)]
+pub struct SignResponse {
+    pub signature_base64: String,
+}
+
+pub fn routes() -> Router<Arc<AppState>> {
+    Router::new()
+        .route("/accounts", post(create_account).delete(delete_account))
+        .route("/accounts/sign", post(sign_account))
+}
+
+fn parse_key_type(
+    s: &str,
+) -> Result<crate::application_service::account_service::KeyTypeMapper, (StatusCode, String)> {
+    use crate::application_service::account_service::KeyTypeMapper;
+    match s.to_uppercase().as_str() {
+        "K256" => Ok(KeyTypeMapper::K256),
+        "P256" => Ok(KeyTypeMapper::P256),
+        other => Err((
+            StatusCode::BAD_REQUEST,
+            format!("unsupported key_type: {other}"),
+        )),
     }
-
-    pub fn public_key(&self) -> &[u8] {
-        self.public_key.as_slice()
-    }
-
-    pub fn secret_key(&self) -> &[u8] {
-        self.secret_key.as_slice()
-    }
 }
 
-pub fn create(args: ReqArguments) -> Result<Response, AccountServiceError> {
-    match AccountService::create(args.generating_key_type) {
-        Ok(account) => Ok(to_response(account)),
-        Err(e) => Err(e),
-    }
+async fn create_account(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CreateAccountRequest>,
+) -> Result<Json<CreateAccountResponse>, (StatusCode, String)> {
+    let key_type = parse_key_type(&req.key_type)?;
+
+    let account = AccountService::create(&state.key_store, key_type)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+
+    let public_key_base64 = BASE64_STANDARD.encode(account.public_key_bytes());
+    let secret_key_base64 = BASE64_STANDARD.encode(account.secret_key_bytes());
+
+    Ok(Json(CreateAccountResponse {
+        algorithm: req.key_type.to_uppercase(),
+        public_key_base64,
+        secret_key_base64,
+    }))
 }
 
-fn to_response(account: Account) -> Response {
-    let key_pair = account.keypair();
-    let generated_key_pair = GeneratedKeyPair::new(
-        Vec::from(key_pair.public_key_bytes()),
-        Vec::from(key_pair.secret_key_bytes()),
-    );
-    Response { generated_key_pair }
+async fn delete_account(
+    State(state): State<Arc<AppState>>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    AccountService::delete(&state.key_store)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
-#[cfg(test)]
-mod account_presentation_tests {
-    use super::*;
+async fn sign_account(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SignRequest>,
+) -> Result<Json<SignResponse>, (StatusCode, String)> {
+    let msg = BASE64_STANDARD.decode(&req.message_base64).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid message_base64: {e}"),
+        )
+    })?;
 
-    #[test]
-    fn account_create_test() {
-        let args = ReqArguments {
-            generating_key_type: KeyTypeMapper::K256,
+    let (sig, _rec_id) = AccountService::sign(&state.key_store, &msg).map_err(|e| {
+        let status = match e {
+            SignError::NotFound => StatusCode::NOT_FOUND,
+            SignError::KeyStore(_) | SignError::InvalidKey(_) => StatusCode::BAD_REQUEST,
         };
-        let result = create(args).unwrap();
-        println!("{:?}", result.generated_key_pair.public_key);
-        assert!(!result.generated_key_pair.public_key.is_empty());
-    }
+        (status, e.to_string())
+    })?;
+
+    let signature_base64 = BASE64_STANDARD.encode(&sig);
+
+    Ok(Json(SignResponse { signature_base64 }))
 }

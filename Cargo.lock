@@ -1306,10 +1306,18 @@ dependencies = [
 name = "monas-account"
 version = "0.1.0"
 dependencies = [
+ "axum",
+ "base64",
  "k256",
  "p256",
  "rand_core 0.9.3",
+ "serde",
+ "serde_json",
  "sha3",
+ "sled",
+ "tempfile",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]
