@@ -29,9 +29,5 @@ fn main() {
     let secret_key_b64 = BASE64_STANDARD.encode(secret_key_bytes);
 
     println!("recipient_public_key_base64: {public_key_b64}");
-    println!(
-        "recipient_private_key_base64: {secret_key_b64}"
-    );
+    println!("recipient_private_key_base64: {secret_key_b64}");
 }
-
-

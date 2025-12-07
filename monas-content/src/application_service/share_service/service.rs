@@ -68,26 +68,54 @@ where
             .map_err(ShareApplicationError::ContentEncryptionKeyStore)?
             .ok_or(ShareApplicationError::MissingContentEncryptionKey)?;
 
-        // 3. 受信者公開鍵を登録し、対応する KeyId を発行
+        // 3. KeyId を計算
         let recipient_key_id = self
             .public_key_directory
-            .register_public_key(&cmd.recipient_public_key)
-            .map_err(ShareApplicationError::PublicKeyDirectory)?;
-        let recipient_public_key = &cmd.recipient_public_key;
+            .compute_key_id(&cmd.recipient_public_key);
 
-        // 4. HPKE で CEK をラップ
+        // 4. Share をロード
+        let mut share = self
+            .share_repository
+            .load(&cmd.content_id)
+            .map_err(ShareApplicationError::ShareRepository)?
+            .unwrap_or_else(|| Share::new(cmd.content_id.clone()));
+
+        // 5. Share のドメインルール検証
+        let event = match cmd.permission {
+            crate::domain::share::Permission::Read => share.grant_read(recipient_key_id.clone()),
+            crate::domain::share::Permission::Write => share.grant_write(recipient_key_id.clone()),
+        }
+        .map_err(ShareApplicationError::Share)?;
+
+        let _ = event;
+
+        // 6. CEK をラップ
+        let recipient_public_key = &cmd.recipient_public_key;
         let (enc, wrapped_cek) = self
             .key_wrapper
             .wrap_cek(&cek, recipient_public_key, &cmd.content_id)
             .map_err(|e| ShareApplicationError::KeyWrapping(format!("{e:?}")))?;
 
+        // 7. 公開鍵を登録
+        self.public_key_directory
+            .register_public_key(&cmd.recipient_public_key)
+            .map_err(ShareApplicationError::PublicKeyDirectory)?;
+
+        // 8. Share を保存（失敗時は公開鍵を削除してロールバック）
+        if let Err(e) = self.share_repository.save(&share) {
+            // 補償トランザクション: 公開鍵を削除してロールバック
+            let _ = self
+                .public_key_directory
+                .delete_public_key(&recipient_key_id);
+            return Err(ShareApplicationError::ShareRepository(e));
+        }
+        // 9. KeyEnvelope を構築
         let wrapped_recipient = crate::domain::share::WrappedRecipientKey::new(
             recipient_key_id.clone(),
             enc,
             wrapped_cek,
         );
 
-        // 5. KeyEnvelope を構築
         let envelope = KeyEnvelope::new(
             cmd.content_id.clone(),
             crate::domain::share::key_envelope::KeyWrapAlgorithm::HpkeV1,
@@ -95,26 +123,6 @@ where
             wrapped_recipient,
             ciphertext,
         );
-
-        // 6. Share (ACL) を更新
-        let mut share = self
-            .share_repository
-            .load(&cmd.content_id)
-            .map_err(ShareApplicationError::ShareRepository)?
-            .unwrap_or_else(|| Share::new(cmd.content_id.clone()));
-
-        let event = match cmd.permission {
-            crate::domain::share::Permission::Read => share.grant_read(recipient_key_id.clone()),
-            crate::domain::share::Permission::Write => share.grant_write(recipient_key_id.clone()),
-        }
-        .map_err(ShareApplicationError::Share)?;
-
-        // NOTE: 現状では ShareEvent は外に返さず、ACL の保存のみ行う。
-        let _ = event;
-
-        self.share_repository
-            .save(&share)
-            .map_err(ShareApplicationError::ShareRepository)?;
 
         Ok(GrantShareResult {
             envelope,
@@ -340,17 +348,20 @@ mod tests {
     #[derive(Clone, Default)]
     struct TestPublicKeyDirectory {
         registered: Arc<Mutex<Vec<Vec<u8>>>>,
+        deleted: Arc<Mutex<Vec<KeyId>>>,
     }
 
     impl PublicKeyDirectory for TestPublicKeyDirectory {
+        fn compute_key_id(&self, _public_key: &[u8]) -> KeyId {
+            KeyId::new(vec![1, 2, 3])
+        }
+
         fn register_public_key(&self, public_key: &[u8]) -> Result<KeyId, PublicKeyDirectoryError> {
             let mut guard = self
                 .registered
                 .lock()
                 .map_err(|e| PublicKeyDirectoryError::Lookup(e.to_string()))?;
             guard.push(public_key.to_vec());
-
-            // テストでは固定の KeyId を返す。
             Ok(KeyId::new(vec![1, 2, 3]))
         }
 
@@ -362,8 +373,16 @@ mod tests {
                 .registered
                 .lock()
                 .map_err(|e| PublicKeyDirectoryError::Lookup(e.to_string()))?;
-
             Ok(guard.first().cloned())
+        }
+
+        fn delete_public_key(&self, key_id: &KeyId) -> Result<(), PublicKeyDirectoryError> {
+            let mut guard = self
+                .deleted
+                .lock()
+                .map_err(|e| PublicKeyDirectoryError::Lookup(e.to_string()))?;
+            guard.push(key_id.clone());
+            Ok(())
         }
     }
 
@@ -419,6 +438,21 @@ mod tests {
         {
             Err(crate::domain::share::encryption::KeyWrappingError::Other(
                 "unwrap failed (test)".into(),
+            ))
+        }
+    }
+
+    #[derive(Clone)]
+    struct FailingSaveShareRepository;
+
+    impl ShareRepository for FailingSaveShareRepository {
+        fn load(&self, _content_id: &ContentId) -> Result<Option<Share>, ShareRepositoryError> {
+            Ok(None)
+        }
+
+        fn save(&self, _share: &Share) -> Result<(), ShareRepositoryError> {
+            Err(ShareRepositoryError::Storage(
+                "save failed (test)".to_string(),
             ))
         }
     }
@@ -898,6 +932,65 @@ mod tests {
             .grant_share(cmd)
             .expect_err("grant_share should fail when key wrapping fails");
         assert!(matches!(err, ShareApplicationError::KeyWrapping(_)));
+    }
+
+    #[test]
+    fn grant_share_rollbacks_public_key_when_share_save_fails() {
+        let (content_repo, content_storage) = TestContentRepository::new();
+        let (key_store, key_storage) = TestKeyStore::new();
+        let share_repo = FailingSaveShareRepository;
+        let public_key_dir = TestPublicKeyDirectory::default();
+        let key_wrapper = TestKeyWrapper;
+
+        let cid = cid();
+        let content = build_content(&cid, Some(encrypted()), false);
+        {
+            let mut guard = content_storage.lock().unwrap();
+            guard.insert(cid.as_str().to_string(), content);
+        }
+        {
+            let mut guard = key_storage.lock().unwrap();
+            guard.insert(cid.as_str().to_string(), cek());
+        }
+
+        let service = ShareService {
+            share_repository: share_repo,
+            content_repository: content_repo,
+            cek_store: key_store,
+            public_key_directory: public_key_dir.clone(),
+            key_wrapper,
+        };
+
+        let cmd = GrantShareCommand {
+            content_id: cid,
+            sender_key_id: sender_key_id(),
+            recipient_public_key: vec![1, 2, 3, 4],
+            permission: Permission::Read,
+        };
+
+        let err = service
+            .grant_share(cmd)
+            .expect_err("grant_share should fail when share save fails");
+        assert!(matches!(err, ShareApplicationError::ShareRepository(_)));
+
+        let registered = public_key_dir.registered.lock().unwrap();
+        assert_eq!(
+            registered.len(),
+            1,
+            "public key should have been registered"
+        );
+
+        let deleted = public_key_dir.deleted.lock().unwrap();
+        assert_eq!(
+            deleted.len(),
+            1,
+            "delete_public_key should have been called for rollback"
+        );
+        assert_eq!(
+            deleted[0],
+            KeyId::new(vec![1, 2, 3]),
+            "correct key_id should be deleted"
+        );
     }
 
     #[test]

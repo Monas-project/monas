@@ -1057,7 +1057,7 @@ mod tests {
                 assert_eq!(expected, expected_cid.as_str());
                 assert_eq!(actual, actual_cid.as_str());
             }
-            other => panic!("unexpected error variant: {:?}", other),
+            other => panic!("unexpected error variant: {other:?}"),
         }
     }
 }
