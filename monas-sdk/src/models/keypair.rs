@@ -24,71 +24,17 @@ impl std::fmt::Display for KeyType {
 /// 鍵ペア生成のリクエスト
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GenerateKeypairInput {
-    /// 生成する楕円曲線の種類
     pub key_type: KeyType,
 }
 
 /// 鍵ペア生成のレスポンス
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GenerateKeypairOutput {
-    /// 鍵の種類
     pub key_type: KeyType,
     /// 公開鍵（base64url）
     pub public_key: String,
     /// 秘密鍵（base64url）
     pub private_key: String,
-}
-
-// ============================================
-// sign
-// ============================================
-
-/// 署名リクエスト
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SignInput {
-    /// 鍵の種類
-    pub key_type: KeyType,
-    /// 秘密鍵（base64url）
-    pub private_key: String,
-    /// 署名対象のデータ（base64url）
-    pub message: String,
-}
-
-/// 署名レスポンス
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SignOutput {
-    /// 署名（base64url）
-    pub signature: String,
-    /// リカバリーID（secp256k1の場合のみ）
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub recovery_id: Option<u8>,
-}
-
-// ============================================
-// verify
-// ============================================
-
-/// 署名検証リクエスト
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VerifyInput {
-    /// 鍵の種類
-    pub key_type: KeyType,
-    /// 公開鍵（base64url）
-    pub public_key: String,
-    /// 署名対象データ（base64url）
-    pub message: String,
-    /// 署名（base64url）
-    pub signature: String,
-}
-
-/// 署名検証レスポンス
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VerifyOutput {
-    /// 署名が有効ならtrue
-    pub valid: bool,
-    /// 無効な場合の理由
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
 }
 
 #[cfg(test)]
@@ -134,47 +80,5 @@ mod tests {
         let json = serde_json::to_string(&output).unwrap();
         assert!(json.contains("\"public_key\":\"A9C2oMamPJwStcOm\""));
         assert!(json.contains("\"private_key\":\"w13wjJT3L08Mg9jI\""));
-    }
-
-    #[test]
-    fn test_sign_output_without_recovery_id() {
-        let output = SignOutput {
-            signature: "signature_data".into(),
-            recovery_id: None,
-        };
-        let json = serde_json::to_string(&output).unwrap();
-        assert!(!json.contains("recovery_id"));
-    }
-
-    #[test]
-    fn test_sign_output_with_recovery_id() {
-        let output = SignOutput {
-            signature: "signature_data".into(),
-            recovery_id: Some(1),
-        };
-        let json = serde_json::to_string(&output).unwrap();
-        assert!(json.contains("\"recovery_id\":1"));
-    }
-
-    #[test]
-    fn test_verify_output_valid() {
-        let output = VerifyOutput {
-            valid: true,
-            reason: None,
-        };
-        let json = serde_json::to_string(&output).unwrap();
-        assert!(json.contains("\"valid\":true"));
-        assert!(!json.contains("reason"));
-    }
-
-    #[test]
-    fn test_verify_output_invalid() {
-        let output = VerifyOutput {
-            valid: false,
-            reason: Some("signature mismatch".into()),
-        };
-        let json = serde_json::to_string(&output).unwrap();
-        assert!(json.contains("\"valid\":false"));
-        assert!(json.contains("\"reason\":\"signature mismatch\""));
     }
 }

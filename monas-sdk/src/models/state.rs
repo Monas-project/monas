@@ -91,11 +91,26 @@ mod tests {
 
     #[test]
     fn test_operation_type_serialization() {
-        assert_eq!(serde_json::to_string(&OperationType::Create).unwrap(), "\"create\"");
-        assert_eq!(serde_json::to_string(&OperationType::Update).unwrap(), "\"update\"");
-        assert_eq!(serde_json::to_string(&OperationType::Delete).unwrap(), "\"delete\"");
-        assert_eq!(serde_json::to_string(&OperationType::Share).unwrap(), "\"share\"");
-        assert_eq!(serde_json::to_string(&OperationType::RevokeShare).unwrap(), "\"revoke_share\"");
+        assert_eq!(
+            serde_json::to_string(&OperationType::Create).unwrap(),
+            "\"create\""
+        );
+        assert_eq!(
+            serde_json::to_string(&OperationType::Update).unwrap(),
+            "\"update\""
+        );
+        assert_eq!(
+            serde_json::to_string(&OperationType::Delete).unwrap(),
+            "\"delete\""
+        );
+        assert_eq!(
+            serde_json::to_string(&OperationType::Share).unwrap(),
+            "\"share\""
+        );
+        assert_eq!(
+            serde_json::to_string(&OperationType::RevokeShare).unwrap(),
+            "\"revoke_share\""
+        );
     }
 
     #[test]
