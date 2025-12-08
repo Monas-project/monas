@@ -1,0 +1,32 @@
+# Monas Filesync Configuration File
+# Copy this file to filesync.toml and customize as needed
+
+# IPFS provider configuration
+[ipfs]
+# IPFS gateway URL for accessing IPFS content
+gateway = "https://ipfs.io"
+
+# Google Drive provider configuration
+[google_drive]
+# Google Drive API endpoint
+api_endpoint = "https://www.googleapis.com/drive/v3"
+# OAuth client ID (optional, for future implementation)
+# client_id = "your-client-id"
+# OAuth client secret (optional, for future implementation)
+# client_secret = "your-client-secret"
+
+# OneDrive provider configuration
+[onedrive]
+# Microsoft Graph API endpoint
+api_endpoint = "https://graph.microsoft.com/v1.0"
+# OAuth client ID (optional, for future implementation)
+# client_id = "your-client-id"
+# OAuth client secret (optional, for future implementation)
+# client_secret = "your-client-secret"
+
+# Local storage configuration
+[local]
+# Base path for local storage (optional)
+# If not specified, uses the path from the URI directly
+# base_path = "/path/to/storage"
+
