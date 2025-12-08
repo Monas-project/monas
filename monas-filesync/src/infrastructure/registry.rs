@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use super::{StorageProvider, FilesyncConfig};
+use super::{FilesyncConfig, StorageProvider};
 
 pub struct FetcherRegistry(RwLock<HashMap<&'static str, Arc<dyn StorageProvider>>>);
 
@@ -12,7 +12,9 @@ impl Default for FetcherRegistry {
 }
 
 impl FetcherRegistry {
-    pub fn new() -> Self { Self(RwLock::new(HashMap::new())) }
+    pub fn new() -> Self {
+        Self(RwLock::new(HashMap::new()))
+    }
 
     pub fn register(&self, scheme: &'static str, f: impl StorageProvider + 'static) {
         self.0.write().unwrap().insert(scheme, Arc::new(f));
@@ -25,27 +27,30 @@ impl FetcherRegistry {
     /// Initialize registry from configuration
     pub fn from_config(config: &FilesyncConfig) -> Self {
         let registry = Self::new();
-        
+
         // Register IPFS provider
         use crate::infrastructure::providers::ipfs::IpfsProvider;
         registry.register("ipfs", IpfsProvider::new(config.ipfs.gateway.clone()));
-        
+
         // Register Google Drive provider
         use crate::infrastructure::providers::google_drive::GoogleDriveProvider;
-        registry.register("google-drive", GoogleDriveProvider::new(&config.google_drive));
-        
+        registry.register(
+            "google-drive",
+            GoogleDriveProvider::new(&config.google_drive),
+        );
+
         // Register OneDrive provider
         use crate::infrastructure::providers::onedrive::OneDriveProvider;
         registry.register("onedrive", OneDriveProvider::new(&config.onedrive));
-        
+
         // Register Local Desktop provider
         use crate::infrastructure::providers::local_desktop::LocalDesktopProvider;
         registry.register("local", LocalDesktopProvider::new(&config.local));
-        
+
         // Register Local Mobile provider
         use crate::infrastructure::providers::local_mobile::LocalMobileProvider;
         registry.register("local-mobile", LocalMobileProvider::new(&config.local));
-        
+
         registry
     }
 }
@@ -84,10 +89,19 @@ mod tests {
     #[test]
     fn test_registry_multiple_schemes() {
         let registry = FetcherRegistry::new();
-        
-        registry.register("google-drive", GoogleDriveProvider::new(&GoogleDriveConfig::default()));
-        registry.register("onedrive", OneDriveProvider::new(&OneDriveConfig::default()));
-        registry.register("ipfs", crate::infrastructure::providers::ipfs::IpfsProvider::new("https://ipfs.io"));
+
+        registry.register(
+            "google-drive",
+            GoogleDriveProvider::new(&GoogleDriveConfig::default()),
+        );
+        registry.register(
+            "onedrive",
+            OneDriveProvider::new(&OneDriveConfig::default()),
+        );
+        registry.register(
+            "ipfs",
+            crate::infrastructure::providers::ipfs::IpfsProvider::new("https://ipfs.io"),
+        );
 
         assert!(registry.resolve("google-drive").is_some());
         assert!(registry.resolve("onedrive").is_some());
@@ -98,13 +112,19 @@ mod tests {
     #[test]
     fn test_registry_overwrite() {
         let registry = FetcherRegistry::new();
-        
-        registry.register("google-drive", GoogleDriveProvider::new(&GoogleDriveConfig::default()));
+
+        registry.register(
+            "google-drive",
+            GoogleDriveProvider::new(&GoogleDriveConfig::default()),
+        );
         let first = registry.resolve("google-drive");
-        
-        registry.register("google-drive", GoogleDriveProvider::new(&GoogleDriveConfig::default()));
+
+        registry.register(
+            "google-drive",
+            GoogleDriveProvider::new(&GoogleDriveConfig::default()),
+        );
         let second = registry.resolve("google-drive");
-        
+
         assert!(first.is_some());
         assert!(second.is_some());
     }
@@ -113,7 +133,7 @@ mod tests {
     fn test_registry_from_config() {
         let config = FilesyncConfig::default();
         let registry = FetcherRegistry::from_config(&config);
-        
+
         assert!(registry.resolve("ipfs").is_some());
         assert!(registry.resolve("google-drive").is_some());
         assert!(registry.resolve("onedrive").is_some());
@@ -129,7 +149,7 @@ gateway = "https://custom-ipfs.io"
 "#;
         let config = FilesyncConfig::from_toml_str(toml_content).unwrap();
         let registry = FetcherRegistry::from_config(&config);
-        
+
         assert!(registry.resolve("ipfs").is_some());
     }
 }

@@ -3,8 +3,8 @@ use std::time::SystemTime;
 #[cfg(feature = "cloud-connectivity")]
 use std::time::Duration;
 
-use crate::infrastructure::{AuthSession, StorageProvider, FetchError, FetchResult};
 use crate::infrastructure::config::GoogleDriveConfig;
+use crate::infrastructure::{AuthSession, FetchError, FetchResult, StorageProvider};
 
 #[cfg(feature = "cloud-connectivity")]
 use reqwest::Client;
@@ -107,18 +107,19 @@ impl GoogleDriveProvider {
             });
         }
 
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|err| FetchError {
-                message: format!("failed to read Google Drive response body: {err}"),
-            })?;
+        let bytes = resp.bytes().await.map_err(|err| FetchError {
+            message: format!("failed to read Google Drive response body: {err}"),
+        })?;
 
         Ok(bytes.to_vec())
     }
 
     #[cfg(feature = "cloud-connectivity")]
-    async fn fetch_metadata(&self, auth: &AuthSession, path: &str) -> FetchResult<(u64, SystemTime)> {
+    async fn fetch_metadata(
+        &self,
+        auth: &AuthSession,
+        path: &str,
+    ) -> FetchResult<(u64, SystemTime)> {
         #[derive(serde::Deserialize)]
         struct Metadata {
             size: Option<String>,
@@ -152,12 +153,9 @@ impl GoogleDriveProvider {
             });
         }
 
-        let metadata: Metadata = resp
-            .json()
-            .await
-            .map_err(|err| FetchError {
-                message: format!("failed to parse Google Drive metadata: {err}"),
-            })?;
+        let metadata: Metadata = resp.json().await.map_err(|err| FetchError {
+            message: format!("failed to parse Google Drive metadata: {err}"),
+        })?;
 
         let size = metadata
             .size
@@ -169,11 +167,9 @@ impl GoogleDriveProvider {
                 message: format!("invalid Google Drive size value: {err}"),
             })?;
 
-        let modified_str = metadata
-            .modified_time
-            .ok_or_else(|| FetchError {
-                message: "Google Drive metadata missing modifiedTime".into(),
-            })?;
+        let modified_str = metadata.modified_time.ok_or_else(|| FetchError {
+            message: "Google Drive metadata missing modifiedTime".into(),
+        })?;
 
         let parsed = OffsetDateTime::parse(&modified_str, &Rfc3339).map_err(|err| FetchError {
             message: format!("failed to parse modifiedTime: {err}"),
@@ -207,7 +203,11 @@ impl StorageProvider for GoogleDriveProvider {
         }
     }
 
-    async fn size_and_mtime(&self, auth: &AuthSession, path: &str) -> FetchResult<(u64, SystemTime)> {
+    async fn size_and_mtime(
+        &self,
+        auth: &AuthSession,
+        path: &str,
+    ) -> FetchResult<(u64, SystemTime)> {
         #[cfg(feature = "cloud-connectivity")]
         {
             return self.fetch_metadata(auth, path).await;
@@ -235,8 +235,10 @@ mod tests {
     #[tokio::test]
     async fn test_google_drive_provider_fetch() {
         let provider = GoogleDriveProvider::new(&GoogleDriveConfig::default());
-        let auth = AuthSession { access_token: "test_token".to_string() };
-        
+        let auth = AuthSession {
+            access_token: "test_token".to_string(),
+        };
+
         let result = provider.fetch(&auth, "google-drive://file123").await;
         assert!(result.is_err());
         assert!(result.unwrap_err().message.contains("cloud-connectivity"));
@@ -245,9 +247,13 @@ mod tests {
     #[tokio::test]
     async fn test_google_drive_provider_size_and_mtime() {
         let provider = GoogleDriveProvider::new(&GoogleDriveConfig::default());
-        let auth = AuthSession { access_token: "test_token".to_string() };
-        
-        let result = provider.size_and_mtime(&auth, "google-drive://file123").await;
+        let auth = AuthSession {
+            access_token: "test_token".to_string(),
+        };
+
+        let result = provider
+            .size_and_mtime(&auth, "google-drive://file123")
+            .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().message.contains("cloud-connectivity"));
     }
@@ -255,11 +261,18 @@ mod tests {
     #[tokio::test]
     async fn test_google_drive_provider_save() {
         let provider = GoogleDriveProvider::new(&GoogleDriveConfig::default());
-        let auth = AuthSession { access_token: "test_token".to_string() };
-        
-        let result = provider.save(&auth, "google-drive://file123", b"test data").await;
+        let auth = AuthSession {
+            access_token: "test_token".to_string(),
+        };
+
+        let result = provider
+            .save(&auth, "google-drive://file123", b"test data")
+            .await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().message.contains("Google Drive save is not yet supported"));
+        assert!(result
+            .unwrap_err()
+            .message
+            .contains("Google Drive save is not yet supported"));
     }
 
     #[test]

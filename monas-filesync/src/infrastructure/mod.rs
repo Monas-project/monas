@@ -1,10 +1,10 @@
+pub mod config;
+pub mod path;
 pub mod providers;
 pub mod registry;
 pub mod repository;
-pub mod path;
-pub mod config;
 
-pub use config::{FilesyncConfig, ConfigError};
+pub use config::{ConfigError, FilesyncConfig};
 
 use std::fmt;
 use std::time::SystemTime;
@@ -47,6 +47,10 @@ pub struct AuthSession {
 #[async_trait::async_trait]
 pub trait StorageProvider: Send + Sync {
     async fn fetch(&self, auth: &AuthSession, path: &str) -> FetchResult<Vec<u8>>;
-    async fn size_and_mtime(&self, auth: &AuthSession, path: &str) -> FetchResult<(u64, SystemTime)>;
+    async fn size_and_mtime(
+        &self,
+        auth: &AuthSession,
+        path: &str,
+    ) -> FetchResult<(u64, SystemTime)>;
     async fn save(&self, auth: &AuthSession, path: &str, data: &[u8]) -> FetchResult<()>;
 }

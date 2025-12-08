@@ -26,7 +26,11 @@ async fn google_drive_connectivity() {
         .await
         .expect("request failed");
 
-    assert!(resp.status().is_success(), "Google Drive GET failed: {}", resp.status());
+    assert!(
+        resp.status().is_success(),
+        "Google Drive GET failed: {}",
+        resp.status()
+    );
 }
 
 #[tokio::test]
@@ -54,7 +58,11 @@ async fn onedrive_connectivity() {
         .await
         .expect("request failed");
 
-    assert!(resp.status().is_success(), "OneDrive GET failed: {}", resp.status());
+    assert!(
+        resp.status().is_success(),
+        "OneDrive GET failed: {}",
+        resp.status()
+    );
 }
 
 #[tokio::test]
@@ -68,9 +76,7 @@ async fn onedrive_put_connectivity() {
         _ => return, // skip when upload target is not provided
     };
 
-    let url = format!(
-        "https://graph.microsoft.com/v1.0/drive/items/{item_id}/content"
-    );
+    let url = format!("https://graph.microsoft.com/v1.0/drive/items/{item_id}/content");
 
     let client = reqwest::Client::builder()
         .http2_prior_knowledge()

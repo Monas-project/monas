@@ -104,7 +104,7 @@ mod tests {
         // scheme() should handle edge cases gracefully
         let path = ExternalFilePath::new("test://path").unwrap();
         assert_eq!(path.scheme(), "test");
-        
+
         // Test with empty scheme (shouldn't happen in practice, but test the unwrap_or)
         // This is tested indirectly through the split_once logic
         let path = ExternalFilePath::new("a://b").unwrap();

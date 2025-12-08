@@ -1,8 +1,8 @@
 pub mod infrastructure;
 
 pub use infrastructure::{
-    FilesyncConfig, ConfigError, StorageProvider, AuthSession, FetchError,
-    registry::FetcherRegistry,
+    registry::FetcherRegistry, AuthSession, ConfigError, FetchError, FilesyncConfig,
+    StorageProvider,
 };
 
 /// Initialize a registry from a configuration file

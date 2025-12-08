@@ -9,15 +9,15 @@ pub struct FilesyncConfig {
     /// IPFS provider configuration
     #[serde(default)]
     pub ipfs: IpfsConfig,
-    
+
     /// Google Drive provider configuration
     #[serde(default)]
     pub google_drive: GoogleDriveConfig,
-    
+
     /// OneDrive provider configuration
     #[serde(default)]
     pub onedrive: OneDriveConfig,
-    
+
     /// Local storage configuration
     #[serde(default)]
     pub local: LocalConfig,
@@ -26,26 +26,23 @@ pub struct FilesyncConfig {
 impl FilesyncConfig {
     /// Load configuration from a TOML file
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, ConfigError> {
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| ConfigError::IoError(e.to_string()))?;
-        
-        toml::from_str(&content)
-            .map_err(|e| ConfigError::ParseError(e.to_string()))
+        let content =
+            std::fs::read_to_string(path).map_err(|e| ConfigError::IoError(e.to_string()))?;
+
+        toml::from_str(&content).map_err(|e| ConfigError::ParseError(e.to_string()))
     }
 
     /// Load configuration from a TOML string
     pub fn from_toml_str(content: &str) -> Result<Self, ConfigError> {
-        toml::from_str(content)
-            .map_err(|e| ConfigError::ParseError(e.to_string()))
+        toml::from_str(content).map_err(|e| ConfigError::ParseError(e.to_string()))
     }
 
     /// Save configuration to a TOML file
     pub fn to_file<P: AsRef<Path>>(&self, path: P) -> Result<(), ConfigError> {
-        let content = toml::to_string_pretty(self)
-            .map_err(|e| ConfigError::SerializeError(e.to_string()))?;
-        
-        std::fs::write(path, content)
-            .map_err(|e| ConfigError::IoError(e.to_string()))
+        let content =
+            toml::to_string_pretty(self).map_err(|e| ConfigError::SerializeError(e.to_string()))?;
+
+        std::fs::write(path, content).map_err(|e| ConfigError::IoError(e.to_string()))
     }
 }
 
@@ -75,11 +72,11 @@ pub struct GoogleDriveConfig {
     /// Google Drive API endpoint
     #[serde(default = "default_google_drive_endpoint")]
     pub api_endpoint: String,
-    
+
     /// Client ID for OAuth (optional, for future implementation)
     #[serde(default)]
     pub client_id: Option<String>,
-    
+
     /// Client secret for OAuth (optional, for future implementation)
     #[serde(default)]
     pub client_secret: Option<String>,
@@ -105,11 +102,11 @@ pub struct OneDriveConfig {
     /// Microsoft Graph API endpoint
     #[serde(default = "default_onedrive_endpoint")]
     pub api_endpoint: String,
-    
+
     /// Client ID for OAuth (optional, for future implementation)
     #[serde(default)]
     pub client_id: Option<String>,
-    
+
     /// Client secret for OAuth (optional, for future implementation)
     #[serde(default)]
     pub client_secret: Option<String>,
@@ -165,8 +162,14 @@ mod tests {
     fn test_config_default() {
         let config = FilesyncConfig::default();
         assert_eq!(config.ipfs.gateway, "https://ipfs.io");
-        assert_eq!(config.google_drive.api_endpoint, "https://www.googleapis.com/drive/v3");
-        assert_eq!(config.onedrive.api_endpoint, "https://graph.microsoft.com/v1.0");
+        assert_eq!(
+            config.google_drive.api_endpoint,
+            "https://www.googleapis.com/drive/v3"
+        );
+        assert_eq!(
+            config.onedrive.api_endpoint,
+            "https://graph.microsoft.com/v1.0"
+        );
     }
 
     #[test]
@@ -185,12 +188,21 @@ api_endpoint = "https://custom.graph.microsoft.com"
 [local]
 base_path = "/custom/path"
 "#;
-        
+
         let config = FilesyncConfig::from_toml_str(toml_content).unwrap();
         assert_eq!(config.ipfs.gateway, "https://custom-ipfs.io");
-        assert_eq!(config.google_drive.api_endpoint, "https://custom.googleapis.com");
-        assert_eq!(config.google_drive.client_id, Some("test-client-id".to_string()));
-        assert_eq!(config.onedrive.api_endpoint, "https://custom.graph.microsoft.com");
+        assert_eq!(
+            config.google_drive.api_endpoint,
+            "https://custom.googleapis.com"
+        );
+        assert_eq!(
+            config.google_drive.client_id,
+            Some("test-client-id".to_string())
+        );
+        assert_eq!(
+            config.onedrive.api_endpoint,
+            "https://custom.graph.microsoft.com"
+        );
         assert_eq!(config.local.base_path, Some("/custom/path".to_string()));
     }
 
@@ -201,11 +213,14 @@ base_path = "/custom/path"
 [ipfs]
 gateway = "https://custom-ipfs.io"
 "#;
-        
+
         let config = FilesyncConfig::from_toml_str(toml_content).unwrap();
         assert_eq!(config.ipfs.gateway, "https://custom-ipfs.io");
         // Other fields should use defaults
-        assert_eq!(config.google_drive.api_endpoint, "https://www.googleapis.com/drive/v3");
+        assert_eq!(
+            config.google_drive.api_endpoint,
+            "https://www.googleapis.com/drive/v3"
+        );
     }
 
     #[test]

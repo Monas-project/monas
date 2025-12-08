@@ -15,7 +15,9 @@ impl Default for MemoryFileRepository {
 }
 
 impl MemoryFileRepository {
-    pub fn new() -> Self { Self(RwLock::new(HashMap::new())) }
+    pub fn new() -> Self {
+        Self(RwLock::new(HashMap::new()))
+    }
 }
 
 impl FileRepository for MemoryFileRepository {
@@ -45,7 +47,7 @@ mod tests {
         let value = b"test_value".to_vec();
 
         repo.put(key, value.clone());
-        
+
         let retrieved = repo.get(key);
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap(), value);
@@ -61,10 +63,10 @@ mod tests {
     fn test_memory_repository_overwrite() {
         let repo = MemoryFileRepository::new();
         let key = "test_key";
-        
+
         repo.put(key, b"first_value".to_vec());
         repo.put(key, b"second_value".to_vec());
-        
+
         let retrieved = repo.get(key);
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap(), b"second_value".to_vec());
@@ -73,11 +75,11 @@ mod tests {
     #[test]
     fn test_memory_repository_multiple_keys() {
         let repo = MemoryFileRepository::new();
-        
+
         repo.put("key1", b"value1".to_vec());
         repo.put("key2", b"value2".to_vec());
         repo.put("key3", b"value3".to_vec());
-        
+
         assert_eq!(repo.get("key1").unwrap(), b"value1".to_vec());
         assert_eq!(repo.get("key2").unwrap(), b"value2".to_vec());
         assert_eq!(repo.get("key3").unwrap(), b"value3".to_vec());
@@ -87,9 +89,9 @@ mod tests {
     fn test_memory_repository_empty_value() {
         let repo = MemoryFileRepository::new();
         let key = "empty_key";
-        
+
         repo.put(key, vec![]);
-        
+
         let retrieved = repo.get(key);
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap(), vec![]);
