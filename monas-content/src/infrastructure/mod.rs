@@ -1,4 +1,4 @@
-pub mod content;
 pub mod content_id;
 pub mod encryption;
-pub mod metadata;
+pub mod key_store;
+pub mod repository;
