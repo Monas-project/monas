@@ -35,7 +35,7 @@ mod tests {
         let error = FetchError {
             message: "test error message".to_string(),
         };
-        assert_eq!(format!("{}", error), "test error message");
+        assert_eq!(format!("{error}"), "test error message");
     }
 }
 

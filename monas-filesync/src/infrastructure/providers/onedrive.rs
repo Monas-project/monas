@@ -108,10 +108,11 @@ mod tests {
 
     #[test]
     fn test_onedrive_provider_stores_config() {
-        let mut config = OneDriveConfig::default();
-        config.api_endpoint = "https://example.graph".into();
-        config.client_id = Some("client".into());
-        config.client_secret = Some("secret".into());
+        let config = OneDriveConfig {
+            api_endpoint: "https://example.graph".into(),
+            client_id: Some("client".into()),
+            client_secret: Some("secret".into()),
+        };
 
         let provider = OneDriveProvider::new(&config);
         assert_eq!(provider.api_endpoint, "https://example.graph");

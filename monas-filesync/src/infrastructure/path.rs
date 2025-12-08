@@ -96,7 +96,7 @@ mod tests {
     #[test]
     fn test_parse_path_error_display() {
         let error = ParsePathError::Invalid;
-        assert_eq!(format!("{}", error), "invalid path format");
+        assert_eq!(format!("{error}"), "invalid path format");
     }
 
     #[test]

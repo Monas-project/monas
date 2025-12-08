@@ -277,10 +277,11 @@ mod tests {
 
     #[test]
     fn test_google_drive_provider_stores_config() {
-        let mut config = GoogleDriveConfig::default();
-        config.api_endpoint = "https://example.com".into();
-        config.client_id = Some("client".into());
-        config.client_secret = Some("secret".into());
+        let config = GoogleDriveConfig {
+            api_endpoint: "https://example.com".into(),
+            client_id: Some("client".into()),
+            client_secret: Some("secret".into()),
+        };
 
         let provider = GoogleDriveProvider::new(&config);
         assert_eq!(provider.api_endpoint, "https://example.com");

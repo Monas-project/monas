@@ -241,16 +241,13 @@ mod tests {
         // Tamper with part of the ciphertext (modify the first byte after IV)
         let original_byte = ciphertext[IV_LEN];
         println!("\n--- Before Tampering ---");
-        println!(
-            "Byte at position [IV_LEN=16]: 0x{:02x} ({})",
-            original_byte, original_byte
-        );
+        println!("Byte at position [IV_LEN=16]: 0x{original_byte:02x} ({original_byte})");
 
         ciphertext[IV_LEN] ^= 0x11; // Tampering by bit flipping
         println!("\n--- After Tampering ---");
         println!(
-            "Byte at position [IV_LEN=16]: 0x{:02x} ({}) ← TAMPERED!",
-            ciphertext[IV_LEN], ciphertext[IV_LEN]
+            "Byte at position [IV_LEN=16]: 0x{tampered:02x} ({tampered}) ← TAMPERED!",
+            tampered = ciphertext[IV_LEN]
         );
         println!(
             "Modified ciphertext (hex):     {}",
