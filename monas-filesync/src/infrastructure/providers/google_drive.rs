@@ -80,6 +80,30 @@ impl GoogleDriveProvider {
     }
 
     #[cfg(feature = "cloud-connectivity")]
+    fn upload_endpoint(&self) -> String {
+        let trimmed = self.trim_endpoint();
+        if trimmed.contains("/upload/") {
+            trimmed.to_string()
+        } else if let Some(idx) = trimmed.find("/drive/") {
+            let prefix = &trimmed[..idx];
+            let suffix = &trimmed[idx + "/drive/".len()..];
+            format!("{prefix}/upload/drive/{suffix}")
+        } else {
+            format!("{trimmed}/upload")
+        }
+    }
+
+    #[cfg(feature = "cloud-connectivity")]
+    fn file_upload_url(&self, file_id: &str) -> String {
+        let base = self.upload_endpoint();
+        format!(
+            "{}/files/{}?uploadType=media",
+            base.trim_end_matches('/'),
+            file_id
+        )
+    }
+
+    #[cfg(feature = "cloud-connectivity")]
     async fn fetch_remote(&self, auth: &AuthSession, path: &str) -> FetchResult<Vec<u8>> {
         let token = auth.access_token.trim();
         if token.is_empty() {
@@ -186,6 +210,39 @@ impl GoogleDriveProvider {
 
         Ok((size, system_time))
     }
+
+    #[cfg(feature = "cloud-connectivity")]
+    async fn save_remote(&self, auth: &AuthSession, path: &str, data: &[u8]) -> FetchResult<()> {
+        let token = auth.access_token.trim();
+        if token.is_empty() {
+            return Err(FetchError {
+                message: "missing Google Drive access token".into(),
+            });
+        }
+
+        let file_id = Self::extract_file_id(path)?;
+        let url = self.file_upload_url(file_id);
+
+        let resp = self
+            .http_client
+            .patch(url)
+            .bearer_auth(token)
+            .header("Content-Type", "application/octet-stream")
+            .body(data.to_vec())
+            .send()
+            .await
+            .map_err(|err| FetchError {
+                message: format!("Google Drive save request failed: {err}"),
+            })?;
+
+        if !resp.status().is_success() {
+            return Err(FetchError {
+                message: format!("Google Drive save failed with status {}", resp.status()),
+            });
+        }
+
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -220,10 +277,17 @@ impl StorageProvider for GoogleDriveProvider {
         }
     }
 
-    async fn save(&self, _auth: &AuthSession, _path: &str, _data: &[u8]) -> FetchResult<()> {
-        Err(FetchError {
-            message: "Google Drive save is not yet supported".into(),
-        })
+    async fn save(&self, auth: &AuthSession, path: &str, data: &[u8]) -> FetchResult<()> {
+        #[cfg(feature = "cloud-connectivity")]
+        {
+            return self.save_remote(auth, path, data).await;
+        }
+
+        #[cfg(not(feature = "cloud-connectivity"))]
+        {
+            let _ = (auth, path, data);
+            Err(Self::feature_disabled_error("save"))
+        }
     }
 }
 
@@ -269,10 +333,7 @@ mod tests {
             .save(&auth, "google-drive://file123", b"test data")
             .await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .message
-            .contains("Google Drive save is not yet supported"));
+        assert!(result.unwrap_err().message.contains("cloud-connectivity"));
     }
 
     #[test]
