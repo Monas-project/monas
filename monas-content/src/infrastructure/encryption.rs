@@ -1,12 +1,12 @@
-use crate::domain::content::ContentError;
-use crate::domain::encryption::{
+use crate::domain::content::encryption::{
     ContentEncryption, ContentEncryptionKey, ContentEncryptionKeyGenerator,
 };
+use crate::domain::content::ContentError;
 
 use aes::Aes256;
 use ctr::cipher::{KeyIvInit, StreamCipher};
 use ctr::Ctr128BE;
-use rand_core::{OsRng, TryRngCore};
+use rand_core::{OsRng, RngCore};
 
 type Aes256Ctr = Ctr128BE<Aes256>;
 
@@ -19,8 +19,7 @@ impl ContentEncryptionKeyGenerator for OsRngContentEncryptionKeyGenerator {
     fn generate(&self) -> ContentEncryptionKey {
         let mut key_bytes = [0u8; 32];
         let mut rng = OsRng;
-        rng.try_fill_bytes(&mut key_bytes)
-            .expect("failed to obtain randomness from OS");
+        rng.fill_bytes(&mut key_bytes);
         ContentEncryptionKey(key_bytes.to_vec())
     }
 }
@@ -34,6 +33,7 @@ impl ContentEncryptionKeyGenerator for OsRngContentEncryptionKeyGenerator {
 pub struct Aes256CtrContentEncryption;
 
 const IV_LEN: usize = 16;
+const KEY_LEN: usize = 32;
 
 impl ContentEncryption for Aes256CtrContentEncryption {
     fn encrypt(
@@ -41,15 +41,16 @@ impl ContentEncryption for Aes256CtrContentEncryption {
         key: &ContentEncryptionKey,
         plaintext: &[u8],
     ) -> Result<Vec<u8>, ContentError> {
-        if key.0.len() != 32 {
-            return Err(ContentError::EncryptionError(
-                "Invalid content encryption key length; expected 32 bytes".into(),
-            ));
+        if key.0.len() != KEY_LEN {
+            return Err(ContentError::EncryptionError(format!(
+                "Invalid content encryption key length; expected {} bytes, got {} bytes",
+                KEY_LEN,
+                key.0.len()
+            )));
         }
         let mut iv = [0u8; IV_LEN];
         let mut rng = OsRng;
-        rng.try_fill_bytes(&mut iv)
-            .expect("failed to obtain randomness from OS");
+        rng.fill_bytes(&mut iv);
 
         let mut buffer = plaintext.to_vec();
         let mut cipher = Aes256Ctr::new_from_slices(key.0.as_slice(), &iv).map_err(|_| {
@@ -66,9 +67,10 @@ impl ContentEncryption for Aes256CtrContentEncryption {
     }
 
     fn decrypt(&self, key: &ContentEncryptionKey, data: &[u8]) -> Result<Vec<u8>, ContentError> {
-        if key.0.len() != 32 {
+        if key.0.len() != KEY_LEN {
             return Err(ContentError::DecryptionError(format!(
-                "Invalid content encryption key length; expected 32 bytes, got {} bytes",
+                "Invalid content encryption key length; expected {} bytes, got {} bytes",
+                KEY_LEN,
                 key.0.len()
             )));
         }
@@ -241,16 +243,13 @@ mod tests {
         // Tamper with part of the ciphertext (modify the first byte after IV)
         let original_byte = ciphertext[IV_LEN];
         println!("\n--- Before Tampering ---");
-        println!(
-            "Byte at position [IV_LEN=16]: 0x{:02x} ({})",
-            original_byte, original_byte
-        );
+        println!("Byte at position [IV_LEN=16]: 0x{original_byte:02x} ({original_byte})");
 
         ciphertext[IV_LEN] ^= 0x11; // Tampering by bit flipping
         println!("\n--- After Tampering ---");
+        let tampered_byte = ciphertext[IV_LEN];
         println!(
-            "Byte at position [IV_LEN=16]: 0x{:02x} ({}) ← TAMPERED!",
-            ciphertext[IV_LEN], ciphertext[IV_LEN]
+            "Byte at position [IV_LEN=16]: 0x{tampered_byte:02x} ({tampered_byte}) ← TAMPERED!"
         );
         println!(
             "Modified ciphertext (hex):     {}",
