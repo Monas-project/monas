@@ -1,4 +1,4 @@
-use crate::domain::{content_id::ContentId, metadata::Metadata};
+use crate::domain::{content::metadata::Metadata, content_id::ContentId};
 
 /// コンテンツ作成ユースケースの入力。
 #[derive(Debug)]
