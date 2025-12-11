@@ -1,7 +1,7 @@
 use crate::domain::{
+    content::encryption::{ContentEncryption, ContentEncryptionKey, ContentEncryptionKeyGenerator},
     content::{Content, ContentError},
     content_id::{ContentId, ContentIdGenerator},
-    encryption::{ContentEncryption, ContentEncryptionKeyGenerator},
 };
 
 use super::{
@@ -33,17 +33,7 @@ where
 {
     pub fn create(&self, cmd: CreateContentCommand) -> Result<CreateContentResult, CreateError> {
         // 簡易バリデーション
-        if cmd.name.trim().is_empty() {
-            return Err(CreateError::Validation("name must not be empty".into()));
-        }
-        if cmd.path.trim().is_empty() {
-            return Err(CreateError::Validation("path must not be empty".into()));
-        }
-        if cmd.raw_content.is_empty() {
-            return Err(CreateError::Validation(
-                "raw_content must not be empty".into(),
-            ));
-        }
+        Self::validate_create_command(&cmd)?;
 
         // CEK の生成
         let key = self.key_generator.generate();
@@ -93,29 +83,29 @@ where
         })
     }
 
+    /// CreateContentCommand の簡易バリデーション。
+    fn validate_create_command(cmd: &CreateContentCommand) -> Result<(), CreateError> {
+        if cmd.name.trim().is_empty() {
+            return Err(CreateError::Validation("name must not be empty".into()));
+        }
+        if cmd.path.trim().is_empty() {
+            return Err(CreateError::Validation("path must not be empty".into()));
+        }
+        if cmd.raw_content.is_empty() {
+            return Err(CreateError::Validation(
+                "raw_content must not be empty".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// コンテンツ更新ユースケース。
     ///
     /// - `new_name` と `new_raw_content` はどちらか片方だけ、あるいは両方指定可能
     /// - どちらも `None` の場合は Validation エラーとする
     pub fn update(&self, cmd: UpdateContentCommand) -> Result<UpdateContentResult, UpdateError> {
         // 簡易バリデーション
-        if cmd.new_name.as_ref().is_none() && cmd.new_raw_content.as_ref().is_none() {
-            return Err(UpdateError::Validation(
-                "at least one of new_name or new_raw_content must be provided".into(),
-            ));
-        }
-        if let Some(name) = &cmd.new_name {
-            if name.trim().is_empty() {
-                return Err(UpdateError::Validation("name must not be empty".into()));
-            }
-        }
-        if let Some(raw) = &cmd.new_raw_content {
-            if raw.is_empty() {
-                return Err(UpdateError::Validation(
-                    "new_raw_content must not be empty when provided".into(),
-                ));
-            }
-        }
+        Self::validate_update_command(&cmd)?;
 
         // 既存コンテンツの取得
         let mut content = self
@@ -180,6 +170,31 @@ where
         })
     }
 
+    /// UpdateContentCommand の簡易バリデーション。
+    ///
+    /// - `new_name` / `new_raw_content` のいずれか一方以上が指定されていること。
+    /// - 指定されている場合、それぞれの値が妥当であること。
+    fn validate_update_command(cmd: &UpdateContentCommand) -> Result<(), UpdateError> {
+        if cmd.new_name.as_ref().is_none() && cmd.new_raw_content.as_ref().is_none() {
+            return Err(UpdateError::Validation(
+                "at least one of new_name or new_raw_content must be provided".into(),
+            ));
+        }
+        if let Some(name) = &cmd.new_name {
+            if name.trim().is_empty() {
+                return Err(UpdateError::Validation("name must not be empty".into()));
+            }
+        }
+        if let Some(raw) = &cmd.new_raw_content {
+            if raw.is_empty() {
+                return Err(UpdateError::Validation(
+                    "new_raw_content must not be empty when provided".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// コンテンツ本体を復号して取得するユースケース（fetch）。
     ///
     /// - `content_id` に対応するコンテンツを取得し、CEK を用いて復号したバイト列を返す。
@@ -213,6 +228,34 @@ where
             metadata: content.metadata().clone(),
             raw_content,
         })
+    }
+
+    /// 外部でアンラップされた CEK と暗号化済みコンテンツを用いて復号するユースケース。
+    ///
+    /// - 共有フロー（Share）で KeyEnvelope から CEK を取り出した後の復号処理を想定。
+    /// - 復号結果のバイト列から ContentId を再計算し、引数の `content_id` と一致することを検証する。
+    ///   （コンテンツアドレス化に基づく整合性チェック）
+    pub fn decrypt_with_cek(
+        &self,
+        expected_content_id: ContentId,
+        key: ContentEncryptionKey,
+        ciphertext: Vec<u8>,
+    ) -> Result<Vec<u8>, DecryptWithCekError> {
+        let plaintext = self
+            .encryptor
+            .decrypt(&key, &ciphertext)
+            .map_err(DecryptWithCekError::Domain)?;
+
+        // 復号したプレーンテキストから ContentId を再生成し、期待される ID と一致するか確認する。
+        let actual_id = self.content_id_generator.generate(&plaintext);
+        if actual_id != expected_content_id {
+            return Err(DecryptWithCekError::ContentIdMismatch {
+                expected: expected_content_id.as_str().to_string(),
+                actual: actual_id.as_str().to_string(),
+            });
+        }
+
+        Ok(plaintext)
     }
 
     /// コンテンツ削除ユースケース。
@@ -316,13 +359,21 @@ pub enum FetchError {
     KeyStore(ContentEncryptionKeyStoreError),
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum DecryptWithCekError {
+    #[error("content id mismatch: expected {expected}, actual {actual}")]
+    ContentIdMismatch { expected: String, actual: String },
+    #[error("domain error: {0:?}")]
+    Domain(ContentError),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::domain::{
+        content::encryption::{ContentEncryptionKey, ContentEncryptionKeyGenerator},
         content::ContentStatus,
         content_id::{ContentId, ContentIdGenerator},
-        encryption::{ContentEncryptionKey, ContentEncryptionKeyGenerator},
     };
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -961,5 +1012,52 @@ mod tests {
             Ok(_) => panic!("expected missing-key error but got Ok"),
         };
         assert!(matches!(err, FetchError::MissingKey));
+    }
+
+    #[test]
+    fn decrypt_with_cek_success_when_content_id_matches() {
+        let (repo, _storage) = TestContentRepository::new(false);
+        let client = TestStateNodeClient::default();
+        let (key_store, _key_storage) = TestKeyStore::new(false, false);
+        let service = build_service(repo, client, TestKeyGenerator, TestEncryptor, key_store);
+
+        let plaintext = b"decrypt-cek-success".to_vec();
+        let expected_cid = service.content_id_generator.generate(&plaintext);
+
+        let key = ContentEncryptionKey(vec![1, 2, 3]);
+        let ciphertext = plaintext.clone();
+
+        let result = service
+            .decrypt_with_cek(expected_cid.clone(), key, ciphertext)
+            .expect("decrypt_with_cek should succeed when content_id matches");
+
+        assert_eq!(result, plaintext);
+    }
+
+    #[test]
+    fn decrypt_with_cek_returns_mismatch_error_when_content_id_differs() {
+        let (repo, _storage) = TestContentRepository::new(false);
+        let client = TestStateNodeClient::default();
+        let (key_store, _key_storage) = TestKeyStore::new(false, false);
+        let service = build_service(repo, client, TestKeyGenerator, TestEncryptor, key_store);
+
+        let plaintext = b"decrypt-cek-mismatch".to_vec();
+        let actual_cid = service.content_id_generator.generate(&plaintext);
+        let expected_cid = ContentId::new("some-other-id".into());
+
+        let key = ContentEncryptionKey(vec![9, 9, 9]);
+        let ciphertext = plaintext.clone();
+
+        let err = service
+            .decrypt_with_cek(expected_cid.clone(), key, ciphertext)
+            .expect_err("decrypt_with_cek should fail when content_id mismatches");
+
+        match err {
+            DecryptWithCekError::ContentIdMismatch { expected, actual } => {
+                assert_eq!(expected, expected_cid.as_str());
+                assert_eq!(actual, actual_cid.as_str());
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
     }
 }
