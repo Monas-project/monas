@@ -247,7 +247,7 @@ mod tests {
 
         ciphertext[IV_LEN] ^= 0x11; // Tampering by bit flipping
         println!("\n--- After Tampering ---");
-        let tampered_byte = ciphertext[IV_LEN];
+        let _tampered_byte = ciphertext[IV_LEN];
         println!(
             "Byte at position [IV_LEN=16]: 0x{tampered:02x} ({tampered}) ← TAMPERED!",
             tampered = ciphertext[IV_LEN]
