@@ -18,6 +18,9 @@ pub struct SerializedOperation {
     pub author: String,
     /// Timestamp of this operation.
     pub timestamp: u64,
+    /// DAG node timestamp for CID-consistent replication.
+    /// This timestamp is used to generate the same CID across replicas.
+    pub node_timestamp: u64,
 }
 
 /// Result of committing content to the CRDT store.

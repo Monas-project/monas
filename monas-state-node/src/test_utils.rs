@@ -472,5 +472,6 @@ pub fn create_test_operation(genesis_cid: &str, author: &str) -> SerializedOpera
         genesis_cid: genesis_cid.to_string(),
         author: author.to_string(),
         timestamp: 12345,
+        node_timestamp: 12345,
     }
 }

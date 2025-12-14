@@ -268,6 +268,20 @@ impl ContentRepository for CrslCrdtRepository {
             None
         };
 
+        // Get all DAG nodes for this genesis to find node timestamps
+        let history = repo
+            .linear_history(&genesis)
+            .map_err(|e| anyhow::anyhow!("Failed to get history: {}", e))?;
+
+        // Build a map of operation timestamp -> DAG node timestamp
+        // This is needed because DAG node timestamps may differ from operation timestamps
+        let mut node_timestamps: Vec<(u64, u64)> = Vec::new();
+        for node_cid in &history {
+            if let Ok(Some(node)) = repo.dag.get_node(node_cid) {
+                node_timestamps.push((node.timestamp(), node.timestamp()));
+            }
+        }
+
         let mut operations = Vec::new();
         for (idx, op) in indexed_ops {
             // Skip operations at or before the since_version index
@@ -276,6 +290,35 @@ impl ContentRepository for CrslCrdtRepository {
                     continue;
                 }
             }
+
+            // Find the corresponding DAG node timestamp
+            // For Create operations, use the genesis node timestamp
+            // For other operations, find the node with matching or closest timestamp
+            let node_timestamp = if matches!(op.kind, OperationType::Create(_)) {
+                // For Create operation, get the genesis node timestamp
+                repo.dag
+                    .get_node(&genesis)
+                    .ok()
+                    .flatten()
+                    .map(|n| n.timestamp())
+                    .unwrap_or(op.timestamp)
+            } else {
+                // For Update/Delete/Merge, find the node in history that corresponds to this operation
+                // The node timestamp should be close to the operation timestamp
+                history
+                    .iter()
+                    .filter_map(|cid| repo.dag.get_node(cid).ok().flatten())
+                    .find(|node| {
+                        // Node timestamp should be within a reasonable range of op timestamp
+                        // or we just find the closest one
+                        let node_ts = node.timestamp();
+                        // Allow some tolerance for timestamp matching
+                        node_ts >= op.timestamp.saturating_sub(1_000_000_000)
+                            && node_ts <= op.timestamp.saturating_add(1_000_000_000)
+                    })
+                    .map(|n| n.timestamp())
+                    .unwrap_or(op.timestamp)
+            };
 
             // Serialize the operation using serde_json for network transfer
             let serialized = serde_json::to_vec(&op)
@@ -286,6 +329,7 @@ impl ContentRepository for CrslCrdtRepository {
                 genesis_cid: genesis_cid.to_string(),
                 author: op.author.clone(),
                 timestamp: op.timestamp,
+                node_timestamp,
             });
         }
 
@@ -302,8 +346,11 @@ impl ContentRepository for CrslCrdtRepository {
 
         for serialized_op in operations {
             // Deserialize the operation
-            let op: Operation<Cid, ContentPayload> = serde_json::from_slice(&serialized_op.data)
+            let mut op: Operation<Cid, ContentPayload> = serde_json::from_slice(&serialized_op.data)
                 .map_err(|e| anyhow::anyhow!("Failed to deserialize operation: {}", e))?;
+
+            // Set node_timestamp for import mode to ensure CID consistency across replicas
+            op.node_timestamp = Some(serialized_op.node_timestamp);
 
             // Apply the operation
             match repo.commit_operation(op) {
