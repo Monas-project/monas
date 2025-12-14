@@ -346,8 +346,9 @@ impl ContentRepository for CrslCrdtRepository {
 
         for serialized_op in operations {
             // Deserialize the operation
-            let mut op: Operation<Cid, ContentPayload> = serde_json::from_slice(&serialized_op.data)
-                .map_err(|e| anyhow::anyhow!("Failed to deserialize operation: {}", e))?;
+            let mut op: Operation<Cid, ContentPayload> =
+                serde_json::from_slice(&serialized_op.data)
+                    .map_err(|e| anyhow::anyhow!("Failed to deserialize operation: {}", e))?;
 
             // Set node_timestamp for import mode to ensure CID consistency across replicas
             op.node_timestamp = Some(serialized_op.node_timestamp);
