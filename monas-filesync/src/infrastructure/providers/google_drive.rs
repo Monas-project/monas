@@ -11,10 +11,62 @@ use reqwest::Client;
 #[cfg(feature = "cloud-connectivity")]
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
+/// Parsed path information
+#[derive(Debug, PartialEq)]
+enum PathInfo<'a> {
+    /// Legacy format: direct file ID
+    ById(&'a str),
+    /// New format: folder name and filename
+    ByName { folder: &'a str, filename: &'a str },
+}
+
+#[cfg(feature = "cloud-connectivity")]
+#[derive(serde::Deserialize)]
+struct FileItem {
+    id: String,
+}
+
+#[cfg(feature = "cloud-connectivity")]
+#[derive(serde::Deserialize)]
+struct FileList {
+    files: Vec<FileItem>,
+}
+
+#[cfg(feature = "cloud-connectivity")]
+#[derive(serde::Deserialize)]
+struct Metadata {
+    size: Option<String>,
+    #[serde(rename = "modifiedTime")]
+    modified_time: Option<String>,
+}
+
+#[cfg(feature = "cloud-connectivity")]
+#[derive(serde::Serialize)]
+struct CreateFolderRequest<'a> {
+    name: &'a str,
+    #[serde(rename = "mimeType")]
+    mime_type: &'a str,
+    parents: Vec<&'a str>,
+}
+
+#[cfg(feature = "cloud-connectivity")]
+#[derive(serde::Deserialize)]
+struct CreateResponse {
+    id: String,
+}
+
+#[cfg(feature = "cloud-connectivity")]
+#[derive(serde::Serialize)]
+struct FileMetadata<'a> {
+    name: &'a str,
+    parents: Vec<&'a str>,
+}
+
 pub struct GoogleDriveProvider {
     pub api_endpoint: String,
     pub client_id: Option<String>,
     pub client_secret: Option<String>,
+    pub root_folder_id: Option<String>,
     #[cfg(feature = "cloud-connectivity")]
     http_client: Client,
 }
@@ -25,6 +77,7 @@ impl GoogleDriveProvider {
             api_endpoint: config.api_endpoint.clone(),
             client_id: config.client_id.clone(),
             client_secret: config.client_secret.clone(),
+            root_folder_id: config.root_folder_id.clone(),
             #[cfg(feature = "cloud-connectivity")]
             http_client: Client::builder()
                 .http2_prior_knowledge()
@@ -33,8 +86,13 @@ impl GoogleDriveProvider {
         }
     }
 
+    /// Parses a Google Drive path and returns (folder_path, filename) or just file_id.
+    ///
+    /// Supported formats:
+    /// - `google-drive://content/filename.json` -> PathInfo::ByName { folder: "content", filename: "filename.json" }
+    /// - `google-drive://file_id` -> PathInfo::ById("file_id")
     #[cfg_attr(not(feature = "cloud-connectivity"), allow(dead_code))]
-    fn extract_file_id(path: &str) -> FetchResult<&str> {
+    fn parse_path(path: &str) -> FetchResult<PathInfo<'_>> {
         const PREFIX: &str = "google-drive://";
         if !path.starts_with(PREFIX) {
             return Err(FetchError {
@@ -42,14 +100,27 @@ impl GoogleDriveProvider {
             });
         }
 
-        let id = &path[PREFIX.len()..];
-        if id.is_empty() {
+        let rest = &path[PREFIX.len()..];
+        if rest.is_empty() {
             return Err(FetchError {
-                message: "Google Drive URI is missing a file id".into(),
+                message: "Google Drive URI is missing a path".into(),
             });
         }
 
-        Ok(id)
+        // Check if it's a path with folder/filename format
+        if let Some(slash_pos) = rest.find('/') {
+            let folder = &rest[..slash_pos];
+            let filename = &rest[slash_pos + 1..];
+            if filename.is_empty() {
+                return Err(FetchError {
+                    message: "Google Drive URI is missing a filename".into(),
+                });
+            }
+            Ok(PathInfo::ByName { folder, filename })
+        } else {
+            // Legacy format: just a file ID
+            Ok(PathInfo::ById(rest))
+        }
     }
 
     fn feature_disabled_error(op: &str) -> FetchError {
@@ -103,18 +174,26 @@ impl GoogleDriveProvider {
         )
     }
 
+    /// Validate and extract access token from auth session
     #[cfg(feature = "cloud-connectivity")]
-    async fn fetch_remote(&self, auth: &AuthSession, path: &str) -> FetchResult<Vec<u8>> {
+    fn validate_token<'a>(&self, auth: &'a AuthSession) -> FetchResult<&'a str> {
         let token = auth.access_token.trim();
         if token.is_empty() {
             return Err(FetchError {
                 message: "missing Google Drive access token".into(),
             });
         }
+        Ok(token)
+    }
 
-        let file_id = Self::extract_file_id(path)?;
-        let url = self.file_content_url(file_id);
-
+    /// Execute a GET request and parse JSON response
+    #[cfg(feature = "cloud-connectivity")]
+    async fn get_json<T: serde::de::DeserializeOwned>(
+        &self,
+        token: &str,
+        url: &str,
+        error_context: &str,
+    ) -> FetchResult<T> {
         let resp = self
             .http_client
             .get(url)
@@ -122,20 +201,114 @@ impl GoogleDriveProvider {
             .send()
             .await
             .map_err(|err| FetchError {
-                message: format!("Google Drive fetch request failed: {err}"),
+                message: format!("Google Drive {} request failed: {err}", error_context),
             })?;
 
         if !resp.status().is_success() {
             return Err(FetchError {
-                message: format!("Google Drive fetch failed with status {}", resp.status()),
+                message: format!(
+                    "Google Drive {} failed with status {}",
+                    error_context,
+                    resp.status()
+                ),
             });
         }
 
-        let bytes = resp.bytes().await.map_err(|err| FetchError {
-            message: format!("failed to read Google Drive response body: {err}"),
-        })?;
+        resp.json().await.map_err(|err| FetchError {
+            message: format!("failed to parse {} response: {err}", error_context),
+        })
+    }
 
-        Ok(bytes.to_vec())
+    /// Execute a GET request and return raw bytes
+    #[cfg(feature = "cloud-connectivity")]
+    async fn get_bytes(&self, token: &str, url: &str, error_context: &str) -> FetchResult<Vec<u8>> {
+        let resp = self
+            .http_client
+            .get(url)
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|err| FetchError {
+                message: format!("Google Drive {} request failed: {err}", error_context),
+            })?;
+
+        if !resp.status().is_success() {
+            return Err(FetchError {
+                message: format!(
+                    "Google Drive {} failed with status {}",
+                    error_context,
+                    resp.status()
+                ),
+            });
+        }
+
+        resp.bytes()
+            .await
+            .map_err(|err| FetchError {
+                message: format!("failed to read {} response body: {err}", error_context),
+            })
+            .map(|b| b.to_vec())
+    }
+
+    /// Resolve file ID from path (supports both ById and ByName formats)
+    #[cfg(feature = "cloud-connectivity")]
+    async fn resolve_file_id(&self, token: &str, path: &str) -> FetchResult<String> {
+        match Self::parse_path(path)? {
+            PathInfo::ById(id) => Ok(id.to_string()),
+            PathInfo::ByName { folder, filename } => {
+                let folder_id =
+                    self.find_folder(token, folder)
+                        .await?
+                        .ok_or_else(|| FetchError {
+                            message: format!("Google Drive folder not found: {}", folder),
+                        })?;
+
+                self.find_file_in_folder(token, &folder_id, filename)
+                    .await?
+                    .ok_or_else(|| FetchError {
+                        message: format!("Google Drive file not found: {}/{}", folder, filename),
+                    })
+            }
+        }
+    }
+
+    #[cfg(feature = "cloud-connectivity")]
+    async fn fetch_remote(&self, auth: &AuthSession, path: &str) -> FetchResult<Vec<u8>> {
+        let token = self.validate_token(auth)?;
+        let file_id = self.resolve_file_id(token, path).await?;
+        let url = self.file_content_url(&file_id);
+        self.get_bytes(token, &url, "fetch").await
+    }
+
+    /// Search for folders by name in a parent folder
+    #[cfg(feature = "cloud-connectivity")]
+    async fn search_folders(
+        &self,
+        token: &str,
+        folder_name: &str,
+        parent_id: &str,
+    ) -> FetchResult<FileList> {
+        // Escape single quotes in folder_name to prevent query injection
+        let escaped_folder_name = folder_name.replace('\'', "\\'");
+        let query = format!(
+            "name='{}' and mimeType='application/vnd.google-apps.folder' and '{}' in parents and trashed=false",
+            escaped_folder_name, parent_id
+        );
+        let url = format!(
+            "{}/files?q={}&fields=files(id,name)",
+            self.trim_endpoint(),
+            urlencoding::encode(&query)
+        );
+
+        self.get_json(token, &url, "folder search").await
+    }
+
+    /// Find a folder by name (without creating it)
+    #[cfg(feature = "cloud-connectivity")]
+    async fn find_folder(&self, token: &str, folder_name: &str) -> FetchResult<Option<String>> {
+        let parent_id = self.root_folder_id.as_deref().unwrap_or("root");
+        let list = self.search_folders(token, folder_name, parent_id).await?;
+        Ok(list.files.into_iter().next().map(|f| f.id))
     }
 
     #[cfg(feature = "cloud-connectivity")]
@@ -144,42 +317,11 @@ impl GoogleDriveProvider {
         auth: &AuthSession,
         path: &str,
     ) -> FetchResult<(u64, SystemTime)> {
-        #[derive(serde::Deserialize)]
-        struct Metadata {
-            size: Option<String>,
-            #[serde(rename = "modifiedTime")]
-            modified_time: Option<String>,
-        }
+        let token = self.validate_token(auth)?;
+        let file_id = self.resolve_file_id(token, path).await?;
+        let url = self.file_metadata_url(&file_id);
 
-        let token = auth.access_token.trim();
-        if token.is_empty() {
-            return Err(FetchError {
-                message: "missing Google Drive access token".into(),
-            });
-        }
-
-        let file_id = Self::extract_file_id(path)?;
-        let url = self.file_metadata_url(file_id);
-
-        let resp = self
-            .http_client
-            .get(url)
-            .bearer_auth(token)
-            .send()
-            .await
-            .map_err(|err| FetchError {
-                message: format!("Google Drive metadata request failed: {err}"),
-            })?;
-
-        if !resp.status().is_success() {
-            return Err(FetchError {
-                message: format!("Google Drive metadata failed with status {}", resp.status()),
-            });
-        }
-
-        let metadata: Metadata = resp.json().await.map_err(|err| FetchError {
-            message: format!("failed to parse Google Drive metadata: {err}"),
-        })?;
+        let metadata: Metadata = self.get_json(token, &url, "metadata").await?;
 
         let size = metadata
             .size
@@ -213,14 +355,23 @@ impl GoogleDriveProvider {
 
     #[cfg(feature = "cloud-connectivity")]
     async fn save_remote(&self, auth: &AuthSession, path: &str, data: &[u8]) -> FetchResult<()> {
-        let token = auth.access_token.trim();
-        if token.is_empty() {
-            return Err(FetchError {
-                message: "missing Google Drive access token".into(),
-            });
-        }
+        let token = self.validate_token(auth)?;
 
-        let file_id = Self::extract_file_id(path)?;
+        match Self::parse_path(path)? {
+            PathInfo::ById(file_id) => {
+                // Legacy mode: update existing file by ID
+                self.update_file_by_id(token, file_id, data).await
+            }
+            PathInfo::ByName { folder, filename } => {
+                // New mode: search for file, create if not found
+                self.save_by_name(token, folder, filename, data).await
+            }
+        }
+    }
+
+    /// Update an existing file by its ID (PATCH)
+    #[cfg(feature = "cloud-connectivity")]
+    async fn update_file_by_id(&self, token: &str, file_id: &str, data: &[u8]) -> FetchResult<()> {
         let url = self.file_upload_url(file_id);
 
         let resp = self
@@ -232,12 +383,182 @@ impl GoogleDriveProvider {
             .send()
             .await
             .map_err(|err| FetchError {
-                message: format!("Google Drive save request failed: {err}"),
+                message: format!("Google Drive update request failed: {err}"),
             })?;
 
         if !resp.status().is_success() {
             return Err(FetchError {
-                message: format!("Google Drive save failed with status {}", resp.status()),
+                message: format!("Google Drive update failed with status {}", resp.status()),
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Save file by folder name and filename (search → create or update)
+    #[cfg(feature = "cloud-connectivity")]
+    async fn save_by_name(
+        &self,
+        token: &str,
+        folder: &str,
+        filename: &str,
+        data: &[u8],
+    ) -> FetchResult<()> {
+        // Get folder ID (create folder only if it doesn't exist)
+        let folder_id = self.get_or_create_folder_id(token, folder).await?;
+
+        // Search for existing file in the folder
+        if let Some(file_id) = self
+            .find_file_in_folder(token, &folder_id, filename)
+            .await?
+        {
+            // File exists, update it
+            self.update_file_by_id(token, &file_id, data).await
+        } else {
+            // File doesn't exist, create it
+            self.create_file(token, &folder_id, filename, data).await
+        }
+    }
+
+    /// Get folder ID, creating the folder if it doesn't exist
+    #[cfg(feature = "cloud-connectivity")]
+    async fn get_or_create_folder_id(&self, token: &str, folder_name: &str) -> FetchResult<String> {
+        // Try to find existing folder
+        if let Some(folder_id) = self.find_folder(token, folder_name).await? {
+            return Ok(folder_id);
+        }
+
+        // Folder doesn't exist, create it
+        let parent_id = self.root_folder_id.as_deref().unwrap_or("root");
+        self.create_folder(token, parent_id, folder_name).await
+    }
+
+    /// Create a new folder
+    #[cfg(feature = "cloud-connectivity")]
+    async fn create_folder(
+        &self,
+        token: &str,
+        parent_id: &str,
+        folder_name: &str,
+    ) -> FetchResult<String> {
+        let url = format!("{}/files", self.trim_endpoint());
+
+        let body = CreateFolderRequest {
+            name: folder_name,
+            mime_type: "application/vnd.google-apps.folder",
+            parents: vec![parent_id],
+        };
+
+        let resp = self
+            .http_client
+            .post(&url)
+            .bearer_auth(token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|err| FetchError {
+                message: format!("Google Drive folder creation failed: {err}"),
+            })?;
+
+        if !resp.status().is_success() {
+            return Err(FetchError {
+                message: format!(
+                    "Google Drive folder creation failed with status {}",
+                    resp.status()
+                ),
+            });
+        }
+
+        let created: CreateResponse = resp.json().await.map_err(|err| FetchError {
+            message: format!("failed to parse folder creation response: {err}"),
+        })?;
+
+        Ok(created.id)
+    }
+
+    /// Search for a file by name within a folder
+    #[cfg(feature = "cloud-connectivity")]
+    async fn find_file_in_folder(
+        &self,
+        token: &str,
+        folder_id: &str,
+        filename: &str,
+    ) -> FetchResult<Option<String>> {
+        // Escape single quotes in filename to prevent query injection
+        let escaped_filename = filename.replace('\'', "\\'");
+        let query = format!(
+            "name='{}' and '{}' in parents and trashed=false",
+            escaped_filename, folder_id
+        );
+        let url = format!(
+            "{}/files?q={}&fields=files(id,name)",
+            self.trim_endpoint(),
+            urlencoding::encode(&query)
+        );
+
+        let list: FileList = self.get_json(token, &url, "file search").await?;
+        Ok(list.files.into_iter().next().map(|f| f.id))
+    }
+
+    /// Create a new file with content
+    #[cfg(feature = "cloud-connectivity")]
+    async fn create_file(
+        &self,
+        token: &str,
+        folder_id: &str,
+        filename: &str,
+        data: &[u8],
+    ) -> FetchResult<()> {
+        // Use multipart upload for creating file with content
+        let upload_url = format!("{}/files?uploadType=multipart", self.upload_endpoint());
+
+        // Build multipart body
+        let metadata = FileMetadata {
+            name: filename,
+            parents: vec![folder_id],
+        };
+        let metadata_json = serde_json::to_string(&metadata).map_err(|err| FetchError {
+            message: format!("failed to serialize file metadata: {err}"),
+        })?;
+
+        // Create multipart form
+        let form = reqwest::multipart::Form::new()
+            .part(
+                "metadata",
+                reqwest::multipart::Part::text(metadata_json)
+                    .mime_str("application/json")
+                    .map_err(|err| FetchError {
+                        message: format!("failed to set metadata mime type: {err}"),
+                    })?,
+            )
+            .part(
+                "media",
+                reqwest::multipart::Part::bytes(data.to_vec())
+                    .mime_str("application/octet-stream")
+                    .map_err(|err| FetchError {
+                        message: format!("failed to set media mime type: {err}"),
+                    })?,
+            );
+
+        let resp = self
+            .http_client
+            .post(&upload_url)
+            .bearer_auth(token)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|err| FetchError {
+                message: format!("Google Drive file creation failed: {err}"),
+            })?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(FetchError {
+                message: format!(
+                    "Google Drive file creation failed with status {}: {}",
+                    status, body
+                ),
             });
         }
 
@@ -297,6 +618,7 @@ mod tests {
     use crate::infrastructure::config::GoogleDriveConfig;
 
     #[tokio::test]
+    #[cfg(not(feature = "cloud-connectivity"))]
     async fn test_google_drive_provider_fetch() {
         let provider = GoogleDriveProvider::new(&GoogleDriveConfig::default());
         let auth = AuthSession {
@@ -309,6 +631,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(not(feature = "cloud-connectivity"))]
     async fn test_google_drive_provider_size_and_mtime() {
         let provider = GoogleDriveProvider::new(&GoogleDriveConfig::default());
         let auth = AuthSession {
@@ -323,6 +646,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(not(feature = "cloud-connectivity"))]
     async fn test_google_drive_provider_save() {
         let provider = GoogleDriveProvider::new(&GoogleDriveConfig::default());
         let auth = AuthSession {
@@ -342,26 +666,43 @@ mod tests {
             api_endpoint: "https://example.com".into(),
             client_id: Some("client".into()),
             client_secret: Some("secret".into()),
+            root_folder_id: Some("root123".into()),
         };
 
         let provider = GoogleDriveProvider::new(&config);
         assert_eq!(provider.api_endpoint, "https://example.com");
         assert_eq!(provider.client_id.as_deref(), Some("client"));
         assert_eq!(provider.client_secret.as_deref(), Some("secret"));
+        assert_eq!(provider.root_folder_id.as_deref(), Some("root123"));
     }
 
     #[test]
-    fn test_extract_file_id_success() {
-        let id = GoogleDriveProvider::extract_file_id("google-drive://abc").unwrap();
-        assert_eq!(id, "abc");
+    fn test_parse_path_by_id() {
+        let result = GoogleDriveProvider::parse_path("google-drive://abc123").unwrap();
+        assert_eq!(result, PathInfo::ById("abc123"));
     }
 
     #[test]
-    fn test_extract_file_id_errors() {
-        let err = GoogleDriveProvider::extract_file_id("invalid://abc").unwrap_err();
+    fn test_parse_path_by_name() {
+        let result = GoogleDriveProvider::parse_path("google-drive://content/file.json").unwrap();
+        assert_eq!(
+            result,
+            PathInfo::ByName {
+                folder: "content",
+                filename: "file.json"
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_path_errors() {
+        let err = GoogleDriveProvider::parse_path("invalid://abc").unwrap_err();
         assert!(err.message.contains("unsupported"));
 
-        let err = GoogleDriveProvider::extract_file_id("google-drive://").unwrap_err();
-        assert!(err.message.contains("missing a file id"));
+        let err = GoogleDriveProvider::parse_path("google-drive://").unwrap_err();
+        assert!(err.message.contains("missing a path"));
+
+        let err = GoogleDriveProvider::parse_path("google-drive://folder/").unwrap_err();
+        assert!(err.message.contains("missing a filename"));
     }
 }

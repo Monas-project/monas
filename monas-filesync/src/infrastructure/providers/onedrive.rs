@@ -266,6 +266,7 @@ mod tests {
     use crate::infrastructure::AuthSession;
 
     #[tokio::test]
+    #[cfg(not(feature = "cloud-connectivity"))]
     async fn test_onedrive_provider_fetch() {
         let provider = OneDriveProvider::new(&OneDriveConfig::default());
         let auth = AuthSession {
@@ -278,6 +279,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(not(feature = "cloud-connectivity"))]
     async fn test_onedrive_provider_size_and_mtime() {
         let provider = OneDriveProvider::new(&OneDriveConfig::default());
         let auth = AuthSession {
@@ -290,6 +292,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(not(feature = "cloud-connectivity"))]
     async fn test_onedrive_provider_save() {
         let provider = OneDriveProvider::new(&OneDriveConfig::default());
         let auth = AuthSession {
