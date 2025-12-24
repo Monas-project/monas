@@ -169,7 +169,7 @@ mod tests {
     fn sign_returns_not_found_if_key_missing() {
         let store = InMemoryAccountKeyStore::default();
         let err = AccountService::sign(&store, b"msg").unwrap_err();
-        matches!(err, SignError::NotFound);
+        assert!(matches!(err, SignError::NotFound));
     }
 
     #[test]
@@ -180,6 +180,6 @@ mod tests {
         AccountService::delete(&store).unwrap();
 
         let err = AccountService::sign(&store, b"after-delete").unwrap_err();
-        matches!(err, SignError::NotFound);
+        assert!(matches!(err, SignError::NotFound));
     }
 }
