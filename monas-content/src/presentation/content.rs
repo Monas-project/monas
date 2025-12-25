@@ -68,12 +68,6 @@ pub fn routes() -> Router<Arc<AppState>> {
             "/providers/{provider}/disconnect",
             delete(disconnect_provider),
         )
-        .route("/providers", get(list_providers))
-        .route("/providers/{provider}/connect", post(connect_provider))
-        .route(
-            "/providers/{provider}/disconnect",
-            delete(disconnect_provider),
-        )
 }
 
 async fn create_content(
