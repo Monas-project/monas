@@ -1,8 +1,9 @@
 use crate::domain::content::encryption::{ContentEncryption, ContentEncryptionKey};
 use crate::domain::content::Metadata;
 use crate::domain::content_id::{ContentId, ContentIdGenerator};
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ContentStatus {
     Active,
     Deleting,
@@ -25,11 +26,13 @@ pub enum ContentEvent {
     Deleted,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Content {
     id: ContentId,
     series_id: ContentId,
     metadata: Metadata,
+    /// 永続化時は含めない（暗号化済みデータのみ保存）
+    #[serde(skip)]
     raw_content: Option<Vec<u8>>,
     encrypted_content: Option<Vec<u8>>,
     is_deleted: bool,
@@ -62,6 +65,7 @@ impl Content {
         name: String,
         raw_content: Vec<u8>,
         path: String,
+        provider: Option<String>,
         id_generator: &G,
         key: &ContentEncryptionKey,
         encryption: &E,
@@ -71,7 +75,7 @@ impl Content {
         E: ContentEncryption,
     {
         let cid = id_generator.generate(&raw_content);
-        let metadata = Metadata::new(name, path, cid.clone());
+        let metadata = Metadata::new(name, path, cid.clone(), provider);
 
         if key.0.is_empty() {
             return Err(ContentError::EncryptionError(
@@ -275,6 +279,7 @@ mod tests {
             "test_content".to_string(),
             "test/path".to_string(),
             ContentId::new("test-content-id".into()),
+            None,
         )
     }
 
@@ -305,6 +310,7 @@ mod tests {
             name.clone(),
             raw_data.clone(),
             path.clone(),
+            None,
             &id_gen,
             &key,
             &encryption,
@@ -331,6 +337,7 @@ mod tests {
             "test".to_string(),
             b"old".to_vec(),
             "path.txt".to_string(),
+            None,
             &id_gen,
             &key,
             &encryption,
@@ -378,6 +385,7 @@ mod tests {
             "test".to_string(),
             b"data".to_vec(),
             "path.txt".to_string(),
+            None,
             &id_gen,
             &key,
             &encryption,
@@ -452,8 +460,16 @@ mod tests {
         let raw_data = b"Sensitive information".to_vec();
         let path = "documents/secrets.txt".to_string();
 
-        let (content, _) =
-            Content::create(name, raw_data.clone(), path, &id_gen, &key, &encryption).unwrap();
+        let (content, _) = Content::create(
+            name,
+            raw_data.clone(),
+            path,
+            None,
+            &id_gen,
+            &key,
+            &encryption,
+        )
+        .unwrap();
 
         assert!(content.encrypted_content().is_some());
 

@@ -9,14 +9,16 @@ path = "src/lib.rs"
 
 [dependencies]
 async-trait = "0.1"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "json"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "json", "multipart"], optional = true }
 time = { version = "0.3", features = ["parsing", "formatting"], optional = true }
 serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", optional = true }
+urlencoding = { version = "2.1", optional = true }
 toml = "0.8"
 
 [features]
 default = []
-cloud-connectivity = ["reqwest", "time"]
+cloud-connectivity = ["reqwest", "time", "serde_json", "urlencoding"]
 
 [dev-dependencies]
 tokio = { version = "1.0", features = ["rt", "macros"] }
