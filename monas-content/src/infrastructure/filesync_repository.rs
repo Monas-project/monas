@@ -165,8 +165,7 @@ impl MultiStorageRepository {
 
         if self.inner.registry.resolve(&provider).is_none() {
             return Err(ContentRepositoryError::Storage(format!(
-                "unknown storage provider: {}",
-                provider
+                "unknown storage provider: {provider}"
             )));
         }
 
@@ -363,8 +362,7 @@ impl MultiStorageRepository {
     ) -> Result<(Arc<dyn StorageProvider>, AuthSession), ContentRepositoryError> {
         let storage_provider = self.inner.registry.resolve(provider).ok_or_else(|| {
             ContentRepositoryError::Storage(format!(
-                "storage provider '{}' not found in registry",
-                provider
+                "storage provider '{provider}' not found in registry"
             ))
         })?;
 
@@ -375,8 +373,7 @@ impl MultiStorageRepository {
 
         let auth = sessions.get(provider).ok_or_else(|| {
             ContentRepositoryError::Storage(format!(
-                "storage provider '{}' is not connected. Call connect() first.",
-                provider
+                "storage provider '{provider}' is not connected. Call connect() first."
             ))
         })?;
 

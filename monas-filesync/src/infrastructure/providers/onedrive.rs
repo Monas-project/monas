@@ -52,6 +52,7 @@ impl OneDriveProvider {
         Ok(id)
     }
 
+    #[allow(dead_code)]
     fn feature_disabled_error(op: &str) -> FetchError {
         FetchError {
             message: format!("OneDrive {op} requires enabling the `cloud-connectivity` feature"),
@@ -263,7 +264,6 @@ impl StorageProvider for OneDriveProvider {
 mod tests {
     use super::*;
     use crate::infrastructure::config::OneDriveConfig;
-    use crate::infrastructure::AuthSession;
 
     #[tokio::test]
     #[cfg(not(feature = "cloud-connectivity"))]

@@ -123,6 +123,7 @@ impl GoogleDriveProvider {
         }
     }
 
+    #[allow(dead_code)]
     fn feature_disabled_error(op: &str) -> FetchError {
         FetchError {
             message: format!(
@@ -201,7 +202,7 @@ impl GoogleDriveProvider {
             .send()
             .await
             .map_err(|err| FetchError {
-                message: format!("Google Drive {} request failed: {err}", error_context),
+                message: format!("Google Drive {error_context} request failed: {err}"),
             })?;
 
         if !resp.status().is_success() {
@@ -215,7 +216,7 @@ impl GoogleDriveProvider {
         }
 
         resp.json().await.map_err(|err| FetchError {
-            message: format!("failed to parse {} response: {err}", error_context),
+            message: format!("failed to parse {error_context} response: {err}"),
         })
     }
 
@@ -229,7 +230,7 @@ impl GoogleDriveProvider {
             .send()
             .await
             .map_err(|err| FetchError {
-                message: format!("Google Drive {} request failed: {err}", error_context),
+                message: format!("Google Drive {error_context} request failed: {err}"),
             })?;
 
         if !resp.status().is_success() {
@@ -245,7 +246,7 @@ impl GoogleDriveProvider {
         resp.bytes()
             .await
             .map_err(|err| FetchError {
-                message: format!("failed to read {} response body: {err}", error_context),
+                message: format!("failed to read {error_context} response body: {err}"),
             })
             .map(|b| b.to_vec())
     }
@@ -260,13 +261,13 @@ impl GoogleDriveProvider {
                     self.find_folder(token, folder)
                         .await?
                         .ok_or_else(|| FetchError {
-                            message: format!("Google Drive folder not found: {}", folder),
+                            message: format!("Google Drive folder not found: {folder}"),
                         })?;
 
                 self.find_file_in_folder(token, &folder_id, filename)
                     .await?
                     .ok_or_else(|| FetchError {
-                        message: format!("Google Drive file not found: {}/{}", folder, filename),
+                        message: format!("Google Drive file not found: {folder}/{filename}"),
                     })
             }
         }
@@ -291,8 +292,7 @@ impl GoogleDriveProvider {
         // Escape single quotes in folder_name to prevent query injection
         let escaped_folder_name = folder_name.replace('\'', "\\'");
         let query = format!(
-            "name='{}' and mimeType='application/vnd.google-apps.folder' and '{}' in parents and trashed=false",
-            escaped_folder_name, parent_id
+            "name='{escaped_folder_name}' and mimeType='application/vnd.google-apps.folder' and '{parent_id}' in parents and trashed=false"
         );
         let url = format!(
             "{}/files?q={}&fields=files(id,name)",
@@ -486,10 +486,8 @@ impl GoogleDriveProvider {
     ) -> FetchResult<Option<String>> {
         // Escape single quotes in filename to prevent query injection
         let escaped_filename = filename.replace('\'', "\\'");
-        let query = format!(
-            "name='{}' and '{}' in parents and trashed=false",
-            escaped_filename, folder_id
-        );
+        let query =
+            format!("name='{escaped_filename}' and '{folder_id}' in parents and trashed=false");
         let url = format!(
             "{}/files?q={}&fields=files(id,name)",
             self.trim_endpoint(),
@@ -555,10 +553,7 @@ impl GoogleDriveProvider {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             return Err(FetchError {
-                message: format!(
-                    "Google Drive file creation failed with status {}: {}",
-                    status, body
-                ),
+                message: format!("Google Drive file creation failed with status {status}: {body}"),
             });
         }
 
