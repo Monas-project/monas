@@ -3,9 +3,12 @@ use crate::domain::{content::metadata::Metadata, content_id::ContentId};
 /// コンテンツ作成ユースケースの入力。
 #[derive(Debug)]
 pub struct CreateContentCommand {
-    pub name: String,
-    pub path: String,
+    /// コンテンツの生データ
     pub raw_content: Vec<u8>,
+    /// コンテンツ名
+    pub name: String,
+    /// コンテンツのパス
+    pub path: String,
 }
 
 /// コンテンツ作成ユースケースの出力。

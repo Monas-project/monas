@@ -69,9 +69,9 @@ async fn create_content(
     };
 
     let cmd = CreateContentCommand {
+        raw_content: raw,
         name: req.name,
         path: req.path,
-        raw_content: raw,
     };
 
     let result = state
