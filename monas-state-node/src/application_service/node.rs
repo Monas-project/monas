@@ -236,6 +236,7 @@ impl StateNode {
         // Subscribe to network events
         let mut event_rx = self.network.subscribe_events();
         let service = self.service.clone();
+        let sync_service_for_events = self.sync_service.clone();
 
         // Spawn event handler task
         tokio::spawn(async move {
@@ -253,6 +254,35 @@ impl StateNode {
                         match service.handle_sync_event(&received.event).await {
                             Ok(outcome) => {
                                 tracing::debug!("Processed sync event: {:?}", outcome);
+
+                                // If sync is needed, perform it
+                                if let crate::application_service::state_node_service::ApplyOutcome::NeedsSync { content_id } = outcome {
+                                    tracing::info!("Content sync needed for {}, initiating sync", content_id);
+                                    match sync_service_for_events.sync_from_peers(&content_id).await {
+                                        Ok(result) => {
+                                            tracing::info!(
+                                                "Content sync completed for {}: {} operations applied from {} providers",
+                                                content_id,
+                                                result.operations_applied,
+                                                result.providers_contacted
+                                            );
+                                            if !result.errors.is_empty() {
+                                                tracing::warn!(
+                                                    "Sync had {} errors: {:?}",
+                                                    result.errors.len(),
+                                                    result.errors
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::error!(
+                                                "Failed to sync content {}: {}",
+                                                content_id,
+                                                e
+                                            );
+                                        }
+                                    }
+                                }
                             }
                             Err(e) => {
                                 tracing::error!("Failed to process sync event: {}", e);

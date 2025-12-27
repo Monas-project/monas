@@ -177,13 +177,12 @@ async fn test_content_network_sync_via_event() {
     node1.service().handle_sync_event(&event).await.unwrap();
 
     // Verify node1 has the content network
-    let network1 = node1
-        .service()
-        .get_content_network("test-content-e2e")
-        .await
-        .unwrap();
-    assert!(network1.is_some(), "Node1 should have the content network");
-    println!("Content network created on Node1: {:?}", network1);
+    let networks = node1.service().list_content_networks().await.unwrap();
+    assert!(
+        networks.contains(&"test-content-e2e".to_string()),
+        "Node1 should have the content network"
+    );
+    println!("Content network created on Node1: {:?}", networks);
 }
 
 #[tokio::test]

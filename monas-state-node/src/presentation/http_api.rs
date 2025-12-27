@@ -36,10 +36,9 @@ pub fn create_router(state: AppState) -> Router {
         .route("/node/register", post(register_node))
         .route("/nodes", get(list_nodes))
         .route("/content", post(create_content))
-        .route("/content/:id", get(get_content))
         .route("/content/:id", put(update_content))
         .route("/contents", get(list_contents))
-        // New CRDT-related endpoints
+        // CRDT-related endpoints
         .route("/content/:id/data", get(get_content_data))
         .route("/content/:id/history", get(get_content_history))
         .route("/content/:id/version/:version", get(get_content_version))
@@ -83,13 +82,6 @@ pub struct CreateContentRequest {
 #[derive(Debug, Serialize)]
 pub struct CreateContentResponse {
     pub content_id: String,
-    pub member_nodes: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ContentResponse {
-    pub content_id: String,
-    pub member_nodes: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -223,17 +215,8 @@ async fn create_content(
 
     match state.create_content(&data).await {
         Ok(event) => {
-            if let crate::domain::events::Event::ContentCreated {
-                content_id,
-                member_nodes,
-                ..
-            } = event
-            {
-                Json(CreateContentResponse {
-                    content_id,
-                    member_nodes,
-                })
-                .into_response()
+            if let crate::domain::events::Event::ContentCreated { content_id, .. } = event {
+                Json(CreateContentResponse { content_id }).into_response()
             } else {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -244,34 +227,6 @@ async fn create_content(
                     .into_response()
             }
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-            .into_response(),
-    }
-}
-
-/// Get content network info.
-async fn get_content(
-    State(state): State<AppState>,
-    Path(content_id): Path<String>,
-) -> impl IntoResponse {
-    match state.get_content_network(&content_id).await {
-        Ok(Some(network)) => Json(ContentResponse {
-            content_id: network.content_id,
-            member_nodes: network.member_nodes.into_iter().collect(),
-        })
-        .into_response(),
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: format!("Content not found: {}", content_id),
-            }),
-        )
-            .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -516,26 +471,12 @@ mod tests {
     fn test_create_content_response_serialization() {
         let response = CreateContentResponse {
             content_id: "cid-1".to_string(),
-            member_nodes: vec!["node-1".to_string(), "node-2".to_string()],
         };
 
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"content_id\":\"cid-1\""));
-        assert!(json.contains("\"member_nodes\""));
-        assert!(json.contains("\"node-1\""));
-        assert!(json.contains("\"node-2\""));
-    }
-
-    #[test]
-    fn test_content_response_serialization() {
-        let response = ContentResponse {
-            content_id: "cid-1".to_string(),
-            member_nodes: vec!["node-1".to_string()],
-        };
-
-        let json = serde_json::to_string(&response).unwrap();
-        assert!(json.contains("\"content_id\":\"cid-1\""));
-        assert!(json.contains("\"member_nodes\""));
+        // member_nodes is no longer exposed to prevent information leakage
+        assert!(!json.contains("\"member_nodes\""));
     }
 
     #[test]

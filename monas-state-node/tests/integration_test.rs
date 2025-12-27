@@ -121,13 +121,8 @@ async fn test_create_content() {
     );
 
     // Verify the content network was persisted
-    let network = service
-        .get_content_network("test-content-id")
-        .await
-        .unwrap();
-    assert!(network.is_some());
-    let network = network.unwrap();
-    assert_eq!(network.content_id, "test-content-id");
+    let networks = service.list_content_networks().await.unwrap();
+    assert!(networks.contains(&"test-content-id".to_string()));
 }
 
 #[tokio::test]
@@ -221,14 +216,8 @@ async fn test_handle_content_created_sync() {
     );
 
     // Verify the content network was created
-    let network = service
-        .get_content_network("external-content-1")
-        .await
-        .unwrap();
-    assert!(network.is_some());
-    let network = network.unwrap();
-    assert!(network.member_nodes.contains("node-a"));
-    assert!(network.member_nodes.contains("node-b"));
+    let networks = service.list_content_networks().await.unwrap();
+    assert!(networks.contains(&"external-content-1".to_string()));
 }
 
 // ============================================================================

@@ -13,10 +13,15 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 /// Result of applying an event.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApplyOutcome {
+    /// Event was applied, no further action needed.
     Applied,
+    /// Event was ignored (not relevant to this node).
     Ignored,
+    /// Event was applied and content sync is needed for the given content_id.
+    /// The node should call sync_from_peers for this content.
+    NeedsSync { content_id: String },
 }
 
 // ============================================================================
@@ -72,11 +77,6 @@ where
             crdt_repo,
             local_node_id,
         }
-    }
-
-    /// Get the content network repository.
-    pub fn content_repo(&self) -> &Arc<tokio::sync::RwLock<C>> {
-        &self.content_repo
     }
 
     /// Get the CRDT repository.
@@ -211,31 +211,55 @@ where
     }
 
     /// Handle a sync event from another node.
+    ///
+    /// Returns `ApplyOutcome::NeedsSync` when the caller should perform content
+    /// synchronization (e.g., call `ContentSyncService::sync_from_peers`).
     pub async fn handle_sync_event(&self, event: &Event) -> Result<ApplyOutcome> {
         match event {
-            Event::ContentUpdated { content_id, .. } => {
+            Event::ContentUpdated {
+                content_id,
+                updated_node_id,
+                ..
+            } => {
+                // Skip if we sent this update ourselves
+                if updated_node_id == &self.local_node_id {
+                    return Ok(ApplyOutcome::Ignored);
+                }
+
                 // Ensure content network exists
-                let exists = self
+                let network = self
                     .content_repo
                     .read()
                     .await
                     .get_content_network(content_id)
-                    .await?
-                    .is_some();
+                    .await?;
 
-                if !exists {
-                    let network = ContentNetwork {
-                        content_id: content_id.clone(),
-                        member_nodes: BTreeSet::new(),
-                    };
-                    self.content_repo
-                        .write()
-                        .await
-                        .save_content_network(network)
-                        .await?;
+                match network {
+                    Some(net) => {
+                        // If we're a member of this content network, we need to sync
+                        if net.member_nodes.contains(&self.local_node_id) {
+                            Ok(ApplyOutcome::NeedsSync {
+                                content_id: content_id.clone(),
+                            })
+                        } else {
+                            // We're not a member, just acknowledge
+                            Ok(ApplyOutcome::Applied)
+                        }
+                    }
+                    None => {
+                        // Network doesn't exist locally, create it (empty members)
+                        let network = ContentNetwork {
+                            content_id: content_id.clone(),
+                            member_nodes: BTreeSet::new(),
+                        };
+                        self.content_repo
+                            .write()
+                            .await
+                            .save_content_network(network)
+                            .await?;
+                        Ok(ApplyOutcome::Applied)
+                    }
                 }
-
-                Ok(ApplyOutcome::Applied)
             }
 
             Event::ContentNetworkManagerAdded {
@@ -252,7 +276,15 @@ where
                     .await
                     .save_content_network(network)
                     .await?;
-                Ok(ApplyOutcome::Applied)
+
+                // If we're now a member, we need to sync the content
+                if member_nodes.contains(&self.local_node_id) {
+                    Ok(ApplyOutcome::NeedsSync {
+                        content_id: content_id.clone(),
+                    })
+                } else {
+                    Ok(ApplyOutcome::Applied)
+                }
             }
 
             Event::ContentCreated {
@@ -269,7 +301,15 @@ where
                     .await
                     .save_content_network(network)
                     .await?;
-                Ok(ApplyOutcome::Applied)
+
+                // If we're a member of this new content, we need to sync it
+                if member_nodes.contains(&self.local_node_id) {
+                    Ok(ApplyOutcome::NeedsSync {
+                        content_id: content_id.clone(),
+                    })
+                } else {
+                    Ok(ApplyOutcome::Applied)
+                }
             }
 
             Event::NodeCreated {
@@ -295,15 +335,6 @@ where
         }
     }
 
-    /// Get content network info.
-    pub async fn get_content_network(&self, content_id: &str) -> Result<Option<ContentNetwork>> {
-        self.content_repo
-            .read()
-            .await
-            .get_content_network(content_id)
-            .await
-    }
-
     /// Get node info.
     pub async fn get_node(&self, node_id: &str) -> Result<Option<NodeSnapshot>> {
         self.node_registry.read().await.get_node(node_id).await
@@ -317,6 +348,22 @@ where
     /// List all content networks.
     pub async fn list_content_networks(&self) -> Result<Vec<String>> {
         self.content_repo.read().await.list_content_networks().await
+    }
+
+    /// Get content network info (test-only).
+    ///
+    /// This method is only available in tests to verify internal state.
+    /// It is not exposed via HTTP API to prevent information leakage.
+    #[cfg(test)]
+    pub(crate) async fn get_content_network_for_test(
+        &self,
+        content_id: &str,
+    ) -> Result<Option<ContentNetwork>> {
+        self.content_repo
+            .read()
+            .await
+            .get_content_network(content_id)
+            .await
     }
 }
 
@@ -597,7 +644,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handle_sync_event_content_created() {
+    async fn test_handle_sync_event_content_created_as_member() {
         let service = create_test_service("node-1");
 
         let event = Event::ContentCreated {
@@ -609,11 +656,17 @@ mod tests {
         };
 
         let outcome = service.handle_sync_event(&event).await.unwrap();
-        assert_eq!(outcome, ApplyOutcome::Applied);
+        // node-1 is a member, so it should need sync
+        assert_eq!(
+            outcome,
+            ApplyOutcome::NeedsSync {
+                content_id: "content-1".to_string()
+            }
+        );
 
         // Verify content network was stored
         let network = service
-            .get_content_network("content-1")
+            .get_content_network_for_test("content-1")
             .await
             .unwrap()
             .unwrap();
@@ -622,9 +675,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handle_sync_event_content_updated_creates_network() {
+    async fn test_handle_sync_event_content_created_not_member() {
         let service = create_test_service("node-1");
 
+        let event = Event::ContentCreated {
+            content_id: "content-1".to_string(),
+            creator_node_id: "node-2".to_string(),
+            content_size: 100,
+            member_nodes: vec!["node-2".to_string(), "node-3".to_string()], // node-1 not included
+            timestamp: 12345,
+        };
+
+        let outcome = service.handle_sync_event(&event).await.unwrap();
+        // node-1 is NOT a member, so just Applied
+        assert_eq!(outcome, ApplyOutcome::Applied);
+
+        // Verify content network was stored
+        let network = service
+            .get_content_network_for_test("content-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!network.member_nodes.contains("node-1"));
+    }
+
+    #[tokio::test]
+    async fn test_handle_sync_event_content_updated_creates_network_if_missing() {
+        let service = create_test_service("node-1");
+
+        // ContentUpdated for a content we don't know about
         let event = Event::ContentUpdated {
             content_id: "new-content".to_string(),
             updated_node_id: "node-2".to_string(),
@@ -632,11 +711,12 @@ mod tests {
         };
 
         let outcome = service.handle_sync_event(&event).await.unwrap();
+        // Network didn't exist, so it's created with empty members, no sync needed
         assert_eq!(outcome, ApplyOutcome::Applied);
 
         // Verify network was created (empty members)
         let network = service
-            .get_content_network("new-content")
+            .get_content_network_for_test("new-content")
             .await
             .unwrap()
             .unwrap();
@@ -644,7 +724,110 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handle_sync_event_content_network_manager_added() {
+    async fn test_handle_sync_event_content_updated_as_member_needs_sync() {
+        // Create service with pre-existing content network where node-1 is a member
+        let node_registry = MockNodeRegistry::new();
+        let content_repo = Arc::new(RwLock::new(
+            MockContentNetworkRepository::new()
+                .with_network(create_test_network("content-1", vec!["node-1", "node-2"])),
+        ));
+        let peer_network = Arc::new(MockPeerNetwork::new().with_local_peer_id("node-1"));
+        let event_publisher = MockEventPublisher::new();
+        let crdt_repo = Arc::new(MockContentRepository::new());
+
+        let service = StateNodeService::new(
+            node_registry,
+            content_repo,
+            peer_network,
+            event_publisher,
+            crdt_repo,
+            "node-1".to_string(),
+        );
+
+        // ContentUpdated from another node
+        let event = Event::ContentUpdated {
+            content_id: "content-1".to_string(),
+            updated_node_id: "node-2".to_string(),
+            timestamp: 12345,
+        };
+
+        let outcome = service.handle_sync_event(&event).await.unwrap();
+        // node-1 is a member, so it should need sync
+        assert_eq!(
+            outcome,
+            ApplyOutcome::NeedsSync {
+                content_id: "content-1".to_string()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_sync_event_content_updated_ignores_self() {
+        // Create service with pre-existing content network where node-1 is a member
+        let node_registry = MockNodeRegistry::new();
+        let content_repo = Arc::new(RwLock::new(
+            MockContentNetworkRepository::new()
+                .with_network(create_test_network("content-1", vec!["node-1", "node-2"])),
+        ));
+        let peer_network = Arc::new(MockPeerNetwork::new().with_local_peer_id("node-1"));
+        let event_publisher = MockEventPublisher::new();
+        let crdt_repo = Arc::new(MockContentRepository::new());
+
+        let service = StateNodeService::new(
+            node_registry,
+            content_repo,
+            peer_network,
+            event_publisher,
+            crdt_repo,
+            "node-1".to_string(),
+        );
+
+        // ContentUpdated from ourselves - should be ignored
+        let event = Event::ContentUpdated {
+            content_id: "content-1".to_string(),
+            updated_node_id: "node-1".to_string(), // Same as local node
+            timestamp: 12345,
+        };
+
+        let outcome = service.handle_sync_event(&event).await.unwrap();
+        // Should be ignored since we sent it
+        assert_eq!(outcome, ApplyOutcome::Ignored);
+    }
+
+    #[tokio::test]
+    async fn test_handle_sync_event_content_updated_not_member() {
+        // Create service with pre-existing content network where node-1 is NOT a member
+        let node_registry = MockNodeRegistry::new();
+        let content_repo = Arc::new(RwLock::new(
+            MockContentNetworkRepository::new()
+                .with_network(create_test_network("content-1", vec!["node-2", "node-3"])),
+        ));
+        let peer_network = Arc::new(MockPeerNetwork::new().with_local_peer_id("node-1"));
+        let event_publisher = MockEventPublisher::new();
+        let crdt_repo = Arc::new(MockContentRepository::new());
+
+        let service = StateNodeService::new(
+            node_registry,
+            content_repo,
+            peer_network,
+            event_publisher,
+            crdt_repo,
+            "node-1".to_string(),
+        );
+
+        let event = Event::ContentUpdated {
+            content_id: "content-1".to_string(),
+            updated_node_id: "node-2".to_string(),
+            timestamp: 12345,
+        };
+
+        let outcome = service.handle_sync_event(&event).await.unwrap();
+        // node-1 is NOT a member, so just Applied (no sync needed)
+        assert_eq!(outcome, ApplyOutcome::Applied);
+    }
+
+    #[tokio::test]
+    async fn test_handle_sync_event_content_network_manager_added_as_member() {
         let service = create_test_service("node-1");
 
         let event = Event::ContentNetworkManagerAdded {
@@ -659,14 +842,43 @@ mod tests {
         };
 
         let outcome = service.handle_sync_event(&event).await.unwrap();
-        assert_eq!(outcome, ApplyOutcome::Applied);
+        // node-1 is a member, so it should need sync
+        assert_eq!(
+            outcome,
+            ApplyOutcome::NeedsSync {
+                content_id: "content-1".to_string()
+            }
+        );
 
         let network = service
-            .get_content_network("content-1")
+            .get_content_network_for_test("content-1")
             .await
             .unwrap()
             .unwrap();
         assert_eq!(network.member_nodes.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_handle_sync_event_content_network_manager_added_not_member() {
+        let service = create_test_service("node-1");
+
+        let event = Event::ContentNetworkManagerAdded {
+            content_id: "content-1".to_string(),
+            added_node_id: "node-3".to_string(),
+            member_nodes: vec!["node-2".to_string(), "node-3".to_string()], // node-1 not included
+            timestamp: 12345,
+        };
+
+        let outcome = service.handle_sync_event(&event).await.unwrap();
+        // node-1 is NOT a member
+        assert_eq!(outcome, ApplyOutcome::Applied);
+
+        let network = service
+            .get_content_network_for_test("content-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(network.member_nodes.len(), 2);
     }
 
     #[tokio::test]
@@ -737,7 +949,7 @@ mod tests {
     async fn test_get_content_network_not_found() {
         let service = create_test_service("node-1");
 
-        let result = service.get_content_network("nonexistent").await.unwrap();
+        let result = service.get_content_network_for_test("nonexistent").await.unwrap();
         assert!(result.is_none());
     }
 
