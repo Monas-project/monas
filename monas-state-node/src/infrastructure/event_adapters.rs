@@ -129,4 +129,3 @@ mod tests {
         assert!(!any_ref.is::<Vec<u8>>());
     }
 }
-

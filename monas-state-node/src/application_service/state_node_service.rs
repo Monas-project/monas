@@ -949,7 +949,10 @@ mod tests {
     async fn test_get_content_network_not_found() {
         let service = create_test_service("node-1");
 
-        let result = service.get_content_network_for_test("nonexistent").await.unwrap();
+        let result = service
+            .get_content_network_for_test("nonexistent")
+            .await
+            .unwrap();
         assert!(result.is_none());
     }
 
