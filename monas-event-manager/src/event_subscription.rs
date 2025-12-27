@@ -81,7 +81,7 @@ impl<'de> serde::Deserialize<'de> for DeliveryStatus {
     {
         struct DeliveryStatusVisitor;
 
-        impl<'de> serde::de::Visitor<'de> for DeliveryStatusVisitor {
+        impl serde::de::Visitor<'_> for DeliveryStatusVisitor {
             type Value = DeliveryStatus;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
