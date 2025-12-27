@@ -29,7 +29,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 base64 = "0.22"
 sled = "0.34"
-hpke-rs = { version = "0.3", features = ["hazmat"] }
+hpke-rs = { version = "0.4", features = ["hazmat"] }
 hpke-rs-rust-crypto = "0.3"
 
 [dev-dependencies]

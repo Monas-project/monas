@@ -47,4 +47,6 @@ coverage/
 
 # Coverage reports
 tarpaulin-report.html
+
+monas-state-node/data*/
 /docs
