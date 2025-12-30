@@ -57,13 +57,21 @@ where
 
         let metadata = content.metadata().clone();
         let content_id = content.id().clone();
+        let encrypted_content = content
+            .encrypted_content()
+            .ok_or_else(|| {
+                CreateError::Domain(ContentError::Other(
+                    "Encrypted content not found in created content".into(),
+                ))
+            })?
+            .clone();
 
-        // State Nodeは内部でEventを生成するため、ここでOperationを作成する必要はない
-        // 将来的にShare/鍵管理と連携したらpublic_keyを設定する想定
+
         Ok(CreateContentResult {
             content_id,
             metadata,
             public_key: String::new(), // TODO: 将来的に公開鍵を設定
+            encrypted_content,
         })
     }
 
@@ -134,13 +142,21 @@ where
             .save(content.id(), &content)
             .map_err(UpdateError::Repository)?;
 
-        // State Nodeは内部でEventを生成するため、ここでOperationを作成する必要はない
         let metadata = content.metadata().clone();
         let content_id = content.id().clone();
+        let encrypted_content = content
+            .encrypted_content()
+            .ok_or_else(|| {
+                UpdateError::Domain(ContentError::Other(
+                    "Encrypted content not found in updated content".into(),
+                ))
+            })?
+            .clone();
 
         Ok(UpdateContentResult {
             content_id,
             metadata,
+            encrypted_content,
         })
     }
 

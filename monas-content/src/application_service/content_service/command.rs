@@ -19,6 +19,7 @@ pub struct CreateContentResult {
     /// コンテンツ暗号化に用いた鍵から導出される公開情報など。
     /// 具体的な意味づけは後続の設計で決める。
     pub public_key: String,
+    pub encrypted_content: Vec<u8>,
 }
 
 /// コンテンツ更新ユースケースの入力。
@@ -34,6 +35,7 @@ pub struct UpdateContentCommand {
 pub struct UpdateContentResult {
     pub content_id: ContentId,
     pub metadata: Metadata,
+    pub encrypted_content: Vec<u8>,
 }
 
 /// コンテンツ削除ユースケースの入力。

@@ -46,7 +46,6 @@ fn default_permissions() -> Vec<Permission> {
 pub struct ShareContentOutput {
     pub content_id: String,
     pub recipient_public_key: String,
-    pub operation_id: String,
     pub key_envelope: KeyEnvelope,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shared_at: Option<String>,
@@ -69,7 +68,6 @@ pub struct RevokeShareInput {
 pub struct RevokeShareOutput {
     pub content_id: String,
     pub recipient_public_key: String,
-    pub operation_id: String,
     pub revoked: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub revoked_at: Option<String>,
@@ -155,7 +153,6 @@ mod tests {
         let output = ShareContentOutput {
             content_id: "test_id".into(),
             recipient_public_key: "recipient_key".into(),
-            operation_id: "op_123".into(),
             key_envelope: KeyEnvelope {
                 enc: "enc".into(),
                 wrapped_cek: "cek".into(),
@@ -173,7 +170,6 @@ mod tests {
         let output = RevokeShareOutput {
             content_id: "test_id".into(),
             recipient_public_key: "recipient_key".into(),
-            operation_id: "op_456".into(),
             revoked: true,
             revoked_at: Some("2025-12-05T12:34:56Z".into()),
         };

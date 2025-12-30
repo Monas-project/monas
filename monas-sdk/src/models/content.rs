@@ -20,8 +20,6 @@ pub struct ContentMetadata {
 /// コンテンツ作成リクエスト
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateContentInput {
-    /// 署名用の秘密鍵（base64url）
-    pub private_key: String,
     /// コンテンツデータ（base64url）
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -32,7 +30,6 @@ pub struct CreateContentInput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateContentOutput {
     pub content_id: String,
-    pub operation_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
 }
@@ -45,8 +42,6 @@ pub struct CreateContentOutput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetContentInput {
     pub content_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub private_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
 }
@@ -70,8 +65,6 @@ pub struct GetContentOutput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateContentInput {
     pub content_id: String,
-    /// 署名用の秘密鍵（所有者のもの）
-    pub private_key: String,
     /// 新しいコンテンツデータ（base64url）
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -83,7 +76,6 @@ pub struct UpdateContentInput {
 pub struct UpdateContentOutput {
     pub content_id: String,
     pub new_version: String,
-    pub operation_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
 }
@@ -96,15 +88,12 @@ pub struct UpdateContentOutput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeleteContentInput {
     pub content_id: String,
-    /// 署名用の秘密鍵（所有者のもの）
-    pub private_key: String,
 }
 
 /// コンテンツ削除レスポンス
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeleteContentOutput {
     pub content_id: String,
-    pub operation_id: String,
     pub deleted: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deleted_at: Option<String>,
@@ -132,7 +121,6 @@ mod tests {
     #[test]
     fn test_create_content_input() {
         let input = CreateContentInput {
-            private_key: "test_key".into(),
             content: "SGVsbG8gV29ybGQ=".into(),
             metadata: Some(ContentMetadata {
                 name: Some("hello.txt".into()),
@@ -142,7 +130,6 @@ mod tests {
             }),
         };
         let json = serde_json::to_string(&input).unwrap();
-        assert!(json.contains("\"private_key\":\"test_key\""));
         assert!(json.contains("\"content\":\"SGVsbG8gV29ybGQ=\""));
         assert!(json.contains("\"name\":\"hello.txt\""));
     }
@@ -151,12 +138,10 @@ mod tests {
     fn test_create_content_output() {
         let output = CreateContentOutput {
             content_id: "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi".into(),
-            operation_id: "op_abc123".into(),
             created_at: Some("2025-12-05T12:34:56Z".into()),
         };
         let json = serde_json::to_string(&output).unwrap();
         assert!(json.contains("\"content_id\""));
-        assert!(json.contains("\"operation_id\":\"op_abc123\""));
         assert!(json.contains("\"created_at\":\"2025-12-05T12:34:56Z\""));
     }
 
@@ -165,7 +150,6 @@ mod tests {
         let json = r#"{"content_id": "test_id"}"#;
         let input: GetContentInput = serde_json::from_str(json).unwrap();
         assert_eq!(input.content_id, "test_id");
-        assert!(input.private_key.is_none());
         assert!(input.version.is_none());
     }
 
@@ -188,13 +172,11 @@ mod tests {
     fn test_update_content_input() {
         let input = UpdateContentInput {
             content_id: "test_id".into(),
-            private_key: "test_key".into(),
             content: "bmV3IGNvbnRlbnQ=".into(),
             metadata: None,
         };
         let json = serde_json::to_string(&input).unwrap();
         assert!(json.contains("\"content_id\":\"test_id\""));
-        assert!(json.contains("\"private_key\":\"test_key\""));
         assert!(json.contains("\"content\":\"bmV3IGNvbnRlbnQ=\""));
     }
 
@@ -202,7 +184,6 @@ mod tests {
     fn test_delete_content_output() {
         let output = DeleteContentOutput {
             content_id: "test_id".into(),
-            operation_id: "op_del123".into(),
             deleted: true,
             deleted_at: Some("2025-12-05T12:34:56Z".into()),
         };
