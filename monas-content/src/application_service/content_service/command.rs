@@ -3,9 +3,12 @@ use crate::domain::{content::metadata::Metadata, content_id::ContentId};
 /// コンテンツ作成ユースケースの入力。
 #[derive(Debug)]
 pub struct CreateContentCommand {
-    pub name: String,
-    pub path: String,
+    /// コンテンツの生データ
     pub raw_content: Vec<u8>,
+    /// コンテンツ名
+    pub name: String,
+    /// コンテンツのパス
+    pub path: String,
 }
 
 /// コンテンツ作成ユースケースの出力。
@@ -16,6 +19,7 @@ pub struct CreateContentResult {
     /// コンテンツ暗号化に用いた鍵から導出される公開情報など。
     /// 具体的な意味づけは後続の設計で決める。
     pub public_key: String,
+    pub encrypted_content: Vec<u8>,
 }
 
 /// コンテンツ更新ユースケースの入力。
@@ -31,6 +35,7 @@ pub struct UpdateContentCommand {
 pub struct UpdateContentResult {
     pub content_id: ContentId,
     pub metadata: Metadata,
+    pub encrypted_content: Vec<u8>,
 }
 
 /// コンテンツ削除ユースケースの入力。

@@ -5,28 +5,24 @@ use crate::domain::{
 };
 
 use super::{
-    ContentCreatedOperation, ContentDeletedOperation, ContentEncryptionKeyStore,
-    ContentEncryptionKeyStoreError, ContentRepository, ContentRepositoryError,
-    ContentUpdatedOperation, CreateContentCommand, CreateContentResult, DeleteContentCommand,
-    DeleteContentResult, FetchContentResult, StateNodeClient, StateNodeClientError,
-    UpdateContentCommand, UpdateContentResult,
+    ContentEncryptionKeyStore, ContentEncryptionKeyStoreError, ContentRepository,
+    ContentRepositoryError, CreateContentCommand, CreateContentResult, DeleteContentCommand,
+    DeleteContentResult, FetchContentResult, UpdateContentCommand, UpdateContentResult,
 };
 
 /// コンテンツ作成ユースケースのアプリケーションサービス。
-pub struct ContentService<G, R, C, K, E, S> {
+pub struct ContentService<G, R, K, E, S> {
     pub content_id_generator: G,
     pub content_repository: R,
-    pub state_node_client: C,
     pub key_generator: K,
     pub encryptor: E,
     pub cek_store: S,
 }
 
-impl<G, R, C, K, E, S> ContentService<G, R, C, K, E, S>
+impl<G, R, K, E, S> ContentService<G, R, K, E, S>
 where
     G: ContentIdGenerator,
     R: ContentRepository,
-    C: StateNodeClient,
     K: ContentEncryptionKeyGenerator,
     E: ContentEncryption,
     S: ContentEncryptionKeyStore,
@@ -59,42 +55,37 @@ where
             .save(content.id(), &content)
             .map_err(CreateError::Repository)?;
 
-        // state-node に送る Operation を組み立て
         let metadata = content.metadata().clone();
         let content_id = content.id().clone();
-        let operation = ContentCreatedOperation {
-            content_id: content_id.clone(),
-            hash: content_id.as_str().to_string(),
-            path: metadata.path().to_string(),
-            // 現時点では公開鍵を扱っていないため空文字。
-            // 将来的にShare/鍵管理と連携したら埋める想定。
-            public_key: String::new(),
-        };
-
-        // state-node へ通知
-        self.state_node_client
-            .send_content_created(&operation)
-            .map_err(CreateError::StateNode)?;
+        let encrypted_content = content
+            .encrypted_content()
+            .ok_or_else(|| {
+                CreateError::Domain(ContentError::Other(
+                    "Encrypted content not found in created content".into(),
+                ))
+            })?
+            .clone();
 
         Ok(CreateContentResult {
             content_id,
             metadata,
-            public_key: operation.public_key,
+            public_key: String::new(), // TODO: 将来的に公開鍵を設定
+            encrypted_content,
         })
     }
 
     /// CreateContentCommand の簡易バリデーション。
     fn validate_create_command(cmd: &CreateContentCommand) -> Result<(), CreateError> {
+        if cmd.raw_content.is_empty() {
+            return Err(CreateError::Validation(
+                "raw_content must not be empty".into(),
+            ));
+        }
         if cmd.name.trim().is_empty() {
             return Err(CreateError::Validation("name must not be empty".into()));
         }
         if cmd.path.trim().is_empty() {
             return Err(CreateError::Validation("path must not be empty".into()));
-        }
-        if cmd.raw_content.is_empty() {
-            return Err(CreateError::Validation(
-                "raw_content must not be empty".into(),
-            ));
         }
         Ok(())
     }
@@ -150,23 +141,21 @@ where
             .save(content.id(), &content)
             .map_err(UpdateError::Repository)?;
 
-        // state-node に送る更新 Operation を組み立て
         let metadata = content.metadata().clone();
         let content_id = content.id().clone();
-        let operation = ContentUpdatedOperation {
-            content_id: content_id.clone(),
-            hash: content_id.as_str().to_string(),
-            path: metadata.path().to_string(),
-        };
-
-        // state-node へ通知
-        self.state_node_client
-            .send_content_updated(&operation)
-            .map_err(UpdateError::StateNode)?;
+        let encrypted_content = content
+            .encrypted_content()
+            .ok_or_else(|| {
+                UpdateError::Domain(ContentError::Other(
+                    "Encrypted content not found in updated content".into(),
+                ))
+            })?
+            .clone();
 
         Ok(UpdateContentResult {
             content_id,
             metadata,
+            encrypted_content,
         })
     }
 
@@ -282,18 +271,8 @@ where
             .save(deleted_content.id(), &deleted_content)
             .map_err(DeleteError::Repository)?;
 
-        // state-node に送る削除 Operation を組み立て
-        let metadata = deleted_content.metadata().clone();
+        // State Nodeは内部でEventを生成するため、ここでOperationを作成する必要はない
         let content_id = deleted_content.id().clone();
-        let operation = ContentDeletedOperation {
-            content_id: content_id.clone(),
-            path: metadata.path().to_string(),
-        };
-
-        // state-node へ通知
-        self.state_node_client
-            .send_content_deleted(&operation)
-            .map_err(DeleteError::StateNode)?;
 
         Ok(DeleteContentResult { content_id })
     }
@@ -309,8 +288,6 @@ pub enum DeleteError {
     Repository(ContentRepositoryError),
     #[error("key-store error: {0}")]
     KeyStore(ContentEncryptionKeyStoreError),
-    #[error("state-node error: {0}")]
-    StateNode(StateNodeClientError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -323,8 +300,6 @@ pub enum CreateError {
     Repository(ContentRepositoryError),
     #[error("key-store error: {0}")]
     KeyStore(ContentEncryptionKeyStoreError),
-    #[error("state-node error: {0}")]
-    StateNode(StateNodeClientError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -339,8 +314,6 @@ pub enum UpdateError {
     Repository(ContentRepositoryError),
     #[error("key-store error: {0}")]
     KeyStore(ContentEncryptionKeyStoreError),
-    #[error("state-node error: {0}")]
-    StateNode(StateNodeClientError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -502,54 +475,6 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Default)]
-    struct TestStateNodeClient {
-        fail_on_created: bool,
-        fail_on_updated: bool,
-        fail_on_deleted: bool,
-    }
-
-    impl StateNodeClient for TestStateNodeClient {
-        fn send_content_created(
-            &self,
-            _operation: &ContentCreatedOperation,
-        ) -> Result<(), StateNodeClientError> {
-            if self.fail_on_created {
-                Err(StateNodeClientError::Network(
-                    "created operation failed (test)".into(),
-                ))
-            } else {
-                Ok(())
-            }
-        }
-
-        fn send_content_updated(
-            &self,
-            _operation: &ContentUpdatedOperation,
-        ) -> Result<(), StateNodeClientError> {
-            if self.fail_on_updated {
-                Err(StateNodeClientError::Network(
-                    "updated operation failed (test)".into(),
-                ))
-            } else {
-                Ok(())
-            }
-        }
-
-        fn send_content_deleted(
-            &self,
-            _operation: &ContentDeletedOperation,
-        ) -> Result<(), StateNodeClientError> {
-            if self.fail_on_deleted {
-                Err(StateNodeClientError::Network(
-                    "deleted operation failed (test)".into(),
-                ))
-            } else {
-                Ok(())
-            }
-        }
-    }
-
     /// テスト用のインメモリ CEK ストア。
     #[derive(Clone, Default)]
     struct TestKeyStore {
@@ -625,16 +550,14 @@ mod tests {
         }
     }
 
-    fn build_service<R, C, K, E, S>(
+    fn build_service<R, K, E, S>(
         repo: R,
-        client: C,
         key_gen: K,
         encryptor: E,
         key_store: S,
-    ) -> ContentService<TestIdGenerator, R, C, K, E, S>
+    ) -> ContentService<TestIdGenerator, R, K, E, S>
     where
         R: ContentRepository,
-        C: StateNodeClient,
         K: ContentEncryptionKeyGenerator,
         E: ContentEncryption,
         S: ContentEncryptionKeyStore,
@@ -642,7 +565,6 @@ mod tests {
         ContentService {
             content_id_generator: TestIdGenerator,
             content_repository: repo,
-            state_node_client: client,
             key_generator: key_gen,
             encryptor,
             cek_store: key_store,
@@ -652,9 +574,8 @@ mod tests {
     #[test]
     fn create_success_persists_and_notifies_state_node() {
         let (repo, storage) = TestContentRepository::new(false);
-        let client = TestStateNodeClient::default();
         let (key_store, _key_storage) = TestKeyStore::new(false, false);
-        let service = build_service(repo, client, TestKeyGenerator, TestEncryptor, key_store);
+        let service = build_service(repo, TestKeyGenerator, TestEncryptor, key_store);
 
         let cmd = CreateContentCommand {
             name: "test".into(),
@@ -678,9 +599,8 @@ mod tests {
     #[test]
     fn create_validation_error_when_name_is_empty() {
         let (repo, _) = TestContentRepository::new(false);
-        let client = TestStateNodeClient::default();
         let (key_store, _) = TestKeyStore::new(false, false);
-        let service = build_service(repo, client, TestKeyGenerator, TestEncryptor, key_store);
+        let service = build_service(repo, TestKeyGenerator, TestEncryptor, key_store);
 
         let cmd = CreateContentCommand {
             name: "   ".into(),
@@ -696,40 +616,10 @@ mod tests {
     }
 
     #[test]
-    fn create_state_node_error_is_propagated() {
-        let (repo, _) = TestContentRepository::new(false);
-        let client = TestStateNodeClient {
-            fail_on_created: true,
-            ..Default::default()
-        };
-        let (key_store, _) = TestKeyStore::new(false, false);
-        let service = build_service(repo, client, TestKeyGenerator, TestEncryptor, key_store);
-
-        let cmd = CreateContentCommand {
-            name: "test".into(),
-            path: "path.txt".into(),
-            raw_content: b"hello".to_vec(),
-        };
-
-        let err = match service.create(cmd) {
-            Err(e) => e,
-            Ok(_) => panic!("expected state-node error but got Ok"),
-        };
-        assert!(matches!(err, CreateError::StateNode(_)));
-    }
-
-    #[test]
     fn update_success_changes_content_and_name() {
         let (repo, storage) = TestContentRepository::new(false);
-        let client = TestStateNodeClient::default();
         let (key_store, key_storage) = TestKeyStore::new(false, false);
-        let service = build_service(
-            repo.clone(),
-            client,
-            TestKeyGenerator,
-            TestEncryptor,
-            key_store,
-        );
+        let service = build_service(repo.clone(), TestKeyGenerator, TestEncryptor, key_store);
 
         let base_cmd = CreateContentCommand {
             name: "old".into(),
@@ -765,9 +655,8 @@ mod tests {
     #[test]
     fn update_not_found_returns_error() {
         let (repo, _) = TestContentRepository::new(false);
-        let client = TestStateNodeClient::default();
         let (key_store, _) = TestKeyStore::new(false, false);
-        let service = build_service(repo, client, TestKeyGenerator, TestEncryptor, key_store);
+        let service = build_service(repo, TestKeyGenerator, TestEncryptor, key_store);
 
         let update_cmd = UpdateContentCommand {
             content_id: ContentId::new("unknown-id".into()),
@@ -783,55 +672,10 @@ mod tests {
     }
 
     #[test]
-    fn update_state_node_error_is_propagated() {
-        let (repo, _) = TestContentRepository::new(false);
-        let client = TestStateNodeClient {
-            fail_on_updated: true,
-            ..Default::default()
-        };
-        let (key_store, _) = TestKeyStore::new(false, false);
-        let service = build_service(
-            repo.clone(),
-            client,
-            TestKeyGenerator,
-            TestEncryptor,
-            key_store,
-        );
-
-        let base_cmd = CreateContentCommand {
-            name: "name".into(),
-            path: "path.txt".into(),
-            raw_content: b"data".to_vec(),
-        };
-        let base_result = service
-            .create(base_cmd)
-            .expect("initial create should succeed");
-
-        let update_cmd = UpdateContentCommand {
-            content_id: base_result.content_id,
-            new_name: Some("new".into()),
-            new_raw_content: None,
-        };
-
-        let err = match service.update(update_cmd) {
-            Err(e) => e,
-            Ok(_) => panic!("expected state-node error but got Ok"),
-        };
-        assert!(matches!(err, UpdateError::StateNode(_)));
-    }
-
-    #[test]
     fn delete_success_marks_content_deleted_and_notifies_state_node() {
         let (repo, storage) = TestContentRepository::new(false);
-        let client = TestStateNodeClient::default();
         let (key_store, _) = TestKeyStore::new(false, false);
-        let service = build_service(
-            repo.clone(),
-            client,
-            TestKeyGenerator,
-            TestEncryptor,
-            key_store,
-        );
+        let service = build_service(repo.clone(), TestKeyGenerator, TestEncryptor, key_store);
 
         let base_cmd = CreateContentCommand {
             name: "name".into(),
@@ -862,9 +706,8 @@ mod tests {
     #[test]
     fn delete_not_found_returns_error() {
         let (repo, _) = TestContentRepository::new(false);
-        let client = TestStateNodeClient::default();
         let (key_store, _) = TestKeyStore::new(false, false);
-        let service = build_service(repo, client, TestKeyGenerator, TestEncryptor, key_store);
+        let service = build_service(repo, TestKeyGenerator, TestEncryptor, key_store);
 
         let delete_cmd = DeleteContentCommand {
             content_id: ContentId::new("unknown-id".into()),
@@ -878,47 +721,10 @@ mod tests {
     }
 
     #[test]
-    fn delete_state_node_error_is_propagated() {
-        let (repo, _) = TestContentRepository::new(false);
-        let client = TestStateNodeClient {
-            fail_on_deleted: true,
-            ..Default::default()
-        };
-        let (key_store, _) = TestKeyStore::new(false, false);
-        let service = build_service(
-            repo.clone(),
-            client,
-            TestKeyGenerator,
-            TestEncryptor,
-            key_store,
-        );
-
-        let base_cmd = CreateContentCommand {
-            name: "name".into(),
-            path: "path.txt".into(),
-            raw_content: b"data".to_vec(),
-        };
-        let base_result = service
-            .create(base_cmd)
-            .expect("initial create should succeed");
-
-        let delete_cmd = DeleteContentCommand {
-            content_id: base_result.content_id,
-        };
-
-        let err = match service.delete(delete_cmd) {
-            Err(e) => e,
-            Ok(_) => panic!("expected state-node error but got Ok"),
-        };
-        assert!(matches!(err, DeleteError::StateNode(_)));
-    }
-
-    #[test]
     fn fetch_success_returns_decrypted_content() {
         let (repo, _) = TestContentRepository::new(false);
-        let client = TestStateNodeClient::default();
         let (key_store, _) = TestKeyStore::new(false, false);
-        let service = build_service(repo, client, TestKeyGenerator, TestEncryptor, key_store);
+        let service = build_service(repo, TestKeyGenerator, TestEncryptor, key_store);
 
         let raw = b"hello-fetch".to_vec();
 
@@ -942,9 +748,8 @@ mod tests {
     #[test]
     fn fetch_not_found_returns_error() {
         let (repo, _) = TestContentRepository::new(false);
-        let client = TestStateNodeClient::default();
         let (key_store, _) = TestKeyStore::new(false, false);
-        let service = build_service(repo, client, TestKeyGenerator, TestEncryptor, key_store);
+        let service = build_service(repo, TestKeyGenerator, TestEncryptor, key_store);
 
         let unknown_id = ContentId::new("unknown-id".into());
 
@@ -958,15 +763,8 @@ mod tests {
     #[test]
     fn fetch_deleted_returns_deleted_error() {
         let (repo, _) = TestContentRepository::new(false);
-        let client = TestStateNodeClient::default();
         let (key_store, _) = TestKeyStore::new(false, false);
-        let service = build_service(
-            repo.clone(),
-            client,
-            TestKeyGenerator,
-            TestEncryptor,
-            key_store,
-        );
+        let service = build_service(repo.clone(), TestKeyGenerator, TestEncryptor, key_store);
 
         let cmd = CreateContentCommand {
             name: "to-delete".into(),
@@ -990,9 +788,8 @@ mod tests {
     #[test]
     fn fetch_missing_key_returns_missing_key_error() {
         let (repo, _) = TestContentRepository::new(false);
-        let client = TestStateNodeClient::default();
         let (key_store, key_storage) = TestKeyStore::new(false, false);
-        let service = build_service(repo, client, TestKeyGenerator, TestEncryptor, key_store);
+        let service = build_service(repo, TestKeyGenerator, TestEncryptor, key_store);
 
         let cmd = CreateContentCommand {
             name: "no-key".into(),
@@ -1017,9 +814,8 @@ mod tests {
     #[test]
     fn decrypt_with_cek_success_when_content_id_matches() {
         let (repo, _storage) = TestContentRepository::new(false);
-        let client = TestStateNodeClient::default();
         let (key_store, _key_storage) = TestKeyStore::new(false, false);
-        let service = build_service(repo, client, TestKeyGenerator, TestEncryptor, key_store);
+        let service = build_service(repo, TestKeyGenerator, TestEncryptor, key_store);
 
         let plaintext = b"decrypt-cek-success".to_vec();
         let expected_cid = service.content_id_generator.generate(&plaintext);
@@ -1037,9 +833,8 @@ mod tests {
     #[test]
     fn decrypt_with_cek_returns_mismatch_error_when_content_id_differs() {
         let (repo, _storage) = TestContentRepository::new(false);
-        let client = TestStateNodeClient::default();
         let (key_store, _key_storage) = TestKeyStore::new(false, false);
-        let service = build_service(repo, client, TestKeyGenerator, TestEncryptor, key_store);
+        let service = build_service(repo, TestKeyGenerator, TestEncryptor, key_store);
 
         let plaintext = b"decrypt-cek-mismatch".to_vec();
         let actual_cid = service.content_id_generator.generate(&plaintext);
