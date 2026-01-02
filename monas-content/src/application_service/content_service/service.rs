@@ -66,7 +66,6 @@ where
             })?
             .clone();
 
-
         Ok(CreateContentResult {
             content_id,
             metadata,

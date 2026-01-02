@@ -29,8 +29,8 @@ pub struct KeyEnvelope {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShareContentInput {
     pub content_id: String,
-    /// 署名用の秘密鍵（所有者のもの）
-    pub private_key: String,
+    /// 送信者の公開鍵（base64url） - sender_key_idを計算するために使用
+    pub sender_public_key: String,
     /// 共有先の公開鍵（base64url）
     pub recipient_public_key: String,
     #[serde(default = "default_permissions")]
@@ -46,6 +46,8 @@ fn default_permissions() -> Vec<Permission> {
 pub struct ShareContentOutput {
     pub content_id: String,
     pub recipient_public_key: String,
+    pub sender_key_id: String,
+    pub recipient_key_id: String,
     pub key_envelope: KeyEnvelope,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shared_at: Option<String>,
@@ -59,7 +61,6 @@ pub struct ShareContentOutput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RevokeShareInput {
     pub content_id: String,
-    pub private_key: String,
     pub recipient_public_key: String,
 }
 
@@ -81,8 +82,9 @@ pub struct RevokeShareOutput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetSharedContentInput {
     pub content_id: String,
-    /// 復号用の秘密鍵（base64url）
     pub private_key: String,
+    pub sender_key_id: String,
+    pub recipient_key_id: String,
     pub key_envelope: KeyEnvelope,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
@@ -129,7 +131,7 @@ mod tests {
     fn test_share_content_input_default_permissions() {
         let json = r#"{
             "content_id": "test_id",
-            "private_key": "test_key",
+            "sender_public_key": "sender_pub",
             "recipient_public_key": "recipient_key"
         }"#;
         let input: ShareContentInput = serde_json::from_str(json).unwrap();
@@ -140,7 +142,7 @@ mod tests {
     fn test_share_content_input_with_permissions() {
         let json = r#"{
             "content_id": "test_id",
-            "private_key": "test_key",
+            "sender_public_key": "sender_pub",
             "recipient_public_key": "recipient_key",
             "permissions": ["read", "write"]
         }"#;
@@ -153,6 +155,8 @@ mod tests {
         let output = ShareContentOutput {
             content_id: "test_id".into(),
             recipient_public_key: "recipient_key".into(),
+            sender_key_id: "sender_key_id".into(),
+            recipient_key_id: "recipient_key_id".into(),
             key_envelope: KeyEnvelope {
                 enc: "enc".into(),
                 wrapped_cek: "cek".into(),
@@ -182,6 +186,8 @@ mod tests {
         let input = GetSharedContentInput {
             content_id: "test_id".into(),
             private_key: "test_key".into(),
+            sender_key_id: "sender_key_id".into(),
+            recipient_key_id: "recipient_key_id".into(),
             key_envelope: KeyEnvelope {
                 enc: "enc".into(),
                 wrapped_cek: "cek".into(),

@@ -28,3 +28,24 @@ pub struct StateNodeUpdateContentResponse {
     pub updated: bool,
 }
 
+/// State Nodeからのコンテンツ履歴レスポンス
+#[derive(Debug, Deserialize)]
+pub struct StateNodeContentHistoryResponse {
+    pub content_id: String,
+    pub versions: Vec<String>,
+}
+
+/// State Nodeからのコンテンツデータレスポンス
+#[derive(Debug, Deserialize)]
+pub struct StateNodeContentDataResponse {
+    pub content_id: String,
+    /// Base64(Standard)エンコードされたデータ
+    pub data: String,
+    pub version: Option<String>,
+}
+
+/// State Nodeのエラーレスポンス
+#[derive(Debug, Deserialize)]
+pub struct StateNodeErrorResponse {
+    pub error: String,
+}

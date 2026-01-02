@@ -1,4 +1,7 @@
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use base64::{
+    engine::general_purpose::STANDARD as BASE64_STANDARD, engine::general_purpose::URL_SAFE_NO_PAD,
+    Engine,
+};
 use chrono::Utc;
 
 use crate::common::{generate_trace_id, ApiError, ApiResponse};
@@ -32,13 +35,14 @@ pub(super) type ContentServiceInstance = ContentService<
 >;
 
 impl MonasController {
-
     /// FetchErrorをApiErrorにマッピング
     fn map_fetch_error(e: FetchError) -> ApiError {
         match e {
             FetchError::NotFound => ApiError::NotFound("Content not found".into()),
             FetchError::Deleted => ApiError::NotFound("Content is deleted".into()),
-            FetchError::MissingKey => ApiError::Internal("Missing encryption key for content".into()),
+            FetchError::MissingKey => {
+                ApiError::Internal("Missing encryption key for content".into())
+            }
             FetchError::Domain(err) => ApiError::Internal(format!("Domain error: {:?}", err)),
             FetchError::Repository(err) => ApiError::Internal(format!("Repository error: {}", err)),
             FetchError::KeyStore(err) => ApiError::Internal(format!("Key store error: {}", err)),
@@ -51,7 +55,9 @@ impl MonasController {
             UpdateError::NotFound => ApiError::NotFound("Content not found".into()),
             UpdateError::Validation(msg) => ApiError::Validation(msg),
             UpdateError::Domain(err) => ApiError::Internal(format!("Domain error: {:?}", err)),
-            UpdateError::Repository(err) => ApiError::Internal(format!("Repository error: {}", err)),
+            UpdateError::Repository(err) => {
+                ApiError::Internal(format!("Repository error: {}", err))
+            }
             UpdateError::KeyStore(err) => ApiError::Internal(format!("Key store error: {}", err)),
         }
     }
@@ -61,7 +67,9 @@ impl MonasController {
         match e {
             DeleteError::NotFound => ApiError::NotFound("Content not found".into()),
             DeleteError::Domain(err) => ApiError::Internal(format!("Domain error: {:?}", err)),
-            DeleteError::Repository(err) => ApiError::Internal(format!("Repository error: {}", err)),
+            DeleteError::Repository(err) => {
+                ApiError::Internal(format!("Repository error: {}", err))
+            }
             DeleteError::KeyStore(err) => ApiError::Internal(format!("Key store error: {}", err)),
         }
     }
@@ -126,10 +134,7 @@ impl MonasController {
         let state_node_url = format!("{}/content", self.state_node_url);
         if let Err(e) = ureq::post(&state_node_url).send_json(state_node_request) {
             let error_msg = format!("Failed to send request to State Node: {}", e);
-            return Some(ApiResponse::error(
-                ApiError::Internal(error_msg),
-                trace_id,
-            ));
+            return Some(ApiResponse::error(ApiError::Internal(error_msg), trace_id));
         }
 
         None
@@ -151,10 +156,7 @@ impl MonasController {
         let state_node_url = format!("{}/content/{}", self.state_node_url, content_id);
         if let Err(e) = ureq::put(&state_node_url).send_json(state_node_request) {
             let error_msg = format!("Failed to send request to State Node: {}", e);
-            return Some(ApiResponse::error(
-                ApiError::Internal(error_msg),
-                trace_id,
-            ));
+            return Some(ApiResponse::error(ApiError::Internal(error_msg), trace_id));
         }
 
         None
@@ -198,11 +200,7 @@ impl MonasController {
             );
         }
 
-        let name = match input
-            .metadata
-            .as_ref()
-            .and_then(|m| m.name.clone())
-        {
+        let name = match input.metadata.as_ref().and_then(|m| m.name.clone()) {
             Some(name) => name,
             None => {
                 return ApiResponse::error(
@@ -232,7 +230,9 @@ impl MonasController {
             }
         };
 
-        if let Some(response) = self.send_create_to_state_node(&result.encrypted_content, trace_id.clone()) {
+        if let Some(response) =
+            self.send_create_to_state_node(&result.encrypted_content, trace_id.clone())
+        {
             return response;
         }
 
@@ -319,10 +319,7 @@ impl MonasController {
         let content_id = ContentId::new(original_content_id.clone());
 
         // 3. new_nameとnew_raw_contentを準備
-        let new_name = input
-            .metadata
-            .as_ref()
-            .and_then(|m| m.name.clone());
+        let new_name = input.metadata.as_ref().and_then(|m| m.name.clone());
 
         let new_raw_content = if input.content.is_empty() {
             None
@@ -385,7 +382,7 @@ impl MonasController {
     ///    - リポジトリからコンテンツを削除（論理削除）
     ///    - キーストアからCEKを削除
     /// 4. 結果を返却
-    /// 
+    ///
     /// 注意: State Nodeへの削除リクエスト送信は未実装（State Node側のdeleteエンドポイント実装後に追加予定）
     pub fn delete_content(&self, input: DeleteContentInput) -> ApiResponse<DeleteContentOutput> {
         let trace_id = generate_trace_id();

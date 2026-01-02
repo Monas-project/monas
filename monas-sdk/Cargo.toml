@@ -18,3 +18,4 @@ chrono = { version = "0.4", features = ["serde"] }
 ureq = { version = "3.1.4", features = ["json"] }
 url = "2.5"
 dotenv = "0.15"
+sha2 = "0.10"
