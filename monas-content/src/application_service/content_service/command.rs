@@ -6,6 +6,9 @@ pub struct CreateContentCommand {
     pub name: String,
     pub path: String,
     pub raw_content: Vec<u8>,
+    /// 保存先のストレージプロバイダー。
+    /// `None` の場合はデフォルトプロバイダーに保存される。
+    pub provider: Option<String>,
 }
 
 /// コンテンツ作成ユースケースの出力。
@@ -24,6 +27,7 @@ pub struct UpdateContentCommand {
     pub content_id: ContentId,
     pub new_name: Option<String>,
     pub new_raw_content: Option<Vec<u8>>,
+    pub provider: Option<String>,
 }
 
 /// コンテンツ更新ユースケースの出力。
@@ -37,6 +41,7 @@ pub struct UpdateContentResult {
 #[derive(Debug)]
 pub struct DeleteContentCommand {
     pub content_id: ContentId,
+    pub provider: Option<String>,
 }
 
 /// コンテンツ削除ユースケースの出力。
