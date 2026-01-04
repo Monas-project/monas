@@ -29,6 +29,28 @@ impl KeyPairGenerateFactory {
             KeyAlgorithm::P256 => Box::new(P256KeyPair::generate()),
         }
     }
+
+    /// 永続化された鍵バイト列から鍵ペアを復元する。
+    pub fn from_key_bytes(
+        key_type: KeyAlgorithm,
+        public_key: &[u8],
+        secret_key: &[u8],
+    ) -> Result<Box<dyn AccountKeyPair>, KeyPairError> {
+        match key_type {
+            KeyAlgorithm::K256 => Ok(Box::new(K256KeyPair::from_key_bytes(
+                public_key, secret_key,
+            )?)),
+            KeyAlgorithm::P256 => Ok(Box::new(P256KeyPair::from_key_bytes(
+                public_key, secret_key,
+            )?)),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum KeyPairError {
+    #[error("invalid secret key: {0}")]
+    InvalidSecretKey(String),
 }
 
 #[cfg(test)]

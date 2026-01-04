@@ -1,49 +1,29 @@
-use std::fmt::Debug;
-use std::ops::Deref;
-
 pub struct Account {
     key_pair: Box<dyn AccountKeyPair>,
-    deleted: bool,
 }
 
-#[derive(Debug, Eq, PartialEq)]
-pub enum AccountError {
-    AccountAlreadyDeleted,
-}
-
+/// アカウント = 鍵ペアという前提のシンプルなドメインモデル。
+/// 永続化や削除（ストレージから鍵を消す）はインフラ層の責務とし、
+/// ドメインでは「署名できること」と「鍵素材へのアクセス」に集中する。
 impl Account {
-    pub fn init(key_pair: Box<dyn AccountKeyPair>) -> Self {
-        Account {
-            key_pair,
-            deleted: false,
-        }
+    /// 既に生成済みの鍵ペアからアカウントを構築する。
+    pub fn new(key_pair: Box<dyn AccountKeyPair>) -> Self {
+        Account { key_pair }
     }
 
-    pub fn regenerate_keypair(
-        &self,
-        key_pair: Box<dyn AccountKeyPair>,
-    ) -> Result<Account, AccountError> {
-        if self.deleted {
-            return Err(AccountError::AccountAlreadyDeleted);
-        }
-        Ok(Self::init(key_pair))
+    /// メッセージに署名する。
+    pub fn sign(&self, msg: &[u8]) -> (Vec<u8>, Option<u8>) {
+        self.key_pair.sign(msg)
     }
 
-    //ContentNodeに通達する
-    pub fn delete(&mut self) -> Result<(), AccountError> {
-        if self.deleted {
-            return Err(AccountError::AccountAlreadyDeleted);
-        }
-        self.deleted = true;
-        Ok(())
+    /// 公開鍵バイト列へのアクセス。
+    pub fn public_key_bytes(&self) -> &[u8] {
+        self.key_pair.public_key_bytes()
     }
 
-    pub fn keypair(&self) -> &dyn AccountKeyPair {
-        self.key_pair.deref()
-    }
-
-    pub fn is_deleted(&self) -> bool {
-        self.deleted
+    /// 秘密鍵バイト列へのアクセス。
+    pub fn secret_key_bytes(&self) -> &[u8] {
+        self.key_pair.secret_key_bytes()
     }
 }
 
@@ -61,36 +41,16 @@ mod account_tests {
     use crate::infrastructure::key_pair::KeyPairGenerateFactory;
 
     #[test]
-    fn regenerate_key_pair() {
-        let before_account = Account::init(KeyPairGenerateFactory::generate(K256));
+    fn create_account_and_use_key_material() {
+        let account = Account::new(KeyPairGenerateFactory::generate(K256));
 
-        let before_key_pair = before_account.key_pair.public_key_bytes();
+        // 公開鍵・秘密鍵のサイズが想定通りであることを確認
+        assert_eq!(account.public_key_bytes().len(), 65);
+        assert_eq!(account.secret_key_bytes().len(), 32);
 
-        let after_account = before_account
-            .regenerate_keypair(KeyPairGenerateFactory::generate(K256))
-            .unwrap();
-
-        let after_key_pair = after_account.key_pair.public_key_bytes();
-
-        assert_ne!(before_key_pair, after_key_pair);
-
-        assert!(!before_account.is_deleted());
-    }
-
-    #[test]
-    fn throw_error_regenerate_key_pair_when_account_was_deleted() {
-        let mut account = Account::init(KeyPairGenerateFactory::generate(K256));
-
-        account.delete().unwrap();
-        assert!(account.is_deleted());
-        let result = account.regenerate_keypair(KeyPairGenerateFactory::generate(K256));
-        matches!(result, Err(AccountError::AccountAlreadyDeleted));
-    }
-
-    #[test]
-    fn delete_account() {
-        let mut account = Account::init(KeyPairGenerateFactory::generate(K256));
-        account.delete().unwrap();
-        assert!(account.is_deleted());
+        // 署名が正常に生成できることを確認
+        let message = b"test message";
+        let (sig, _rec_id) = account.sign(message);
+        assert!(!sig.is_empty());
     }
 }
