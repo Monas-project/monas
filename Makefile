@@ -1,21 +1,8 @@
-.PHONY: dev-up dev-down state-node-up state-node-down gateway-up gateway-down
+.PHONY: state-node-run gateway-run
 
-dev-up:
-	@./scripts/dev-up.sh
+# Foreground run (use separate terminals)
+state-node-run:
+	@./scripts/state-node-run.sh
 
-dev-down:
-	@./scripts/dev-down.sh
-
-state-node-up:
-	@./scripts/state-node-up.sh
-
-state-node-down:
-	@./scripts/state-node-down.sh
-
-gateway-up:
-	@./scripts/gateway-up.sh
-
-gateway-down:
-	@./scripts/gateway-down.sh
-
-
+gateway-run:
+	@./scripts/gateway-run.sh

@@ -20,28 +20,16 @@ rustup target add wasm32-wasip1
 ゲートウェイとして `monas-gateway` を用意しています（デフォルト `127.0.0.1:3000`）。
 外部依存として `monas-state-node`（デフォルト `127.0.0.1:8080`）を別プロセスで起動します。
 
-### One command
+### Foreground (recommended)
+
+
 
 ```bash
-make dev-up
-```
+# terminal 1
+make state-node-run
 
-止めるとき:
-
-```bash
-make dev-down
-```
-
-### Individual
-
-```bash
-# State Node only
-make state-node-up
-make state-node-down
-
-# Gateway only
-make gateway-up
-make gateway-down
+# terminal 2
+make gateway-run
 ```
 
 ### Manual
