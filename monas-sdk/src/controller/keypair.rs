@@ -37,7 +37,7 @@ impl MonasController {
                 ApiResponse::success(output, trace_id)
             }
             Err(e) => ApiResponse::error(
-                ApiError::Internal(format!("Failed to generate keypair: {:?}", e)),
+                ApiError::Internal(format!("Failed to generate keypair: {e:?}")),
                 trace_id,
             ),
         }

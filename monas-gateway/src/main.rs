@@ -1,0 +1,149 @@
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    routing::{get, post},
+    Json, Router,
+};
+use monas_sdk::models::content::{
+    CreateContentInput, DeleteContentInput, GetContentInput, UpdateContentInput,
+};
+use monas_sdk::models::keypair::GenerateKeypairInput;
+use monas_sdk::models::share::{GetSharedContentInput, RevokeShareInput, ShareContentInput};
+use monas_sdk::models::state::{GetHistoryInput, GetLatestVersionInput, VerifyIntegrityInput};
+use monas_sdk::{ApiResponse, MonasController};
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+#[derive(Clone)]
+struct AppState {
+    controller: Arc<MonasController>,
+}
+
+#[tokio::main]
+async fn main() {
+    // monas-sdk側でもenvを見るが、ここで明示的に読むことで挙動が分かりやすくなる
+    let state_node_url =
+        std::env::var("MONAS_STATE_NODE_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".into());
+    let controller = Arc::new(MonasController::with_state_node_url(state_node_url));
+
+    let app_state = AppState { controller };
+
+    let app = Router::new()
+        .route("/health", get(health))
+        .route("/keypair", post(generate_keypair))
+        .route("/content", post(create_content))
+        .route(
+            "/content/{id}",
+            get(get_content).put(update_content).delete(delete_content),
+        )
+        // share
+        .route("/share", post(share_content))
+        .route("/share/revoke", post(revoke_share))
+        .route("/share/get", post(get_shared_content))
+        // state
+        .route("/state/latest-version", post(get_latest_version))
+        .route("/state/history", post(get_history))
+        .route("/state/verify-integrity", post(verify_integrity))
+        .with_state(app_state);
+
+    let port: u16 = std::env::var("MONAS_API_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3000);
+
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    eprintln!("monas-gateway listening on http://{addr}");
+
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .expect("failed to bind");
+    axum::serve(listener, app).await.expect("server error");
+}
+
+async fn health() -> StatusCode {
+    StatusCode::OK
+}
+
+async fn generate_keypair(
+    State(state): State<AppState>,
+    Json(input): Json<GenerateKeypairInput>,
+) -> Json<ApiResponse<monas_sdk::models::keypair::GenerateKeypairOutput>> {
+    Json(state.controller.generate_keypair(input))
+}
+
+async fn create_content(
+    State(state): State<AppState>,
+    Json(input): Json<CreateContentInput>,
+) -> Json<ApiResponse<monas_sdk::models::content::CreateContentOutput>> {
+    Json(state.controller.create_content(input))
+}
+
+async fn get_content(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Json<ApiResponse<monas_sdk::models::content::GetContentOutput>> {
+    let input = GetContentInput {
+        content_id: id,
+        version: None,
+    };
+    Json(state.controller.get_content(input))
+}
+
+async fn update_content(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(mut input): Json<UpdateContentInput>,
+) -> Json<ApiResponse<monas_sdk::models::content::UpdateContentOutput>> {
+    input.content_id = id;
+    Json(state.controller.update_content(input))
+}
+
+async fn delete_content(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Json<ApiResponse<monas_sdk::models::content::DeleteContentOutput>> {
+    let input = DeleteContentInput { content_id: id };
+    Json(state.controller.delete_content(input))
+}
+
+async fn share_content(
+    State(state): State<AppState>,
+    Json(input): Json<ShareContentInput>,
+) -> Json<ApiResponse<monas_sdk::models::share::ShareContentOutput>> {
+    Json(state.controller.share_content(input))
+}
+
+async fn revoke_share(
+    State(state): State<AppState>,
+    Json(input): Json<RevokeShareInput>,
+) -> Json<ApiResponse<monas_sdk::models::share::RevokeShareOutput>> {
+    Json(state.controller.revoke_share(input))
+}
+
+async fn get_shared_content(
+    State(state): State<AppState>,
+    Json(input): Json<GetSharedContentInput>,
+) -> Json<ApiResponse<monas_sdk::models::share::GetSharedContentOutput>> {
+    Json(state.controller.get_shared_content(input))
+}
+
+async fn get_latest_version(
+    State(state): State<AppState>,
+    Json(input): Json<GetLatestVersionInput>,
+) -> Json<ApiResponse<monas_sdk::models::state::GetLatestVersionOutput>> {
+    Json(state.controller.get_latest_version(input))
+}
+
+async fn get_history(
+    State(state): State<AppState>,
+    Json(input): Json<GetHistoryInput>,
+) -> Json<ApiResponse<monas_sdk::models::state::GetHistoryOutput>> {
+    Json(state.controller.get_history(input))
+}
+
+async fn verify_integrity(
+    State(state): State<AppState>,
+    Json(input): Json<VerifyIntegrityInput>,
+) -> Json<ApiResponse<monas_sdk::models::state::VerifyIntegrityOutput>> {
+    Json(state.controller.verify_integrity(input))
+}

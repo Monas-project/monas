@@ -95,25 +95,25 @@ impl MonasController {
                 ApiError::Internal("Missing content encryption key".into())
             }
             ShareApplicationError::Share(err) => {
-                ApiError::Internal(format!("Share domain error: {:?}", err))
+                ApiError::Internal(format!("Share domain error: {err:?}"))
             }
             ShareApplicationError::ContentRepository(err) => {
-                ApiError::Internal(format!("Content repository error: {}", err))
+                ApiError::Internal(format!("Content repository error: {err}"))
             }
             ShareApplicationError::ContentEncryptionKeyStore(err) => {
-                ApiError::Internal(format!("Key store error: {}", err))
+                ApiError::Internal(format!("Key store error: {err}"))
             }
             ShareApplicationError::ShareRepository(err) => {
-                ApiError::Internal(format!("Share repository error: {}", err))
+                ApiError::Internal(format!("Share repository error: {err}"))
             }
             ShareApplicationError::PublicKeyDirectory(err) => {
-                ApiError::Internal(format!("Public key directory error: {}", err))
+                ApiError::Internal(format!("Public key directory error: {err}"))
             }
             ShareApplicationError::MissingPublicKey => {
                 ApiError::NotFound("Missing public key".into())
             }
             ShareApplicationError::KeyWrapping(msg) => {
-                ApiError::Internal(format!("Key wrapping error: {}", msg))
+                ApiError::Internal(format!("Key wrapping error: {msg}"))
             }
         }
     }

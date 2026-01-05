@@ -39,7 +39,7 @@ impl MonasController {
             .call()
             .map_err(|e| {
                 ApiResponse::error(
-                    ApiError::Internal(format!("Failed to call State Node: {}", e)),
+                    ApiError::Internal(format!("Failed to call State Node: {e}")),
                     trace_id_for_call,
                 )
             })?;
@@ -47,7 +47,7 @@ impl MonasController {
         let status = resp.status().as_u16();
         let body = resp.into_body().read_to_string().map_err(|e| {
             ApiResponse::error(
-                ApiError::Internal(format!("Failed to read State Node response body: {}", e)),
+                ApiError::Internal(format!("Failed to read State Node response body: {e}")),
                 trace_id,
             )
         })?;
@@ -60,7 +60,7 @@ impl MonasController {
         body: Option<String>,
         trace_id: String,
     ) -> ApiResponse<T> {
-        let msg = body.unwrap_or_else(|| format!("State Node returned HTTP {}", status));
+        let msg = body.unwrap_or_else(|| format!("State Node returned HTTP {status}"));
         match status {
             400 => ApiResponse::error(ApiError::Validation(msg), trace_id),
             404 => ApiResponse::error(ApiError::NotFound(msg), trace_id),
@@ -87,7 +87,7 @@ impl MonasController {
 
         serde_json::from_str::<StateNodeContentHistoryResponse>(&body).map_err(|e| {
             ApiResponse::error(
-                ApiError::Internal(format!("Failed to parse State Node response: {}", e)),
+                ApiError::Internal(format!("Failed to parse State Node response: {e}")),
                 trace_id,
             )
         })
@@ -115,7 +115,7 @@ impl MonasController {
 
         serde_json::from_str::<StateNodeContentDataResponse>(&body).map_err(|e| {
             ApiResponse::error(
-                ApiError::Internal(format!("Failed to parse State Node response: {}", e)),
+                ApiError::Internal(format!("Failed to parse State Node response: {e}")),
                 trace_id,
             )
         })
@@ -216,7 +216,7 @@ impl MonasController {
             Ok(b) => b,
             Err(e) => {
                 return ApiResponse::error(
-                    ApiError::Validation(format!("Invalid content base64url: {}", e)),
+                    ApiError::Validation(format!("Invalid content base64url: {e}")),
                     trace_id,
                 );
             }
@@ -226,7 +226,7 @@ impl MonasController {
             let mut hasher = Sha256::new();
             hasher.update(&content_bytes);
             let digest = hasher.finalize();
-            format!("{:x}", digest)
+            format!("{digest:x}")
         };
 
         let version_to_check = if let Some(v) = input.expected_version.clone() {
@@ -266,8 +266,7 @@ impl MonasController {
                         valid: false,
                         computed_hash,
                         reason: Some(format!(
-                            "version not found on state node: {}",
-                            version_to_check
+                            "version not found on state node: {version_to_check}"
                         )),
                     },
                     trace_id,
@@ -282,7 +281,7 @@ impl MonasController {
                     VerifyIntegrityOutput {
                         valid: false,
                         computed_hash,
-                        reason: Some(format!("invalid base64 data from state node: {}", e)),
+                        reason: Some(format!("invalid base64 data from state node: {e}")),
                     },
                     trace_id,
                 );
@@ -294,8 +293,7 @@ impl MonasController {
             None
         } else {
             Some(format!(
-                "content mismatch with state node (version={})",
-                version_to_check
+                "content mismatch with state node (version={version_to_check})"
             ))
         };
 

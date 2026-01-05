@@ -43,9 +43,9 @@ impl MonasController {
             FetchError::MissingKey => {
                 ApiError::Internal("Missing encryption key for content".into())
             }
-            FetchError::Domain(err) => ApiError::Internal(format!("Domain error: {:?}", err)),
-            FetchError::Repository(err) => ApiError::Internal(format!("Repository error: {}", err)),
-            FetchError::KeyStore(err) => ApiError::Internal(format!("Key store error: {}", err)),
+            FetchError::Domain(err) => ApiError::Internal(format!("Domain error: {err:?}")),
+            FetchError::Repository(err) => ApiError::Internal(format!("Repository error: {err}")),
+            FetchError::KeyStore(err) => ApiError::Internal(format!("Key store error: {err}")),
         }
     }
 
@@ -54,11 +54,9 @@ impl MonasController {
         match e {
             UpdateError::NotFound => ApiError::NotFound("Content not found".into()),
             UpdateError::Validation(msg) => ApiError::Validation(msg),
-            UpdateError::Domain(err) => ApiError::Internal(format!("Domain error: {:?}", err)),
-            UpdateError::Repository(err) => {
-                ApiError::Internal(format!("Repository error: {}", err))
-            }
-            UpdateError::KeyStore(err) => ApiError::Internal(format!("Key store error: {}", err)),
+            UpdateError::Domain(err) => ApiError::Internal(format!("Domain error: {err:?}")),
+            UpdateError::Repository(err) => ApiError::Internal(format!("Repository error: {err}")),
+            UpdateError::KeyStore(err) => ApiError::Internal(format!("Key store error: {err}")),
         }
     }
 
@@ -66,11 +64,9 @@ impl MonasController {
     fn map_delete_error(e: DeleteError) -> ApiError {
         match e {
             DeleteError::NotFound => ApiError::NotFound("Content not found".into()),
-            DeleteError::Domain(err) => ApiError::Internal(format!("Domain error: {:?}", err)),
-            DeleteError::Repository(err) => {
-                ApiError::Internal(format!("Repository error: {}", err))
-            }
-            DeleteError::KeyStore(err) => ApiError::Internal(format!("Key store error: {}", err)),
+            DeleteError::Domain(err) => ApiError::Internal(format!("Domain error: {err:?}")),
+            DeleteError::Repository(err) => ApiError::Internal(format!("Repository error: {err}")),
+            DeleteError::KeyStore(err) => ApiError::Internal(format!("Key store error: {err}")),
         }
     }
 
@@ -103,7 +99,7 @@ impl MonasController {
             Ok(bytes) => bytes,
             Err(e) => {
                 return Err(ApiResponse::error(
-                    ApiError::Validation(format!("Invalid content base64url: {}", e)),
+                    ApiError::Validation(format!("Invalid content base64url: {e}")),
                     trace_id,
                 ));
             }
@@ -133,7 +129,7 @@ impl MonasController {
 
         let state_node_url = format!("{}/content", self.state_node_url);
         if let Err(e) = ureq::post(&state_node_url).send_json(state_node_request) {
-            let error_msg = format!("Failed to send request to State Node: {}", e);
+            let error_msg = format!("Failed to send request to State Node: {e}");
             return Some(ApiResponse::error(ApiError::Internal(error_msg), trace_id));
         }
 
@@ -155,7 +151,7 @@ impl MonasController {
 
         let state_node_url = format!("{}/content/{}", self.state_node_url, content_id);
         if let Err(e) = ureq::put(&state_node_url).send_json(state_node_request) {
-            let error_msg = format!("Failed to send request to State Node: {}", e);
+            let error_msg = format!("Failed to send request to State Node: {e}");
             return Some(ApiResponse::error(ApiError::Internal(error_msg), trace_id));
         }
 
@@ -187,7 +183,7 @@ impl MonasController {
             Ok(bytes) => bytes,
             Err(e) => {
                 return ApiResponse::error(
-                    ApiError::Validation(format!("Invalid content base64url: {}", e)),
+                    ApiError::Validation(format!("Invalid content base64url: {e}")),
                     trace_id,
                 );
             }
@@ -210,7 +206,7 @@ impl MonasController {
             }
         };
 
-        let path = format!("/{}", name);
+        let path = format!("/{name}");
 
         let content_service = &self.content_service;
 
@@ -224,7 +220,7 @@ impl MonasController {
             Ok(result) => result,
             Err(e) => {
                 return ApiResponse::error(
-                    ApiError::Internal(format!("Failed to create content: {}", e)),
+                    ApiError::Internal(format!("Failed to create content: {e}")),
                     trace_id,
                 );
             }

@@ -24,13 +24,13 @@ pub enum ApiError {
 impl fmt::Display for ApiError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ApiError::Validation(msg) => write!(f, "Validation error: {}", msg),
-            ApiError::Unauthorized(msg) => write!(f, "Unauthorized: {}", msg),
-            ApiError::Forbidden(msg) => write!(f, "Forbidden: {}", msg),
-            ApiError::NotFound(msg) => write!(f, "Not found: {}", msg),
-            ApiError::Conflict(msg) => write!(f, "Conflict: {}", msg),
-            ApiError::Timeout(msg) => write!(f, "Timeout: {}", msg),
-            ApiError::Internal(msg) => write!(f, "Internal error: {}", msg),
+            ApiError::Validation(msg) => write!(f, "Validation error: {msg}"),
+            ApiError::Unauthorized(msg) => write!(f, "Unauthorized: {msg}"),
+            ApiError::Forbidden(msg) => write!(f, "Forbidden: {msg}"),
+            ApiError::NotFound(msg) => write!(f, "Not found: {msg}"),
+            ApiError::Conflict(msg) => write!(f, "Conflict: {msg}"),
+            ApiError::Timeout(msg) => write!(f, "Timeout: {msg}"),
+            ApiError::Internal(msg) => write!(f, "Internal error: {msg}"),
         }
     }
 }

@@ -1,0 +1,7 @@
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.02s
+     Running `target/debug/monas-gateway`
+monas-gateway listening on http://127.0.0.1:3000
+
+thread 'main' panicked at monas-gateway/src/main.rs:49:10:
+failed to bind: Os { code: 48, kind: AddrInUse, message: "Address already in use" }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
