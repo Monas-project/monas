@@ -1,5 +1,6 @@
 use crate::domain::content::encryption::{ContentEncryption, ContentEncryptionKey};
 use crate::domain::content::Metadata;
+use crate::domain::content::provider::StorageProvider;
 use crate::domain::content_id::{ContentId, ContentIdGenerator};
 use serde::{Deserialize, Serialize};
 
@@ -65,7 +66,7 @@ impl Content {
         name: String,
         raw_content: Vec<u8>,
         path: String,
-        provider: Option<String>,
+        provider: Option<StorageProvider>,
         id_generator: &G,
         key: &ContentEncryptionKey,
         encryption: &E,

@@ -1,4 +1,5 @@
 use crate::domain::content_id::ContentId;
+use crate::domain::content::provider::StorageProvider;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
@@ -10,12 +11,12 @@ pub struct Metadata {
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
     id: ContentId,
-    provider: Option<String>,
+    provider: Option<StorageProvider>,
 }
 
 impl Metadata {
     /// ContentId を伴うメタデータの生成。
-    pub fn new(name: String, path: String, id: ContentId, provider: Option<String>) -> Self {
+    pub fn new(name: String, path: String, id: ContentId, provider: Option<StorageProvider>) -> Self {
         let now = Utc::now();
         Self {
             name,
@@ -89,8 +90,8 @@ impl Metadata {
         self.updated_at
     }
 
-    pub fn provider(&self) -> Option<&str> {
-        self.provider.as_deref()
+    pub fn provider(&self) -> Option<&StorageProvider> {
+        self.provider.as_ref()
     }
 }
 
@@ -122,28 +123,30 @@ mod tests {
 
     #[test]
     fn test_metadata_with_provider() {
+        use crate::domain::content::provider::StorageProvider;
         let cid = ContentId::new("cid-provider".to_string());
         let metadata = Metadata::new(
             "name".to_string(),
             "/path".to_string(),
             cid.clone(),
-            Some("google-drive".to_string()),
+            Some(StorageProvider::GoogleDrive),
         );
 
-        assert_eq!(metadata.provider(), Some("google-drive"));
+        assert_eq!(metadata.provider(), Some(&StorageProvider::GoogleDrive));
     }
 
     #[test]
     fn test_metadata_provider_preserved_on_touch() {
+        use crate::domain::content::provider::StorageProvider;
         let cid = ContentId::new("cid-touch".to_string());
         let metadata = Metadata::new(
             "name".to_string(),
             "/path".to_string(),
             cid,
-            Some("local".to_string()),
+            Some(StorageProvider::Local),
         );
 
         let touched = metadata.touch();
-        assert_eq!(touched.provider(), Some("local"));
+        assert_eq!(touched.provider(), Some(&StorageProvider::Local));
     }
 }

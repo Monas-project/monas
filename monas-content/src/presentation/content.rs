@@ -16,7 +16,10 @@ use crate::{
         DeleteContentCommand, UpdateContentCommand,
     },
     domain::{
-        content::encryption::ContentEncryptionKey, content::ContentStatus, content_id::ContentId,
+        content::encryption::ContentEncryptionKey,
+        content::provider::StorageProvider,
+        content::ContentStatus,
+        content_id::ContentId,
     },
 };
 
@@ -84,11 +87,24 @@ async fn create_content(
         }
     };
 
+    let provider = match req.provider {
+        Some(p) => match p.parse::<StorageProvider>() {
+            Ok(provider) => Some(provider),
+            Err(_) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid storage provider: {p}"),
+                ))
+            }
+        },
+        None => None,
+    };
+
     let cmd = CreateContentCommand {
         name: req.name,
         path: req.path,
         raw_content: raw,
-        provider: req.provider,
+        provider,
     };
 
     let result = state
@@ -140,11 +156,24 @@ async fn update_content(
         None
     };
 
+    let provider = match req.provider {
+        Some(p) => match p.parse::<StorageProvider>() {
+            Ok(provider) => Some(provider),
+            Err(_) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid storage provider: {p}"),
+                ))
+            }
+        },
+        None => None,
+    };
+
     let cmd = UpdateContentCommand {
         content_id,
         new_name: req.name,
         new_raw_content: raw_opt,
-        provider: req.provider,
+        provider,
     };
 
     let result = state
@@ -168,9 +197,22 @@ async fn delete_content(
 ) -> Result<StatusCode, (StatusCode, String)> {
     let content_id = ContentId::new(id);
 
+    let provider = match query.provider {
+        Some(p) => match p.parse::<StorageProvider>() {
+            Ok(provider) => Some(provider),
+            Err(_) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid storage provider: {p}"),
+                ))
+            }
+        },
+        None => None,
+    };
+
     let cmd = DeleteContentCommand {
         content_id,
-        provider: query.provider,
+        provider,
     };
 
     state
@@ -199,9 +241,22 @@ async fn fetch_content(
 ) -> Result<Json<FetchContentResponse>, (StatusCode, String)> {
     let content_id = ContentId::new(id);
 
+    let provider_str = match query.provider {
+        Some(p) => match p.parse::<StorageProvider>() {
+            Ok(provider) => Some(provider.as_str()),
+            Err(_) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid storage provider: {p}"),
+                ))
+            }
+        },
+        None => None,
+    };
+
     let result = state
         .content_service
-        .fetch(content_id, query.provider.as_deref())
+        .fetch(content_id, provider_str)
         .map_err(|e| {
             // とりあえず NotFound 系は 404、それ以外は 400 として扱う。
             let status = match e {
