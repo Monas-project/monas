@@ -1,6 +1,6 @@
 use crate::domain::content::encryption::{ContentEncryption, ContentEncryptionKey};
-use crate::domain::content::Metadata;
 use crate::domain::content::provider::StorageProvider;
+use crate::domain::content::Metadata;
 use crate::domain::content_id::{ContentId, ContentIdGenerator};
 use serde::{Deserialize, Serialize};
 

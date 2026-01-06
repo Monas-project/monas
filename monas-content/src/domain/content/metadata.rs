@@ -1,5 +1,5 @@
-use crate::domain::content_id::ContentId;
 use crate::domain::content::provider::StorageProvider;
+use crate::domain::content_id::ContentId;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
@@ -16,7 +16,12 @@ pub struct Metadata {
 
 impl Metadata {
     /// ContentId を伴うメタデータの生成。
-    pub fn new(name: String, path: String, id: ContentId, provider: Option<StorageProvider>) -> Self {
+    pub fn new(
+        name: String,
+        path: String,
+        id: ContentId,
+        provider: Option<StorageProvider>,
+    ) -> Self {
         let now = Utc::now();
         Self {
             name,

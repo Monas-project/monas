@@ -16,10 +16,8 @@ use crate::{
         DeleteContentCommand, UpdateContentCommand,
     },
     domain::{
-        content::encryption::ContentEncryptionKey,
-        content::provider::StorageProvider,
-        content::ContentStatus,
-        content_id::ContentId,
+        content::encryption::ContentEncryptionKey, content::provider::StorageProvider,
+        content::ContentStatus, content_id::ContentId,
     },
 };
 

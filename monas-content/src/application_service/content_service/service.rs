@@ -57,9 +57,10 @@ where
 
         // コンテンツを永続化（プロバイダー指定があればそちらに、なければデフォルト）
         match &cmd.provider {
-            Some(provider) => self
-                .content_repository
-                .save_to(provider.as_str(), content.id(), &content),
+            Some(provider) => {
+                self.content_repository
+                    .save_to(provider.as_str(), content.id(), &content)
+            }
             None => self.content_repository.save(content.id(), &content),
         }
         .map_err(CreateError::Repository)?;
@@ -114,7 +115,9 @@ where
 
         // 既存コンテンツの取得（プロバイダー指定があればそこから、なければデフォルト）
         let mut content = match &cmd.provider {
-            Some(provider) => self.content_repository.find_from(provider.as_str(), &cmd.content_id),
+            Some(provider) => self
+                .content_repository
+                .find_from(provider.as_str(), &cmd.content_id),
             None => self.content_repository.find_by_id(&cmd.content_id),
         }
         .map_err(UpdateError::Repository)?
@@ -153,9 +156,10 @@ where
 
         // コンテンツを永続化（metadata の provider があればそこに、なければデフォルト）
         match content.metadata().provider() {
-            Some(provider) => self
-                .content_repository
-                .save_to(provider.as_str(), content.id(), &content),
+            Some(provider) => {
+                self.content_repository
+                    .save_to(provider.as_str(), content.id(), &content)
+            }
             None => self.content_repository.save(content.id(), &content),
         }
         .map_err(UpdateError::Repository)?;
@@ -280,7 +284,9 @@ where
     pub fn delete(&self, cmd: DeleteContentCommand) -> Result<DeleteContentResult, DeleteError> {
         // 既存コンテンツの取得
         let content = match &cmd.provider {
-            Some(provider) => self.content_repository.find_from(provider.as_str(), &cmd.content_id),
+            Some(provider) => self
+                .content_repository
+                .find_from(provider.as_str(), &cmd.content_id),
             None => self.content_repository.find_by_id(&cmd.content_id),
         }
         .map_err(DeleteError::Repository)?
@@ -296,10 +302,11 @@ where
 
         // 論理削除済みの状態を保存
         match deleted_content.metadata().provider() {
-            Some(provider) => {
-                self.content_repository
-                    .save_to(provider.as_str(), deleted_content.id(), &deleted_content)
-            }
+            Some(provider) => self.content_repository.save_to(
+                provider.as_str(),
+                deleted_content.id(),
+                &deleted_content,
+            ),
             None => self
                 .content_repository
                 .save(deleted_content.id(), &deleted_content),
