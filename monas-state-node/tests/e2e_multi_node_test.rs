@@ -31,6 +31,7 @@ async fn create_test_node(port: u16) -> (StateNode, TempDir) {
         node_id: None,
         sync_interval_secs: 30,
         outbox_retry_interval_secs: 10,
+        ..StateNodeConfig::default()
     };
 
     let node = StateNode::new(config).await.unwrap();

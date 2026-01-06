@@ -3,7 +3,7 @@
 #[cfg(not(target_arch = "wasm32"))]
 use crate::application_service::content_sync_service::ContentSyncService;
 #[cfg(not(target_arch = "wasm32"))]
-use crate::application_service::state_node_service::StateNodeService;
+use crate::application_service::state_node_service::{ServiceConfig, StateNodeService};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::infrastructure::crdt_repository::CrslCrdtRepository;
 #[cfg(not(target_arch = "wasm32"))]
@@ -53,6 +53,12 @@ pub struct StateNodeConfig {
     pub sync_interval_secs: u64,
     /// Outbox retry interval in seconds (default: 10).
     pub outbox_retry_interval_secs: u64,
+    /// Minimum replication factor for content networks (default: 3).
+    /// Can be set via MIN_REPLICATION_FACTOR environment variable.
+    pub min_replication_factor: usize,
+    /// Capacity threshold in bytes below which a node is considered low on storage (default: 1GB).
+    /// Can be set via CAPACITY_THRESHOLD_BYTES environment variable.
+    pub capacity_threshold_bytes: u64,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -65,6 +71,14 @@ impl Default for StateNodeConfig {
             node_id: None,
             sync_interval_secs: 30,
             outbox_retry_interval_secs: 10,
+            min_replication_factor: std::env::var("MIN_REPLICATION_FACTOR")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(3),
+            capacity_threshold_bytes: std::env::var("CAPACITY_THRESHOLD_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1_073_741_824), // 1GB
         }
     }
 }
@@ -158,13 +172,17 @@ impl StateNode {
         ));
 
         // Create service with CRDT repository
-        let service = Arc::new(StateNodeService::new(
+        let service = Arc::new(StateNodeService::with_config(
             node_registry,
             content_repo,
             network.clone(),
             event_publisher,
             crdt_repo.clone(),
             node_id,
+            ServiceConfig {
+                min_replication_factor: config.min_replication_factor,
+                capacity_threshold_bytes: config.capacity_threshold_bytes,
+            },
         ));
 
         Ok(Self {
@@ -400,6 +418,8 @@ mod tests {
             node_id: Some("test-node".to_string()),
             sync_interval_secs: 60,
             outbox_retry_interval_secs: 20,
+            min_replication_factor: 3,
+            capacity_threshold_bytes: 1_073_741_824,
         };
 
         let cloned = config.clone();
@@ -440,6 +460,7 @@ mod tests {
             node_id: Some("test-node-id".to_string()),
             sync_interval_secs: 30,
             outbox_retry_interval_secs: 10,
+            ..StateNodeConfig::default()
         };
 
         let node = StateNode::new(config).await.unwrap();
@@ -467,6 +488,7 @@ mod tests {
             node_id: None,
             sync_interval_secs: 30,
             outbox_retry_interval_secs: 10,
+            ..StateNodeConfig::default()
         };
 
         let node = StateNode::new(config).await.unwrap();
@@ -495,6 +517,7 @@ mod tests {
             node_id: None, // Will be auto-generated
             sync_interval_secs: 30,
             outbox_retry_interval_secs: 10,
+            ..StateNodeConfig::default()
         };
 
         let node = StateNode::new(config).await.unwrap();
@@ -520,6 +543,7 @@ mod tests {
             node_id: None,
             sync_interval_secs: 30,
             outbox_retry_interval_secs: 10,
+            ..StateNodeConfig::default()
         };
 
         let node = StateNode::new(config).await.unwrap();
@@ -549,6 +573,7 @@ mod tests {
             node_id: Some("test-node".to_string()),
             sync_interval_secs: 30,
             outbox_retry_interval_secs: 10,
+            ..StateNodeConfig::default()
         };
 
         let node = StateNode::new(config).await.unwrap();

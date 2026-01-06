@@ -88,6 +88,7 @@ async fn main() -> Result<()> {
         node_id: args.node_id,
         sync_interval_secs: 30,
         outbox_retry_interval_secs: 10,
+        ..StateNodeConfig::default()
     };
 
     // Create and run the node

@@ -23,6 +23,24 @@ pub enum ApplyOutcome {
     NeedsSync { content_id: String },
 }
 
+/// Configuration for StateNodeService redundancy management.
+#[derive(Debug, Clone)]
+pub struct ServiceConfig {
+    /// Minimum number of member nodes for redundancy.
+    pub min_replication_factor: usize,
+    /// Capacity threshold in bytes below which a node is considered low on storage.
+    pub capacity_threshold_bytes: u64,
+}
+
+impl Default for ServiceConfig {
+    fn default() -> Self {
+        Self {
+            min_replication_factor: 3,
+            capacity_threshold_bytes: 1_073_741_824, // 1GB
+        }
+    }
+}
+
 // ============================================================================
 // StateNodeService - Structured service with dependency injection
 // ============================================================================
@@ -45,6 +63,10 @@ where
     event_publisher: Arc<E>,
     crdt_repo: Arc<R>,
     local_node_id: String,
+    /// Minimum number of member nodes for redundancy.
+    min_replication_factor: usize,
+    /// Capacity threshold in bytes below which a node is considered low on storage.
+    capacity_threshold_bytes: u64,
 }
 
 impl<N, C, P, E, R> StateNodeService<N, C, P, E, R>
@@ -68,6 +90,27 @@ where
         crdt_repo: Arc<R>,
         local_node_id: String,
     ) -> Self {
+        Self::with_config(
+            node_registry,
+            content_repo,
+            peer_network,
+            event_publisher,
+            crdt_repo,
+            local_node_id,
+            ServiceConfig::default(),
+        )
+    }
+
+    /// Create a new StateNodeService with custom configuration.
+    pub fn with_config(
+        node_registry: N,
+        content_repo: Arc<tokio::sync::RwLock<C>>,
+        peer_network: Arc<P>,
+        event_publisher: E,
+        crdt_repo: Arc<R>,
+        local_node_id: String,
+        config: ServiceConfig,
+    ) -> Self {
         Self {
             node_registry: Arc::new(tokio::sync::RwLock::new(node_registry)),
             content_repo,
@@ -75,6 +118,8 @@ where
             event_publisher: Arc::new(event_publisher),
             crdt_repo,
             local_node_id,
+            min_replication_factor: config.min_replication_factor,
+            capacity_threshold_bytes: config.capacity_threshold_bytes,
         }
     }
 
@@ -206,6 +251,15 @@ where
 
         self.event_publisher.publish_all(&event).await?;
 
+        // 5. Check and maintain redundancy (best effort - don't fail update if this fails)
+        if let Err(e) = self.check_and_maintain_redundancy(content_id).await {
+            tracing::warn!(
+                "Failed to check/maintain redundancy for content {}: {}",
+                content_id,
+                e
+            );
+        }
+
         Ok(event)
     }
 
@@ -282,6 +336,131 @@ where
         last_event.ok_or_else(|| anyhow::anyhow!("No events generated"))
     }
 
+    /// Check and maintain redundancy for a content network.
+    ///
+    /// This method:
+    /// 1. Queries capacity of all member nodes
+    /// 2. Identifies nodes with low capacity (below threshold)
+    /// 3. Adds new members if healthy member count < min_replication_factor
+    /// 4. Removes low-capacity members after new members are added
+    ///
+    /// Called automatically after content updates.
+    pub async fn check_and_maintain_redundancy(&self, content_id: &str) -> Result<()> {
+        use crate::domain::content_network::remove_member_node;
+
+        // 1. Get content network
+        let network = self
+            .content_repo
+            .read()
+            .await
+            .get_content_network(content_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Content network {} not found", content_id))?;
+
+        // Only check if we're a member
+        if !network.member_nodes.contains(&self.local_node_id) {
+            return Ok(());
+        }
+
+        // 2. Query capacity of all member nodes
+        let member_list: Vec<String> = network.member_nodes.iter().cloned().collect();
+        let capacities = self
+            .peer_network
+            .query_node_capacity_batch(&member_list)
+            .await?;
+
+        // 3. Identify low-capacity nodes
+        let mut low_capacity_nodes: Vec<String> = Vec::new();
+        let mut healthy_count = 0usize;
+
+        for node_id in &member_list {
+            let available = capacities.get(node_id).cloned().unwrap_or(0);
+            if available < self.capacity_threshold_bytes {
+                low_capacity_nodes.push(node_id.clone());
+                tracing::info!(
+                    "Node {} has low capacity ({} bytes < {} threshold)",
+                    node_id,
+                    available,
+                    self.capacity_threshold_bytes
+                );
+            } else {
+                healthy_count += 1;
+            }
+        }
+
+        // 4. Add new members if needed
+        let needed = self.min_replication_factor.saturating_sub(healthy_count);
+
+        if needed > 0 {
+            tracing::info!(
+                "Content {} has {} healthy members, need {} more (min: {})",
+                content_id,
+                healthy_count,
+                needed,
+                self.min_replication_factor
+            );
+
+            // Try to add new members (ignore errors - best effort)
+            match self.add_member_to_content(content_id, needed).await {
+                Ok(event) => {
+                    tracing::info!("Added new members to content {}: {:?}", content_id, event);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to add new members to content {}: {}", content_id, e);
+                }
+            }
+        }
+
+        // 5. Remove low-capacity nodes (after adding new ones)
+        // Re-fetch network to get updated member list
+        let network = self
+            .content_repo
+            .read()
+            .await
+            .get_content_network(content_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Content network {} not found", content_id))?;
+
+        let mut updated_network = network;
+        for node_id in low_capacity_nodes {
+            // Don't remove ourselves
+            if node_id == self.local_node_id {
+                continue;
+            }
+
+            // Don't remove if it would drop below minimum
+            if updated_network.member_nodes.len() <= self.min_replication_factor {
+                tracing::info!(
+                    "Skipping removal of {} - would drop below minimum replication factor",
+                    node_id
+                );
+                break;
+            }
+
+            let (net, events) =
+                remove_member_node(updated_network, node_id.clone(), "low_capacity".to_string());
+            updated_network = net;
+
+            for event in events {
+                self.event_publisher.publish_all(&event).await?;
+                tracing::info!(
+                    "Removed low-capacity member {} from content {}",
+                    node_id,
+                    content_id
+                );
+            }
+        }
+
+        // 6. Save updated network
+        self.content_repo
+            .write()
+            .await
+            .save_content_network(updated_network)
+            .await?;
+
+        Ok(())
+    }
+
     /// Handle a sync event from another node.
     ///
     /// Returns `ApplyOutcome::NeedsSync` when the caller should perform content
@@ -351,6 +530,35 @@ where
                 } else {
                     Ok(ApplyOutcome::Applied)
                 }
+            }
+
+            Event::ContentNetworkManagerRemoved {
+                content_id,
+                member_nodes,
+                removed_node_id,
+                ..
+            } => {
+                // Update local network with new member list
+                let network = ContentNetwork {
+                    content_id: content_id.clone(),
+                    member_nodes: member_nodes.iter().cloned().collect(),
+                };
+                self.content_repo
+                    .write()
+                    .await
+                    .save_content_network(network)
+                    .await?;
+
+                // If we were removed, log it
+                if removed_node_id == &self.local_node_id {
+                    tracing::info!(
+                        "This node was removed from content network {}: removed_node_id={}",
+                        content_id,
+                        removed_node_id
+                    );
+                }
+
+                Ok(ApplyOutcome::Applied)
             }
 
             Event::ContentCreated {
