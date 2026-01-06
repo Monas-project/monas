@@ -6,9 +6,6 @@ use content::ContentServiceInstance;
 use share::ShareServiceInstance;
 
 /// MonasController - SDK のオーケストレーター
-///
-/// 各ドメイン（monas-account, monas-content, monas-state-node）の
-/// Presentation層を呼び出してオーケストレーションを行う
 pub struct MonasController {
     /// State NodeのベースURL
     state_node_url: String,
@@ -22,7 +19,7 @@ impl MonasController {
     /// 環境変数からState Node URLを取得してMonasControllerを生成
     ///
     /// 環境変数 `MONAS_STATE_NODE_URL` が設定されている場合はそれを使用し、
-    /// 設定されていない場合はデフォルト値 `http://127.0.0.1:8080` を使用します。
+    /// 設定されていない場合はデフォルト値 `http://127.0.0.1:8080` を使用
     pub fn new() -> Self {
         let state_node_url = std::env::var("MONAS_STATE_NODE_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());

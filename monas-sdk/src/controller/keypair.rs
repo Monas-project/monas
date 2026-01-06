@@ -3,8 +3,8 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use crate::common::{generate_trace_id, ApiError, ApiResponse};
 use crate::models::keypair::{GenerateKeypairInput, GenerateKeypairOutput, KeyType};
 
-use monas_account::application_service::account_service::KeyTypeMapper;
-use monas_account::presentation::account::{self as account_presentation, ReqArguments};
+use monas_account::application_service::account_service::{AccountService, KeyTypeMapper};
+use monas_account::infrastructure::key_store::InMemoryAccountKeyStore;
 
 use super::MonasController;
 
@@ -22,22 +22,23 @@ impl MonasController {
             KeyType::Secp256r1 => KeyTypeMapper::P256,
         };
 
-        // monas-account の presentation 層を呼び出し
-        let args = ReqArguments {
-            generating_key_type: key_type_mapper,
-        };
+        // monas-account は main で HTTP(presentation) 実装に寄せられたため、
+        // SDK からは application_service を直接呼び出す。
+        //
+        // ここでは「鍵生成＝外部へ返す」用途のため、永続化ストアはインメモリ実装を使う。
+        let store = InMemoryAccountKeyStore::default();
 
-        match account_presentation::create(args) {
-            Ok(response) => {
+        match AccountService::create(&store, key_type_mapper) {
+            Ok(account) => {
                 let output = GenerateKeypairOutput {
                     key_type: input.key_type,
-                    public_key: URL_SAFE_NO_PAD.encode(response.generated_key_pair.public_key()),
-                    private_key: URL_SAFE_NO_PAD.encode(response.generated_key_pair.secret_key()),
+                    public_key: URL_SAFE_NO_PAD.encode(account.public_key_bytes()),
+                    private_key: URL_SAFE_NO_PAD.encode(account.secret_key_bytes()),
                 };
                 ApiResponse::success(output, trace_id)
             }
             Err(e) => ApiResponse::error(
-                ApiError::Internal(format!("Failed to generate keypair: {e:?}")),
+                ApiError::Internal(format!("Failed to generate keypair: {e}")),
                 trace_id,
             ),
         }

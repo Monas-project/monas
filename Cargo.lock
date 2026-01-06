@@ -2995,8 +2995,8 @@ dependencies = [
 name = "monas-account"
 version = "0.1.0"
 dependencies = [
- "axum",
- "base64",
+ "axum 0.8.7",
+ "base64 0.22.1",
  "k256",
  "p256",
  "rand_core 0.9.3",
@@ -3005,7 +3005,7 @@ dependencies = [
  "sha3",
  "sled",
  "tempfile",
- "thiserror",
+ "thiserror 2.0.17",
  "tokio",
 ]
 
