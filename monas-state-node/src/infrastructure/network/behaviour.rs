@@ -258,8 +258,8 @@ mod tests {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    #[test]
-    fn test_node_behaviour_creation() {
+    #[tokio::test]
+    async fn test_node_behaviour_creation() {
         let keypair = Keypair::generate_ed25519();
         let local_peer_id = keypair.public().to_peer_id();
         let config = BehaviourConfig::default();
@@ -278,8 +278,8 @@ mod tests {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
-    #[test]
-    fn test_node_behaviour_with_custom_config() {
+    #[tokio::test]
+    async fn test_node_behaviour_with_custom_config() {
         let keypair = Keypair::generate_ed25519();
         let local_peer_id = keypair.public().to_peer_id();
         let config = BehaviourConfig {
