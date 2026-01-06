@@ -37,6 +37,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/nodes", get(list_nodes))
         .route("/content", post(create_content))
         .route("/content/:id", put(update_content))
+        .route("/content/:id/members", post(add_members))
         .route("/contents", get(list_contents))
         // CRDT-related endpoints
         .route("/content/:id/data", get(get_content_data))
@@ -93,6 +94,19 @@ pub struct UpdateContentRequest {
 pub struct UpdateContentResponse {
     pub content_id: String,
     pub updated: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AddMembersRequest {
+    /// Number of members to add
+    pub count: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AddMembersResponse {
+    pub content_id: String,
+    pub added_node_id: String,
+    pub member_nodes: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -264,6 +278,49 @@ async fn update_content(
             updated: true,
         })
         .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// Add member nodes to a content network.
+async fn add_members(
+    State(state): State<AppState>,
+    Path(content_id): Path<String>,
+    Json(req): Json<AddMembersRequest>,
+) -> impl IntoResponse {
+    use crate::domain::events::Event;
+
+    match state.add_member_to_content(&content_id, req.count).await {
+        Ok(event) => {
+            if let Event::ContentNetworkManagerAdded {
+                content_id,
+                added_node_id,
+                member_nodes,
+                ..
+            } = event
+            {
+                Json(AddMembersResponse {
+                    content_id,
+                    added_node_id,
+                    member_nodes,
+                })
+                .into_response()
+            } else {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: "Unexpected event type".to_string(),
+                    }),
+                )
+                    .into_response()
+            }
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {

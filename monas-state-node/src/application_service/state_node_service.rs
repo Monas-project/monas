@@ -9,7 +9,6 @@ use crate::port::event_publisher::EventPublisher;
 use crate::port::peer_network::PeerNetwork;
 use crate::port::persistence::{PersistentContentRepository, PersistentNodeRegistry};
 use anyhow::Result;
-use std::collections::BTreeSet;
 use std::sync::Arc;
 
 /// Result of applying an event.
@@ -210,6 +209,79 @@ where
         Ok(event)
     }
 
+    /// Add new member nodes to a content network.
+    ///
+    /// This uses the same node selection pattern as create_content:
+    /// find closest peers via DHT and select by capacity.
+    /// Only existing members can add new members.
+    pub async fn add_member_to_content(&self, content_id: &str, count: usize) -> Result<Event> {
+        use crate::domain::content_network::add_member_node;
+
+        // 1. Get content network
+        let network = self
+            .content_repo
+            .read()
+            .await
+            .get_content_network(content_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Content network {} not found", content_id))?;
+
+        // 2. Verify caller is a member
+        if !network.member_nodes.contains(&self.local_node_id) {
+            return Err(anyhow::anyhow!(
+                "Local node {} is not a member of content network {}",
+                self.local_node_id,
+                content_id
+            ));
+        }
+
+        // 3. Find closest peers (same pattern as create_content)
+        let key = compute_dht_key(content_id);
+        let k = count + network.member_nodes.len(); // Request more to filter
+        let closest = self.peer_network.find_closest_peers(key, k).await?;
+        let caps = self
+            .peer_network
+            .query_node_capacity_batch(&closest)
+            .await?;
+
+        // 4. Select nodes: exclude existing members, sort by capacity
+        let mut scored: Vec<(u64, String)> = closest
+            .into_iter()
+            .filter(|peer| !network.member_nodes.contains(peer)) // Exclude existing members
+            .map(|peer| (caps.get(&peer).cloned().unwrap_or(0), peer))
+            .collect();
+        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        let selected: Vec<String> = scored.into_iter().take(count).map(|(_, pid)| pid).collect();
+
+        if selected.is_empty() {
+            return Err(anyhow::anyhow!(
+                "No available nodes found to add as members"
+            ));
+        }
+
+        // 5. Add each node using domain function
+        let mut updated_network = network;
+        let mut last_event = None;
+        for node_id in &selected {
+            let (net, events) = add_member_node(updated_network, node_id.clone());
+            updated_network = net;
+            // Publish each event
+            for event in events {
+                self.event_publisher.publish_all(&event).await?;
+                last_event = Some(event);
+            }
+        }
+
+        // 6. Save updated network
+        self.content_repo
+            .write()
+            .await
+            .save_content_network(updated_network)
+            .await?;
+
+        last_event.ok_or_else(|| anyhow::anyhow!("No events generated"))
+    }
+
     /// Handle a sync event from another node.
     ///
     /// Returns `ApplyOutcome::NeedsSync` when the caller should perform content
@@ -247,17 +319,11 @@ where
                         }
                     }
                     None => {
-                        // Network doesn't exist locally, create it (empty members)
-                        let network = ContentNetwork {
-                            content_id: content_id.clone(),
-                            member_nodes: BTreeSet::new(),
-                        };
-                        self.content_repo
-                            .write()
-                            .await
-                            .save_content_network(network)
-                            .await?;
-                        Ok(ApplyOutcome::Applied)
+                        // Network doesn't exist locally = we're not a member
+                        // Don't create empty network, just ignore this event
+                        // We'll receive ContentCreated or ContentNetworkManagerAdded
+                        // when we actually become a member
+                        Ok(ApplyOutcome::Ignored)
                     }
                 }
             }
@@ -700,7 +766,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handle_sync_event_content_updated_creates_network_if_missing() {
+    async fn test_handle_sync_event_content_updated_ignores_unknown_network() {
         let service = create_test_service("node-1");
 
         // ContentUpdated for a content we don't know about
@@ -711,16 +777,15 @@ mod tests {
         };
 
         let outcome = service.handle_sync_event(&event).await.unwrap();
-        // Network didn't exist, so it's created with empty members, no sync needed
-        assert_eq!(outcome, ApplyOutcome::Applied);
+        // Network doesn't exist locally = we're not a member, just ignore
+        assert_eq!(outcome, ApplyOutcome::Ignored);
 
-        // Verify network was created (empty members)
+        // Verify network was NOT created
         let network = service
             .get_content_network_for_test("new-content")
             .await
-            .unwrap()
             .unwrap();
-        assert!(network.member_nodes.is_empty());
+        assert!(network.is_none());
     }
 
     #[tokio::test]
