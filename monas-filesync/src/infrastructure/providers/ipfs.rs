@@ -69,10 +69,7 @@ impl IpfsProvider {
     }
 
     #[cfg(feature = "cloud-connectivity")]
-    fn apply_auth(
-        mut req: reqwest::RequestBuilder,
-        auth: &AuthSession,
-    ) -> reqwest::RequestBuilder {
+    fn apply_auth(mut req: reqwest::RequestBuilder, auth: &AuthSession) -> reqwest::RequestBuilder {
         let token = auth.access_token.trim();
         if !token.is_empty() {
             req = req.bearer_auth(token);
