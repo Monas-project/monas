@@ -1,6 +1,6 @@
 use std::time::SystemTime;
 
-use crate::infrastructure::{AuthSession, FetchError, StorageProvider};
+use crate::infrastructure::{AuthSession, FetchError, FetchResult, StorageProvider};
 
 pub struct IpfsProvider {
     pub gateway: String,
@@ -23,8 +23,7 @@ impl IpfsProvider {
     }
 
     #[cfg(feature = "cloud-connectivity")]
-    fn 
-    extract_cid(path: &str) -> Result<&str, FetchError> {
+    fn extract_cid(path: &str) -> Result<&str, FetchError> {
         const PREFIX: &str = "ipfs://";
 
         if !path.starts_with(PREFIX) {
@@ -153,7 +152,7 @@ impl IpfsProvider {
 
         let client = Self::http_client();
         let form = reqwest::multipart::Form::new().part(
-            "data",
+            "file",
             reqwest::multipart::Part::bytes(data.to_vec())
                 .mime_str("application/octet-stream")
                 .map_err(|err| FetchError {
@@ -176,14 +175,15 @@ impl IpfsProvider {
 
         if actual_cid != expected_cid {
             return Err(FetchError {
-                message: format!(
-                    "IPFS CID mismatch: expected {expected_cid}, got {actual_cid}"
-                ),
+                message: format!("IPFS CID mismatch: expected {expected_cid}, got {actual_cid}"),
             });
         }
 
         // Ensure retention (Monas default pin strategy).
-        let pin_url = format!("{base}/api/v0/pin/add?arg={}", urlencoding::encode(actual_cid));
+        let pin_url = format!(
+            "{base}/api/v0/pin/add?arg={}",
+            urlencoding::encode(actual_cid)
+        );
         let pin_req = Self::apply_auth(client.post(pin_url), auth);
         let _pin_resp = Self::send_expect_success(pin_req, "IPFS pin/add request failed").await?;
 
@@ -193,11 +193,7 @@ impl IpfsProvider {
 
 #[async_trait::async_trait]
 impl StorageProvider for IpfsProvider {
-    async fn fetch(
-        &self,
-        auth: &AuthSession,
-        path: &str,
-    ) -> Result<Vec<u8>, crate::infrastructure::FetchError> {
+    async fn fetch(&self, auth: &AuthSession, path: &str) -> FetchResult<Vec<u8>> {
         #[cfg(feature = "cloud-connectivity")]
         {
             return self.fetch_remote(auth, path).await;
@@ -214,7 +210,7 @@ impl StorageProvider for IpfsProvider {
         &self,
         auth: &AuthSession,
         path: &str,
-    ) -> Result<(u64, SystemTime), crate::infrastructure::FetchError> {
+    ) -> FetchResult<(u64, SystemTime)> {
         #[cfg(feature = "cloud-connectivity")]
         {
             let size = self.size_remote(auth, path).await?;
@@ -229,12 +225,7 @@ impl StorageProvider for IpfsProvider {
         }
     }
 
-    async fn save(
-        &self,
-        auth: &AuthSession,
-        path: &str,
-        data: &[u8],
-    ) -> Result<(), crate::infrastructure::FetchError> {
+    async fn save(&self, auth: &AuthSession, path: &str, data: &[u8]) -> FetchResult<()> {
         #[cfg(feature = "cloud-connectivity")]
         {
             return self.save_remote(auth, path, data).await;
@@ -251,189 +242,288 @@ impl StorageProvider for IpfsProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::infrastructure::AuthSession;
 
     #[test]
-    fn test_ipfs_provider_new() {
-        let provider = IpfsProvider::new("https://ipfs.io");
-        assert_eq!(provider.gateway, "https://ipfs.io");
+    fn new_stores_gateway() {
+        let gw1 = "https://ipfs.io";
+        let gw2 = String::from("https://gateway.ipfs.io");
 
-        // Test with String type
-        let gateway = String::from("https://gateway.ipfs.io");
-        let provider = IpfsProvider::new(gateway.clone());
-        assert_eq!(provider.gateway, gateway);
+        let p1 = IpfsProvider::new(gw1);
+        let p2 = IpfsProvider::new(gw2.clone());
+
+        assert_eq!(p1.gateway, gw1);
+        assert_eq!(p2.gateway, gw2);
     }
 
-    #[tokio::test]
-    async fn test_ipfs_provider_fetch() {
-        let provider = IpfsProvider::new("https://ipfs.io");
-        let auth = AuthSession {
-            access_token: "test_token".to_string(),
-        };
-
-        let result = provider.fetch(&auth, "ipfs://QmHash").await;
-        assert!(result.is_err());
+    fn auth(token: &str) -> AuthSession {
+        AuthSession {
+            access_token: token.to_string(),
+        }
     }
 
-    #[tokio::test]
-    async fn test_ipfs_provider_size_and_mtime() {
-        let provider = IpfsProvider::new("https://ipfs.io");
-        let auth = AuthSession {
-            access_token: "test_token".to_string(),
-        };
-
-        let result = provider.size_and_mtime(&auth, "ipfs://QmHash").await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
     #[cfg(not(feature = "cloud-connectivity"))]
-    async fn test_ipfs_provider_save() {
-        let provider = IpfsProvider::new("https://ipfs.io");
-        let auth = AuthSession {
-            access_token: "test_token".to_string(),
-        };
+    mod without_cloud_connectivity {
+        use super::*;
 
-        let result = provider.save(&auth, "ipfs://bafyTEST", b"test data").await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().message.contains("cloud-connectivity"));
+        #[tokio::test]
+        async fn fetch_returns_feature_disabled_error() {
+            let provider = IpfsProvider::new("https://ipfs.io");
+            let auth = auth("test_token");
+
+            let err = provider.fetch(&auth, "ipfs://bafyTEST").await.unwrap_err();
+
+            assert!(err.message.contains("cloud-connectivity"));
+            assert!(err.message.contains("IPFS fetch"));
+        }
+
+        #[tokio::test]
+        async fn size_and_mtime_returns_feature_disabled_error() {
+            let provider = IpfsProvider::new("https://ipfs.io");
+            let auth = auth("test_token");
+
+            let err = provider
+                .size_and_mtime(&auth, "ipfs://bafyTEST")
+                .await
+                .unwrap_err();
+
+            assert!(err.message.contains("cloud-connectivity"));
+            assert!(err.message.contains("IPFS size_and_mtime"));
+        }
+
+        #[tokio::test]
+        async fn save_returns_feature_disabled_error() {
+            let provider = IpfsProvider::new("https://ipfs.io");
+            let auth = auth("test_token");
+
+            let err = provider
+                .save(&auth, "ipfs://bafyTEST", b"test data")
+                .await
+                .unwrap_err();
+
+            assert!(err.message.contains("cloud-connectivity"));
+            assert!(err.message.contains("IPFS save"));
+        }
     }
 
-    #[tokio::test]
     #[cfg(feature = "cloud-connectivity")]
-    async fn test_ipfs_provider_save_block_put_and_pin_success() {
+    mod with_cloud_connectivity {
+        use super::*;
         use std::io::{Read, Write};
-        use std::net::TcpListener;
-        use std::net::Shutdown;
+        use std::net::{Shutdown, TcpListener};
         use std::sync::mpsc;
         use std::thread;
 
-        // Minimal HTTP server to capture two requests without extra dependencies.
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let base_url = format!("http://{}", addr);
-
-        let (tx, rx) = mpsc::channel::<Vec<(String, Vec<(String, String)>, Vec<u8>)>>();
-        thread::spawn(move || {
-            fn read_one(stream: &mut std::net::TcpStream) -> (String, Vec<(String, String)>, Vec<u8>) {
-                let mut buf = Vec::new();
-                let mut tmp = [0u8; 1024];
-                loop {
-                    let n = stream.read(&mut tmp).unwrap();
-                    if n == 0 {
-                        break;
-                    }
-                    buf.extend_from_slice(&tmp[..n]);
-                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-                        break;
-                    }
-                }
-
-                let header_end = buf
-                    .windows(4)
-                    .position(|w| w == b"\r\n\r\n")
-                    .unwrap()
-                    + 4;
-                let header_bytes = &buf[..header_end];
-                let mut body = buf[header_end..].to_vec();
-
-                let header_str = String::from_utf8_lossy(header_bytes);
-                let mut lines = header_str.split("\r\n");
-                let request_line = lines.next().unwrap_or("").to_string();
-
-                let mut headers = Vec::new();
-                let mut content_length: usize = 0;
-                for line in lines {
-                    if line.is_empty() {
-                        break;
-                    }
-                    if let Some((k, v)) = line.split_once(':') {
-                        let key = k.trim().to_string();
-                        let val = v.trim().to_string();
-                        if key.eq_ignore_ascii_case("content-length") {
-                            content_length = val.parse().unwrap_or(0);
-                        }
-                        headers.push((key, val));
-                    }
-                }
-
-                while body.len() < content_length {
-                    let n = stream.read(&mut tmp).unwrap();
-                    if n == 0 {
-                        break;
-                    }
-                    body.extend_from_slice(&tmp[..n]);
-                }
-                (request_line, headers, body)
-            }
-
-            let mut captured = Vec::new();
-
-            // 1st request: block/put
-            let (mut stream1, _) = listener.accept().unwrap();
-            let (req1, headers1, body1) = read_one(&mut stream1);
-            captured.push((req1, headers1, body1));
-            let resp1 =
-                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 18\r\nConnection: close\r\n\r\n{\"Key\":\"bafyTEST\"}";
-            stream1.write_all(resp1).unwrap();
-            let _ = stream1.shutdown(Shutdown::Both);
-            drop(stream1);
-
-            // 2nd request: pin/add
-            let (mut stream2, _) = listener.accept().unwrap();
-            let (req2, headers2, body2) = read_one(&mut stream2);
-            captured.push((req2, headers2, body2));
-            let resp2 = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-            stream2.write_all(resp2).unwrap();
-            let _ = stream2.shutdown(Shutdown::Both);
-
-            tx.send(captured).unwrap();
-        });
-
-        let provider = IpfsProvider::new(base_url);
-        let auth = AuthSession {
-            access_token: "test_token".to_string(),
-        };
-
-        provider
-            .save(&auth, "ipfs://bafyTEST", b"test data")
-            .await
-            .unwrap();
-
-        let captured = rx.recv().unwrap();
-        assert_eq!(captured.len(), 2);
-
-        let (req1, headers1, body1) = &captured[0];
-        assert!(
-            req1.starts_with("POST /api/v0/block/put?format=raw&mhtype=sha2-256 HTTP/1.1"),
-            "unexpected request line: {req1}"
-        );
-        let mut has_multipart = false;
-        let mut has_auth = false;
-        for (k, v) in headers1 {
-            if k.eq_ignore_ascii_case("content-type") && v.contains("multipart/form-data") {
-                has_multipart = true;
-            }
-            if k.eq_ignore_ascii_case("authorization") && v == "Bearer test_token" {
-                has_auth = true;
-            }
+        #[derive(Debug)]
+        struct CapturedRequest {
+            request_line: String,
+            headers: Vec<(String, String)>,
+            body: Vec<u8>,
         }
-        assert!(has_multipart, "missing multipart Content-Type header");
-        assert!(has_auth, "missing Authorization header");
-        assert!(
-            body1.windows(b"test data".len()).any(|w| w == b"test data"),
-            "multipart body did not contain payload"
-        );
-        let body_str = String::from_utf8_lossy(body1);
-        assert!(
-            body_str.contains("Content-Disposition: form-data; name=\"data\""),
-            "missing multipart field name=data"
-        );
 
-        let (req2, _headers2, _body2) = &captured[1];
-        assert!(
-            req2.starts_with("POST /api/v0/pin/add?arg=bafyTEST HTTP/1.1"),
-            "unexpected pin request line: {req2}"
-        );
+        fn http_response(status_line: &str, headers: &[(&str, String)], body: &[u8]) -> Vec<u8> {
+            let mut out = Vec::new();
+            out.extend_from_slice(status_line.as_bytes());
+            out.extend_from_slice(b"\r\n");
+            out.extend_from_slice(format!("Content-Length: {}\r\n", body.len()).as_bytes());
+            for (k, v) in headers {
+                out.extend_from_slice(format!("{k}: {v}\r\n").as_bytes());
+            }
+            out.extend_from_slice(b"Connection: close\r\n\r\n");
+            out.extend_from_slice(body);
+            out
+        }
+
+        fn http_json_response(body_json: &str) -> Vec<u8> {
+            http_response(
+                "HTTP/1.1 200 OK",
+                &[("Content-Type", "application/json".to_string())],
+                body_json.as_bytes(),
+            )
+        }
+
+        fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+            headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.as_str())
+        }
+
+        fn start_server_with_responses(
+            responses: Vec<Vec<u8>>,
+        ) -> (String, mpsc::Receiver<Vec<CapturedRequest>>) {
+            // Minimal HTTP server to capture N requests without extra dependencies.
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let base_url = format!("http://{}", addr);
+
+            let (tx, rx) = mpsc::channel::<Vec<CapturedRequest>>();
+            thread::spawn(move || {
+                fn read_one(stream: &mut std::net::TcpStream) -> CapturedRequest {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 1024];
+                    loop {
+                        let n = stream.read(&mut tmp).unwrap();
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+
+                    let header_end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+                    let header_bytes = &buf[..header_end];
+                    let mut body = buf[header_end..].to_vec();
+
+                    let header_str = String::from_utf8_lossy(header_bytes);
+                    let mut lines = header_str.split("\r\n");
+                    let request_line = lines.next().unwrap_or("").to_string();
+
+                    let mut headers = Vec::new();
+                    let mut content_length: usize = 0;
+                    for line in lines {
+                        if line.is_empty() {
+                            break;
+                        }
+                        if let Some((k, v)) = line.split_once(':') {
+                            let key = k.trim().to_string();
+                            let val = v.trim().to_string();
+                            if key.eq_ignore_ascii_case("content-length") {
+                                content_length = val.parse().unwrap_or(0);
+                            }
+                            headers.push((key, val));
+                        }
+                    }
+
+                    while body.len() < content_length {
+                        let n = stream.read(&mut tmp).unwrap();
+                        if n == 0 {
+                            break;
+                        }
+                        body.extend_from_slice(&tmp[..n]);
+                    }
+
+                    CapturedRequest {
+                        request_line,
+                        headers,
+                        body,
+                    }
+                }
+
+                let mut captured = Vec::new();
+                for response in responses {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let req = read_one(&mut stream);
+                    captured.push(req);
+                    stream.write_all(&response).unwrap();
+                    let _ = stream.shutdown(Shutdown::Both);
+                }
+                tx.send(captured).unwrap();
+            });
+
+            (base_url, rx)
+        }
+
+        #[tokio::test]
+        async fn fetch_sends_block_get_with_auth_and_returns_bytes() {
+            let expected = b"hello-ipfs".to_vec();
+            let resp = http_response("HTTP/1.1 200 OK", &[], &expected);
+            let (base_url, rx) = start_server_with_responses(vec![resp]);
+            let provider = IpfsProvider::new(base_url);
+            let auth = auth("test_token");
+
+            let actual = provider.fetch(&auth, "ipfs://bafyTEST").await.unwrap();
+
+            assert_eq!(actual, expected);
+            let captured = rx.recv().unwrap();
+            assert_eq!(captured.len(), 1);
+            let req = &captured[0];
+            assert!(
+                req.request_line
+                    .starts_with("POST /api/v0/block/get?arg=bafyTEST HTTP/1.1"),
+                "unexpected request line: {}",
+                req.request_line
+            );
+            assert_eq!(
+                header_value(&req.headers, "authorization"),
+                Some("Bearer test_token")
+            );
+        }
+
+        #[tokio::test]
+        async fn size_and_mtime_sends_block_stat_and_returns_size_and_epoch() {
+            let resp = http_json_response("{\"Size\":123}");
+            let (base_url, rx) = start_server_with_responses(vec![resp]);
+            let provider = IpfsProvider::new(base_url);
+            let auth = auth("test_token");
+
+            let (size, mtime) = provider
+                .size_and_mtime(&auth, "ipfs://bafyTEST")
+                .await
+                .unwrap();
+
+            assert_eq!(size, 123);
+            assert_eq!(mtime, SystemTime::UNIX_EPOCH);
+            let captured = rx.recv().unwrap();
+            assert_eq!(captured.len(), 1);
+            let req = &captured[0];
+            assert!(
+                req.request_line
+                    .starts_with("POST /api/v0/block/stat?arg=bafyTEST HTTP/1.1"),
+                "unexpected request line: {}",
+                req.request_line
+            );
+            assert_eq!(
+                header_value(&req.headers, "authorization"),
+                Some("Bearer test_token")
+            );
+        }
+
+        #[tokio::test]
+        async fn save_sends_block_put_then_pin_add_with_auth_and_payload() {
+            let resp_put = http_json_response("{\"Key\":\"bafyTEST\"}");
+            let resp_pin = http_response("HTTP/1.1 200 OK", &[], &[]);
+            let (base_url, rx) = start_server_with_responses(vec![resp_put, resp_pin]);
+
+            let provider = IpfsProvider::new(base_url);
+            let auth = auth("test_token");
+            let path = "ipfs://bafyTEST";
+            let data = b"test data";
+
+            provider.save(&auth, path, data).await.unwrap();
+
+            let captured = rx.recv().unwrap();
+            assert_eq!(captured.len(), 2);
+
+            let req1 = &captured[0];
+            assert!(
+                req1.request_line
+                    .starts_with("POST /api/v0/block/put?format=raw&mhtype=sha2-256 HTTP/1.1"),
+                "unexpected request line: {}",
+                req1.request_line
+            );
+            let content_type = header_value(&req1.headers, "content-type").unwrap_or("");
+            assert!(content_type.contains("multipart/form-data"));
+            assert_eq!(
+                header_value(&req1.headers, "authorization"),
+                Some("Bearer test_token")
+            );
+            assert!(req1.body.windows(data.len()).any(|w| w == data));
+            let body_str = String::from_utf8_lossy(&req1.body);
+            assert!(body_str.contains("Content-Disposition: form-data; name=\"file\""));
+
+            let req2 = &captured[1];
+            assert!(
+                req2.request_line
+                    .starts_with("POST /api/v0/pin/add?arg=bafyTEST HTTP/1.1"),
+                "unexpected pin request line: {}",
+                req2.request_line
+            );
+            assert_eq!(
+                header_value(&req2.headers, "authorization"),
+                Some("Bearer test_token")
+            );
+        }
     }
 }
