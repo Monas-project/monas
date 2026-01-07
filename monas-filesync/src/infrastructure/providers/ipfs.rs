@@ -69,9 +69,9 @@ impl IpfsProvider {
     }
 
     #[cfg(feature = "cloud-connectivity")]
-    fn apply_auth<'a>(
+    fn apply_auth(
         mut req: reqwest::RequestBuilder,
-        auth: &'a AuthSession,
+        auth: &AuthSession,
     ) -> reqwest::RequestBuilder {
         let token = auth.access_token.trim();
         if !token.is_empty() {
@@ -354,7 +354,7 @@ mod tests {
             // Minimal HTTP server to capture N requests without extra dependencies.
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
-            let base_url = format!("http://{}", addr);
+            let base_url = format!("http://{addr}");
 
             let (tx, rx) = mpsc::channel::<Vec<CapturedRequest>>();
             thread::spawn(move || {
