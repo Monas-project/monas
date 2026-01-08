@@ -9,12 +9,13 @@ rust-version.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
+monas-filesync = { path = "../monas-filesync", optional = true }
 aes-gcm = "0.10.3"
 aes = "0.8"
 ctr = "0.9"
 rand_core = { version = "0.6.4", features = ["std"] }
 rand = "0.8.5"
-chrono = "0.4.40"
+chrono = { version = "0.4.40", features = ["serde"] }
 hex = "0.4.3"
 hkdf = "0.12.4"
 hmac = "0.12.1"
@@ -31,6 +32,10 @@ base64 = "0.22"
 sled = "0.34"
 hpke-rs = { version = "0.3", features = ["hazmat"] }
 hpke-rs-rust-crypto = "0.3"
+
+[features]
+default = ["filesync"]
+filesync = ["monas-filesync", "monas-filesync/cloud-connectivity"]
 
 [dev-dependencies]
 tempfile = "3.19.1"

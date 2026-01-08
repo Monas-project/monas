@@ -478,7 +478,7 @@ mod tests {
         encrypted_content: Option<Vec<u8>>,
         deleted: bool,
     ) -> Content {
-        let metadata = Metadata::new("name".into(), "/path".into(), cid.clone());
+        let metadata = Metadata::new("name".into(), "/path".into(), cid.clone(), None);
         Content::new(
             cid.clone(),
             metadata,
