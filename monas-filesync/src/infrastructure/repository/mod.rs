@@ -94,6 +94,6 @@ mod tests {
 
         let retrieved = repo.get(key);
         assert!(retrieved.is_some());
-        assert_eq!(retrieved.unwrap(), vec![]);
+        assert_eq!(retrieved.unwrap(), Vec::<u8>::new());
     }
 }

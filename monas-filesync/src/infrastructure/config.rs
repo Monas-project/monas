@@ -82,7 +82,9 @@ impl FilesyncConfig {
         if let Some(value) = lookup("MONAS_GOOGLE_DRIVE_CLIENT_SECRET") {
             self.google_drive.client_secret = Some(value);
         }
-
+        if let Some(value) = lookup("MONAS_GOOGLE_DRIVE_ROOT_FOLDER_ID") {
+            self.google_drive.root_folder_id = Some(value);
+        }
         if let Some(value) = lookup("MONAS_ONEDRIVE_API_ENDPOINT") {
             self.onedrive.api_endpoint = value;
         }
@@ -92,7 +94,6 @@ impl FilesyncConfig {
         if let Some(value) = lookup("MONAS_ONEDRIVE_CLIENT_SECRET") {
             self.onedrive.client_secret = Some(value);
         }
-
         if let Some(value) = lookup("MONAS_LOCAL_BASE_PATH") {
             self.local.base_path = Some(value);
         }
@@ -133,6 +134,11 @@ pub struct GoogleDriveConfig {
     /// Client secret for OAuth (optional, for future implementation)
     #[serde(default)]
     pub client_secret: Option<String>,
+
+    /// Root folder ID where files will be stored (optional).
+    /// If not set, files will be created in the user's root Drive folder.
+    #[serde(default)]
+    pub root_folder_id: Option<String>,
 }
 
 impl Default for GoogleDriveConfig {
@@ -141,6 +147,7 @@ impl Default for GoogleDriveConfig {
             api_endpoint: default_google_drive_endpoint(),
             client_id: None,
             client_secret: None,
+            root_folder_id: None,
         }
     }
 }
@@ -230,16 +237,20 @@ mod tests {
             .map(|(key, _)| ((*key).to_string(), env::var(key).ok()))
             .collect();
 
-        for (key, value) in pairs {
-            env::set_var(key, value);
+        unsafe {
+            for (key, value) in pairs {
+                env::set_var(key, value);
+            }
         }
 
         let result = test();
 
-        for (key, value) in snapshot {
-            match value {
-                Some(original) => env::set_var(&key, original),
-                None => env::remove_var(&key),
+        unsafe {
+            for (key, value) in snapshot {
+                match value {
+                    Some(original) => env::set_var(&key, original),
+                    None => env::remove_var(&key),
+                }
             }
         }
 
