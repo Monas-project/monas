@@ -36,7 +36,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/node/register", post(register_node))
         .route("/nodes", get(list_nodes))
         .route("/content", post(create_content))
-        .route("/content/:id", put(update_content))
+        .route("/content/:id", put(update_content).delete(delete_content))
         .route("/content/:id/members", post(add_members))
         .route("/contents", get(list_contents))
         // CRDT-related endpoints
@@ -94,6 +94,12 @@ pub struct UpdateContentRequest {
 pub struct UpdateContentResponse {
     pub content_id: String,
     pub updated: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DeleteContentResponse {
+    pub content_id: String,
+    pub deleted: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -285,6 +291,42 @@ async fn update_content(
             }),
         )
             .into_response(),
+    }
+}
+
+/// Delete content.
+///
+/// Physically deletes the ContentNetwork but preserves:
+/// - CRDT history and CID for offline node notification
+/// - ContentDeleted event for propagation to other nodes
+async fn delete_content(
+    State(state): State<AppState>,
+    Path(content_id): Path<String>,
+) -> impl IntoResponse {
+    match state.delete_content(&content_id).await {
+        Ok(_) => Json(DeleteContentResponse {
+            content_id,
+            deleted: true,
+        })
+        .into_response(),
+        Err(e) => {
+            // Check if it's a "not found" error
+            let error_msg = e.to_string();
+            let status = if error_msg.contains("not found") {
+                StatusCode::NOT_FOUND
+            } else if error_msg.contains("not a member") {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (
+                status,
+                Json(ErrorResponse {
+                    error: error_msg,
+                }),
+            )
+                .into_response()
+        }
     }
 }
 

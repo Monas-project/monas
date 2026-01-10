@@ -217,6 +217,54 @@ where
         Ok(event)
     }
 
+    /// Delete content.
+    ///
+    /// This method:
+    /// 1. Verifies the content network exists and local node is a member
+    /// 2. Removes the ContentNetwork (access control)
+    /// 3. Publishes ContentDeleted event for offline node notification
+    ///
+    /// Note: The CRDT history and CID are preserved for:
+    /// - Offline nodes to receive deletion notification via event
+    /// - Historical record keeping
+    pub async fn delete_content(&self, content_id: &str) -> Result<Event> {
+        // 1. Verify content network exists
+        let network = self
+            .content_repo
+            .read()
+            .await
+            .get_content_network(content_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Content network not found: {}", content_id))?;
+
+        // 2. Verify local node is a member (only members can delete)
+        if !network.member_nodes.contains(&self.local_node_id) {
+            return Err(anyhow::anyhow!(
+                "Local node {} is not a member of content network {}",
+                self.local_node_id,
+                content_id
+            ));
+        }
+
+        // 3. Delete the ContentNetwork
+        self.content_repo
+            .write()
+            .await
+            .delete_content_network(content_id)
+            .await?;
+
+        // 4. Create and publish ContentDeleted event
+        let event = Event::ContentDeleted {
+            content_id: content_id.to_string(),
+            deleted_by_node_id: self.local_node_id.clone(),
+            timestamp: current_timestamp(),
+        };
+
+        self.event_publisher.publish_all(&event).await?;
+
+        Ok(event)
+    }
+
     /// Update existing content.
     pub async fn update_content(&self, content_id: &str, data: &[u8]) -> Result<Event> {
         // 1. Verify content network exists
@@ -602,6 +650,40 @@ where
                     .await
                     .upsert_node(&snapshot)
                     .await?;
+                Ok(ApplyOutcome::Applied)
+            }
+
+            Event::ContentDeleted {
+                content_id,
+                deleted_by_node_id,
+                ..
+            } => {
+                // Skip if we initiated the deletion
+                if deleted_by_node_id == &self.local_node_id {
+                    return Ok(ApplyOutcome::Ignored);
+                }
+
+                // Delete the local ContentNetwork if it exists
+                // This handles the case where an offline node receives the deletion event
+                if let Ok(Some(_)) = self
+                    .content_repo
+                    .read()
+                    .await
+                    .get_content_network(content_id)
+                    .await
+                {
+                    self.content_repo
+                        .write()
+                        .await
+                        .delete_content_network(content_id)
+                        .await?;
+                    tracing::info!(
+                        "Content {} deleted by node {}, removed local ContentNetwork",
+                        content_id,
+                        deleted_by_node_id
+                    );
+                }
+
                 Ok(ApplyOutcome::Applied)
             }
 

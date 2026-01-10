@@ -75,6 +75,20 @@ pub enum Event {
         /// Request timestamp.
         timestamp: u64,
     },
+
+    /// Content has been deleted.
+    ///
+    /// The actual content data is physically deleted from storage,
+    /// but this event and the content history/CID are preserved
+    /// to notify offline nodes about the deletion.
+    ContentDeleted {
+        /// The content ID (CID) of the deleted content.
+        content_id: String,
+        /// The node that initiated the deletion.
+        deleted_by_node_id: String,
+        /// Deletion timestamp.
+        timestamp: u64,
+    },
 }
 
 impl Event {
@@ -88,6 +102,7 @@ impl Event {
             Event::ContentUpdated { .. } => "ContentUpdated",
             Event::ContentCreated { .. } => "ContentCreated",
             Event::ContentSyncRequested { .. } => "ContentSyncRequested",
+            Event::ContentDeleted { .. } => "ContentDeleted",
         }
     }
 
@@ -100,6 +115,7 @@ impl Event {
             Event::ContentUpdated { content_id, .. } => Some(content_id),
             Event::ContentCreated { content_id, .. } => Some(content_id),
             Event::ContentSyncRequested { content_id, .. } => Some(content_id),
+            Event::ContentDeleted { content_id, .. } => Some(content_id),
             Event::NodeCreated { .. } => None,
         }
     }
@@ -114,6 +130,7 @@ impl Event {
             Event::ContentUpdated { timestamp, .. } => *timestamp,
             Event::ContentCreated { timestamp, .. } => *timestamp,
             Event::ContentSyncRequested { timestamp, .. } => *timestamp,
+            Event::ContentDeleted { timestamp, .. } => *timestamp,
         }
     }
 }

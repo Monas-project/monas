@@ -278,6 +278,14 @@ impl<P: PeerNetwork> ReliableEventPublisher<P> {
                 content_id.hash(&mut hasher);
                 timestamp.hash(&mut hasher);
             }
+            Event::ContentDeleted {
+                content_id,
+                timestamp,
+                ..
+            } => {
+                content_id.hash(&mut hasher);
+                timestamp.hash(&mut hasher);
+            }
         }
 
         format!("{:016x}", hasher.finish())
