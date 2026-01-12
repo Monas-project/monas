@@ -6,10 +6,12 @@ use crate::domain::KeyId;
 /// コンテンツに対するアクセス権限。
 ///
 /// - `Write` は常に `Read` を内包するものとして扱う。
+/// - `Owner` は `Read` と `Write` を内包し、権限管理が可能。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Permission {
     Read,
     Write,
+    Owner,
 }
 
 impl Permission {
@@ -17,12 +19,19 @@ impl Permission {
     pub fn can_read(perms: &[Permission]) -> bool {
         perms
             .iter()
-            .any(|p| matches!(p, Permission::Read | Permission::Write))
+            .any(|p| matches!(p, Permission::Read | Permission::Write | Permission::Owner))
     }
 
     /// 書き込み可能かを判定するヘルパ。
     pub fn can_write(perms: &[Permission]) -> bool {
-        perms.iter().any(|p| matches!(p, Permission::Write))
+        perms
+            .iter()
+            .any(|p| matches!(p, Permission::Write | Permission::Owner))
+    }
+
+    /// 権限管理可能かを判定するヘルパ（Owner権限のみ）。
+    pub fn can_manage_permissions(perms: &[Permission]) -> bool {
+        perms.iter().any(|p| matches!(p, Permission::Owner))
     }
 }
 
@@ -176,6 +185,46 @@ impl Share {
 
     pub fn is_empty(&self) -> bool {
         self.recipients.is_empty()
+    }
+
+    /// Owner権限を付与。
+    ///
+    /// - 既にOwner権限を持つユーザが存在する場合は `InvalidOperation` を返す。
+    pub fn grant_owner(&mut self, key_id: KeyId) -> Result<ShareEvent, ShareError> {
+        // 既にOwner権限を持つユーザが存在するか確認
+        if self.owner_key_id().is_some() {
+            return Err(ShareError::InvalidOperation(
+                "Owner already exists".to_string(),
+            ));
+        }
+
+        // ShareRecipientにOwner権限を追加
+        if let Some(recipient) = self.recipients.get_mut(&key_id) {
+            // 既存のShareRecipientにOwner権限を追加
+            if !recipient.permissions().contains(&Permission::Owner) {
+                let mut perms = recipient.permissions().to_vec();
+                perms.push(Permission::Owner);
+                recipient.update_permissions(perms);
+            }
+        } else {
+            // 新しいShareRecipientを作成してOwner権限を付与
+            let recipient = ShareRecipient::new(key_id.clone(), vec![Permission::Owner]);
+            self.recipients.insert(key_id.clone(), recipient);
+        }
+
+        Ok(ShareEvent::RecipientGranted {
+            content_id: self.content_id.clone(),
+            key_id,
+            permissions: vec![Permission::Owner],
+        })
+    }
+
+    /// Owner権限を持つKeyIdを取得（ShareRecipientから導出）。
+    pub fn owner_key_id(&self) -> Option<&KeyId> {
+        self.recipients
+            .iter()
+            .find(|(_, recipient)| Permission::can_manage_permissions(recipient.permissions()))
+            .map(|(key_id, _)| key_id)
     }
 }
 
