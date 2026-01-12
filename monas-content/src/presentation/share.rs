@@ -14,12 +14,11 @@ use crate::{
     application_service::share_service::{GrantShareCommand, RevokeShareCommand},
     domain::share::{
         key_envelope::{KeyEnvelope, KeyWrapAlgorithm, WrappedRecipientKey},
-        KeyId,
     },
     domain::{content_id::ContentId, share::Permission},
 };
 
-use super::AppState;
+use super::{AppState, decode_base64, decode_key_id_base64};
 
 #[derive(Deserialize)]
 pub struct GrantShareRequest {
@@ -91,28 +90,20 @@ async fn grant_share(
 ) -> Result<Json<GrantShareResponse>, (StatusCode, String)> {
     let content_id = ContentId::new(req.content_id.clone());
 
-    let sender_key_bytes = BASE64_STANDARD
-        .decode(&req.sender_key_id_base64)
-        .map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!("invalid sender_key_id_base64: {e}"),
-            )
-        })?;
-    let sender_key_id = KeyId::new(sender_key_bytes);
+    let sender_key_id = decode_key_id_base64(
+        &req.sender_key_id_base64,
+        "sender_key_id_base64",
+    )?;
 
-    let recipient_pubkey = BASE64_STANDARD
-        .decode(&req.recipient_public_key_base64)
-        .map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!("invalid recipient_public_key_base64: {e}"),
-            )
-        })?;
+    let recipient_pubkey = decode_base64(
+        &req.recipient_public_key_base64,
+        "recipient_public_key_base64",
+    )?;
 
-    let permission = match req.permission.to_lowercase().as_str() {
+    let permission = match req.permission.to_lowercase().trim() {
         "read" => Permission::Read,
         "write" => Permission::Write,
+        "owner" => Permission::Owner,
         other => {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -158,56 +149,23 @@ async fn unwrap_cek(
 ) -> Result<Json<UnwrapCekResponse>, (StatusCode, String)> {
     let content_id = ContentId::new(req.content_id.clone());
 
-    let sender_key_bytes = BASE64_STANDARD
-        .decode(&req.sender_key_id_base64)
-        .map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!("invalid sender_key_id_base64: {e}"),
-            )
-        })?;
-    let sender_key_id = KeyId::new(sender_key_bytes);
+    let sender_key_id = decode_key_id_base64(
+        &req.sender_key_id_base64,
+        "sender_key_id_base64",
+    )?;
 
-    let recipient_key_bytes = BASE64_STANDARD
-        .decode(&req.recipient_key_id_base64)
-        .map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!("invalid recipient_key_id_base64: {e}"),
-            )
-        })?;
-    let recipient_key_id = KeyId::new(recipient_key_bytes);
+    let recipient_key_id = decode_key_id_base64(
+        &req.recipient_key_id_base64,
+        "recipient_key_id_base64",
+    )?;
 
-    let enc = BASE64_STANDARD
-        .decode(&req.enc_base64)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid enc_base64: {e}")))?;
-
-    let wrapped_cek = BASE64_STANDARD
-        .decode(&req.wrapped_cek_base64)
-        .map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!("invalid wrapped_cek_base64: {e}"),
-            )
-        })?;
-
-    let ciphertext = BASE64_STANDARD
-        .decode(&req.ciphertext_base64)
-        .map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!("invalid ciphertext_base64: {e}"),
-            )
-        })?;
-
-    let recipient_private_key = BASE64_STANDARD
-        .decode(&req.recipient_private_key_base64)
-        .map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!("invalid recipient_private_key_base64: {e}"),
-            )
-        })?;
+    let enc = decode_base64(&req.enc_base64, "enc_base64")?;
+    let wrapped_cek = decode_base64(&req.wrapped_cek_base64, "wrapped_cek_base64")?;
+    let ciphertext = decode_base64(&req.ciphertext_base64, "ciphertext_base64")?;
+    let recipient_private_key = decode_base64(
+        &req.recipient_private_key_base64,
+        "recipient_private_key_base64",
+    )?;
 
     let recipient = WrappedRecipientKey::new(recipient_key_id, enc, wrapped_cek);
     let envelope = KeyEnvelope::new(
@@ -233,13 +191,10 @@ async fn revoke_share(
 ) -> Result<Json<RevokeShareResponse>, (StatusCode, String)> {
     let content_id = ContentId::new(content_id_str.clone());
 
-    let recipient_key_bytes = BASE64_STANDARD.decode(&recipient_key_id_b64).map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("invalid recipient_key_id (base64): {e}"),
-        )
-    })?;
-    let recipient_key_id = KeyId::new(recipient_key_bytes);
+    let recipient_key_id = decode_key_id_base64(
+        &recipient_key_id_b64,
+        "recipient_key_id (base64)",
+    )?;
 
     let cmd = RevokeShareCommand {
         content_id,
@@ -287,6 +242,7 @@ async fn get_share(
             .map(|p| match p {
                 Permission::Read => "read".to_string(),
                 Permission::Write => "write".to_string(),
+                Permission::Owner => "owner".to_string(),
             })
             .collect();
 
