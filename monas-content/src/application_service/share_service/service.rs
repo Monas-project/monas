@@ -84,6 +84,7 @@ where
         let event = match cmd.permission {
             crate::domain::share::Permission::Read => share.grant_read(recipient_key_id.clone()),
             crate::domain::share::Permission::Write => share.grant_write(recipient_key_id.clone()),
+            crate::domain::share::Permission::Owner => share.grant_owner(recipient_key_id.clone()),
         }
         .map_err(ShareApplicationError::Share)?;
 
@@ -288,6 +289,21 @@ mod tests {
 
             Ok(guard.get(content_id.as_str()).cloned())
         }
+
+        // 将来の実装: 暗号文からContentIdを生成する場合の削除処理
+        // 将来的には暗号文からContentIdを生成するため、再暗号化時にContentIdが変わるので、
+        // 古いContentIdのContentを削除する処理が必要になる
+        // 現状は使用していない
+        // 理由: 再暗号化では上書き保存により古いデータが自動的に新しいデータに置き換えられる
+        // fn delete(&self, content_id: &ContentId) -> Result<(), ContentRepositoryError> {
+        //     let mut guard = self
+        //         .inner
+        //         .lock()
+        //         .map_err(|e| ContentRepositoryError::Storage(e.to_string()))?;
+        //
+        //     guard.remove(content_id.as_str());
+        //     Ok(())
+        // }
     }
 
     #[derive(Clone)]
