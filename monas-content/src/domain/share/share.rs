@@ -309,4 +309,80 @@ mod tests {
         let err = share.revoke(&kid).expect_err("revoke should fail");
         assert!(matches!(err, ShareError::RecipientNotFound));
     }
+
+    #[test]
+    fn permission_can_read_includes_owner() {
+        assert!(Permission::can_read(&[Permission::Owner]));
+        assert!(Permission::can_read(&[Permission::Read]));
+        assert!(Permission::can_read(&[Permission::Write]));
+        assert!(!Permission::can_read(&[]));
+    }
+
+    #[test]
+    fn permission_can_write_includes_owner() {
+        assert!(Permission::can_write(&[Permission::Owner]));
+        assert!(!Permission::can_write(&[Permission::Read]));
+        assert!(Permission::can_write(&[Permission::Write]));
+        assert!(!Permission::can_write(&[]));
+    }
+
+    #[test]
+    fn permission_can_manage_permissions_only_owner() {
+        assert!(Permission::can_manage_permissions(&[Permission::Owner]));
+        assert!(!Permission::can_manage_permissions(&[Permission::Read]));
+        assert!(!Permission::can_manage_permissions(&[Permission::Write]));
+        assert!(!Permission::can_manage_permissions(&[]));
+    }
+
+    #[test]
+    fn grant_owner_adds_recipient() {
+        let mut share = Share::new(cid());
+        let kid = key_id(&[1, 2, 3]);
+
+        let event = share
+            .grant_owner(kid.clone())
+            .expect("grant_owner should succeed");
+
+        assert!(matches!(event, ShareEvent::RecipientGranted { .. }));
+        let recipient = share.recipient(&kid).expect("recipient should exist");
+        assert_eq!(recipient.key_id(), &kid);
+        assert!(recipient.permissions().contains(&Permission::Owner));
+        assert!(Permission::can_manage_permissions(recipient.permissions()));
+    }
+
+    #[test]
+    fn grant_owner_when_owner_exists_returns_error() {
+        let mut share = Share::new(cid());
+        let kid1 = key_id(&[1, 2, 3]);
+        let kid2 = key_id(&[4, 5, 6]);
+
+        share
+            .grant_owner(kid1.clone())
+            .expect("first grant_owner should succeed");
+        let err = share
+            .grant_owner(kid2.clone())
+            .expect_err("second grant_owner should fail");
+
+        assert!(matches!(err, ShareError::InvalidOperation(_)));
+    }
+
+    #[test]
+    fn owner_key_id_returns_correct_key_id() {
+        let mut share = Share::new(cid());
+        let kid = key_id(&[1, 2, 3]);
+
+        assert!(share.owner_key_id().is_none());
+
+        share
+            .grant_owner(kid.clone())
+            .expect("grant_owner should succeed");
+
+        assert_eq!(share.owner_key_id(), Some(&kid));
+    }
+
+    #[test]
+    fn owner_key_id_returns_none_when_no_owner() {
+        let share = Share::new(cid());
+        assert!(share.owner_key_id().is_none());
+    }
 }
