@@ -57,3 +57,20 @@ pub struct FetchContentResult {
     pub metadata: Metadata,
     pub raw_content: Vec<u8>,
 }
+
+/// コンテンツ再暗号化ユースケースの入力。
+#[derive(Debug)]
+pub struct ReencryptContentCommand {
+    pub content_id: ContentId,
+    pub requester_key_id: crate::domain::KeyId,
+    pub revoked_key_id: crate::domain::KeyId,
+}
+
+/// コンテンツ再暗号化ユースケースの出力。
+#[derive(Debug)]
+pub struct ReencryptContentResult {
+    pub content_id: ContentId,
+    pub series_id: ContentId,
+    pub metadata: Metadata,
+    pub encrypted_content: Vec<u8>,
+}
