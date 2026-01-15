@@ -328,14 +328,7 @@ where
             .map_err(|_| ReencryptError::ShareNotFound)?
             .ok_or(ReencryptError::ShareNotFound)?;
 
-        let owner_key_id = share.owner_key_id().ok_or_else(|| {
-            ReencryptError::OwnerPermissionDenied(
-                cmd.requester_key_id.clone(),
-                cmd.content_id.as_str().to_string(),
-            )
-        })?;
-
-        if owner_key_id != &cmd.requester_key_id {
+        if share.owner_key_id() != Some(&cmd.requester_key_id) {
             return Err(ReencryptError::OwnerPermissionDenied(
                 cmd.requester_key_id.clone(),
                 cmd.content_id.as_str().to_string(),
