@@ -1,4 +1,5 @@
 pub mod crdt_repository;
+pub mod crypto;
 pub mod disk_capacity;
 pub mod event_adapters;
 pub mod event_bus_publisher;

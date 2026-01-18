@@ -3,6 +3,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 
+use crate::domain::access_control::ContentAccessControl;
 use crate::domain::content_network::ContentNetwork;
 use crate::domain::state_node::NodeSnapshot;
 
@@ -74,6 +75,27 @@ pub trait PersistentContentStorage: Send + Sync {
 
     /// Delete content by CID.
     async fn delete_content(&self, cid: &str) -> Result<()>;
+
+    /// Flush pending writes to disk.
+    async fn flush(&self) -> Result<()>;
+}
+
+/// Access control persistence operations.
+///
+/// Stores ContentAccessControl state for each content.
+#[async_trait]
+pub trait PersistentAccessControlRepository: Send + Sync {
+    /// Get access control state for a content.
+    async fn get_access_control(&self, content_id: &str) -> Result<Option<ContentAccessControl>>;
+
+    /// Save or update access control state.
+    async fn save_access_control(&self, access_control: &ContentAccessControl) -> Result<()>;
+
+    /// Delete access control state for a content.
+    async fn delete_access_control(&self, content_id: &str) -> Result<()>;
+
+    /// List all content IDs with access control state.
+    async fn list_access_controls(&self) -> Result<Vec<String>>;
 
     /// Flush pending writes to disk.
     async fn flush(&self) -> Result<()>;

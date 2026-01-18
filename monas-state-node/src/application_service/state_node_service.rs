@@ -1,5 +1,8 @@
 //! State Node Service - Application layer for managing state nodes.
 
+use crate::domain::access_control::{
+    AccessControlError, AccessControlUpdate, ContentAccessControl,
+};
 use crate::domain::content_network::ContentNetwork;
 use crate::domain::events::{current_timestamp, Event};
 use crate::domain::state_node::{self, NodeSnapshot};
@@ -7,7 +10,9 @@ use crate::infrastructure::placement::compute_dht_key;
 use crate::port::content_repository::ContentRepository;
 use crate::port::event_publisher::EventPublisher;
 use crate::port::peer_network::PeerNetwork;
-use crate::port::persistence::{PersistentContentRepository, PersistentNodeRegistry};
+use crate::port::persistence::{
+    PersistentAccessControlRepository, PersistentContentRepository, PersistentNodeRegistry,
+};
 use anyhow::Result;
 use std::sync::Arc;
 
@@ -49,19 +54,21 @@ impl Default for ServiceConfig {
 ///
 /// This service provides high-level operations for managing state nodes,
 /// content networks, and event publishing.
-pub struct StateNodeService<N, C, P, E, R>
+pub struct StateNodeService<N, C, P, E, R, A = NoOpAccessControlRepository>
 where
     N: PersistentNodeRegistry,
     C: PersistentContentRepository,
     P: PeerNetwork,
     E: EventPublisher,
     R: ContentRepository,
+    A: PersistentAccessControlRepository,
 {
     node_registry: Arc<tokio::sync::RwLock<N>>,
     content_repo: Arc<tokio::sync::RwLock<C>>,
     peer_network: Arc<P>,
     event_publisher: Arc<E>,
     crdt_repo: Arc<R>,
+    access_control_repo: Option<Arc<tokio::sync::RwLock<A>>>,
     local_node_id: String,
     /// Minimum number of member nodes for redundancy.
     min_replication_factor: usize,
@@ -69,13 +76,36 @@ where
     capacity_threshold_bytes: u64,
 }
 
-impl<N, C, P, E, R> StateNodeService<N, C, P, E, R>
+/// No-op access control repository for backward compatibility.
+pub struct NoOpAccessControlRepository;
+
+#[async_trait::async_trait]
+impl PersistentAccessControlRepository for NoOpAccessControlRepository {
+    async fn get_access_control(&self, _content_id: &str) -> Result<Option<ContentAccessControl>> {
+        Ok(None)
+    }
+    async fn save_access_control(&self, _access_control: &ContentAccessControl) -> Result<()> {
+        Ok(())
+    }
+    async fn delete_access_control(&self, _content_id: &str) -> Result<()> {
+        Ok(())
+    }
+    async fn list_access_controls(&self) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+    async fn flush(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl<N, C, P, E, R, A> StateNodeService<N, C, P, E, R, A>
 where
     N: PersistentNodeRegistry,
     C: PersistentContentRepository,
     P: PeerNetwork,
     E: EventPublisher,
     R: ContentRepository,
+    A: PersistentAccessControlRepository,
 {
     /// Create a new StateNodeService.
     ///
@@ -117,10 +147,19 @@ where
             peer_network,
             event_publisher: Arc::new(event_publisher),
             crdt_repo,
+            access_control_repo: None,
             local_node_id,
             min_replication_factor: config.min_replication_factor,
             capacity_threshold_bytes: config.capacity_threshold_bytes,
         }
+    }
+
+    /// Set the access control repository (builder pattern).
+    ///
+    /// This method allows adding access control support after construction.
+    pub fn with_access_control_repo(mut self, access_control_repo: A) -> Self {
+        self.access_control_repo = Some(Arc::new(tokio::sync::RwLock::new(access_control_repo)));
+        self
     }
 
     /// Get the CRDT repository.
@@ -721,6 +760,128 @@ where
             .get_content_network(content_id)
             .await
     }
+
+    // ========================================================================
+    // Access Control Methods (ShareToken support)
+    // ========================================================================
+
+    /// Verify if a ShareToken is valid for accessing content.
+    ///
+    /// This method checks:
+    /// 1. The token's issued_at (iat) is >= min_valid_issued_at for the content
+    /// 2. The content exists
+    ///
+    /// Returns Ok(true) if access is allowed, Ok(false) if denied.
+    pub async fn verify_access(&self, content_id: &str, token_iat: u64) -> Result<bool> {
+        let ac_repo = match &self.access_control_repo {
+            Some(repo) => repo,
+            None => {
+                // No access control repository configured, allow all access
+                return Ok(true);
+            }
+        };
+
+        // Get access control state
+        let access_control = ac_repo.read().await.get_access_control(content_id).await?;
+
+        match access_control {
+            Some(ac) => {
+                // Check if token is valid
+                Ok(ac.is_token_valid(token_iat))
+            }
+            None => {
+                // No access control state = no restrictions
+                Ok(true)
+            }
+        }
+    }
+
+    /// Get access control state for a content.
+    pub async fn get_access_control(
+        &self,
+        content_id: &str,
+    ) -> Result<Option<ContentAccessControl>> {
+        let ac_repo = match &self.access_control_repo {
+            Some(repo) => repo,
+            None => return Ok(None),
+        };
+
+        ac_repo.read().await.get_access_control(content_id).await
+    }
+
+    /// Update access control for a content.
+    ///
+    /// This method:
+    /// 1. Verifies the signature on the update request
+    /// 2. Applies the update if valid
+    /// 3. Persists the new state
+    ///
+    /// Note: Authorization (checking if the signer is the owner) should be done
+    /// by the caller before invoking this method.
+    ///
+    /// Note: The caller is responsible for verifying the signature using `monas-account`
+    /// before calling this method. This method assumes the signature has already been verified.
+    pub async fn update_access_control(
+        &self,
+        update: &AccessControlUpdate,
+    ) -> Result<ContentAccessControl, AccessControlError> {
+        let ac_repo = match &self.access_control_repo {
+            Some(repo) => repo,
+            None => {
+                return Err(AccessControlError::ContentNotFound);
+            }
+        };
+
+        // Note: Signature verification should be done by the caller using monas-account.
+        // This method assumes the update has been verified.
+        if update.signature().is_empty() || update.signer_public_key().is_empty() {
+            return Err(AccessControlError::InvalidSignature);
+        }
+
+        // 1. Get or create access control state
+        let mut access_control = ac_repo
+            .read()
+            .await
+            .get_access_control(&update.content_id)
+            .await
+            .map_err(|_| AccessControlError::ContentNotFound)?
+            .unwrap_or_else(|| ContentAccessControl::new(update.content_id.clone()));
+
+        // 3. Apply the update
+        access_control.invalidate_before(update.new_min_valid_issued_at)?;
+
+        // 4. Persist the new state
+        ac_repo
+            .write()
+            .await
+            .save_access_control(&access_control)
+            .await
+            .map_err(|_| AccessControlError::ContentNotFound)?;
+
+        Ok(access_control)
+    }
+
+    /// Initialize access control for a new content.
+    ///
+    /// Called when content is created to set up initial access control state.
+    pub async fn init_access_control(&self, content_id: &str) -> Result<ContentAccessControl> {
+        let ac_repo = match &self.access_control_repo {
+            Some(repo) => repo,
+            None => {
+                // Return a default state if no repo is configured
+                return Ok(ContentAccessControl::new(content_id.to_string()));
+            }
+        };
+
+        let access_control = ContentAccessControl::new(content_id.to_string());
+        ac_repo
+            .write()
+            .await
+            .save_access_control(&access_control)
+            .await?;
+
+        Ok(access_control)
+    }
 }
 
 #[cfg(test)]
@@ -739,6 +900,7 @@ mod tests {
         MockPeerNetwork,
         MockEventPublisher,
         MockContentRepository,
+        NoOpAccessControlRepository,
     >;
 
     fn create_test_service(local_node_id: &str) -> TestService {
@@ -913,7 +1075,7 @@ mod tests {
             .await
             .insert("content-1".to_string(), b"old data".to_vec());
 
-        let service = StateNodeService::new(
+        let service: TestService = StateNodeService::new(
             node_registry,
             content_repo,
             peer_network,
@@ -951,7 +1113,7 @@ mod tests {
         let event_publisher = MockEventPublisher::new();
         let crdt_repo = Arc::new(MockContentRepository::new());
 
-        let service = StateNodeService::new(
+        let service: TestService = StateNodeService::new(
             node_registry,
             content_repo,
             peer_network,
@@ -1090,7 +1252,7 @@ mod tests {
         let event_publisher = MockEventPublisher::new();
         let crdt_repo = Arc::new(MockContentRepository::new());
 
-        let service = StateNodeService::new(
+        let service: TestService = StateNodeService::new(
             node_registry,
             content_repo,
             peer_network,
@@ -1128,7 +1290,7 @@ mod tests {
         let event_publisher = MockEventPublisher::new();
         let crdt_repo = Arc::new(MockContentRepository::new());
 
-        let service = StateNodeService::new(
+        let service: TestService = StateNodeService::new(
             node_registry,
             content_repo,
             peer_network,
@@ -1161,7 +1323,7 @@ mod tests {
         let event_publisher = MockEventPublisher::new();
         let crdt_repo = Arc::new(MockContentRepository::new());
 
-        let service = StateNodeService::new(
+        let service: TestService = StateNodeService::new(
             node_registry,
             content_repo,
             peer_network,

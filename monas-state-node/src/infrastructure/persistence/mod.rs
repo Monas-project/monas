@@ -11,10 +11,12 @@
 //! These use `WasmNodeRegistry` and `WasmContentRepository` traits which are
 //! `?Send` to accommodate browser's single-threaded nature.
 
+pub mod sled_access_control_repository;
 pub mod sled_content_network_repository;
 pub mod sled_node_registry;
 
 // Re-export sled implementations
+pub use sled_access_control_repository::SledAccessControlRepository;
 pub use sled_content_network_repository::SledContentNetworkRepository;
 pub use sled_node_registry::SledNodeRegistry;
 
