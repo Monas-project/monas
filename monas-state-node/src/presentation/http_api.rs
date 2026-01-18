@@ -319,13 +319,7 @@ async fn delete_content(
             } else {
                 StatusCode::INTERNAL_SERVER_ERROR
             };
-            (
-                status,
-                Json(ErrorResponse {
-                    error: error_msg,
-                }),
-            )
-                .into_response()
+            (status, Json(ErrorResponse { error: error_msg })).into_response()
         }
     }
 }
