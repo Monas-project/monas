@@ -111,7 +111,7 @@ async fn test_create_content() {
     // In isolated test environment, create_content will fail because no other peers are available.
     // This is expected behavior - content creation requires at least one other node to store the content.
     let data = b"Hello, World!";
-    let result = service.create_content(data).await;
+    let result = service.create_content(data, None).await;
 
     // Verify that it fails with the expected error in isolated environment
     assert!(result.is_err());

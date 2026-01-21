@@ -3,17 +3,24 @@
 use crate::domain::access_control::{
     AccessControlError, AccessControlUpdate, ContentAccessControl,
 };
+use crate::domain::access_policy::AccessPolicy;
+use crate::domain::auth_capability::AuthCapability;
 use crate::domain::content_network::ContentNetwork;
 use crate::domain::errors::{CrdtError, NetworkError, StateNodeError};
 use crate::domain::events::{current_timestamp, Event};
+use crate::domain::identity::Identity;
 use crate::domain::state_node::{self, NodeSnapshot};
 use crate::domain::value_objects::ContentId;
 use crate::infrastructure::placement::compute_dht_key;
+use crate::port::auth_token::AuthToken;
+use crate::port::authentication_service::AuthenticationService;
+use crate::port::authorization_service::{AuthorizationRequest, AuthorizationService};
 use crate::port::content_repository::ContentRepository;
 use crate::port::event_publisher::EventPublisher;
 use crate::port::peer_network::PeerNetwork;
 use crate::port::persistence::{
-    PersistentAccessControlRepository, PersistentContentRepository, PersistentNodeRegistry,
+    PersistentAccessControlRepository, PersistentAccessPolicyRepository,
+    PersistentContentRepository, PersistentNodeRegistry,
 };
 use anyhow::Result;
 use std::sync::Arc;
@@ -71,6 +78,12 @@ where
     event_publisher: Arc<E>,
     crdt_repo: Arc<R>,
     access_control_repo: Option<Arc<tokio::sync::RwLock<A>>>,
+    /// Authentication service for DID-based authentication
+    auth_service: Option<Arc<dyn AuthenticationService>>,
+    /// Authorization service for capability-based authorization
+    authz_service: Option<Arc<dyn AuthorizationService>>,
+    /// Access policy repository for managing content permissions
+    access_policy_repo: Option<Arc<tokio::sync::RwLock<dyn PersistentAccessPolicyRepository>>>,
     local_node_id: String,
     /// Minimum number of member nodes for redundancy.
     min_replication_factor: usize,
@@ -150,6 +163,9 @@ where
             event_publisher: Arc::new(event_publisher),
             crdt_repo,
             access_control_repo: None,
+            auth_service: None,
+            authz_service: None,
+            access_policy_repo: None,
             local_node_id,
             min_replication_factor: config.min_replication_factor,
             capacity_threshold_bytes: config.capacity_threshold_bytes,
@@ -161,6 +177,39 @@ where
     /// This method allows adding access control support after construction.
     pub fn with_access_control_repo(mut self, access_control_repo: A) -> Self {
         self.access_control_repo = Some(Arc::new(tokio::sync::RwLock::new(access_control_repo)));
+        self
+    }
+
+    /// Set the authentication service (builder pattern).
+    ///
+    /// This method allows adding authentication support after construction.
+    pub fn with_authentication_service(
+        mut self,
+        auth_service: impl AuthenticationService + 'static,
+    ) -> Self {
+        self.auth_service = Some(Arc::new(auth_service));
+        self
+    }
+
+    /// Set the authorization service (builder pattern).
+    ///
+    /// This method allows adding authorization support after construction.
+    pub fn with_authorization_service(
+        mut self,
+        authz_service: impl AuthorizationService + 'static,
+    ) -> Self {
+        self.authz_service = Some(Arc::new(authz_service));
+        self
+    }
+
+    /// Set the access policy repository (builder pattern).
+    ///
+    /// This method allows adding access policy management after construction.
+    pub fn with_access_policy_repo(
+        mut self,
+        access_policy_repo: impl PersistentAccessPolicyRepository + 'static,
+    ) -> Self {
+        self.access_policy_repo = Some(Arc::new(tokio::sync::RwLock::new(access_policy_repo)));
         self
     }
 
@@ -205,8 +254,29 @@ where
     ///
     /// The content will be assigned to other nodes in the network (not the creator).
     /// At least one member node must be available for the content to be created.
-    pub async fn create_content(&self, data: &[u8]) -> Result<Event, StateNodeError> {
-        // 1. Save content to CRDT repository first
+    ///
+    /// If authentication is configured and a token is provided, the caller will be authenticated
+    /// and an access policy will be created with the authenticated identity as owner.
+    pub async fn create_content(
+        &self,
+        data: &[u8],
+        token: Option<&AuthToken>,
+    ) -> Result<Event, StateNodeError> {
+        // 1. Authenticate caller if token and auth service are provided
+        let owner_identity = if let (Some(token), Some(auth_service)) = (token, &self.auth_service)
+        {
+            // Authenticate the token to get the identity
+            let identity = auth_service
+                .authenticate(token)
+                .await
+                .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))?;
+            Some(identity)
+        } else {
+            // No authentication configured or no token provided
+            None
+        };
+
+        // 2. Save content to CRDT repository first
         let commit_result = self
             .crdt_repo
             .create_content(data, &self.local_node_id)
@@ -214,7 +284,7 @@ where
             .map_err(|e| StateNodeError::CrdtError(CrdtError::StorageError(e.to_string())))?;
         let content_id = commit_result.genesis_cid;
 
-        // 2. Find closest peers for content placement
+        // 3. Find closest peers for content placement
         let key = compute_dht_key(&content_id);
         let k = 3usize;
         let closest = self
@@ -246,7 +316,7 @@ where
             return Err(StateNodeError::NoAvailableMembers);
         }
 
-        // 3. Create content network
+        // 4. Create content network
         let network = ContentNetwork::from_strings(content_id.clone(), selected.clone())?;
         self.content_repo
             .write()
@@ -255,7 +325,19 @@ where
             .await
             .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
 
-        // 4. Create and publish event both locally and to the network
+        // 5. Create access policy if authentication was used
+        if let (Some(identity), Some(policy_repo)) = (owner_identity, &self.access_policy_repo) {
+            let content_id_vo = ContentId::new(content_id.clone())?;
+            let policy = AccessPolicy::new(content_id_vo, identity);
+            policy_repo
+                .write()
+                .await
+                .save_policy(&policy)
+                .await
+                .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
+        }
+
+        // 6. Create and publish event both locally and to the network
         let event = Event::ContentCreated {
             content_id,
             creator_node_id: self.local_node_id.clone(),
@@ -278,13 +360,21 @@ where
     ///
     /// This method:
     /// 1. Verifies the content network exists and local node is a member
-    /// 2. Removes the ContentNetwork (access control)
-    /// 3. Publishes ContentDeleted event for offline node notification
+    /// 2. Checks authorization if authentication is configured
+    /// 3. Removes the ContentNetwork (access control)
+    /// 4. Publishes ContentDeleted event for offline node notification
     ///
     /// Note: The CRDT history and CID are preserved for:
     /// - Offline nodes to receive deletion notification via event
     /// - Historical record keeping
-    pub async fn delete_content(&self, content_id: &str) -> Result<Event, StateNodeError> {
+    ///
+    /// If authentication/authorization are configured and a token is provided,
+    /// the caller's authorization to delete the content will be checked.
+    pub async fn delete_content(
+        &self,
+        content_id: &str,
+        token: Option<&AuthToken>,
+    ) -> Result<Event, StateNodeError> {
         // 1. Verify content network exists
         let content_id_vo = ContentId::new(content_id.to_string())?;
         let network = self
@@ -296,7 +386,40 @@ where
             .map_err(|e| StateNodeError::StorageError(e.to_string()))?
             .ok_or_else(|| StateNodeError::ContentNotFound(content_id_vo.clone()))?;
 
-        // 2. Verify local node is a member (only members can delete)
+        // 2. Check authorization if token and auth services are provided
+        if let (Some(token), Some(auth_service), Some(authz_service)) =
+            (token, &self.auth_service, &self.authz_service)
+        {
+            // Authenticate to get identity
+            let identity = auth_service
+                .authenticate(token)
+                .await
+                .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))?;
+
+            // Check authorization
+            let authz_request = AuthorizationRequest {
+                identity,
+                resource: content_id_vo.clone(),
+                capability: AuthCapability::DeleteContent,
+                token: Some(token.clone()),
+            };
+
+            let authz_result = authz_service
+                .authorize(&authz_request)
+                .await
+                .map_err(|e| StateNodeError::AuthorizationFailed(e.to_string()))?;
+
+            if authz_result.is_denied() {
+                return Err(StateNodeError::AuthorizationFailed(
+                    authz_result
+                        .denial_reason()
+                        .unwrap_or("Access denied")
+                        .to_string(),
+                ));
+            }
+        }
+
+        // 3. Verify local node is a member (only members can delete)
         if !network.has_member_str(&self.local_node_id) {
             return Err(StateNodeError::NotAMember {
                 node_id: self.local_node_id.clone(),
@@ -304,7 +427,7 @@ where
             });
         }
 
-        // 3. Delete the ContentNetwork
+        // 4. Delete the ContentNetwork
         self.content_repo
             .write()
             .await
@@ -312,7 +435,17 @@ where
             .await
             .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
 
-        // 4. Create and publish ContentDeleted event
+        // 5. Delete the AccessPolicy if it exists
+        if let Some(policy_repo) = &self.access_policy_repo {
+            policy_repo
+                .write()
+                .await
+                .delete_policy(content_id)
+                .await
+                .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
+        }
+
+        // 6. Create and publish ContentDeleted event
         let event = Event::ContentDeleted {
             content_id: content_id.to_string(),
             deleted_by_node_id: self.local_node_id.clone(),
@@ -330,10 +463,14 @@ where
     }
 
     /// Update existing content.
+    ///
+    /// If authentication/authorization are configured and a token is provided,
+    /// the caller's authorization to write the content will be checked.
     pub async fn update_content(
         &self,
         content_id: &str,
         data: &[u8],
+        token: Option<&AuthToken>,
     ) -> Result<Event, StateNodeError> {
         // 1. Verify content network exists
         let content_id_vo = ContentId::new(content_id.to_string())?;
@@ -346,7 +483,40 @@ where
             .map_err(|e| StateNodeError::StorageError(e.to_string()))?
             .ok_or_else(|| StateNodeError::ContentNotFound(content_id_vo.clone()))?;
 
-        // 2. Verify local node is a member
+        // 2. Check authorization if token and auth services are provided
+        if let (Some(token), Some(auth_service), Some(authz_service)) =
+            (token, &self.auth_service, &self.authz_service)
+        {
+            // Authenticate to get identity
+            let identity = auth_service
+                .authenticate(token)
+                .await
+                .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))?;
+
+            // Check authorization
+            let authz_request = AuthorizationRequest {
+                identity,
+                resource: content_id_vo.clone(),
+                capability: AuthCapability::WriteContent,
+                token: Some(token.clone()),
+            };
+
+            let authz_result = authz_service
+                .authorize(&authz_request)
+                .await
+                .map_err(|e| StateNodeError::AuthorizationFailed(e.to_string()))?;
+
+            if authz_result.is_denied() {
+                return Err(StateNodeError::AuthorizationFailed(
+                    authz_result
+                        .denial_reason()
+                        .unwrap_or("Access denied")
+                        .to_string(),
+                ));
+            }
+        }
+
+        // 3. Verify local node is a member
         if !network.has_member_str(&self.local_node_id) {
             return Err(StateNodeError::NotAMember {
                 node_id: self.local_node_id.clone(),
@@ -354,13 +524,13 @@ where
             });
         }
 
-        // 3. Update content in CRDT repository
+        // 4. Update content in CRDT repository
         self.crdt_repo
             .update_content(content_id, data, &self.local_node_id)
             .await
             .map_err(|e| StateNodeError::CrdtError(CrdtError::StorageError(e.to_string())))?;
 
-        // 4. Create and publish update event both locally and to the network
+        // 5. Create and publish update event both locally and to the network
         let event = Event::ContentUpdated {
             content_id: content_id.to_string(),
             updated_node_id: self.local_node_id.clone(),
@@ -374,7 +544,7 @@ where
                 StateNodeError::NetworkError(NetworkError::ProtocolError(e.to_string()))
             })?;
 
-        // 5. Check and maintain redundancy (best effort - don't fail update if this fails)
+        // 6. Check and maintain redundancy (best effort - don't fail update if this fails)
         if let Err(e) = self.check_and_maintain_redundancy(content_id).await {
             tracing::warn!(
                 "Failed to check/maintain redundancy for content {}: {}",
@@ -384,6 +554,81 @@ where
         }
 
         Ok(event)
+    }
+
+    /// Grant access capabilities to an identity for a content.
+    ///
+    /// This method allows the owner of content to share access with other identities.
+    /// Only the owner can grant access.
+    ///
+    /// # Arguments
+    ///
+    /// * `content_id` - The content to grant access to
+    /// * `grantee_identity` - The identity to grant access to
+    /// * `capabilities` - The capabilities to grant
+    /// * `token` - Authentication token of the caller (must be owner)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Authentication fails
+    /// - Caller is not the owner of the content
+    /// - Access policy repository is not configured
+    pub async fn grant_access(
+        &self,
+        content_id: &str,
+        grantee_identity: Identity,
+        capabilities: Vec<AuthCapability>,
+        token: &AuthToken,
+    ) -> Result<(), StateNodeError> {
+        // 1. Ensure auth services are configured
+        let auth_service = self.auth_service.as_ref().ok_or_else(|| {
+            StateNodeError::InvalidConfiguration("Authentication not configured".to_string())
+        })?;
+
+        let policy_repo = self.access_policy_repo.as_ref().ok_or_else(|| {
+            StateNodeError::InvalidConfiguration(
+                "Access policy repository not configured".to_string(),
+            )
+        })?;
+
+        // 2. Authenticate caller
+        let caller_identity = auth_service
+            .authenticate(token)
+            .await
+            .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))?;
+
+        // 3. Get access policy
+        let content_id_vo = ContentId::new(content_id.to_string())?;
+        let mut policy = policy_repo
+            .read()
+            .await
+            .get_policy(content_id)
+            .await
+            .map_err(|e| StateNodeError::StorageError(e.to_string()))?
+            .ok_or_else(|| StateNodeError::ContentNotFound(content_id_vo.clone()))?;
+
+        // 4. Verify caller is owner
+        if !policy.is_owner(&caller_identity) {
+            return Err(StateNodeError::AuthorizationFailed(
+                "Only the owner can grant access".to_string(),
+            ));
+        }
+
+        // 5. Grant capabilities
+        policy
+            .grant(grantee_identity, capabilities)
+            .map_err(|e| StateNodeError::Internal(e.to_string()))?;
+
+        // 6. Save updated policy
+        policy_repo
+            .write()
+            .await
+            .save_policy(&policy)
+            .await
+            .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
+
+        Ok(())
     }
 
     /// Add new member nodes to a content network.
@@ -1107,7 +1352,7 @@ mod tests {
             capacities,
         );
 
-        let event = service.create_content(b"test data").await.unwrap();
+        let event = service.create_content(b"test data", None).await.unwrap();
 
         match event {
             Event::ContentCreated {
@@ -1136,7 +1381,7 @@ mod tests {
             capacities,
         );
 
-        let event = service.create_content(b"test data").await.unwrap();
+        let event = service.create_content(b"test data", None).await.unwrap();
 
         match event {
             Event::ContentCreated { member_nodes, .. } => {
@@ -1152,7 +1397,7 @@ mod tests {
     async fn test_create_content_fails_without_peers() {
         let service = create_test_service("node-1");
 
-        let result = service.create_content(b"test data").await;
+        let result = service.create_content(b"test data", None).await;
 
         assert!(result.is_err());
         assert!(result
@@ -1189,7 +1434,7 @@ mod tests {
         );
 
         let event = service
-            .update_content("content-1", b"new data")
+            .update_content("content-1", b"new data", None)
             .await
             .unwrap();
 
@@ -1226,7 +1471,7 @@ mod tests {
             "node-1".to_string(),
         );
 
-        let result = service.update_content("content-1", b"new data").await;
+        let result = service.update_content("content-1", b"new data", None).await;
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not a member"));
@@ -1236,7 +1481,7 @@ mod tests {
     async fn test_update_content_fails_if_network_not_found() {
         let service = create_test_service("node-1");
 
-        let result = service.update_content("nonexistent", b"data").await;
+        let result = service.update_content("nonexistent", b"data", None).await;
 
         assert!(result.is_err());
         assert!(result

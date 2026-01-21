@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod crdt_repository;
 pub mod crypto;
 pub mod disk_capacity;

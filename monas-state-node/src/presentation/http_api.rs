@@ -227,7 +227,8 @@ async fn create_content(
         }
     };
 
-    match state.create_content(&data).await {
+    // TODO: Extract auth token from request headers
+    match state.create_content(&data, None).await {
         Ok(event) => {
             if let crate::domain::events::Event::ContentCreated { content_id, .. } = event {
                 Json(CreateContentResponse { content_id }).into_response()
@@ -266,7 +267,8 @@ async fn update_content(
         }
     };
 
-    match state.update_content(&content_id, &data).await {
+    // TODO: Extract auth token from request headers
+    match state.update_content(&content_id, &data, None).await {
         Ok(_) => Json(UpdateContentResponse {
             content_id,
             updated: true,
@@ -285,7 +287,8 @@ async fn delete_content(
     State(state): State<AppState>,
     Path(content_id): Path<String>,
 ) -> impl IntoResponse {
-    match state.delete_content(&content_id).await {
+    // TODO: Extract auth token from request headers
+    match state.delete_content(&content_id, None).await {
         Ok(_) => Json(DeleteContentResponse {
             content_id,
             deleted: true,

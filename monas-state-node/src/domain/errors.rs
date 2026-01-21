@@ -38,6 +38,12 @@ pub enum StateNodeError {
     #[error("Invalid UCAN token: {0}")]
     InvalidUcanToken(String),
 
+    #[error("Authentication failed: {0}")]
+    AuthenticationFailed(String),
+
+    #[error("Authorization failed: {0}")]
+    AuthorizationFailed(String),
+
     // Network-related errors
     #[error("Network error: {0}")]
     NetworkError(#[from] NetworkError),
@@ -103,6 +109,8 @@ impl StateNodeError {
             StateNodeError::ContentAlreadyExists(_) => StatusCode::CONFLICT,
             StateNodeError::PermissionDenied(_) => StatusCode::FORBIDDEN,
             StateNodeError::InvalidUcanToken(_) => StatusCode::UNAUTHORIZED,
+            StateNodeError::AuthenticationFailed(_) => StatusCode::UNAUTHORIZED,
+            StateNodeError::AuthorizationFailed(_) => StatusCode::FORBIDDEN,
             StateNodeError::InsufficientCapacity { .. } => StatusCode::INSUFFICIENT_STORAGE,
             StateNodeError::NoAvailableMembers => StatusCode::SERVICE_UNAVAILABLE,
             StateNodeError::NotAMember { .. } => StatusCode::FORBIDDEN,

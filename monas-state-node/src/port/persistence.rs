@@ -4,6 +4,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use crate::domain::access_control::ContentAccessControl;
+use crate::domain::access_policy::AccessPolicy;
 use crate::domain::content_network::ContentNetwork;
 use crate::domain::state_node::NodeSnapshot;
 
@@ -96,6 +97,27 @@ pub trait PersistentAccessControlRepository: Send + Sync {
 
     /// List all content IDs with access control state.
     async fn list_access_controls(&self) -> Result<Vec<String>>;
+
+    /// Flush pending writes to disk.
+    async fn flush(&self) -> Result<()>;
+}
+
+/// Access policy persistence operations (new auth system).
+///
+/// Stores AccessPolicy state for identity-based authorization.
+#[async_trait]
+pub trait PersistentAccessPolicyRepository: Send + Sync {
+    /// Get access policy for a content.
+    async fn get_policy(&self, content_id: &str) -> Result<Option<AccessPolicy>>;
+
+    /// Save or update access policy.
+    async fn save_policy(&self, policy: &AccessPolicy) -> Result<()>;
+
+    /// Delete access policy for a content.
+    async fn delete_policy(&self, content_id: &str) -> Result<()>;
+
+    /// List all content IDs with access policies.
+    async fn list_policies(&self) -> Result<Vec<String>>;
 
     /// Flush pending writes to disk.
     async fn flush(&self) -> Result<()>;
