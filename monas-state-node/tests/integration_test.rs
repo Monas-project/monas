@@ -116,7 +116,7 @@ async fn test_create_content() {
     // Verify that it fails with the expected error in isolated environment
     assert!(result.is_err());
     let err = result.unwrap_err();
-    assert!(err.to_string().contains("no available member nodes found"));
+    assert!(err.to_string().contains("No available member nodes found"));
 
     // Instead, test content network creation via sync event (simulating receiving from another node)
     let event = Event::ContentCreated {

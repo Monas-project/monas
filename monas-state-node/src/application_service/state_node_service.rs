@@ -4,8 +4,10 @@ use crate::domain::access_control::{
     AccessControlError, AccessControlUpdate, ContentAccessControl,
 };
 use crate::domain::content_network::ContentNetwork;
+use crate::domain::errors::{CrdtError, NetworkError, StateNodeError};
 use crate::domain::events::{current_timestamp, Event};
 use crate::domain::state_node::{self, NodeSnapshot};
+use crate::domain::value_objects::ContentId;
 use crate::infrastructure::placement::compute_dht_key;
 use crate::port::content_repository::ContentRepository;
 use crate::port::event_publisher::EventPublisher;
@@ -175,7 +177,10 @@ where
     /// Register a new node.
     ///
     /// This publishes the NodeCreated event both locally and to the network.
-    pub async fn register_node(&self, total_capacity: u64) -> Result<(NodeSnapshot, Vec<Event>)> {
+    pub async fn register_node(
+        &self,
+        total_capacity: u64,
+    ) -> Result<(NodeSnapshot, Vec<Event>), StateNodeError> {
         let (snapshot, events) =
             state_node::create_node(self.local_node_id.clone(), total_capacity);
 
@@ -183,11 +188,14 @@ where
             .write()
             .await
             .upsert_node(&snapshot)
-            .await?;
+            .await
+            .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
 
         // Publish events both locally and to the network
         for event in &events {
-            self.event_publisher.publish_all(event).await?;
+            self.event_publisher.publish_all(event).await.map_err(|e| {
+                StateNodeError::NetworkError(NetworkError::ProtocolError(e.to_string()))
+            })?;
         }
 
         Ok((snapshot, events))
@@ -197,22 +205,32 @@ where
     ///
     /// The content will be assigned to other nodes in the network (not the creator).
     /// At least one member node must be available for the content to be created.
-    pub async fn create_content(&self, data: &[u8]) -> Result<Event> {
+    pub async fn create_content(&self, data: &[u8]) -> Result<Event, StateNodeError> {
         // 1. Save content to CRDT repository first
         let commit_result = self
             .crdt_repo
             .create_content(data, &self.local_node_id)
-            .await?;
+            .await
+            .map_err(|e| StateNodeError::CrdtError(CrdtError::StorageError(e.to_string())))?;
         let content_id = commit_result.genesis_cid;
 
         // 2. Find closest peers for content placement
         let key = compute_dht_key(&content_id);
         let k = 3usize;
-        let closest = self.peer_network.find_closest_peers(key, k).await?;
+        let closest = self
+            .peer_network
+            .find_closest_peers(key, k)
+            .await
+            .map_err(|e| {
+                StateNodeError::NetworkError(NetworkError::ConnectionFailed(e.to_string()))
+            })?;
         let caps = self
             .peer_network
             .query_node_capacity_batch(&closest)
-            .await?;
+            .await
+            .map_err(|e| {
+                StateNodeError::NetworkError(NetworkError::ConnectionFailed(e.to_string()))
+            })?;
 
         // Select nodes with highest capacity, excluding the creator
         let mut scored: Vec<(u64, String)> = closest
@@ -225,22 +243,17 @@ where
 
         // Validate that we have at least one member node
         if selected.is_empty() {
-            return Err(anyhow::anyhow!(
-                "Cannot create content: no available member nodes found. \
-                 At least one other registered node is required to store the content."
-            ));
+            return Err(StateNodeError::NoAvailableMembers);
         }
 
         // 3. Create content network
-        let network = ContentNetwork {
-            content_id: content_id.clone(),
-            member_nodes: selected.iter().cloned().collect(),
-        };
+        let network = ContentNetwork::from_strings(content_id.clone(), selected.clone())?;
         self.content_repo
             .write()
             .await
             .save_content_network(network)
-            .await?;
+            .await
+            .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
 
         // 4. Create and publish event both locally and to the network
         let event = Event::ContentCreated {
@@ -251,7 +264,12 @@ where
             timestamp: current_timestamp(),
         };
 
-        self.event_publisher.publish_all(&event).await?;
+        self.event_publisher
+            .publish_all(&event)
+            .await
+            .map_err(|e| {
+                StateNodeError::NetworkError(NetworkError::ProtocolError(e.to_string()))
+            })?;
 
         Ok(event)
     }
@@ -266,23 +284,24 @@ where
     /// Note: The CRDT history and CID are preserved for:
     /// - Offline nodes to receive deletion notification via event
     /// - Historical record keeping
-    pub async fn delete_content(&self, content_id: &str) -> Result<Event> {
+    pub async fn delete_content(&self, content_id: &str) -> Result<Event, StateNodeError> {
         // 1. Verify content network exists
+        let content_id_vo = ContentId::new(content_id.to_string())?;
         let network = self
             .content_repo
             .read()
             .await
             .get_content_network(content_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("Content network not found: {}", content_id))?;
+            .await
+            .map_err(|e| StateNodeError::StorageError(e.to_string()))?
+            .ok_or_else(|| StateNodeError::ContentNotFound(content_id_vo.clone()))?;
 
         // 2. Verify local node is a member (only members can delete)
-        if !network.member_nodes.contains(&self.local_node_id) {
-            return Err(anyhow::anyhow!(
-                "Local node {} is not a member of content network {}",
-                self.local_node_id,
-                content_id
-            ));
+        if !network.has_member_str(&self.local_node_id) {
+            return Err(StateNodeError::NotAMember {
+                node_id: self.local_node_id.clone(),
+                content_id: content_id_vo,
+            });
         }
 
         // 3. Delete the ContentNetwork
@@ -290,7 +309,8 @@ where
             .write()
             .await
             .delete_content_network(content_id)
-            .await?;
+            .await
+            .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
 
         // 4. Create and publish ContentDeleted event
         let event = Event::ContentDeleted {
@@ -299,35 +319,46 @@ where
             timestamp: current_timestamp(),
         };
 
-        self.event_publisher.publish_all(&event).await?;
+        self.event_publisher
+            .publish_all(&event)
+            .await
+            .map_err(|e| {
+                StateNodeError::NetworkError(NetworkError::ProtocolError(e.to_string()))
+            })?;
 
         Ok(event)
     }
 
     /// Update existing content.
-    pub async fn update_content(&self, content_id: &str, data: &[u8]) -> Result<Event> {
+    pub async fn update_content(
+        &self,
+        content_id: &str,
+        data: &[u8],
+    ) -> Result<Event, StateNodeError> {
         // 1. Verify content network exists
+        let content_id_vo = ContentId::new(content_id.to_string())?;
         let network = self
             .content_repo
             .read()
             .await
             .get_content_network(content_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("Content network not found: {}", content_id))?;
+            .await
+            .map_err(|e| StateNodeError::StorageError(e.to_string()))?
+            .ok_or_else(|| StateNodeError::ContentNotFound(content_id_vo.clone()))?;
 
         // 2. Verify local node is a member
-        if !network.member_nodes.contains(&self.local_node_id) {
-            return Err(anyhow::anyhow!(
-                "Local node {} is not a member of content network {}",
-                self.local_node_id,
-                content_id
-            ));
+        if !network.has_member_str(&self.local_node_id) {
+            return Err(StateNodeError::NotAMember {
+                node_id: self.local_node_id.clone(),
+                content_id: content_id_vo,
+            });
         }
 
         // 3. Update content in CRDT repository
         self.crdt_repo
             .update_content(content_id, data, &self.local_node_id)
-            .await?;
+            .await
+            .map_err(|e| StateNodeError::CrdtError(CrdtError::StorageError(e.to_string())))?;
 
         // 4. Create and publish update event both locally and to the network
         let event = Event::ContentUpdated {
@@ -336,7 +367,12 @@ where
             timestamp: current_timestamp(),
         };
 
-        self.event_publisher.publish_all(&event).await?;
+        self.event_publisher
+            .publish_all(&event)
+            .await
+            .map_err(|e| {
+                StateNodeError::NetworkError(NetworkError::ProtocolError(e.to_string()))
+            })?;
 
         // 5. Check and maintain redundancy (best effort - don't fail update if this fails)
         if let Err(e) = self.check_and_maintain_redundancy(content_id).await {
@@ -355,60 +391,78 @@ where
     /// This uses the same node selection pattern as create_content:
     /// find closest peers via DHT and select by capacity.
     /// Only existing members can add new members.
-    pub async fn add_member_to_content(&self, content_id: &str, count: usize) -> Result<Event> {
+    pub async fn add_member_to_content(
+        &self,
+        content_id: &str,
+        count: usize,
+    ) -> Result<Event, StateNodeError> {
         use crate::domain::content_network::add_member_node;
 
         // 1. Get content network
+        let content_id_vo = ContentId::new(content_id.to_string())?;
         let network = self
             .content_repo
             .read()
             .await
             .get_content_network(content_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("Content network {} not found", content_id))?;
+            .await
+            .map_err(|e| StateNodeError::StorageError(e.to_string()))?
+            .ok_or_else(|| StateNodeError::ContentNotFound(content_id_vo.clone()))?;
 
         // 2. Verify caller is a member
-        if !network.member_nodes.contains(&self.local_node_id) {
-            return Err(anyhow::anyhow!(
-                "Local node {} is not a member of content network {}",
-                self.local_node_id,
-                content_id
-            ));
+        if !network.has_member_str(&self.local_node_id) {
+            return Err(StateNodeError::NotAMember {
+                node_id: self.local_node_id.clone(),
+                content_id: content_id_vo,
+            });
         }
 
         // 3. Find closest peers (same pattern as create_content)
         let key = compute_dht_key(content_id);
-        let k = count + network.member_nodes.len(); // Request more to filter
-        let closest = self.peer_network.find_closest_peers(key, k).await?;
+        let k = count + network.member_count(); // Request more to filter
+        let closest = self
+            .peer_network
+            .find_closest_peers(key, k)
+            .await
+            .map_err(|e| {
+                StateNodeError::NetworkError(NetworkError::ConnectionFailed(e.to_string()))
+            })?;
         let caps = self
             .peer_network
             .query_node_capacity_batch(&closest)
-            .await?;
+            .await
+            .map_err(|e| {
+                StateNodeError::NetworkError(NetworkError::ConnectionFailed(e.to_string()))
+            })?;
 
         // 4. Select nodes: exclude existing members, sort by capacity
         let mut scored: Vec<(u64, String)> = closest
             .into_iter()
-            .filter(|peer| !network.member_nodes.contains(peer)) // Exclude existing members
+            .filter(|peer| !network.has_member_str(peer)) // Exclude existing members
             .map(|peer| (caps.get(&peer).cloned().unwrap_or(0), peer))
             .collect();
         scored.sort_by(|a, b| b.0.cmp(&a.0));
         let selected: Vec<String> = scored.into_iter().take(count).map(|(_, pid)| pid).collect();
 
         if selected.is_empty() {
-            return Err(anyhow::anyhow!(
-                "No available nodes found to add as members"
-            ));
+            return Err(StateNodeError::NoAvailableMembers);
         }
 
         // 5. Add each node using domain function
         let mut updated_network = network;
         let mut last_event = None;
         for node_id in &selected {
-            let (net, events) = add_member_node(updated_network, node_id.clone());
+            let node_id_vo = crate::domain::value_objects::NodeId::new(node_id.clone())?;
+            let (net, events) = add_member_node(updated_network, node_id_vo);
             updated_network = net;
             // Publish each event
             for event in events {
-                self.event_publisher.publish_all(&event).await?;
+                self.event_publisher
+                    .publish_all(&event)
+                    .await
+                    .map_err(|e| {
+                        StateNodeError::NetworkError(NetworkError::ProtocolError(e.to_string()))
+                    })?;
                 last_event = Some(event);
             }
         }
@@ -418,9 +472,10 @@ where
             .write()
             .await
             .save_content_network(updated_network)
-            .await?;
+            .await
+            .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
 
-        last_event.ok_or_else(|| anyhow::anyhow!("No events generated"))
+        last_event.ok_or_else(|| StateNodeError::Internal("No events generated".to_string()))
     }
 
     /// Check and maintain redundancy for a content network.
@@ -432,29 +487,37 @@ where
     /// 4. Removes low-capacity members after new members are added
     ///
     /// Called automatically after content updates.
-    pub async fn check_and_maintain_redundancy(&self, content_id: &str) -> Result<()> {
+    pub async fn check_and_maintain_redundancy(
+        &self,
+        content_id: &str,
+    ) -> Result<(), StateNodeError> {
         use crate::domain::content_network::remove_member_node;
 
         // 1. Get content network
+        let content_id_vo = ContentId::new(content_id.to_string())?;
         let network = self
             .content_repo
             .read()
             .await
             .get_content_network(content_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("Content network {} not found", content_id))?;
+            .await
+            .map_err(|e| StateNodeError::StorageError(e.to_string()))?
+            .ok_or_else(|| StateNodeError::ContentNotFound(content_id_vo.clone()))?;
 
         // Only check if we're a member
-        if !network.member_nodes.contains(&self.local_node_id) {
+        if !network.has_member_str(&self.local_node_id) {
             return Ok(());
         }
 
         // 2. Query capacity of all member nodes
-        let member_list: Vec<String> = network.member_nodes.iter().cloned().collect();
+        let member_list: Vec<String> = network.member_nodes_as_strings();
         let capacities = self
             .peer_network
             .query_node_capacity_batch(&member_list)
-            .await?;
+            .await
+            .map_err(|e| {
+                StateNodeError::NetworkError(NetworkError::ConnectionFailed(e.to_string()))
+            })?;
 
         // 3. Identify low-capacity nodes
         let mut low_capacity_nodes: Vec<String> = Vec::new();
@@ -505,8 +568,9 @@ where
             .read()
             .await
             .get_content_network(content_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("Content network {} not found", content_id))?;
+            .await
+            .map_err(|e| StateNodeError::StorageError(e.to_string()))?
+            .ok_or_else(|| StateNodeError::ContentNotFound(content_id_vo.clone()))?;
 
         let mut updated_network = network;
         for node_id in low_capacity_nodes {
@@ -516,7 +580,7 @@ where
             }
 
             // Don't remove if it would drop below minimum
-            if updated_network.member_nodes.len() <= self.min_replication_factor {
+            if updated_network.member_count() <= self.min_replication_factor {
                 tracing::info!(
                     "Skipping removal of {} - would drop below minimum replication factor",
                     node_id
@@ -524,12 +588,18 @@ where
                 break;
             }
 
+            let node_id_vo = crate::domain::value_objects::NodeId::new(node_id.clone())?;
             let (net, events) =
-                remove_member_node(updated_network, node_id.clone(), "low_capacity".to_string());
+                remove_member_node(updated_network, node_id_vo, "low_capacity".to_string());
             updated_network = net;
 
             for event in events {
-                self.event_publisher.publish_all(&event).await?;
+                self.event_publisher
+                    .publish_all(&event)
+                    .await
+                    .map_err(|e| {
+                        StateNodeError::NetworkError(NetworkError::ProtocolError(e.to_string()))
+                    })?;
                 tracing::info!(
                     "Removed low-capacity member {} from content {}",
                     node_id,
@@ -543,7 +613,8 @@ where
             .write()
             .await
             .save_content_network(updated_network)
-            .await?;
+            .await
+            .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
 
         Ok(())
     }
@@ -552,7 +623,7 @@ where
     ///
     /// Returns `ApplyOutcome::NeedsSync` when the caller should perform content
     /// synchronization (e.g., call `ContentSyncService::sync_from_peers`).
-    pub async fn handle_sync_event(&self, event: &Event) -> Result<ApplyOutcome> {
+    pub async fn handle_sync_event(&self, event: &Event) -> Result<ApplyOutcome, StateNodeError> {
         match event {
             Event::ContentUpdated {
                 content_id,
@@ -570,12 +641,13 @@ where
                     .read()
                     .await
                     .get_content_network(content_id)
-                    .await?;
+                    .await
+                    .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
 
                 match network {
                     Some(net) => {
                         // If we're a member of this content network, we need to sync
-                        if net.member_nodes.contains(&self.local_node_id) {
+                        if net.has_member_str(&self.local_node_id) {
                             Ok(ApplyOutcome::NeedsSync {
                                 content_id: content_id.clone(),
                             })
@@ -599,15 +671,14 @@ where
                 member_nodes,
                 ..
             } => {
-                let network = ContentNetwork {
-                    content_id: content_id.clone(),
-                    member_nodes: member_nodes.iter().cloned().collect(),
-                };
+                let network =
+                    ContentNetwork::from_strings(content_id.clone(), member_nodes.clone())?;
                 self.content_repo
                     .write()
                     .await
                     .save_content_network(network)
-                    .await?;
+                    .await
+                    .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
 
                 // If we're now a member, we need to sync the content
                 if member_nodes.contains(&self.local_node_id) {
@@ -626,15 +697,14 @@ where
                 ..
             } => {
                 // Update local network with new member list
-                let network = ContentNetwork {
-                    content_id: content_id.clone(),
-                    member_nodes: member_nodes.iter().cloned().collect(),
-                };
+                let network =
+                    ContentNetwork::from_strings(content_id.clone(), member_nodes.clone())?;
                 self.content_repo
                     .write()
                     .await
                     .save_content_network(network)
-                    .await?;
+                    .await
+                    .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
 
                 // If we were removed, log it
                 if removed_node_id == &self.local_node_id {
@@ -653,15 +723,14 @@ where
                 member_nodes,
                 ..
             } => {
-                let network = ContentNetwork {
-                    content_id: content_id.clone(),
-                    member_nodes: member_nodes.iter().cloned().collect(),
-                };
+                let network =
+                    ContentNetwork::from_strings(content_id.clone(), member_nodes.clone())?;
                 self.content_repo
                     .write()
                     .await
                     .save_content_network(network)
-                    .await?;
+                    .await
+                    .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
 
                 // If we're a member of this new content, we need to sync it
                 if member_nodes.contains(&self.local_node_id) {
@@ -688,7 +757,8 @@ where
                     .write()
                     .await
                     .upsert_node(&snapshot)
-                    .await?;
+                    .await
+                    .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
                 Ok(ApplyOutcome::Applied)
             }
 
@@ -715,7 +785,8 @@ where
                         .write()
                         .await
                         .delete_content_network(content_id)
-                        .await?;
+                        .await
+                        .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
                     tracing::info!(
                         "Content {} deleted by node {}, removed local ContentNetwork",
                         content_id,
@@ -731,18 +802,33 @@ where
     }
 
     /// Get node info.
-    pub async fn get_node(&self, node_id: &str) -> Result<Option<NodeSnapshot>> {
-        self.node_registry.read().await.get_node(node_id).await
+    pub async fn get_node(&self, node_id: &str) -> Result<Option<NodeSnapshot>, StateNodeError> {
+        self.node_registry
+            .read()
+            .await
+            .get_node(node_id)
+            .await
+            .map_err(|e| StateNodeError::StorageError(e.to_string()))
     }
 
     /// List all nodes.
-    pub async fn list_nodes(&self) -> Result<Vec<String>> {
-        self.node_registry.read().await.list_nodes().await
+    pub async fn list_nodes(&self) -> Result<Vec<String>, StateNodeError> {
+        self.node_registry
+            .read()
+            .await
+            .list_nodes()
+            .await
+            .map_err(|e| StateNodeError::StorageError(e.to_string()))
     }
 
     /// List all content networks.
-    pub async fn list_content_networks(&self) -> Result<Vec<String>> {
-        self.content_repo.read().await.list_content_networks().await
+    pub async fn list_content_networks(&self) -> Result<Vec<String>, StateNodeError> {
+        self.content_repo
+            .read()
+            .await
+            .list_content_networks()
+            .await
+            .map_err(|e| StateNodeError::StorageError(e.to_string()))
     }
 
     /// Get content network info (test-only).
@@ -772,7 +858,11 @@ where
     /// 2. The content exists
     ///
     /// Returns Ok(true) if access is allowed, Ok(false) if denied.
-    pub async fn verify_access(&self, content_id: &str, token_iat: u64) -> Result<bool> {
+    pub async fn verify_access(
+        &self,
+        content_id: &str,
+        token_iat: u64,
+    ) -> Result<bool, StateNodeError> {
         let ac_repo = match &self.access_control_repo {
             Some(repo) => repo,
             None => {
@@ -782,7 +872,12 @@ where
         };
 
         // Get access control state
-        let access_control = ac_repo.read().await.get_access_control(content_id).await?;
+        let access_control = ac_repo
+            .read()
+            .await
+            .get_access_control(content_id)
+            .await
+            .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
 
         match access_control {
             Some(ac) => {
@@ -800,13 +895,18 @@ where
     pub async fn get_access_control(
         &self,
         content_id: &str,
-    ) -> Result<Option<ContentAccessControl>> {
+    ) -> Result<Option<ContentAccessControl>, StateNodeError> {
         let ac_repo = match &self.access_control_repo {
             Some(repo) => repo,
             None => return Ok(None),
         };
 
-        ac_repo.read().await.get_access_control(content_id).await
+        ac_repo
+            .read()
+            .await
+            .get_access_control(content_id)
+            .await
+            .map_err(|e| StateNodeError::StorageError(e.to_string()))
     }
 
     /// Update access control for a content.
@@ -864,7 +964,10 @@ where
     /// Initialize access control for a new content.
     ///
     /// Called when content is created to set up initial access control state.
-    pub async fn init_access_control(&self, content_id: &str) -> Result<ContentAccessControl> {
+    pub async fn init_access_control(
+        &self,
+        content_id: &str,
+    ) -> Result<ContentAccessControl, StateNodeError> {
         let ac_repo = match &self.access_control_repo {
             Some(repo) => repo,
             None => {
@@ -878,7 +981,8 @@ where
             .write()
             .await
             .save_access_control(&access_control)
-            .await?;
+            .await
+            .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
 
         Ok(access_control)
     }
@@ -1054,7 +1158,7 @@ mod tests {
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("no available member nodes"));
+            .contains("No available member nodes found"));
     }
 
     #[tokio::test]
@@ -1138,7 +1242,7 @@ mod tests {
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("Content network not found"));
+            .contains("Content not found"));
     }
 
     #[tokio::test]
@@ -1188,8 +1292,8 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(network.member_nodes.contains("node-1"));
-        assert!(network.member_nodes.contains("node-2"));
+        assert!(network.has_member_str("node-1"));
+        assert!(network.has_member_str("node-2"));
     }
 
     #[tokio::test]
@@ -1214,7 +1318,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(!network.member_nodes.contains("node-1"));
+        assert!(!network.has_member_str("node-1"));
     }
 
     #[tokio::test]
@@ -1372,7 +1476,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(network.member_nodes.len(), 3);
+        assert_eq!(network.member_count(), 3);
     }
 
     #[tokio::test]
@@ -1395,7 +1499,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(network.member_nodes.len(), 2);
+        assert_eq!(network.member_count(), 2);
     }
 
     #[tokio::test]

@@ -401,7 +401,7 @@ impl MockContentNetworkRepository {
 
     pub fn with_network(self, network: ContentNetwork) -> Self {
         let mut networks = HashMap::new();
-        networks.insert(network.content_id.clone(), network);
+        networks.insert(network.content_id().as_str().to_string(), network);
         Self {
             networks: Arc::new(Mutex::new(networks)),
         }
@@ -422,7 +422,7 @@ impl PersistentContentRepository for MockContentNetworkRepository {
         self.networks
             .lock()
             .await
-            .insert(net.content_id.clone(), net);
+            .insert(net.content_id().as_str().to_string(), net);
         Ok(())
     }
 
@@ -446,10 +446,9 @@ impl PersistentContentRepository for MockContentNetworkRepository {
 
 /// Create a test ContentNetwork with the given members.
 pub fn create_test_network(content_id: &str, members: Vec<&str>) -> ContentNetwork {
-    ContentNetwork {
-        content_id: content_id.to_string(),
-        member_nodes: members.into_iter().map(|s| s.to_string()).collect(),
-    }
+    let member_strings: Vec<String> = members.into_iter().map(|s| s.to_string()).collect();
+    ContentNetwork::from_strings(content_id.to_string(), member_strings)
+        .expect("Failed to create test network")
 }
 
 /// Create a test NodeSnapshot.

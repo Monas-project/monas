@@ -103,7 +103,7 @@ impl PersistentContentRepository for SledContentNetworkRepository {
     async fn save_content_network(&self, net: ContentNetwork) -> Result<()> {
         let tree = self.content_tree()?;
         let value = serde_json::to_vec(&net).context("Failed to serialize content network")?;
-        tree.insert(net.content_id.as_bytes(), value)
+        tree.insert(net.content_id().as_str().as_bytes(), value)
             .context("Failed to insert content network")?;
         Ok(())
     }
@@ -139,7 +139,7 @@ impl PersistentContentRepository for SledContentNetworkRepository {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeSet;
+    use crate::domain::value_objects::{ContentId, NodeId};
     use tempfile::TempDir;
 
     #[tokio::test]
@@ -147,14 +147,11 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let repo = SledContentNetworkRepository::open(temp_dir.path()).unwrap();
 
-        let mut members = BTreeSet::new();
-        members.insert("node-1".to_string());
-        members.insert("node-2".to_string());
-
-        let network = ContentNetwork {
-            content_id: "cid-1".to_string(),
-            member_nodes: members,
-        };
+        let network = ContentNetwork::from_strings(
+            "cid-1".to_string(),
+            vec!["node-1".to_string(), "node-2".to_string()],
+        )
+        .unwrap();
 
         repo.save_content_network(network.clone()).await.unwrap();
 
@@ -167,14 +164,14 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let repo = SledContentNetworkRepository::open(temp_dir.path()).unwrap();
 
-        let network1 = ContentNetwork {
-            content_id: "cid-1".to_string(),
-            member_nodes: BTreeSet::new(),
-        };
-        let network2 = ContentNetwork {
-            content_id: "cid-2".to_string(),
-            member_nodes: BTreeSet::new(),
-        };
+        let network1 = ContentNetwork::new(
+            ContentId::new("cid-1".to_string()).unwrap(),
+            NodeId::new("node-1".to_string()).unwrap(),
+        );
+        let network2 = ContentNetwork::new(
+            ContentId::new("cid-2".to_string()).unwrap(),
+            NodeId::new("node-2".to_string()).unwrap(),
+        );
 
         repo.save_content_network(network1).await.unwrap();
         repo.save_content_network(network2).await.unwrap();
@@ -207,10 +204,10 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let repo = SledContentNetworkRepository::open(temp_dir.path()).unwrap();
 
-        let network = ContentNetwork {
-            content_id: "cid-1".to_string(),
-            member_nodes: BTreeSet::new(),
-        };
+        let network = ContentNetwork::new(
+            ContentId::new("cid-1".to_string()).unwrap(),
+            NodeId::new("node-1".to_string()).unwrap(),
+        );
 
         repo.save_content_network(network).await.unwrap();
         assert!(repo.get_content_network("cid-1").await.unwrap().is_some());

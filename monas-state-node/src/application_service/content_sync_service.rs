@@ -199,14 +199,15 @@ where
         }
 
         // 3. Push to each member node
-        for node_id in network.member_nodes {
-            if node_id == self.local_node_id {
+        for node_id in network.member_nodes() {
+            let node_id_str = node_id.as_str();
+            if node_id_str == self.local_node_id {
                 continue; // Skip self
             }
 
             match self
                 .peer_network
-                .push_operations(&node_id, genesis_cid, &operations)
+                .push_operations(node_id_str, genesis_cid, &operations)
                 .await
             {
                 Ok(accepted) => {
@@ -253,7 +254,7 @@ where
                 .get_content_network(&content_id)
                 .await
             {
-                if network.member_nodes.contains(&self.local_node_id) {
+                if network.has_member_str(&self.local_node_id) {
                     match self.sync_from_peers(&content_id).await {
                         Ok(result) => {
                             results.push((content_id, result));

@@ -1,6 +1,7 @@
 //! HTTP API for the state node.
 
 use crate::application_service::state_node_service::StateNodeService;
+use crate::domain::errors::StateNodeError;
 use crate::infrastructure::crdt_repository::CrslCrdtRepository;
 use crate::infrastructure::gossipsub_publisher::GossipsubEventPublisher;
 use crate::infrastructure::network::Libp2pNetwork;
@@ -9,7 +10,7 @@ use crate::port::content_repository::ContentRepository;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{get, post, put},
     Json, Router,
 };
@@ -120,6 +121,17 @@ pub struct ErrorResponse {
     pub error: String,
 }
 
+/// Implement IntoResponse for StateNodeError to automatically map to HTTP responses.
+impl IntoResponse for StateNodeError {
+    fn into_response(self) -> Response {
+        let status = self.to_http_status();
+        let error_response = ErrorResponse {
+            error: self.to_string(),
+        };
+        (status, Json(error_response)).into_response()
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct ContentDataResponse {
     pub content_id: String,
@@ -167,13 +179,7 @@ async fn node_info(State(state): State<AppState>) -> impl IntoResponse {
             available_capacity: None,
         })
         .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-            .into_response(),
+        Err(e) => e.into_response(),
     }
 }
 
@@ -189,13 +195,7 @@ async fn register_node(
             available_capacity: snapshot.available_capacity,
         })
         .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-            .into_response(),
+        Err(e) => e.into_response(),
     }
 }
 
@@ -203,13 +203,7 @@ async fn register_node(
 async fn list_nodes(State(state): State<AppState>) -> impl IntoResponse {
     match state.list_nodes().await {
         Ok(nodes) => Json::<Vec<String>>(nodes).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-            .into_response(),
+        Err(e) => e.into_response(),
     }
 }
 
@@ -247,13 +241,7 @@ async fn create_content(
                     .into_response()
             }
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-            .into_response(),
+        Err(e) => e.into_response(),
     }
 }
 
@@ -284,13 +272,7 @@ async fn update_content(
             updated: true,
         })
         .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-            .into_response(),
+        Err(e) => e.into_response(),
     }
 }
 
@@ -309,18 +291,7 @@ async fn delete_content(
             deleted: true,
         })
         .into_response(),
-        Err(e) => {
-            // Check if it's a "not found" error
-            let error_msg = e.to_string();
-            let status = if error_msg.contains("not found") {
-                StatusCode::NOT_FOUND
-            } else if error_msg.contains("not a member") {
-                StatusCode::FORBIDDEN
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
-            };
-            (status, Json(ErrorResponse { error: error_msg })).into_response()
-        }
+        Err(e) => e.into_response(),
     }
 }
 
@@ -357,13 +328,7 @@ async fn add_members(
                     .into_response()
             }
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-            .into_response(),
+        Err(e) => e.into_response(),
     }
 }
 
@@ -371,13 +336,7 @@ async fn add_members(
 async fn list_contents(State(state): State<AppState>) -> impl IntoResponse {
     match state.list_content_networks().await {
         Ok(contents) => Json::<Vec<String>>(contents).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-            .into_response(),
+        Err(e) => e.into_response(),
     }
 }
 
