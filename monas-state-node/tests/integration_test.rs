@@ -534,15 +534,13 @@ async fn test_access_control_update_missing_signature() {
 }
 
 // ============================================================
-// ShareToken Verification Tests
+// AuthToken Verification Tests
 // ============================================================
 
-mod share_token_tests {
+mod auth_token_tests {
     use monas_state_node::domain::access_control::ContentAccessControl;
-    use monas_state_node::domain::share_token::{CapabilityAction, KeyId};
-    use monas_state_node::domain::share_token_verifier::{
-        ShareTokenVerifier, ShareTokenVerifyError,
-    };
+    use monas_state_node::domain::auth_token::{CapabilityAction, KeyId};
+    use monas_state_node::domain::auth_token_verifier::{AuthTokenVerifier, AuthTokenVerifyError};
     use p256::ecdsa::signature::DigestSigner;
     use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
     use p256::elliptic_curve::rand_core::OsRng;
@@ -655,8 +653,8 @@ mod share_token_tests {
     }
 
     #[test]
-    fn share_token_verification_integration() {
-        // Simulate content owner creating and signing a ShareToken
+    fn auth_token_verification_integration() {
+        // Simulate content owner creating and signing a AuthToken
         let (owner_signing_key, owner_pk) = generate_test_keypair();
         let (_, recipient_pk) = generate_test_keypair();
         let content_id = "test-content-abc123";
@@ -677,7 +675,7 @@ mod share_token_tests {
         );
 
         // State Node verifies the token
-        let result = ShareTokenVerifier::verify(
+        let result = AuthTokenVerifier::verify(
             &jwt,
             &owner_pk,
             Some(&KeyId::new(recipient_pk.clone())),
@@ -693,7 +691,7 @@ mod share_token_tests {
     }
 
     #[test]
-    fn share_token_with_access_control_invalidation() {
+    fn auth_token_with_access_control_invalidation() {
         let (owner_signing_key, owner_pk) = generate_test_keypair();
         let (_, recipient_pk) = generate_test_keypair();
         let content_id = "test-content-invalidation";
@@ -718,7 +716,7 @@ mod share_token_tests {
         access_control.invalidate_before(now + 3600).unwrap();
 
         // Verification should fail due to invalidation
-        let result = ShareTokenVerifier::verify(
+        let result = AuthTokenVerifier::verify(
             &jwt,
             &owner_pk,
             None,
@@ -727,11 +725,11 @@ mod share_token_tests {
             Some(&access_control),
         );
 
-        assert!(matches!(result, Err(ShareTokenVerifyError::Invalidated)));
+        assert!(matches!(result, Err(AuthTokenVerifyError::Invalidated)));
     }
 
     #[test]
-    fn share_token_owner_role_capabilities() {
+    fn auth_token_owner_role_capabilities() {
         let (owner_signing_key, owner_pk) = generate_test_keypair();
         let (_, recipient_pk) = generate_test_keypair();
         let content_id = "test-content-owner-role";
@@ -753,14 +751,13 @@ mod share_token_tests {
 
         // Verify all owner actions are granted
         for action in CapabilityAction::owner_actions() {
-            let result =
-                ShareTokenVerifier::verify(&jwt, &owner_pk, None, content_id, action, None);
+            let result = AuthTokenVerifier::verify(&jwt, &owner_pk, None, content_id, action, None);
             assert!(result.is_ok(), "Owner should have {:?} capability", action);
         }
     }
 
     #[test]
-    fn share_token_editor_role_capabilities() {
+    fn auth_token_editor_role_capabilities() {
         let (owner_signing_key, owner_pk) = generate_test_keypair();
         let (_, recipient_pk) = generate_test_keypair();
         let content_id = "test-content-editor-role";
@@ -781,7 +778,7 @@ mod share_token_tests {
         );
 
         // Editor should have Read and Write
-        let read_result = ShareTokenVerifier::verify(
+        let read_result = AuthTokenVerifier::verify(
             &jwt,
             &owner_pk,
             None,
@@ -791,7 +788,7 @@ mod share_token_tests {
         );
         assert!(read_result.is_ok());
 
-        let write_result = ShareTokenVerifier::verify(
+        let write_result = AuthTokenVerifier::verify(
             &jwt,
             &owner_pk,
             None,
@@ -802,7 +799,7 @@ mod share_token_tests {
         assert!(write_result.is_ok());
 
         // Editor should NOT have Delete, Share, Revoke, Reencrypt
-        let delete_result = ShareTokenVerifier::verify(
+        let delete_result = AuthTokenVerifier::verify(
             &jwt,
             &owner_pk,
             None,
@@ -812,12 +809,12 @@ mod share_token_tests {
         );
         assert!(matches!(
             delete_result,
-            Err(ShareTokenVerifyError::InsufficientCapability { .. })
+            Err(AuthTokenVerifyError::InsufficientCapability { .. })
         ));
     }
 
     #[test]
-    fn share_token_viewer_role_capabilities() {
+    fn auth_token_viewer_role_capabilities() {
         let (owner_signing_key, owner_pk) = generate_test_keypair();
         let (_, recipient_pk) = generate_test_keypair();
         let content_id = "test-content-viewer-role";
@@ -838,7 +835,7 @@ mod share_token_tests {
         );
 
         // Viewer should have Read
-        let read_result = ShareTokenVerifier::verify(
+        let read_result = AuthTokenVerifier::verify(
             &jwt,
             &owner_pk,
             None,
@@ -849,7 +846,7 @@ mod share_token_tests {
         assert!(read_result.is_ok());
 
         // Viewer should NOT have Write
-        let write_result = ShareTokenVerifier::verify(
+        let write_result = AuthTokenVerifier::verify(
             &jwt,
             &owner_pk,
             None,
@@ -859,12 +856,12 @@ mod share_token_tests {
         );
         assert!(matches!(
             write_result,
-            Err(ShareTokenVerifyError::InsufficientCapability { .. })
+            Err(AuthTokenVerifyError::InsufficientCapability { .. })
         ));
     }
 
     #[test]
-    fn share_token_reencrypt_permission() {
+    fn auth_token_reencrypt_permission() {
         let (owner_signing_key, owner_pk) = generate_test_keypair();
         let (_, recipient_pk) = generate_test_keypair();
         let content_id = "test-content-reencrypt";
@@ -885,7 +882,7 @@ mod share_token_tests {
         );
 
         // Should have Reencrypt
-        let result = ShareTokenVerifier::verify(
+        let result = AuthTokenVerifier::verify(
             &jwt,
             &owner_pk,
             None,
@@ -896,7 +893,7 @@ mod share_token_tests {
         assert!(result.is_ok());
 
         // But NOT Read (Reencrypt doesn't imply Read)
-        let read_result = ShareTokenVerifier::verify(
+        let read_result = AuthTokenVerifier::verify(
             &jwt,
             &owner_pk,
             None,
@@ -906,7 +903,7 @@ mod share_token_tests {
         );
         assert!(matches!(
             read_result,
-            Err(ShareTokenVerifyError::InsufficientCapability { .. })
+            Err(AuthTokenVerifyError::InsufficientCapability { .. })
         ));
     }
 }

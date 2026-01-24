@@ -1,8 +1,8 @@
-//! Signature verification for ShareToken and request signatures.
+//! Signature verification for AuthToken and request signatures.
 //!
 //! This module provides signature verification functionality using P256 (ES256).
 
-use super::share_token::{ShareToken, ShareTokenError};
+use super::auth_token::{AuthToken, AuthTokenError};
 use anyhow::{Context, Result};
 use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
 
@@ -10,15 +10,15 @@ use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
 pub struct SignatureVerifier;
 
 impl SignatureVerifier {
-    /// Verify ShareToken signature using owner's public key
+    /// Verify AuthToken signature using owner's public key
     ///
     /// # Arguments
-    /// * `token` - The ShareToken to verify
+    /// * `token` - The AuthToken to verify
     /// * `owner_public_key` - Owner's public key in uncompressed format (65 bytes)
     ///
     /// # Returns
     /// Ok(()) if signature is valid, Err otherwise
-    pub fn verify_share_token_signature(token: &ShareToken, owner_public_key: &[u8]) -> Result<()> {
+    pub fn verify_auth_token_signature(token: &AuthToken, owner_public_key: &[u8]) -> Result<()> {
         let message = token.signing_message()?;
 
         // Parse P256 public key from SEC1 uncompressed format
@@ -32,7 +32,7 @@ impl SignatureVerifier {
         // Verify signature
         verifying_key
             .verify(&message, &signature)
-            .map_err(|e| ShareTokenError::SignatureVerificationFailed(e.to_string()))?;
+            .map_err(|e| AuthTokenError::SignatureVerificationFailed(e.to_string()))?;
 
         Ok(())
     }
@@ -61,7 +61,7 @@ impl SignatureVerifier {
         // Verify signature
         verifying_key
             .verify(message, &sig)
-            .map_err(|e| ShareTokenError::SignatureVerificationFailed(e.to_string()))?;
+            .map_err(|e| AuthTokenError::SignatureVerificationFailed(e.to_string()))?;
 
         Ok(())
     }
@@ -74,14 +74,14 @@ mod tests {
     use rand::rngs::OsRng;
 
     #[test]
-    fn test_verify_share_token_signature() {
+    fn test_verify_auth_token_signature() {
         // Generate a test key pair
         let signing_key = SigningKey::random(&mut OsRng);
         let verifying_key = signing_key.verifying_key();
         let public_key_bytes = verifying_key.to_encoded_point(false).as_bytes().to_vec();
 
-        // Create a test ShareToken
-        let payload = super::super::share_token::ShareTokenPayload {
+        // Create a test AuthToken
+        let payload = super::super::auth_token::AuthTokenPayload {
             iss: "user:alice".to_string(),
             aud: "user:bob".to_string(),
             exp: None,
@@ -91,7 +91,7 @@ mod tests {
             fct: None,
         };
 
-        let mut token = ShareToken::new(payload, vec![]);
+        let mut token = AuthToken::new(payload, vec![]);
         let message = token.signing_message().unwrap();
 
         // Sign the message
@@ -99,19 +99,19 @@ mod tests {
         token.signature = signature.to_vec();
 
         // Verify the signature
-        let result = SignatureVerifier::verify_share_token_signature(&token, &public_key_bytes);
+        let result = SignatureVerifier::verify_auth_token_signature(&token, &public_key_bytes);
         assert!(result.is_ok());
     }
 
     #[test]
-    fn test_verify_share_token_signature_invalid() {
+    fn test_verify_auth_token_signature_invalid() {
         // Generate a test key pair
         let signing_key = SigningKey::random(&mut OsRng);
         let verifying_key = signing_key.verifying_key();
         let public_key_bytes = verifying_key.to_encoded_point(false).as_bytes().to_vec();
 
-        // Create a test ShareToken with invalid signature
-        let payload = super::super::share_token::ShareTokenPayload {
+        // Create a test AuthToken with invalid signature
+        let payload = super::super::auth_token::AuthTokenPayload {
             iss: "user:alice".to_string(),
             aud: "user:bob".to_string(),
             exp: None,
@@ -121,10 +121,10 @@ mod tests {
             fct: None,
         };
 
-        let token = ShareToken::new(payload, vec![0u8; 64]); // Invalid signature
+        let token = AuthToken::new(payload, vec![0u8; 64]); // Invalid signature
 
         // Verify should fail
-        let result = SignatureVerifier::verify_share_token_signature(&token, &public_key_bytes);
+        let result = SignatureVerifier::verify_auth_token_signature(&token, &public_key_bytes);
         assert!(result.is_err());
     }
 

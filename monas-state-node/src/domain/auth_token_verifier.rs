@@ -1,20 +1,20 @@
-//! ShareToken verification service for State Nodes.
+//! AuthToken verification service for State Nodes.
 //!
-//! This module provides verification logic for ShareTokens (UCAN-based authorization).
+//! This module provides verification logic for AuthTokens (UCAN-based authorization).
 //! State Nodes use this to validate incoming requests and ensure proper authorization.
 
 use crate::domain::access_control::ContentAccessControl;
-use crate::domain::share_token::{
-    CapabilityAction, KeyId, ShareToken, ShareTokenParseError, ShareTokenPayload,
+use crate::domain::auth_token::{
+    AuthToken, AuthTokenParseError, AuthTokenPayload, CapabilityAction, KeyId,
 };
 use crate::infrastructure::crypto::{verify_p256_signature, SignatureVerifyError};
 use thiserror::Error;
 
-/// Errors that can occur during ShareToken verification.
+/// Errors that can occur during AuthToken verification.
 #[derive(Debug, Error)]
-pub enum ShareTokenVerifyError {
+pub enum AuthTokenVerifyError {
     #[error("Token parsing error: {0}")]
-    ParseError(#[from] ShareTokenParseError),
+    ParseError(#[from] AuthTokenParseError),
 
     #[error("Signature verification failed: {0}")]
     SignatureError(#[from] SignatureVerifyError),
@@ -44,11 +44,11 @@ pub enum ShareTokenVerifyError {
     IssuerPublicKeyNotFound,
 }
 
-/// Result of ShareToken verification.
+/// Result of AuthToken verification.
 #[derive(Debug, Clone)]
 pub struct VerifiedToken {
     /// The verified token's payload
-    pub payload: ShareTokenPayload,
+    pub payload: AuthTokenPayload,
     /// The issuer's KeyId
     pub issuer: KeyId,
     /// The audience's KeyId
@@ -59,7 +59,7 @@ pub struct VerifiedToken {
     pub action: CapabilityAction,
 }
 
-/// ShareToken verifier for State Nodes.
+/// AuthToken verifier for State Nodes.
 ///
 /// This verifier performs the following checks:
 /// 1. JWT format and structure validation
@@ -67,10 +67,10 @@ pub struct VerifiedToken {
 /// 3. Expiration check
 /// 4. Access control validation (min_valid_issued_at)
 /// 5. Capability matching
-pub struct ShareTokenVerifier;
+pub struct AuthTokenVerifier;
 
-impl ShareTokenVerifier {
-    /// Verify a ShareToken for accessing a specific content with a required action.
+impl AuthTokenVerifier {
+    /// Verify a AuthToken for accessing a specific content with a required action.
     ///
     /// # Arguments
     /// * `jwt` - The JWT string to verify
@@ -82,7 +82,7 @@ impl ShareTokenVerifier {
     ///
     /// # Returns
     /// * `Ok(VerifiedToken)` if verification succeeds
-    /// * `Err(ShareTokenVerifyError)` if verification fails
+    /// * `Err(AuthTokenVerifyError)` if verification fails
     pub fn verify(
         jwt: &str,
         issuer_public_key: &[u8],
@@ -90,13 +90,13 @@ impl ShareTokenVerifier {
         content_id: &str,
         required_action: CapabilityAction,
         access_control: Option<&ContentAccessControl>,
-    ) -> Result<VerifiedToken, ShareTokenVerifyError> {
+    ) -> Result<VerifiedToken, AuthTokenVerifyError> {
         // 1. Parse the JWT
-        let token = ShareToken::from_jwt(jwt)?;
+        let token = AuthToken::from_jwt(jwt)?;
 
         // 2. Check algorithm (only P256/ES256 is supported)
         if token.header.alg != "ES256" {
-            return Err(ShareTokenVerifyError::UnsupportedAlgorithm(
+            return Err(AuthTokenVerifyError::UnsupportedAlgorithm(
                 token.header.alg.clone(),
             ));
         }
@@ -110,20 +110,20 @@ impl ShareTokenVerifier {
 
         // 4. Check expiration
         if token.payload.is_expired() {
-            return Err(ShareTokenVerifyError::Expired);
+            return Err(AuthTokenVerifyError::Expired);
         }
 
         // 5. Check access control (min_valid_issued_at)
         if let Some(ac) = access_control {
             if !ac.is_token_valid(token.payload.iat) {
-                return Err(ShareTokenVerifyError::Invalidated);
+                return Err(AuthTokenVerifyError::Invalidated);
             }
         }
 
         // 6. Check audience if specified
         if let Some(expected_aud) = expected_audience {
             if &token.payload.aud != expected_aud {
-                return Err(ShareTokenVerifyError::AudienceMismatch {
+                return Err(AuthTokenVerifyError::AudienceMismatch {
                     expected: expected_aud.to_string(),
                     actual: token.payload.aud.to_string(),
                 });
@@ -133,7 +133,7 @@ impl ShareTokenVerifier {
         // 7. Check capability
         let resource = format!("monas://content/{}", content_id);
         if !token.payload.has_capability(&resource, required_action) {
-            return Err(ShareTokenVerifyError::InsufficientCapability {
+            return Err(AuthTokenVerifyError::InsufficientCapability {
                 required: required_action,
                 resource,
             });
@@ -145,13 +145,13 @@ impl ShareTokenVerifier {
             .att
             .iter()
             .find_map(|cap| cap.content_id())
-            .ok_or_else(|| ShareTokenVerifyError::ContentIdMismatch {
+            .ok_or_else(|| AuthTokenVerifyError::ContentIdMismatch {
                 expected: content_id.to_string(),
                 actual: "none".to_string(),
             })?;
 
         if cap_content_id != content_id {
-            return Err(ShareTokenVerifyError::ContentIdMismatch {
+            return Err(AuthTokenVerifyError::ContentIdMismatch {
                 expected: content_id.to_string(),
                 actual: cap_content_id.to_string(),
             });
@@ -166,7 +166,7 @@ impl ShareTokenVerifier {
         })
     }
 
-    /// Verify only the signature of a ShareToken.
+    /// Verify only the signature of a AuthToken.
     ///
     /// This is a lightweight verification that only checks the signature,
     /// without checking expiration, access control, or capabilities.
@@ -176,16 +176,16 @@ impl ShareTokenVerifier {
     /// * `issuer_public_key` - The issuer's P256 public key
     ///
     /// # Returns
-    /// * `Ok(ShareToken)` if signature verification succeeds
-    /// * `Err(ShareTokenVerifyError)` if verification fails
+    /// * `Ok(AuthToken)` if signature verification succeeds
+    /// * `Err(AuthTokenVerifyError)` if verification fails
     pub fn verify_signature_only(
         jwt: &str,
         issuer_public_key: &[u8],
-    ) -> Result<ShareToken, ShareTokenVerifyError> {
-        let token = ShareToken::from_jwt(jwt)?;
+    ) -> Result<AuthToken, AuthTokenVerifyError> {
+        let token = AuthToken::from_jwt(jwt)?;
 
         if token.header.alg != "ES256" {
-            return Err(ShareTokenVerifyError::UnsupportedAlgorithm(
+            return Err(AuthTokenVerifyError::UnsupportedAlgorithm(
                 token.header.alg.clone(),
             ));
         }
@@ -333,7 +333,7 @@ mod tests {
             Some(now + 3600),
         );
 
-        let result = ShareTokenVerifier::verify(
+        let result = AuthTokenVerifier::verify(
             &jwt,
             &issuer_pk,
             Some(&KeyId::new(audience_pk.clone())),
@@ -369,7 +369,7 @@ mod tests {
             Some(now + 3600),
         );
 
-        let result = ShareTokenVerifier::verify(
+        let result = AuthTokenVerifier::verify(
             &jwt,
             &wrong_pk,
             None,
@@ -380,7 +380,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(ShareTokenVerifyError::SignatureError(_))
+            Err(AuthTokenVerifyError::SignatureError(_))
         ));
     }
 
@@ -399,7 +399,7 @@ mod tests {
             Some(1), // Expired (Unix timestamp 1)
         );
 
-        let result = ShareTokenVerifier::verify(
+        let result = AuthTokenVerifier::verify(
             &jwt,
             &issuer_pk,
             None,
@@ -408,7 +408,7 @@ mod tests {
             None,
         );
 
-        assert!(matches!(result, Err(ShareTokenVerifyError::Expired)));
+        assert!(matches!(result, Err(AuthTokenVerifyError::Expired)));
     }
 
     #[test]
@@ -435,7 +435,7 @@ mod tests {
         let mut access_control = ContentAccessControl::new(content_id.to_string());
         access_control.invalidate_before(now + 3600).unwrap();
 
-        let result = ShareTokenVerifier::verify(
+        let result = AuthTokenVerifier::verify(
             &jwt,
             &issuer_pk,
             None,
@@ -444,7 +444,7 @@ mod tests {
             Some(&access_control),
         );
 
-        assert!(matches!(result, Err(ShareTokenVerifyError::Invalidated)));
+        assert!(matches!(result, Err(AuthTokenVerifyError::Invalidated)));
     }
 
     #[test]
@@ -469,7 +469,7 @@ mod tests {
         );
 
         // But we require Write
-        let result = ShareTokenVerifier::verify(
+        let result = AuthTokenVerifier::verify(
             &jwt,
             &issuer_pk,
             None,
@@ -480,7 +480,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(ShareTokenVerifyError::InsufficientCapability { .. })
+            Err(AuthTokenVerifyError::InsufficientCapability { .. })
         ));
     }
 
@@ -506,7 +506,7 @@ mod tests {
         );
 
         // Require Read - should succeed because Write satisfies Read
-        let result = ShareTokenVerifier::verify(
+        let result = AuthTokenVerifier::verify(
             &jwt,
             &issuer_pk,
             None,
@@ -539,7 +539,7 @@ mod tests {
             Some(now + 3600),
         );
 
-        let result = ShareTokenVerifier::verify(
+        let result = AuthTokenVerifier::verify(
             &jwt,
             &issuer_pk,
             Some(&KeyId::new(wrong_audience_pk)),
@@ -550,7 +550,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(ShareTokenVerifyError::AudienceMismatch { .. })
+            Err(AuthTokenVerifyError::AudienceMismatch { .. })
         ));
     }
 
@@ -574,7 +574,7 @@ mod tests {
         );
 
         // Try to use token for different content
-        let result = ShareTokenVerifier::verify(
+        let result = AuthTokenVerifier::verify(
             &jwt,
             &issuer_pk,
             None,
@@ -585,7 +585,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(ShareTokenVerifyError::InsufficientCapability { .. })
+            Err(AuthTokenVerifyError::InsufficientCapability { .. })
         ));
     }
 
@@ -609,7 +609,7 @@ mod tests {
             Some(now + 3600),
         );
 
-        let result = ShareTokenVerifier::verify_signature_only(&jwt, &issuer_pk);
+        let result = AuthTokenVerifier::verify_signature_only(&jwt, &issuer_pk);
         assert!(result.is_ok());
     }
 
@@ -636,7 +636,7 @@ mod tests {
         // Verify all owner actions are granted
         for action in CapabilityAction::owner_actions() {
             let result =
-                ShareTokenVerifier::verify(&jwt, &issuer_pk, None, content_id, action, None);
+                AuthTokenVerifier::verify(&jwt, &issuer_pk, None, content_id, action, None);
             assert!(result.is_ok(), "Owner should have {:?} capability", action);
         }
     }
@@ -662,7 +662,7 @@ mod tests {
         );
 
         // Editor should have Read and Write
-        let read_result = ShareTokenVerifier::verify(
+        let read_result = AuthTokenVerifier::verify(
             &jwt,
             &issuer_pk,
             None,
@@ -672,7 +672,7 @@ mod tests {
         );
         assert!(read_result.is_ok());
 
-        let write_result = ShareTokenVerifier::verify(
+        let write_result = AuthTokenVerifier::verify(
             &jwt,
             &issuer_pk,
             None,
@@ -683,7 +683,7 @@ mod tests {
         assert!(write_result.is_ok());
 
         // Editor should NOT have Delete
-        let delete_result = ShareTokenVerifier::verify(
+        let delete_result = AuthTokenVerifier::verify(
             &jwt,
             &issuer_pk,
             None,
@@ -693,7 +693,7 @@ mod tests {
         );
         assert!(matches!(
             delete_result,
-            Err(ShareTokenVerifyError::InsufficientCapability { .. })
+            Err(AuthTokenVerifyError::InsufficientCapability { .. })
         ));
     }
 }

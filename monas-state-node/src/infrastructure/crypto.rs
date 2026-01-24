@@ -1,6 +1,6 @@
 //! Cryptographic utilities for signature verification.
 //!
-//! This module provides P-256 ECDSA signature verification for ShareToken validation.
+//! This module provides P-256 ECDSA signature verification for AuthToken validation.
 //! The signing is done by clients using monas-account, and State Nodes verify the signatures.
 
 use p256::ecdsa::signature::DigestVerifier;

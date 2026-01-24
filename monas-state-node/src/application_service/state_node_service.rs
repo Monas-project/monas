@@ -1097,10 +1097,10 @@ where
     }
 
     // ========================================================================
-    // Access Control Methods (ShareToken support)
+    // Access Control Methods (AuthToken support)
     // ========================================================================
 
-    /// Verify if a ShareToken is valid for accessing content.
+    /// Verify if a AuthToken is valid for accessing content.
     ///
     /// This method checks:
     /// 1. The token's issued_at (iat) is >= min_valid_issued_at for the content

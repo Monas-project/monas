@@ -177,7 +177,7 @@ fn extract_auth_token(headers: &HeaderMap) -> Option<AuthToken> {
 /// Extract request signature from X-Request-Signature header.
 ///
 /// The request signature is a base64-encoded signature that proves the requester
-/// possesses the private key corresponding to the ShareToken's audience (aud).
+/// possesses the private key corresponding to the AuthToken's audience (aud).
 ///
 /// Returns None if the header is missing or cannot be decoded.
 fn extract_request_signature(headers: &HeaderMap) -> Option<Vec<u8>> {

@@ -1,6 +1,6 @@
-//! ShareToken types for State Node verification.
+//! AuthToken types for State Node verification.
 //!
-//! This module defines ShareToken types specifically for State Node's verification needs.
+//! This module defines AuthToken types specifically for State Node's verification needs.
 //! These types are independent of monas-content to avoid domain coupling.
 //!
 //! State Node only needs to:
@@ -13,9 +13,9 @@
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// ShareToken header containing algorithm and type information.
+/// AuthToken header containing algorithm and type information.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ShareTokenHeader {
+pub struct AuthTokenHeader {
     /// Signing algorithm: "ES256" for P256
     pub alg: String,
     /// Token type: always "JWT"
@@ -46,9 +46,9 @@ impl std::fmt::Display for KeyId {
     }
 }
 
-/// ShareToken payload containing authorization claims.
+/// AuthToken payload containing authorization claims.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ShareTokenPayload {
+pub struct AuthTokenPayload {
     /// Issuer's KeyId
     pub iss: KeyId,
     /// Audience (recipient's) KeyId
@@ -67,7 +67,7 @@ pub struct ShareTokenPayload {
     pub fct: Option<serde_json::Value>,
 }
 
-impl ShareTokenPayload {
+impl AuthTokenPayload {
     /// Check if the token has expired.
     pub fn is_expired(&self) -> bool {
         if let Some(exp) = self.exp {
@@ -160,9 +160,9 @@ impl CapabilityAction {
     }
 }
 
-/// Errors that can occur during ShareToken parsing.
+/// Errors that can occur during AuthToken parsing.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ShareTokenParseError {
+pub enum AuthTokenParseError {
     /// Invalid JWT format
     InvalidFormat(String),
     /// Base64 decoding error
@@ -171,41 +171,41 @@ pub enum ShareTokenParseError {
     JsonError(String),
 }
 
-impl std::fmt::Display for ShareTokenParseError {
+impl std::fmt::Display for AuthTokenParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ShareTokenParseError::InvalidFormat(msg) => write!(f, "Invalid token format: {}", msg),
-            ShareTokenParseError::Base64DecodeError(msg) => {
+            AuthTokenParseError::InvalidFormat(msg) => write!(f, "Invalid token format: {}", msg),
+            AuthTokenParseError::Base64DecodeError(msg) => {
                 write!(f, "Base64 decode error: {}", msg)
             }
-            ShareTokenParseError::JsonError(msg) => write!(f, "JSON error: {}", msg),
+            AuthTokenParseError::JsonError(msg) => write!(f, "JSON error: {}", msg),
         }
     }
 }
 
-impl std::error::Error for ShareTokenParseError {}
+impl std::error::Error for AuthTokenParseError {}
 
-/// Parsed ShareToken for verification.
+/// Parsed AuthToken for verification.
 ///
 /// This struct represents a parsed JWT token. State Node uses this for verification only.
 #[derive(Debug, Clone)]
-pub struct ShareToken {
+pub struct AuthToken {
     /// Token header
-    pub header: ShareTokenHeader,
+    pub header: AuthTokenHeader,
     /// Token payload
-    pub payload: ShareTokenPayload,
+    pub payload: AuthTokenPayload,
     /// Raw signature bytes
     pub signature: Vec<u8>,
     /// The signing input (header.payload in base64) - cached for verification
     signing_input: Vec<u8>,
 }
 
-impl ShareToken {
+impl AuthToken {
     /// Parse a token from JWT format.
-    pub fn from_jwt(jwt: &str) -> Result<Self, ShareTokenParseError> {
+    pub fn from_jwt(jwt: &str) -> Result<Self, AuthTokenParseError> {
         let parts: Vec<&str> = jwt.split('.').collect();
         if parts.len() != 3 {
-            return Err(ShareTokenParseError::InvalidFormat(
+            return Err(AuthTokenParseError::InvalidFormat(
                 "JWT must have 3 parts separated by '.'".to_string(),
             ));
         }
@@ -214,10 +214,10 @@ impl ShareToken {
         let payload_bytes = base64_url_decode(parts[1])?;
         let signature = base64_url_decode(parts[2])?;
 
-        let header: ShareTokenHeader = serde_json::from_slice(&header_bytes)
-            .map_err(|e| ShareTokenParseError::JsonError(e.to_string()))?;
-        let payload: ShareTokenPayload = serde_json::from_slice(&payload_bytes)
-            .map_err(|e| ShareTokenParseError::JsonError(e.to_string()))?;
+        let header: AuthTokenHeader = serde_json::from_slice(&header_bytes)
+            .map_err(|e| AuthTokenParseError::JsonError(e.to_string()))?;
+        let payload: AuthTokenPayload = serde_json::from_slice(&payload_bytes)
+            .map_err(|e| AuthTokenParseError::JsonError(e.to_string()))?;
 
         // Cache the signing input for verification
         let signing_input = format!("{}.{}", parts[0], parts[1]).into_bytes();
@@ -242,12 +242,12 @@ impl ShareToken {
 }
 
 /// Base64 URL-safe decoding.
-fn base64_url_decode(data: &str) -> Result<Vec<u8>, ShareTokenParseError> {
+fn base64_url_decode(data: &str) -> Result<Vec<u8>, AuthTokenParseError> {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
     URL_SAFE_NO_PAD
         .decode(data)
-        .map_err(|e| ShareTokenParseError::Base64DecodeError(e.to_string()))
+        .map_err(|e| AuthTokenParseError::Base64DecodeError(e.to_string()))
 }
 
 #[cfg(test)]
@@ -292,16 +292,10 @@ mod tests {
 
     #[test]
     fn parse_invalid_jwt_format() {
-        let result = ShareToken::from_jwt("invalid");
-        assert!(matches!(
-            result,
-            Err(ShareTokenParseError::InvalidFormat(_))
-        ));
+        let result = AuthToken::from_jwt("invalid");
+        assert!(matches!(result, Err(AuthTokenParseError::InvalidFormat(_))));
 
-        let result = ShareToken::from_jwt("a.b");
-        assert!(matches!(
-            result,
-            Err(ShareTokenParseError::InvalidFormat(_))
-        ));
+        let result = AuthToken::from_jwt("a.b");
+        assert!(matches!(result, Err(AuthTokenParseError::InvalidFormat(_))));
     }
 }

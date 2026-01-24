@@ -1,16 +1,16 @@
-//! ShareToken implementation for content sharing authorization.
+//! AuthToken implementation for content sharing authorization.
 //!
-//! This module implements ShareToken, a JWT-based token for delegating
-//! content access capabilities. ShareTokens follow the UCAN-inspired design
+//! This module implements AuthToken, a JWT-based token for delegating
+//! content access capabilities. AuthTokens follow the UCAN-inspired design
 //! with P256 (ES256) signature verification.
 
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
 
-/// ShareToken のヘッダー
+/// AuthToken のヘッダー
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ShareTokenHeader {
+pub struct AuthTokenHeader {
     /// Algorithm: "ES256" (P256 only)
     pub alg: String,
     /// Type: "JWT"
@@ -20,7 +20,7 @@ pub struct ShareTokenHeader {
     pub ver: String,
 }
 
-impl Default for ShareTokenHeader {
+impl Default for AuthTokenHeader {
     fn default() -> Self {
         Self {
             alg: "ES256".to_string(),
@@ -30,9 +30,9 @@ impl Default for ShareTokenHeader {
     }
 }
 
-/// ShareToken のペイロード
+/// AuthToken のペイロード
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ShareTokenPayload {
+pub struct AuthTokenPayload {
     /// Issuer: 発行者のKeyId（"monas:type:id" 形式、例: "monas:user:alice"）
     pub iss: String,
     /// Audience: 受信者のKeyId（"monas:type:id" 形式、例: "monas:user:bob"）
@@ -60,7 +60,7 @@ pub struct Capability {
     pub can: CapabilityAction,
 }
 
-/// アクション種別（ShareToken用）
+/// アクション種別（AuthToken用）
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CapabilityAction {
     Read,
@@ -99,19 +99,19 @@ impl CapabilityAction {
     }
 }
 
-/// ShareToken 本体
+/// AuthToken 本体
 #[derive(Debug, Clone)]
-pub struct ShareToken {
-    pub header: ShareTokenHeader,
-    pub payload: ShareTokenPayload,
+pub struct AuthToken {
+    pub header: AuthTokenHeader,
+    pub payload: AuthTokenPayload,
     pub signature: Vec<u8>, // 署名（バイナリ形式）
 }
 
-impl ShareToken {
-    /// Create a new ShareToken with default header
-    pub fn new(payload: ShareTokenPayload, signature: Vec<u8>) -> Self {
+impl AuthToken {
+    /// Create a new AuthToken with default header
+    pub fn new(payload: AuthTokenPayload, signature: Vec<u8>) -> Self {
         Self {
-            header: ShareTokenHeader::default(),
+            header: AuthTokenHeader::default(),
             payload,
             signature,
         }
@@ -139,9 +139,9 @@ impl ShareToken {
             .context("Failed to decode signature")?;
 
         // JSON parse
-        let header: ShareTokenHeader =
+        let header: AuthTokenHeader =
             serde_json::from_slice(&header_bytes).context("Failed to parse header JSON")?;
-        let payload: ShareTokenPayload =
+        let payload: AuthTokenPayload =
             serde_json::from_slice(&payload_bytes).context("Failed to parse payload JSON")?;
 
         // Validate algorithm
@@ -212,9 +212,9 @@ impl ShareToken {
     }
 }
 
-/// ShareToken エラー型
+/// AuthToken エラー型
 #[derive(Debug, thiserror::Error)]
-pub enum ShareTokenError {
+pub enum AuthTokenError {
     #[error("Invalid JWT format: {0}")]
     InvalidFormat(String),
 
@@ -245,8 +245,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_share_token_header_default() {
-        let header = ShareTokenHeader::default();
+    fn test_auth_token_header_default() {
+        let header = AuthTokenHeader::default();
         assert_eq!(header.alg, "ES256");
         assert_eq!(header.token_type, "JWT");
         assert_eq!(header.ver, "1.0");
@@ -265,8 +265,8 @@ mod tests {
     }
 
     #[test]
-    fn test_share_token_jwt_roundtrip() {
-        let payload = ShareTokenPayload {
+    fn test_auth_token_jwt_roundtrip() {
+        let payload = AuthTokenPayload {
             iss: "monas:user:alice".to_string(),
             aud: "monas:user:bob".to_string(),
             exp: Some(1706744400),
@@ -279,10 +279,10 @@ mod tests {
             fct: None,
         };
 
-        let token = ShareToken::new(payload.clone(), vec![1, 2, 3, 4]);
+        let token = AuthToken::new(payload.clone(), vec![1, 2, 3, 4]);
         let jwt = token.to_jwt().unwrap();
 
-        let parsed = ShareToken::from_jwt(&jwt).unwrap();
+        let parsed = AuthToken::from_jwt(&jwt).unwrap();
         assert_eq!(parsed.header.alg, "ES256");
         assert_eq!(parsed.payload.iss, payload.iss);
         assert_eq!(parsed.payload.aud, payload.aud);
@@ -290,15 +290,15 @@ mod tests {
     }
 
     #[test]
-    fn test_share_token_invalid_jwt_format() {
-        let result = ShareToken::from_jwt("invalid");
+    fn test_auth_token_invalid_jwt_format() {
+        let result = AuthToken::from_jwt("invalid");
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("expected 3 parts"));
     }
 
     #[test]
-    fn test_share_token_signing_message() {
-        let payload = ShareTokenPayload {
+    fn test_auth_token_signing_message() {
+        let payload = AuthTokenPayload {
             iss: "monas:user:alice".to_string(),
             aud: "monas:user:bob".to_string(),
             exp: None,
@@ -308,14 +308,14 @@ mod tests {
             fct: None,
         };
 
-        let token = ShareToken::new(payload, vec![]);
+        let token = AuthToken::new(payload, vec![]);
         let message = token.signing_message().unwrap();
         assert!(!message.is_empty());
     }
 
     #[test]
-    fn test_share_token_has_capability() {
-        let payload = ShareTokenPayload {
+    fn test_auth_token_has_capability() {
+        let payload = AuthTokenPayload {
             iss: "monas:user:alice".to_string(),
             aud: "monas:user:bob".to_string(),
             exp: None,
@@ -334,7 +334,7 @@ mod tests {
             fct: None,
         };
 
-        let token = ShareToken::new(payload, vec![]);
+        let token = AuthToken::new(payload, vec![]);
         assert!(token.has_capability("monas://content/abc123", &CapabilityAction::Read));
         assert!(token.has_capability("monas://content/def456", &CapabilityAction::Write));
         assert!(!token.has_capability("monas://content/abc123", &CapabilityAction::Write));

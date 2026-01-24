@@ -4,7 +4,7 @@
 //! and managing test public keys. These utilities are only available in test builds.
 
 #[cfg(test)]
-use super::share_token::*;
+use super::auth_token::*;
 #[cfg(test)]
 use p256::ecdsa::{signature::Signer, SigningKey};
 #[cfg(test)]
@@ -71,7 +71,7 @@ impl TestKeyPair {
         signature.to_vec()
     }
 
-    /// Create a ShareToken signed by this key pair
+    /// Create a AuthToken signed by this key pair
     ///
     /// # Arguments
     /// * `recipient` - The recipient key pair (for aud field)
@@ -80,22 +80,22 @@ impl TestKeyPair {
     /// * `expires_in_secs` - Optional expiration time in seconds from now
     ///
     /// # Returns
-    /// A signed ShareToken
-    pub fn create_share_token(
+    /// A signed AuthToken
+    pub fn create_auth_token(
         &self,
         recipient: &TestKeyPair,
         resource: &str,
         capabilities: Vec<CapabilityAction>,
         expires_in_secs: Option<u64>,
-    ) -> ShareToken {
+    ) -> AuthToken {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
 
-        let header = ShareTokenHeader::default();
+        let header = AuthTokenHeader::default();
 
-        let payload = ShareTokenPayload {
+        let payload = AuthTokenPayload {
             iss: self.key_id.clone(),
             aud: recipient.key_id.clone(),
             exp: expires_in_secs.map(|s| now + s),
@@ -112,7 +112,7 @@ impl TestKeyPair {
         };
 
         // Create token without signature first
-        let mut token = ShareToken {
+        let mut token = AuthToken {
             header,
             payload,
             signature: Vec::new(),
@@ -130,14 +130,14 @@ impl TestKeyPair {
     /// The request signature format is: "{iss}:{aud}:{jti}"
     ///
     /// # Arguments
-    /// * `share_token` - The ShareToken being used for the request
+    /// * `auth_token` - The AuthToken being used for the request
     ///
     /// # Returns
     /// The request signature bytes
-    pub fn sign_request(&self, share_token: &ShareToken) -> Vec<u8> {
+    pub fn sign_request(&self, auth_token: &AuthToken) -> Vec<u8> {
         let message = format!(
             "{}:{}:{}",
-            share_token.payload.iss, share_token.payload.aud, share_token.payload.jti
+            auth_token.payload.iss, auth_token.payload.aud, auth_token.payload.jti
         );
         self.sign(message.as_bytes())
     }
@@ -222,11 +222,11 @@ mod tests {
     }
 
     #[test]
-    fn test_create_share_token() {
+    fn test_create_auth_token() {
         let alice = TestKeyPair::generate("user", "alice");
         let bob = TestKeyPair::generate("user", "bob");
 
-        let token = alice.create_share_token(
+        let token = alice.create_auth_token(
             &bob,
             "monas://content/test123",
             vec![CapabilityAction::Read],
@@ -247,7 +247,7 @@ mod tests {
         let alice = TestKeyPair::generate("user", "alice");
         let bob = TestKeyPair::generate("user", "bob");
 
-        let token = alice.create_share_token(
+        let token = alice.create_auth_token(
             &bob,
             "monas://content/test123",
             vec![CapabilityAction::Read],
@@ -286,7 +286,7 @@ mod tests {
         let alice = TestKeyPair::generate("user", "alice");
         let bob = TestKeyPair::generate("user", "bob");
 
-        let token = alice.create_share_token(
+        let token = alice.create_auth_token(
             &bob,
             "monas://content/test123",
             vec![CapabilityAction::Read],
@@ -294,7 +294,7 @@ mod tests {
         );
 
         // Verify the signature
-        let result = SignatureVerifier::verify_share_token_signature(&token, alice.public_key());
+        let result = SignatureVerifier::verify_auth_token_signature(&token, alice.public_key());
         assert!(result.is_ok());
     }
 
@@ -303,7 +303,7 @@ mod tests {
         let alice = TestKeyPair::generate("user", "alice");
         let bob = TestKeyPair::generate("user", "bob");
 
-        let token = alice.create_share_token(
+        let token = alice.create_auth_token(
             &bob,
             "monas://content/test123",
             vec![

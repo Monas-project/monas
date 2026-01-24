@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Access control state for a single content.
 ///
 /// State Nodes maintain this for each content they manage.
-/// When verifying a ShareToken, the token's `iat` must be >= `min_valid_issued_at`.
+/// When verifying a AuthToken, the token's `iat` must be >= `min_valid_issued_at`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContentAccessControl {
     /// The content ID this access control applies to.

@@ -27,7 +27,7 @@ pub struct AuthorizationRequest {
 
     /// Optional request signature for verifying the request sender
     /// This is used to verify that the requester possesses the private key
-    /// corresponding to the audience (aud) in the ShareToken
+    /// corresponding to the audience (aud) in the AuthToken
     pub request_signature: Option<Vec<u8>>,
 }
 

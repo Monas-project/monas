@@ -5,7 +5,7 @@
 
 use crate::domain::auth_capability::AuthCapability;
 use crate::domain::identity::{Identity, IdentityType};
-use crate::infrastructure::auth::share_token::{CapabilityAction, ShareToken};
+use crate::infrastructure::auth::auth_token::{AuthToken as InfraAuthToken, CapabilityAction};
 use crate::infrastructure::auth::signature_verifier::SignatureVerifier;
 use crate::port::auth_token::AuthToken;
 use crate::port::authorization_service::{
@@ -78,8 +78,8 @@ where
         format!("monas:{}:{}", identity_type, identity.id())
     }
 
-    /// Map State Node capability to ShareToken capability action
-    fn map_capability_to_share_token(cap: &AuthCapability) -> CapabilityAction {
+    /// Map State Node capability to AuthToken capability action
+    fn map_capability_to_auth_token(cap: &AuthCapability) -> CapabilityAction {
         match cap {
             AuthCapability::ReadContent => CapabilityAction::Read,
             AuthCapability::WriteContent => CapabilityAction::Write,
@@ -294,15 +294,15 @@ where
         Ok(has_capability)
     }
 
-    /// Parse ShareToken from JWT string
+    /// Parse AuthToken from JWT string
     ///
     /// # Arguments
     /// * `token_str` - JWT string in format "header.payload.signature"
     ///
     /// # Returns
-    /// Parsed ShareToken or error if parsing fails
-    fn parse_share_token(&self, token_str: &str) -> Result<ShareToken> {
-        ShareToken::from_jwt(token_str).context("Failed to parse ShareToken")
+    /// Parsed AuthToken or error if parsing fails
+    fn parse_auth_token(&self, token_str: &str) -> Result<InfraAuthToken> {
+        InfraAuthToken::from_jwt(token_str).context("Failed to parse AuthToken")
     }
 
     /// Get public key for a key ID
@@ -332,10 +332,10 @@ where
         }
     }
 
-    /// Verify ShareToken with dual signature verification
+    /// Verify AuthToken with dual signature verification
     ///
     /// # Arguments
-    /// * `token` - The ShareToken to verify
+    /// * `token` - The AuthToken to verify
     /// * `request` - The authorization request containing request signature
     ///
     /// # Returns
@@ -343,9 +343,9 @@ where
     ///
     /// # Verification Steps
     ///
-    /// 1. **ShareToken Signature Verification**
+    /// 1. **AuthToken Signature Verification**
     ///    - Get owner's public key from issuer key ID (iss)
-    ///    - Verify ShareToken signature using owner's public key
+    ///    - Verify AuthToken signature using owner's public key
     ///
     /// 2. **Request Signature Verification**
     ///    - Verify request signature is provided
@@ -358,27 +358,27 @@ where
     ///
     /// 4. **Audience Validation**
     ///    - Verify audience (aud) matches requester identity
-    async fn verify_share_token(
+    async fn verify_auth_token(
         &self,
-        token: &ShareToken,
+        token: &InfraAuthToken,
         request: &AuthorizationRequest,
     ) -> Result<()> {
         // 1. Check expiration
         if token.is_expired() {
-            anyhow::bail!("ShareToken has expired");
+            anyhow::bail!("AuthToken has expired");
         }
 
         // 2. Verify audience matches requester
         let requester_key_id = Self::identity_to_key_id(&request.identity);
         if token.payload.aud != requester_key_id {
             anyhow::bail!(
-                "ShareToken audience mismatch: expected {}, got {}",
+                "AuthToken audience mismatch: expected {}, got {}",
                 requester_key_id,
                 token.payload.aud
             );
         }
 
-        // 3. Get owner's public key and verify ShareToken signature
+        // 3. Get owner's public key and verify AuthToken signature
         let owner_public_key = self
             .get_public_key(&token.payload.iss)
             .await?
@@ -389,8 +389,8 @@ where
                 )
             })?;
 
-        SignatureVerifier::verify_share_token_signature(token, &owner_public_key)
-            .context("ShareToken signature verification failed")?;
+        SignatureVerifier::verify_auth_token_signature(token, &owner_public_key)
+            .context("AuthToken signature verification failed")?;
 
         // 4. Verify request signature if provided
         if let Some(request_signature) = &request.request_signature {
@@ -426,42 +426,42 @@ where
         Ok(())
     }
 
-    /// Check if ShareToken grants a specific capability for a resource
+    /// Check if AuthToken grants a specific capability for a resource
     ///
     /// # Arguments
-    /// * `token` - The ShareToken to check
+    /// * `token` - The AuthToken to check
     /// * `resource` - The resource URI (e.g., "monas://content/abc123")
     /// * `capability` - The required capability
     ///
     /// # Returns
     /// true if token grants the capability, false otherwise
-    fn check_share_token_capability(
+    fn check_auth_token_capability(
         &self,
-        token: &ShareToken,
+        token: &InfraAuthToken,
         resource: &str,
         capability: &AuthCapability,
     ) -> bool {
-        let required_action = Self::map_capability_to_share_token(capability);
+        let required_action = Self::map_capability_to_auth_token(capability);
         let resource_uri = format!("monas://content/{}", resource);
 
         token.has_capability(&resource_uri, &required_action)
     }
 
-    /// Check ShareToken-based authorization
-    async fn check_share_token_authorization(
+    /// Check AuthToken-based authorization
+    async fn check_auth_token_authorization(
         &self,
         token: &AuthToken,
         request: &AuthorizationRequest,
     ) -> Result<bool> {
-        // 1. Parse ShareToken
-        let share_token = self.parse_share_token(token.as_str())?;
+        // 1. Parse AuthToken
+        let auth_token = self.parse_auth_token(token.as_str())?;
 
-        // 2. Verify ShareToken and request signatures
-        self.verify_share_token(&share_token, request).await?;
+        // 2. Verify AuthToken and request signatures
+        self.verify_auth_token(&auth_token, request).await?;
 
-        // 3. Check if ShareToken grants the required capability
-        let has_capability = self.check_share_token_capability(
-            &share_token,
+        // 3. Check if AuthToken grants the required capability
+        let has_capability = self.check_auth_token_capability(
+            &auth_token,
             request.resource.as_str(),
             &request.capability,
         );
@@ -504,17 +504,17 @@ where
 
         // 4. Check token if provided (delegated access)
         if let Some(token) = &request.token {
-            // Try ShareToken first (recommended for new implementations)
-            match self.check_share_token_authorization(token, request).await {
+            // Try AuthToken first (recommended for new implementations)
+            match self.check_auth_token_authorization(token, request).await {
                 Ok(true) => return Ok(AuthorizationResult::Granted),
                 Ok(false) => {
                     return Ok(AuthorizationResult::Denied {
-                        reason: "ShareToken does not grant required capability".to_string(),
+                        reason: "AuthToken does not grant required capability".to_string(),
                     });
                 }
                 Err(e) => {
-                    // If ShareToken parsing/verification fails, try UCAN as fallback
-                    tracing::debug!("ShareToken verification failed, trying UCAN: {}", e);
+                    // If AuthToken parsing/verification fails, try UCAN as fallback
+                    tracing::debug!("AuthToken verification failed, trying UCAN: {}", e);
 
                     match self.check_ucan_authorization(token, request).await {
                         Ok(true) => return Ok(AuthorizationResult::Granted),
@@ -526,7 +526,7 @@ where
                         Err(ucan_err) => {
                             return Ok(AuthorizationResult::Denied {
                                 reason: format!(
-                                    "Token verification failed (ShareToken: {}, UCAN: {})",
+                                    "Token verification failed (AuthToken: {}, UCAN: {})",
                                     e, ucan_err
                                 ),
                             });
@@ -773,7 +773,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_share_token_authorization_e2e() {
+    async fn test_auth_token_authorization_e2e() {
         use crate::infrastructure::auth::test_helpers::TestKeyPair;
         use crate::port::auth_token::AuthToken;
 
@@ -799,20 +799,20 @@ mod tests {
         let policy = AccessPolicy::new(content_id.clone(), alice_identity.clone());
         repo.read().await.save_policy(&policy).await.unwrap();
 
-        // 5. Alice creates a ShareToken for Bob with Read capability
-        let share_token = alice.create_share_token(
+        // 5. Alice creates a AuthToken for Bob with Read capability
+        let auth_token = alice.create_auth_token(
             &bob,
             "monas://content/test-content-123",
-            vec![crate::infrastructure::auth::share_token::CapabilityAction::Read],
+            vec![crate::infrastructure::auth::auth_token::CapabilityAction::Read],
             Some(3600), // 1 hour expiration
         );
 
         // 6. Bob creates request signature
-        let request_sig = bob.sign_request(&share_token);
+        let request_sig = bob.sign_request(&auth_token);
 
-        // 7. Create authorization request from Bob using ShareToken
+        // 7. Create authorization request from Bob using AuthToken
         let bob_identity = Identity::user("bob".to_string()).unwrap();
-        let token = AuthToken::new(share_token.to_jwt().unwrap());
+        let token = AuthToken::new(auth_token.to_jwt().unwrap());
         let request = AuthorizationRequest {
             identity: bob_identity,
             resource: content_id.clone(),
@@ -825,13 +825,13 @@ mod tests {
         let result = adapter.authorize(&request).await.unwrap();
         assert!(
             result.is_granted(),
-            "ShareToken authorization should be granted, but got: {:?}",
+            "AuthToken authorization should be granted, but got: {:?}",
             result
         );
     }
 
     #[tokio::test]
-    async fn test_share_token_authorization_denied_wrong_capability() {
+    async fn test_auth_token_authorization_denied_wrong_capability() {
         use crate::infrastructure::auth::test_helpers::TestKeyPair;
         use crate::port::auth_token::AuthToken;
 
@@ -854,18 +854,18 @@ mod tests {
         repo.read().await.save_policy(&policy).await.unwrap();
 
         // Alice grants Bob only Read capability
-        let share_token = alice.create_share_token(
+        let auth_token = alice.create_auth_token(
             &bob,
             "monas://content/test-content-456",
-            vec![crate::infrastructure::auth::share_token::CapabilityAction::Read],
+            vec![crate::infrastructure::auth::auth_token::CapabilityAction::Read],
             Some(3600),
         );
 
-        let request_sig = bob.sign_request(&share_token);
+        let request_sig = bob.sign_request(&auth_token);
 
         // Bob tries to use Write capability (not granted)
         let bob_identity = Identity::user("bob".to_string()).unwrap();
-        let token = AuthToken::new(share_token.to_jwt().unwrap());
+        let token = AuthToken::new(auth_token.to_jwt().unwrap());
         let request = AuthorizationRequest {
             identity: bob_identity,
             resource: content_id.clone(),
@@ -878,12 +878,12 @@ mod tests {
         let result = adapter.authorize(&request).await.unwrap();
         assert!(
             result.is_denied(),
-            "ShareToken authorization should be denied for wrong capability"
+            "AuthToken authorization should be denied for wrong capability"
         );
     }
 
     #[tokio::test]
-    async fn test_share_token_authorization_denied_expired() {
+    async fn test_auth_token_authorization_denied_expired() {
         use crate::infrastructure::auth::test_helpers::TestKeyPair;
         use crate::port::auth_token::AuthToken;
 
@@ -906,20 +906,20 @@ mod tests {
         repo.read().await.save_policy(&policy).await.unwrap();
 
         // Create an already-expired token (0 seconds = already expired)
-        let share_token = alice.create_share_token(
+        let auth_token = alice.create_auth_token(
             &bob,
             "monas://content/test-content-789",
-            vec![crate::infrastructure::auth::share_token::CapabilityAction::Read],
+            vec![crate::infrastructure::auth::auth_token::CapabilityAction::Read],
             Some(0), // Already expired
         );
 
         // Wait a moment to ensure expiration
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
-        let request_sig = bob.sign_request(&share_token);
+        let request_sig = bob.sign_request(&auth_token);
 
         let bob_identity = Identity::user("bob".to_string()).unwrap();
-        let token = AuthToken::new(share_token.to_jwt().unwrap());
+        let token = AuthToken::new(auth_token.to_jwt().unwrap());
         let request = AuthorizationRequest {
             identity: bob_identity,
             resource: content_id.clone(),
@@ -932,7 +932,7 @@ mod tests {
         let result = adapter.authorize(&request).await.unwrap();
         assert!(
             result.is_denied(),
-            "ShareToken authorization should be denied for expired token"
+            "AuthToken authorization should be denied for expired token"
         );
     }
 }
