@@ -294,8 +294,7 @@ mod tests {
         );
 
         // Verify the signature
-        let result =
-            SignatureVerifier::verify_share_token_signature(&token, alice.public_key());
+        let result = SignatureVerifier::verify_share_token_signature(&token, alice.public_key());
         assert!(result.is_ok());
     }
 
