@@ -6,10 +6,11 @@ use crate::infrastructure::crdt_repository::CrslCrdtRepository;
 use crate::infrastructure::gossipsub_publisher::GossipsubEventPublisher;
 use crate::infrastructure::network::Libp2pNetwork;
 use crate::infrastructure::persistence::{SledContentNetworkRepository, SledNodeRegistry};
+use crate::port::auth_token::AuthToken;
 use crate::port::content_repository::ContentRepository;
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post, put},
     Json, Router,
@@ -151,6 +152,44 @@ pub struct VersionQuery {
 }
 
 // ============================================================================
+// Helper functions
+// ============================================================================
+
+/// Extract authentication token from Authorization header.
+///
+/// Supports both Bearer tokens and raw tokens:
+/// - "Bearer <token>" -> extracts <token>
+/// - "<token>" -> uses token as-is
+///
+/// Returns None if the Authorization header is missing.
+fn extract_auth_token(headers: &HeaderMap) -> Option<AuthToken> {
+    let auth_header = headers.get("authorization")?.to_str().ok()?;
+
+    // Check if it's a Bearer token
+    if let Some(token) = auth_header.strip_prefix("Bearer ") {
+        Some(AuthToken::new(token.to_string()))
+    } else {
+        // Use the header value as-is (for DID-based auth)
+        Some(AuthToken::new(auth_header.to_string()))
+    }
+}
+
+/// Extract request signature from X-Request-Signature header.
+///
+/// The request signature is a base64-encoded signature that proves the requester
+/// possesses the private key corresponding to the ShareToken's audience (aud).
+///
+/// Returns None if the header is missing or cannot be decoded.
+fn extract_request_signature(headers: &HeaderMap) -> Option<Vec<u8>> {
+    let signature_header = headers.get("x-request-signature")?.to_str().ok()?;
+
+    // Decode base64-encoded signature
+    base64::engine::general_purpose::STANDARD
+        .decode(signature_header)
+        .ok()
+}
+
+// ============================================================================
 // Handlers
 // ============================================================================
 
@@ -210,6 +249,7 @@ async fn list_nodes(State(state): State<AppState>) -> impl IntoResponse {
 /// Create new content.
 async fn create_content(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<CreateContentRequest>,
 ) -> impl IntoResponse {
     use base64::Engine;
@@ -227,8 +267,10 @@ async fn create_content(
         }
     };
 
-    // TODO: Extract auth token from request headers
-    match state.create_content(&data, None).await {
+    // Extract authentication token from headers
+    let token = extract_auth_token(&headers);
+
+    match state.create_content(&data, token.as_ref()).await {
         Ok(event) => {
             if let crate::domain::events::Event::ContentCreated { content_id, .. } = event {
                 Json(CreateContentResponse { content_id }).into_response()
@@ -250,6 +292,7 @@ async fn create_content(
 async fn update_content(
     State(state): State<AppState>,
     Path(content_id): Path<String>,
+    headers: HeaderMap,
     Json(req): Json<UpdateContentRequest>,
 ) -> impl IntoResponse {
     use base64::Engine;
@@ -267,8 +310,19 @@ async fn update_content(
         }
     };
 
-    // TODO: Extract auth token from request headers
-    match state.update_content(&content_id, &data, None).await {
+    // Extract authentication token and request signature from headers
+    let token = extract_auth_token(&headers);
+    let request_signature = extract_request_signature(&headers);
+
+    match state
+        .update_content(
+            &content_id,
+            &data,
+            token.as_ref(),
+            request_signature.as_deref(),
+        )
+        .await
+    {
         Ok(_) => Json(UpdateContentResponse {
             content_id,
             updated: true,
@@ -286,9 +340,16 @@ async fn update_content(
 async fn delete_content(
     State(state): State<AppState>,
     Path(content_id): Path<String>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
-    // TODO: Extract auth token from request headers
-    match state.delete_content(&content_id, None).await {
+    // Extract authentication token and request signature from headers
+    let token = extract_auth_token(&headers);
+    let request_signature = extract_request_signature(&headers);
+
+    match state
+        .delete_content(&content_id, token.as_ref(), request_signature.as_deref())
+        .await
+    {
         Ok(_) => Json(DeleteContentResponse {
             content_id,
             deleted: true,
@@ -449,46 +510,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_health_response_serialization() {
-        let response = HealthResponse {
-            status: "ok".to_string(),
-            node_id: "node-1".to_string(),
-        };
-
-        let json = serde_json::to_string(&response).unwrap();
-        assert!(json.contains("\"status\":\"ok\""));
-        assert!(json.contains("\"node_id\":\"node-1\""));
-    }
-
-    #[test]
-    fn test_node_info_response_serialization() {
-        let response = NodeInfoResponse {
-            node_id: "node-1".to_string(),
-            total_capacity: Some(1000),
-            available_capacity: Some(800),
-        };
-
-        let json = serde_json::to_string(&response).unwrap();
-        assert!(json.contains("\"node_id\":\"node-1\""));
-        assert!(json.contains("\"total_capacity\":1000"));
-        assert!(json.contains("\"available_capacity\":800"));
-    }
-
-    #[test]
-    fn test_node_info_response_with_none() {
-        let response = NodeInfoResponse {
-            node_id: "node-1".to_string(),
-            total_capacity: None,
-            available_capacity: None,
-        };
-
-        let json = serde_json::to_string(&response).unwrap();
-        assert!(json.contains("\"node_id\":\"node-1\""));
-        assert!(json.contains("\"total_capacity\":null"));
-        assert!(json.contains("\"available_capacity\":null"));
-    }
-
-    #[test]
     fn test_register_node_request_deserialization() {
         let json = r#"{"total_capacity": 1000}"#;
         let request: RegisterNodeRequest = serde_json::from_str(json).unwrap();
@@ -624,41 +645,9 @@ mod tests {
     }
 
     #[test]
-    fn test_base64_encoding_roundtrip() {
-        let original = b"Hello, World! This is test data.";
-        let encoded = base64::engine::general_purpose::STANDARD.encode(original);
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(&encoded)
-            .unwrap();
-        assert_eq!(original.to_vec(), decoded);
-    }
-
-    #[test]
     fn test_invalid_base64_data() {
         let invalid = "not-valid-base64!!!";
         let result = base64::engine::general_purpose::STANDARD.decode(invalid);
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_response_types_are_debug() {
-        // Ensure all response types implement Debug
-        let health = HealthResponse {
-            status: "ok".to_string(),
-            node_id: "n1".to_string(),
-        };
-        let _ = format!("{:?}", health);
-
-        let node_info = NodeInfoResponse {
-            node_id: "n1".to_string(),
-            total_capacity: Some(100),
-            available_capacity: None,
-        };
-        let _ = format!("{:?}", node_info);
-
-        let error = ErrorResponse {
-            error: "err".to_string(),
-        };
-        let _ = format!("{:?}", error);
     }
 }

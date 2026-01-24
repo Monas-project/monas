@@ -24,6 +24,11 @@ pub struct AuthorizationRequest {
 
     /// Optional authorization token (e.g., delegated UCAN)
     pub token: Option<AuthToken>,
+
+    /// Optional request signature for verifying the request sender
+    /// This is used to verify that the requester possesses the private key
+    /// corresponding to the audience (aud) in the ShareToken
+    pub request_signature: Option<Vec<u8>>,
 }
 
 /// Authorization result
@@ -196,6 +201,7 @@ mod tests {
             resource: content_id.clone(),
             capability: AuthCapability::ReadContent,
             token: None,
+            request_signature: None,
         };
         let result = service.authorize(&request).await.unwrap();
         assert!(result.is_granted());
@@ -206,6 +212,7 @@ mod tests {
             resource: content_id,
             capability: AuthCapability::ReadContent,
             token: None,
+            request_signature: None,
         };
         let result = service.authorize(&request).await.unwrap();
         assert!(result.is_denied());
@@ -226,12 +233,14 @@ mod tests {
                 resource: content_id.clone(),
                 capability: AuthCapability::ReadContent,
                 token: None,
+                request_signature: None,
             },
             AuthorizationRequest {
                 identity: alice.clone(),
                 resource: content_id.clone(),
                 capability: AuthCapability::WriteContent,
                 token: None,
+                request_signature: None,
             },
         ];
 

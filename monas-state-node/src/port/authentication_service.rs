@@ -1,7 +1,7 @@
 //! Authentication service abstraction.
 //!
 //! This trait abstracts away the actual authentication mechanism.
-//! Infrastructure layer provides concrete implementations (DID, OAuth, etc.).
+//! Infrastructure layer provides concrete implementations.
 
 use crate::domain::identity::Identity;
 use crate::port::auth_token::AuthToken;
@@ -11,7 +11,7 @@ use async_trait::async_trait;
 /// Authentication service abstraction
 ///
 /// This trait abstracts away the actual authentication mechanism.
-/// Infrastructure layer provides concrete implementations (DID, OAuth, etc.).
+/// Infrastructure layer provides concrete implementations.
 #[async_trait]
 pub trait AuthenticationService: Send + Sync {
     /// Verify an authentication token and return the identity

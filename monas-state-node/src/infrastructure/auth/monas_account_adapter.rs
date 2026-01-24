@@ -1,7 +1,7 @@
 //! Monas Account authentication adapter.
 //!
 //! This adapter implements the Anti-Corruption Layer pattern.
-//! It translates between State Node's domain concepts and monas-account's DID concepts.
+//! It translates between State Node's domain concepts and external authentication tokens.
 
 use crate::domain::identity::{Identity, IdentityType};
 use crate::port::auth_token::AuthToken;
@@ -12,7 +12,7 @@ use async_trait::async_trait;
 /// Adapter for monas-account authentication
 ///
 /// This adapter implements Anti-Corruption Layer pattern.
-/// It translates between State Node's domain concepts and monas-account's DID concepts.
+/// It translates between State Node's domain concepts and authentication tokens.
 ///
 /// # Architecture
 ///
@@ -21,78 +21,105 @@ use async_trait::async_trait;
 ///          ↕
 /// MonasAccountAdapter (translation)
 ///          ↕
-/// monas-account (DID)
+/// Authentication Token (type:id format)
 /// ```
 pub struct MonasAccountAdapter {
-    /// DID prefix (e.g., "did:monas:")
-    did_prefix: String,
+    // No prefix needed for simple "type:id" format
 }
 
 impl MonasAccountAdapter {
-    /// Create a new adapter with default DID prefix
+    /// Create a new adapter
     pub fn new() -> Self {
-        Self {
-            did_prefix: "did:monas:".to_string(),
-        }
+        Self {}
     }
 
-    /// Create a new adapter with custom DID prefix
-    pub fn with_prefix(did_prefix: String) -> Self {
-        Self { did_prefix }
+    /// Parse key ID from token string
+    /// Expected format: "type:id" (e.g., "user:alice", "node:node123")
+    fn parse_key_id(&self, token: &str) -> Result<String> {
+        // Validate format: "type:id"
+        let parts: Vec<&str> = token.split(':').collect();
+        if parts.len() != 2 {
+            return Err(anyhow::anyhow!(
+                "Invalid key ID format: expected 'type:id', got '{}'",
+                token
+            ));
+        }
+        Ok(token.to_string())
     }
 
-    /// Parse DID from token string
-    fn parse_did(&self, token: &str) -> Result<String> {
-        if token.starts_with(&self.did_prefix) {
-            Ok(token.to_string())
-        } else {
-            Err(anyhow::anyhow!(
-                "Invalid DID format: expected prefix '{}'",
-                self.did_prefix
-            ))
+    /// Validate key ID format.
+    ///
+    /// # Implementation Status
+    ///
+    /// Currently performs basic format validation.
+    ///
+    /// # TODO: Full Validation
+    ///
+    /// When monas-account crate becomes available, implement:
+    ///
+    /// 1. **Registration Check**
+    ///    - Query monas-account registry to verify key ID is registered
+    ///
+    /// 2. **Revocation Check**
+    ///    - Check if key ID has been revoked
+    ///    - Verify key ID is still active/valid
+    ///
+    /// 3. **Identifier Format Validation**
+    ///    - Validate identifier portion follows spec
+    ///    - Check for valid characters and length
+    fn validate_key_id(&self, key_id: &str) -> Result<()> {
+        // Check format: "type:id"
+        let parts: Vec<&str> = key_id.split(':').collect();
+        if parts.len() != 2 {
+            return Err(anyhow::anyhow!(
+                "Invalid key ID structure: expected 'type:id', got '{}'",
+                key_id
+            ));
         }
-    }
 
-    /// Validate DID format
-    fn validate_did(&self, did: &str) -> Result<()> {
-        if !did.starts_with(&self.did_prefix) {
-            return Err(anyhow::anyhow!("Invalid DID format: missing prefix"));
+        // Validate identity type (user, node, service)
+        match parts[0] {
+            "user" | "node" | "service" => {}
+            other => {
+                return Err(anyhow::anyhow!("Unknown identity type: {}", other));
+            }
         }
 
-        // Check minimum length: "did:monas:type:id"
-        let parts: Vec<&str> = did.split(':').collect();
-        if parts.len() < 4 {
-            return Err(anyhow::anyhow!("Invalid DID structure: too few parts"));
+        // Validate identifier is not empty
+        if parts[1].is_empty() {
+            return Err(anyhow::anyhow!("Identity identifier cannot be empty"));
         }
 
-        // Additional validation logic could go here:
-        // - Check DID method
+        // TODO: Additional validation with monas-account crate:
+        // - Check registration status
+        // - Verify hasn't been revoked
         // - Validate identifier format
-        // - Check against revocation list
 
         Ok(())
     }
 
-    /// Convert DID to Identity (domain concept)
-    fn did_to_identity(&self, did: &str) -> Result<Identity> {
-        // Parse DID and determine identity type
-        // Example: "did:monas:user:alice" -> User identity
-        //          "did:monas:node:node123" -> Node identity
+    /// Convert key ID to Identity (domain concept)
+    fn key_id_to_identity(&self, key_id: &str) -> Result<Identity> {
+        // Parse key ID and determine identity type
+        // Example: "user:alice" -> User identity with id="alice"
+        //          "node:node123" -> Node identity with id="node123"
 
-        let parts: Vec<&str> = did.split(':').collect();
+        let parts: Vec<&str> = key_id.split(':').collect();
 
-        if parts.len() < 4 {
-            return Err(anyhow::anyhow!("Invalid DID structure"));
+        if parts.len() != 2 {
+            return Err(anyhow::anyhow!("Invalid key ID structure"));
         }
 
-        let identity_type = match parts[2] {
+        let identity_type = match parts[0] {
             "user" => IdentityType::User,
             "node" => IdentityType::Node,
             "service" => IdentityType::Service,
-            _ => return Err(anyhow::anyhow!("Unknown identity type: {}", parts[2])),
+            _ => return Err(anyhow::anyhow!("Unknown identity type: {}", parts[0])),
         };
 
-        Identity::new(did.to_string(), identity_type).context("Failed to create Identity from DID")
+        // Store only the ID part (e.g., "alice") in Identity, not the full key ID
+        Identity::new(parts[1].to_string(), identity_type)
+            .context("Failed to create Identity from key ID")
     }
 }
 
@@ -104,39 +131,88 @@ impl Default for MonasAccountAdapter {
 
 #[async_trait]
 impl AuthenticationService for MonasAccountAdapter {
+    /// Authenticate a key ID-based token.
+    ///
+    /// # Implementation Status
+    ///
+    /// Currently performs basic key ID format validation and conversion.
+    /// **WARNING**: Does not verify signatures or registration status.
+    ///
+    /// # TODO: Full Authentication
+    ///
+    /// When monas-account crate becomes available, implement:
+    ///
+    /// 1. **Signature Verification**
+    ///    - Extract signature from token if present
+    ///    - Fetch public key from registry
+    ///    - Verify signature matches message + key ID
+    ///
+    /// 2. **Registration Verification**
+    ///    - Query monas-account registry
+    ///    - Verify key ID is registered and active
+    ///
+    /// 3. **Revocation Check**
+    ///    - Check revocation status in registry
+    ///    - Verify key ID hasn't been deactivated
+    ///
+    /// 4. **Challenge-Response (Optional)**
+    ///    - Implement challenge-response protocol
+    ///    - Verify client possesses private key
     async fn authenticate(&self, token: &AuthToken) -> Result<Identity> {
-        // 1. Parse token as DID
-        let did = self
-            .parse_did(token.as_str())
-            .context("Failed to parse DID from token")?;
+        // 1. Parse token as key ID
+        let key_id = self
+            .parse_key_id(token.as_str())
+            .context("Failed to parse key ID from token")?;
 
-        // 2. Validate DID format
-        self.validate_did(&did).context("DID validation failed")?;
+        // 2. Validate key ID format
+        self.validate_key_id(&key_id)
+            .context("Key ID validation failed")?;
 
-        // 3. Here you would integrate with monas-account for actual verification:
-        // - Verify signature if the token includes a signature
-        // - Check if the DID is registered
-        // - Verify that the DID hasn't been revoked
+        // 3. TODO: Integrate with monas-account for actual verification
         //
-        // For now, simplified implementation for demonstration:
-        // let verified = monas_account::verify_did(&did).await?;
+        // Example integration:
+        // ```
+        // use monas_account::AccountRegistry;
+        // let registry = AccountRegistry::new()?;
+        //
+        // // Verify key ID is registered
+        // let account = registry.resolve_key_id(&key_id).await?;
+        //
+        // // Verify signature if token includes one
+        // if let Some(signature) = extract_signature(token) {
+        //     let public_key = account.get_public_key()?;
+        //     verify_signature(public_key, signature, &key_id)?;
+        // }
+        //
+        // // Check revocation status
+        // if registry.is_revoked(&key_id).await? {
+        //     return Err(anyhow::anyhow!("Key ID has been revoked"));
+        // }
+        // ```
+        //
+        // For now, log warning and proceed
 
-        // 4. Convert DID to domain Identity
-        let identity = self.did_to_identity(&did)?;
+        tracing::warn!(
+            "Key ID authentication for {} is not fully implemented - accepting without verification (INSECURE)",
+            key_id
+        );
+
+        // 4. Convert key ID to domain Identity
+        let identity = self.key_id_to_identity(&key_id)?;
 
         Ok(identity)
     }
 
     async fn is_valid(&self, token: &AuthToken) -> Result<bool> {
         // Validate token format
-        match self.parse_did(token.as_str()) {
-            Ok(did) => Ok(self.validate_did(&did).is_ok()),
+        match self.parse_key_id(token.as_str()) {
+            Ok(key_id) => Ok(self.validate_key_id(&key_id).is_ok()),
             Err(_) => Ok(false),
         }
     }
 
     async fn get_issuer(&self, token: &AuthToken) -> Result<Option<Identity>> {
-        // For DID-based authentication, the issuer is the DID itself
+        // For key ID-based authentication, the issuer is the key ID itself
         let identity = self.authenticate(token).await?;
         Ok(Some(identity))
     }
@@ -147,42 +223,42 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_authenticate_valid_user_did() {
+    async fn test_authenticate_valid_user_key_id() {
         let adapter = MonasAccountAdapter::new();
-        let token = AuthToken::new("did:monas:user:alice".to_string());
+        let token = AuthToken::new("user:alice".to_string());
 
         let identity = adapter.authenticate(&token).await.unwrap();
 
-        assert_eq!(identity.id(), "did:monas:user:alice");
+        assert_eq!(identity.id(), "alice");
         assert!(identity.is_user());
     }
 
     #[tokio::test]
-    async fn test_authenticate_valid_node_did() {
+    async fn test_authenticate_valid_node_key_id() {
         let adapter = MonasAccountAdapter::new();
-        let token = AuthToken::new("did:monas:node:node123".to_string());
+        let token = AuthToken::new("node:node123".to_string());
 
         let identity = adapter.authenticate(&token).await.unwrap();
 
-        assert_eq!(identity.id(), "did:monas:node:node123");
+        assert_eq!(identity.id(), "node123");
         assert!(identity.is_node());
     }
 
     #[tokio::test]
-    async fn test_authenticate_valid_service_did() {
+    async fn test_authenticate_valid_service_key_id() {
         let adapter = MonasAccountAdapter::new();
-        let token = AuthToken::new("did:monas:service:indexer".to_string());
+        let token = AuthToken::new("service:indexer".to_string());
 
         let identity = adapter.authenticate(&token).await.unwrap();
 
-        assert_eq!(identity.id(), "did:monas:service:indexer");
+        assert_eq!(identity.id(), "indexer");
         assert!(identity.is_service());
     }
 
     #[tokio::test]
-    async fn test_authenticate_invalid_did_format() {
+    async fn test_authenticate_invalid_key_id_format() {
         let adapter = MonasAccountAdapter::new();
-        let token = AuthToken::new("invalid:did:format".to_string());
+        let token = AuthToken::new("invalid:key:format".to_string());
 
         let result = adapter.authenticate(&token).await;
 
@@ -190,9 +266,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_authenticate_missing_prefix() {
+    async fn test_authenticate_missing_colon() {
         let adapter = MonasAccountAdapter::new();
-        let token = AuthToken::new("user:alice".to_string());
+        let token = AuthToken::new("alice".to_string());
 
         let result = adapter.authenticate(&token).await;
 
@@ -200,9 +276,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_authenticate_invalid_structure() {
+    async fn test_authenticate_empty_id() {
         let adapter = MonasAccountAdapter::new();
-        let token = AuthToken::new("did:monas:alice".to_string()); // Missing type
+        let token = AuthToken::new("user:".to_string());
 
         let result = adapter.authenticate(&token).await;
 
@@ -213,11 +289,11 @@ mod tests {
     async fn test_is_valid() {
         let adapter = MonasAccountAdapter::new();
 
-        // Valid DID
-        let valid_token = AuthToken::new("did:monas:user:alice".to_string());
+        // Valid key ID
+        let valid_token = AuthToken::new("user:alice".to_string());
         assert!(adapter.is_valid(&valid_token).await.unwrap());
 
-        // Invalid DID
+        // Invalid key ID
         let invalid_token = AuthToken::new("invalid".to_string());
         assert!(!adapter.is_valid(&invalid_token).await.unwrap());
     }
@@ -225,29 +301,18 @@ mod tests {
     #[tokio::test]
     async fn test_get_issuer() {
         let adapter = MonasAccountAdapter::new();
-        let token = AuthToken::new("did:monas:user:alice".to_string());
+        let token = AuthToken::new("user:alice".to_string());
 
         let issuer = adapter.get_issuer(&token).await.unwrap();
 
         assert!(issuer.is_some());
-        assert_eq!(issuer.unwrap().id(), "did:monas:user:alice");
-    }
-
-    #[tokio::test]
-    async fn test_custom_prefix() {
-        let adapter = MonasAccountAdapter::with_prefix("did:custom:".to_string());
-        let token = AuthToken::new("did:custom:user:bob".to_string());
-
-        let identity = adapter.authenticate(&token).await.unwrap();
-
-        assert_eq!(identity.id(), "did:custom:user:bob");
-        assert!(identity.is_user());
+        assert_eq!(issuer.unwrap().id(), "alice");
     }
 
     #[tokio::test]
     async fn test_unknown_identity_type() {
         let adapter = MonasAccountAdapter::new();
-        let token = AuthToken::new("did:monas:unknown:test".to_string());
+        let token = AuthToken::new("unknown:test".to_string());
 
         let result = adapter.authenticate(&token).await;
 

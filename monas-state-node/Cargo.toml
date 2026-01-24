@@ -35,6 +35,10 @@ tokio = { version = "1", features = ["full"] }
 # monas-event-manager for EventBus integration
 monas-event-manager = { path = "../monas-event-manager" }
 
+# UCAN for authorization (temporary until monas-ucan is available)
+ucan = "0.7.0-alpha.1"
+ucan-key-support = "0.7.0-alpha.1"
+
 # crsl-lib for CRDT-based content versioning
 crsl-lib = { git = "https://github.com/Monas-project/crsl-lib"}
 

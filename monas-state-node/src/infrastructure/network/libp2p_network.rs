@@ -88,6 +88,9 @@ impl Default for Libp2pNetworkConfig {
 enum SwarmCommand {
     FindClosestPeers {
         key: Vec<u8>,
+        /// Number of closest peers to find.
+        /// Currently not used as libp2p Kademlia uses default value (20 peers).
+        /// TODO: Use this parameter when libp2p supports custom k-value in get_closest_peers.
         #[allow(dead_code)]
         k: usize,
         reply: oneshot::Sender<Result<Vec<PeerId>>>,
@@ -153,14 +156,23 @@ pub struct Libp2pNetwork {
     local_peer_id: PeerId,
     command_tx: mpsc::Sender<SwarmCommand>,
     /// Connected peers and their addresses.
+    ///
+    /// Updated by the swarm event loop when connections are established/closed.
+    /// Reserved for future use in network monitoring and peer management APIs.
     #[allow(dead_code)]
     connected_peers: Arc<RwLock<HashMap<PeerId, Vec<Multiaddr>>>>,
     /// Broadcast channel for received Gossipsub events.
     event_rx: broadcast::Sender<ReceivedEvent>,
     /// Content repository for content storage.
+    ///
+    /// Passed to swarm event loop for handling incoming requests.
+    /// Not directly accessed by PeerNetwork trait methods as they delegate to the swarm.
     #[allow(dead_code)]
     crdt_repo: Arc<dyn ContentRepository>,
     /// Data directory for disk capacity queries.
+    ///
+    /// Passed to swarm event loop for responding to CapacityQuery requests.
+    /// Not directly accessed by PeerNetwork trait methods as they delegate to the swarm.
     #[allow(dead_code)]
     data_dir: PathBuf,
 }

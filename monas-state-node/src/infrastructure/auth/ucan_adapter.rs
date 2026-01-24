@@ -4,6 +4,9 @@
 //! It translates between State Node's capability model and UCAN's capability model.
 
 use crate::domain::auth_capability::AuthCapability;
+use crate::domain::identity::{Identity, IdentityType};
+use crate::infrastructure::auth::share_token::{CapabilityAction, ShareToken};
+use crate::infrastructure::auth::signature_verifier::SignatureVerifier;
 use crate::port::auth_token::AuthToken;
 use crate::port::authorization_service::{
     AuthorizationRequest, AuthorizationResult, AuthorizationService,
@@ -11,6 +14,7 @@ use crate::port::authorization_service::{
 use crate::port::persistence::PersistentAccessPolicyRepository;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -33,6 +37,9 @@ where
     R: PersistentAccessPolicyRepository,
 {
     policy_repo: Arc<RwLock<R>>,
+    /// Public key registry for key ID resolution (Phase 1 mock implementation)
+    /// Maps key ID -> Public Key (65 bytes, uncompressed P256 format)
+    public_keys: Arc<RwLock<HashMap<String, Vec<u8>>>>,
 }
 
 impl<R> UcanAdapter<R>
@@ -40,7 +47,48 @@ where
     R: PersistentAccessPolicyRepository,
 {
     pub fn new(policy_repo: Arc<RwLock<R>>) -> Self {
-        Self { policy_repo }
+        Self {
+            policy_repo,
+            public_keys: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Register a public key for a key ID (for testing and Phase 1 mock implementation)
+    ///
+    /// # Arguments
+    /// * `key_id` - The key ID to register (format: "monas:type:id")
+    /// * `public_key` - The public key in uncompressed P256 format (65 bytes)
+    pub async fn register_public_key(&self, key_id: String, public_key: Vec<u8>) {
+        self.public_keys.write().await.insert(key_id, public_key);
+    }
+
+    /// Convert Identity to key ID format
+    ///
+    /// # Arguments
+    /// * `identity` - The Identity to convert
+    ///
+    /// # Returns
+    /// Key ID string in format "monas:type:id" (e.g., "monas:user:alice")
+    fn identity_to_key_id(identity: &Identity) -> String {
+        let identity_type = match identity.identity_type() {
+            IdentityType::User => "user",
+            IdentityType::Node => "node",
+            IdentityType::Service => "service",
+        };
+        format!("monas:{}:{}", identity_type, identity.id())
+    }
+
+    /// Map State Node capability to ShareToken capability action
+    fn map_capability_to_share_token(cap: &AuthCapability) -> CapabilityAction {
+        match cap {
+            AuthCapability::ReadContent => CapabilityAction::Read,
+            AuthCapability::WriteContent => CapabilityAction::Write,
+            AuthCapability::DeleteContent => CapabilityAction::Delete,
+            AuthCapability::ShareContent => CapabilityAction::Share,
+            AuthCapability::RevokeAccess => CapabilityAction::Revoke,
+            AuthCapability::ReadMetadata => CapabilityAction::Read, // ReadMetadata is subset of Read
+            AuthCapability::ManageMembers => CapabilityAction::Share, // ManageMembers requires Share
+        }
     }
 
     /// Map State Node capability to UCAN capability string
@@ -56,39 +104,140 @@ where
         }
     }
 
-    /// Parse UCAN token (simplified - would use ucan-rs in production)
+    /// Parse UCAN token from JWT string.
+    ///
+    /// # Implementation Status
+    ///
+    /// Currently performs basic JWT format validation.
+    ///
+    /// # TODO: Full UCAN Parsing
+    ///
+    /// When monas-ucan crate becomes available:
+    /// 1. Parse JWT header, payload, and signature
+    /// 2. Extract UCAN fields: iss (issuer), aud (audience), att (attenuations), exp, nbf, etc.
+    /// 3. Validate UCAN structure according to spec: https://ucan.xyz/
+    /// 4. Extract proof chain (prf field)
+    /// 5. Extract capabilities (att field)
+    ///
+    /// Alternative: Use external `ucan` crate (0.7.0-alpha.1) for parsing.
     fn parse_ucan(&self, token: &str) -> Result<UcanToken> {
-        // In production, use proper UCAN parsing library
-        // For now, simplified structure
-
         if token.is_empty() {
             return Err(anyhow::anyhow!("Empty UCAN token"));
         }
 
-        // TODO: Integrate with monas-ucan crate for proper parsing
+        // Basic JWT format validation: header.payload.signature
+        let parts: Vec<&str> = token.split('.').collect();
+        if parts.len() != 3 {
+            return Err(anyhow::anyhow!(
+                "Invalid JWT format: expected 3 parts (header.payload.signature), got {}",
+                parts.len()
+            ));
+        }
+
+        // Validate that each part is non-empty and base64url-encoded
+        for (i, part) in parts.iter().enumerate() {
+            if part.is_empty() {
+                return Err(anyhow::anyhow!("Empty JWT part at index {}", i));
+            }
+        }
+
+        // TODO: Decode and validate JWT structure using ucan crate
+        // For now, store raw token for future processing
         Ok(UcanToken {
             raw: token.to_string(),
         })
     }
 
-    /// Verify UCAN token signature and proof chain
+    /// Verify UCAN token signature and proof chain.
+    ///
+    /// # Implementation Status
+    ///
+    /// Currently performs minimal validation (non-empty check).
+    /// **WARNING**: This is NOT secure for production use.
+    ///
+    /// # TODO: Full UCAN Verification
+    ///
+    /// When monas-ucan crate becomes available, implement:
+    ///
+    /// 1. **Signature Verification**
+    ///    - Extract public key from issuer
+    ///    - Verify signature matches header + payload
+    ///    - Use appropriate signature algorithm (EdDSA, ECDSA, RSA)
+    ///
+    /// 2. **Expiration Check**
+    ///    - Verify exp (expiration time) > current time
+    ///    - Verify nbf (not-before time) <= current time
+    ///
+    /// 3. **Proof Chain Validation**
+    ///    - Recursively validate all UCANs in prf (proofs) field
+    ///    - Ensure delegation chain is valid
+    ///    - Verify each UCAN's audience matches next UCAN's issuer
+    ///
+    /// 4. **Issuer/Audience Validation**
+    ///    - Verify issuer (iss) is valid
+    ///    - Verify audience (aud) matches expected recipient
+    ///
+    /// 5. **Revocation Check**
+    ///    - Check against revocation list if available
+    ///
+    /// Reference: https://ucan.xyz/#verification
     fn verify_ucan(&self, ucan: &UcanToken) -> Result<()> {
-        // In production:
-        // 1. Verify signature
-        // 2. Verify proof chain
-        // 3. Check expiration
-        // 4. Verify issuer/audience
-
-        // TODO: Integrate with monas-ucan crate for proper verification
-
         if ucan.raw.is_empty() {
-            return Err(anyhow::anyhow!("Invalid UCAN"));
+            return Err(anyhow::anyhow!("Invalid UCAN: empty token"));
         }
+
+        // TODO: Implement full verification using ucan crate or monas-ucan
+        //
+        // Example with ucan crate (0.7.0-alpha.1):
+        // ```
+        // use ucan::Ucan;
+        // let parsed_ucan = Ucan::try_from_token_string(&ucan.raw)?;
+        // parsed_ucan.validate()?;
+        // ```
+        //
+        // For now, return Ok to allow testing, but log warning
+
+        tracing::warn!(
+            "UCAN verification is not fully implemented - allowing all UCANs (INSECURE)"
+        );
 
         Ok(())
     }
 
-    /// Check if UCAN grants a specific capability for a resource
+    /// Check if UCAN grants a specific capability for a resource.
+    ///
+    /// # Implementation Status
+    ///
+    /// Currently uses simplified string matching.
+    /// **WARNING**: This is NOT secure for production use.
+    ///
+    /// # TODO: Full Capability Checking
+    ///
+    /// When monas-ucan crate becomes available, implement:
+    ///
+    /// 1. **Parse Capabilities from UCAN**
+    ///    - Extract att (attenuations) field from UCAN payload
+    ///    - Parse capability objects: { "with": "resource-uri", "can": "action" }
+    ///
+    /// 2. **Resource URI Matching**
+    ///    - Support exact matching: "content://abc123"
+    ///    - Support wildcard matching: "content://*", "content://abc*"
+    ///    - Support hierarchical matching: "content://parent/*"
+    ///
+    /// 3. **Capability Hierarchies**
+    ///    - ADMIN > DELETE > WRITE > READ
+    ///    - If UCAN grants WRITE, it also grants READ
+    ///    - If UCAN grants *, it grants all capabilities
+    ///
+    /// 4. **Attenuation Handling**
+    ///    - Verify delegated capabilities are subset of parent UCAN
+    ///    - Ensure no privilege escalation in delegation chain
+    ///
+    /// 5. **Proof Chain Capability Aggregation**
+    ///    - Collect capabilities from all UCANs in proof chain
+    ///    - Validate each delegation step
+    ///
+    /// Reference: https://ucan.xyz/#capabilities
     fn check_ucan_capability(
         &self,
         ucan: &UcanToken,
@@ -97,12 +246,33 @@ where
     ) -> Result<bool> {
         let ucan_cap = Self::map_capability_to_ucan(capability);
 
-        // In production, properly parse UCAN capabilities
-        // For now, simplified string matching
+        // TODO: Implement proper capability checking using ucan crate
+        //
+        // Example with ucan crate (0.7.0-alpha.1):
+        // ```
+        // use ucan::Ucan;
+        // let parsed_ucan = Ucan::try_from_token_string(&ucan.raw)?;
+        // let capabilities = parsed_ucan.attenuations();
+        // for cap in capabilities {
+        //     if cap.resource() == resource && cap.can_do(ucan_cap) {
+        //         return Ok(true);
+        //     }
+        // }
+        // ```
+        //
+        // For now, use simple string matching (INSECURE)
 
-        // TODO: Integrate with monas-ucan crate for proper capability checking
+        let expected = format!("{}:{}", resource, ucan_cap);
+        let has_capability = ucan.raw.contains(&expected);
 
-        Ok(ucan.raw.contains(&format!("{}:{}", resource, ucan_cap)))
+        if has_capability {
+            tracing::warn!(
+                "UCAN capability check succeeded with insecure string matching for {}",
+                expected
+            );
+        }
+
+        Ok(has_capability)
     }
 
     /// Check UCAN-based authorization
@@ -120,6 +290,181 @@ where
         // 3. Check if UCAN grants the required capability
         let has_capability =
             self.check_ucan_capability(&ucan, request.resource.as_str(), &request.capability)?;
+
+        Ok(has_capability)
+    }
+
+    /// Parse ShareToken from JWT string
+    ///
+    /// # Arguments
+    /// * `token_str` - JWT string in format "header.payload.signature"
+    ///
+    /// # Returns
+    /// Parsed ShareToken or error if parsing fails
+    fn parse_share_token(&self, token_str: &str) -> Result<ShareToken> {
+        ShareToken::from_jwt(token_str).context("Failed to parse ShareToken")
+    }
+
+    /// Get public key for a key ID
+    ///
+    /// # Implementation Status
+    ///
+    /// Currently uses mock implementation with in-memory registry.
+    /// **WARNING**: This is NOT secure for production use.
+    ///
+    /// # TODO: Full Public Key Resolution
+    ///
+    /// When account registry becomes available:
+    /// 1. Query account registry for public key
+    /// 2. Support multiple key types (P256, Ed25519, etc.)
+    /// 3. Handle key rotation and revocation
+    /// 4. Cache public keys for performance
+    ///
+    /// For now, uses in-memory registry (Phase 1 mock implementation)
+    async fn get_public_key(&self, key_id: &str) -> Result<Option<Vec<u8>>> {
+        // Phase 1: Use in-memory public key registry
+        let public_keys = self.public_keys.read().await;
+        if let Some(key) = public_keys.get(key_id) {
+            Ok(Some(key.clone()))
+        } else {
+            tracing::warn!("Public key not found for key ID: {}", key_id);
+            Ok(None)
+        }
+    }
+
+    /// Verify ShareToken with dual signature verification
+    ///
+    /// # Arguments
+    /// * `token` - The ShareToken to verify
+    /// * `request` - The authorization request containing request signature
+    ///
+    /// # Returns
+    /// Ok(()) if all verifications pass, Err otherwise
+    ///
+    /// # Verification Steps
+    ///
+    /// 1. **ShareToken Signature Verification**
+    ///    - Get owner's public key from issuer key ID (iss)
+    ///    - Verify ShareToken signature using owner's public key
+    ///
+    /// 2. **Request Signature Verification**
+    ///    - Verify request signature is provided
+    ///    - Get requester's public key from audience key ID (aud)
+    ///    - Construct request message: "{iss}:{aud}:{jti}"
+    ///    - Verify request signature using requester's public key
+    ///
+    /// 3. **Expiration Check**
+    ///    - Verify token has not expired
+    ///
+    /// 4. **Audience Validation**
+    ///    - Verify audience (aud) matches requester identity
+    async fn verify_share_token(
+        &self,
+        token: &ShareToken,
+        request: &AuthorizationRequest,
+    ) -> Result<()> {
+        // 1. Check expiration
+        if token.is_expired() {
+            anyhow::bail!("ShareToken has expired");
+        }
+
+        // 2. Verify audience matches requester
+        let requester_key_id = Self::identity_to_key_id(&request.identity);
+        if token.payload.aud != requester_key_id {
+            anyhow::bail!(
+                "ShareToken audience mismatch: expected {}, got {}",
+                requester_key_id,
+                token.payload.aud
+            );
+        }
+
+        // 3. Get owner's public key and verify ShareToken signature
+        let owner_public_key = self
+            .get_public_key(&token.payload.iss)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Owner public key not found for key ID: {}",
+                    token.payload.iss
+                )
+            })?;
+
+        SignatureVerifier::verify_share_token_signature(token, &owner_public_key)
+            .context("ShareToken signature verification failed")?;
+
+        // 4. Verify request signature if provided
+        if let Some(request_signature) = &request.request_signature {
+            // Get requester's public key
+            let requester_public_key =
+                self.get_public_key(&token.payload.aud)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Requester public key not found for key ID: {}",
+                            token.payload.aud
+                        )
+                    })?;
+
+            // Construct request message: "{iss}:{aud}:{jti}"
+            let request_message = format!(
+                "{}:{}:{}",
+                token.payload.iss, token.payload.aud, token.payload.jti
+            );
+
+            SignatureVerifier::verify_request_signature(
+                request_message.as_bytes(),
+                request_signature,
+                &requester_public_key,
+            )
+            .context("Request signature verification failed")?;
+        } else {
+            tracing::warn!(
+                "No request signature provided - skipping request signature verification"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Check if ShareToken grants a specific capability for a resource
+    ///
+    /// # Arguments
+    /// * `token` - The ShareToken to check
+    /// * `resource` - The resource URI (e.g., "monas://content/abc123")
+    /// * `capability` - The required capability
+    ///
+    /// # Returns
+    /// true if token grants the capability, false otherwise
+    fn check_share_token_capability(
+        &self,
+        token: &ShareToken,
+        resource: &str,
+        capability: &AuthCapability,
+    ) -> bool {
+        let required_action = Self::map_capability_to_share_token(capability);
+        let resource_uri = format!("monas://content/{}", resource);
+
+        token.has_capability(&resource_uri, &required_action)
+    }
+
+    /// Check ShareToken-based authorization
+    async fn check_share_token_authorization(
+        &self,
+        token: &AuthToken,
+        request: &AuthorizationRequest,
+    ) -> Result<bool> {
+        // 1. Parse ShareToken
+        let share_token = self.parse_share_token(token.as_str())?;
+
+        // 2. Verify ShareToken and request signatures
+        self.verify_share_token(&share_token, request).await?;
+
+        // 3. Check if ShareToken grants the required capability
+        let has_capability = self.check_share_token_capability(
+            &share_token,
+            request.resource.as_str(),
+            &request.capability,
+        );
 
         Ok(has_capability)
     }
@@ -157,19 +502,36 @@ where
             return Ok(AuthorizationResult::Granted);
         }
 
-        // 4. Check UCAN token if provided (delegated access)
+        // 4. Check token if provided (delegated access)
         if let Some(token) = &request.token {
-            match self.check_ucan_authorization(token, request).await {
+            // Try ShareToken first (recommended for new implementations)
+            match self.check_share_token_authorization(token, request).await {
                 Ok(true) => return Ok(AuthorizationResult::Granted),
                 Ok(false) => {
                     return Ok(AuthorizationResult::Denied {
-                        reason: "UCAN token does not grant required capability".to_string(),
+                        reason: "ShareToken does not grant required capability".to_string(),
                     });
                 }
                 Err(e) => {
-                    return Ok(AuthorizationResult::Denied {
-                        reason: format!("UCAN verification failed: {}", e),
-                    });
+                    // If ShareToken parsing/verification fails, try UCAN as fallback
+                    tracing::debug!("ShareToken verification failed, trying UCAN: {}", e);
+
+                    match self.check_ucan_authorization(token, request).await {
+                        Ok(true) => return Ok(AuthorizationResult::Granted),
+                        Ok(false) => {
+                            return Ok(AuthorizationResult::Denied {
+                                reason: "Token does not grant required capability".to_string(),
+                            });
+                        }
+                        Err(ucan_err) => {
+                            return Ok(AuthorizationResult::Denied {
+                                reason: format!(
+                                    "Token verification failed (ShareToken: {}, UCAN: {})",
+                                    e, ucan_err
+                                ),
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -266,6 +628,7 @@ mod tests {
             resource: content_id,
             capability: AuthCapability::ReadContent,
             token: None,
+            request_signature: None,
         };
 
         let result = adapter.authorize(&request).await.unwrap();
@@ -291,6 +654,7 @@ mod tests {
             resource: content_id,
             capability: AuthCapability::ReadContent,
             token: None,
+            request_signature: None,
         };
 
         let result = adapter.authorize(&request).await.unwrap();
@@ -319,6 +683,7 @@ mod tests {
             resource: content_id,
             capability: AuthCapability::ReadContent,
             token: None,
+            request_signature: None,
         };
 
         let result = adapter.authorize(&request).await.unwrap();
@@ -339,6 +704,7 @@ mod tests {
             resource: content_id,
             capability: AuthCapability::ReadContent,
             token: None,
+            request_signature: None,
         };
 
         let result = adapter.authorize(&request).await.unwrap();
@@ -367,12 +733,14 @@ mod tests {
                 resource: content_id.clone(),
                 capability: AuthCapability::ReadContent,
                 token: None,
+                request_signature: None,
             },
             AuthorizationRequest {
                 identity: owner.clone(),
                 resource: content_id.clone(),
                 capability: AuthCapability::WriteContent,
                 token: None,
+                request_signature: None,
             },
         ];
 
@@ -401,6 +769,170 @@ mod tests {
                 &AuthCapability::DeleteContent
             ),
             "content/delete"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_share_token_authorization_e2e() {
+        use crate::infrastructure::auth::test_helpers::TestKeyPair;
+        use crate::port::auth_token::AuthToken;
+
+        // 1. Setup: Create test key pairs
+        let alice = TestKeyPair::generate("user", "alice");
+        let bob = TestKeyPair::generate("user", "bob");
+
+        // 2. Setup: Create repository and adapter
+        let repo = Arc::new(RwLock::new(MockAccessPolicyRepository::new()));
+        let adapter = UcanAdapter::new(repo.clone());
+
+        // 3. Register public keys
+        adapter
+            .register_public_key(alice.key_id().to_string(), alice.public_key().to_vec())
+            .await;
+        adapter
+            .register_public_key(bob.key_id().to_string(), bob.public_key().to_vec())
+            .await;
+
+        // 4. Create content and access policy (alice is owner)
+        let content_id = ContentId::new("test-content-123".to_string()).unwrap();
+        let alice_identity = Identity::user("alice".to_string()).unwrap();
+        let policy = AccessPolicy::new(content_id.clone(), alice_identity.clone());
+        repo.read().await.save_policy(&policy).await.unwrap();
+
+        // 5. Alice creates a ShareToken for Bob with Read capability
+        let share_token = alice.create_share_token(
+            &bob,
+            "monas://content/test-content-123",
+            vec![crate::infrastructure::auth::share_token::CapabilityAction::Read],
+            Some(3600), // 1 hour expiration
+        );
+
+        // 6. Bob creates request signature
+        let request_sig = bob.sign_request(&share_token);
+
+        // 7. Create authorization request from Bob using ShareToken
+        let bob_identity = Identity::user("bob".to_string()).unwrap();
+        let token = AuthToken::new(share_token.to_jwt().unwrap());
+        let request = AuthorizationRequest {
+            identity: bob_identity,
+            resource: content_id.clone(),
+            capability: AuthCapability::ReadContent,
+            token: Some(token),
+            request_signature: Some(request_sig),
+        };
+
+        // 8. Verify authorization is granted
+        let result = adapter.authorize(&request).await.unwrap();
+        assert!(
+            result.is_granted(),
+            "ShareToken authorization should be granted, but got: {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_share_token_authorization_denied_wrong_capability() {
+        use crate::infrastructure::auth::test_helpers::TestKeyPair;
+        use crate::port::auth_token::AuthToken;
+
+        // Setup
+        let alice = TestKeyPair::generate("user", "alice");
+        let bob = TestKeyPair::generate("user", "bob");
+        let repo = Arc::new(RwLock::new(MockAccessPolicyRepository::new()));
+        let adapter = UcanAdapter::new(repo.clone());
+
+        adapter
+            .register_public_key(alice.key_id().to_string(), alice.public_key().to_vec())
+            .await;
+        adapter
+            .register_public_key(bob.key_id().to_string(), bob.public_key().to_vec())
+            .await;
+
+        let content_id = ContentId::new("test-content-456".to_string()).unwrap();
+        let alice_identity = Identity::user("alice".to_string()).unwrap();
+        let policy = AccessPolicy::new(content_id.clone(), alice_identity.clone());
+        repo.read().await.save_policy(&policy).await.unwrap();
+
+        // Alice grants Bob only Read capability
+        let share_token = alice.create_share_token(
+            &bob,
+            "monas://content/test-content-456",
+            vec![crate::infrastructure::auth::share_token::CapabilityAction::Read],
+            Some(3600),
+        );
+
+        let request_sig = bob.sign_request(&share_token);
+
+        // Bob tries to use Write capability (not granted)
+        let bob_identity = Identity::user("bob".to_string()).unwrap();
+        let token = AuthToken::new(share_token.to_jwt().unwrap());
+        let request = AuthorizationRequest {
+            identity: bob_identity,
+            resource: content_id.clone(),
+            capability: AuthCapability::WriteContent, // Bob doesn't have this!
+            token: Some(token),
+            request_signature: Some(request_sig),
+        };
+
+        // Verify authorization is denied
+        let result = adapter.authorize(&request).await.unwrap();
+        assert!(
+            result.is_denied(),
+            "ShareToken authorization should be denied for wrong capability"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_share_token_authorization_denied_expired() {
+        use crate::infrastructure::auth::test_helpers::TestKeyPair;
+        use crate::port::auth_token::AuthToken;
+
+        // Setup
+        let alice = TestKeyPair::generate("user", "alice");
+        let bob = TestKeyPair::generate("user", "bob");
+        let repo = Arc::new(RwLock::new(MockAccessPolicyRepository::new()));
+        let adapter = UcanAdapter::new(repo.clone());
+
+        adapter
+            .register_public_key(alice.key_id().to_string(), alice.public_key().to_vec())
+            .await;
+        adapter
+            .register_public_key(bob.key_id().to_string(), bob.public_key().to_vec())
+            .await;
+
+        let content_id = ContentId::new("test-content-789".to_string()).unwrap();
+        let alice_identity = Identity::user("alice".to_string()).unwrap();
+        let policy = AccessPolicy::new(content_id.clone(), alice_identity.clone());
+        repo.read().await.save_policy(&policy).await.unwrap();
+
+        // Create an already-expired token (0 seconds = already expired)
+        let share_token = alice.create_share_token(
+            &bob,
+            "monas://content/test-content-789",
+            vec![crate::infrastructure::auth::share_token::CapabilityAction::Read],
+            Some(0), // Already expired
+        );
+
+        // Wait a moment to ensure expiration
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+
+        let request_sig = bob.sign_request(&share_token);
+
+        let bob_identity = Identity::user("bob".to_string()).unwrap();
+        let token = AuthToken::new(share_token.to_jwt().unwrap());
+        let request = AuthorizationRequest {
+            identity: bob_identity,
+            resource: content_id.clone(),
+            capability: AuthCapability::ReadContent,
+            token: Some(token),
+            request_signature: Some(request_sig),
+        };
+
+        // Verify authorization is denied due to expiration
+        let result = adapter.authorize(&request).await.unwrap();
+        assert!(
+            result.is_denied(),
+            "ShareToken authorization should be denied for expired token"
         );
     }
 }

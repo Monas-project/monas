@@ -374,6 +374,7 @@ where
         &self,
         content_id: &str,
         token: Option<&AuthToken>,
+        request_signature: Option<&[u8]>,
     ) -> Result<Event, StateNodeError> {
         // 1. Verify content network exists
         let content_id_vo = ContentId::new(content_id.to_string())?;
@@ -402,6 +403,7 @@ where
                 resource: content_id_vo.clone(),
                 capability: AuthCapability::DeleteContent,
                 token: Some(token.clone()),
+                request_signature: request_signature.map(|s| s.to_vec()),
             };
 
             let authz_result = authz_service
@@ -471,6 +473,7 @@ where
         content_id: &str,
         data: &[u8],
         token: Option<&AuthToken>,
+        request_signature: Option<&[u8]>,
     ) -> Result<Event, StateNodeError> {
         // 1. Verify content network exists
         let content_id_vo = ContentId::new(content_id.to_string())?;
@@ -499,6 +502,7 @@ where
                 resource: content_id_vo.clone(),
                 capability: AuthCapability::WriteContent,
                 token: Some(token.clone()),
+                request_signature: request_signature.map(|s| s.to_vec()),
             };
 
             let authz_result = authz_service
@@ -1434,7 +1438,7 @@ mod tests {
         );
 
         let event = service
-            .update_content("content-1", b"new data", None)
+            .update_content("content-1", b"new data", None, None)
             .await
             .unwrap();
 
@@ -1471,7 +1475,9 @@ mod tests {
             "node-1".to_string(),
         );
 
-        let result = service.update_content("content-1", b"new data", None).await;
+        let result = service
+            .update_content("content-1", b"new data", None, None)
+            .await;
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not a member"));
@@ -1481,7 +1487,9 @@ mod tests {
     async fn test_update_content_fails_if_network_not_found() {
         let service = create_test_service("node-1");
 
-        let result = service.update_content("nonexistent", b"data", None).await;
+        let result = service
+            .update_content("nonexistent", b"data", None, None)
+            .await;
 
         assert!(result.is_err());
         assert!(result

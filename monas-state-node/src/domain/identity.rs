@@ -1,16 +1,16 @@
 //! Identity types for State Node domain.
 //!
 //! This module defines identity concepts that are independent of external
-//! authentication systems. The actual authentication mechanism (DID, OAuth, etc.)
-//! is handled by the infrastructure layer through adapters.
+//! authentication systems. The actual authentication mechanism is handled
+//! by the infrastructure layer through adapters.
 
 use serde::{Deserialize, Serialize};
 
 /// State Node domain's identity concept
 ///
 /// This is independent from external authentication systems.
-/// The actual authentication mechanism (DID, OAuth, etc.) is handled
-/// by the infrastructure layer through adapters.
+/// The actual authentication mechanism is handled by the infrastructure
+/// layer through adapters.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Identity {
     id: String,
