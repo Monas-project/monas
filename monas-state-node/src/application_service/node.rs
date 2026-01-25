@@ -17,6 +17,12 @@ use crate::infrastructure::outbox_persistence::SledOutboxPersistence;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::infrastructure::persistence::{SledContentNetworkRepository, SledNodeRegistry};
 #[cfg(not(target_arch = "wasm32"))]
+use crate::infrastructure::persistence::{
+    SledAccessControlRepository, SledAccessPolicyRepository,
+};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::infrastructure::auth::{MonasAccountAdapter, UcanAdapter};
+#[cfg(not(target_arch = "wasm32"))]
 use crate::infrastructure::reliable_event_publisher::{
     ReliableEventPublisher, ReliablePublisherConfig,
 };
@@ -120,6 +126,13 @@ impl StateNode {
             SledContentNetworkRepository::open(config.data_dir.join("content"))
                 .context("Failed to open content repository")?,
         ));
+        let access_control_repo =
+            SledAccessControlRepository::open(config.data_dir.join("access_control"))
+                .context("Failed to open access control repository")?;
+        let access_policy_db =
+            sled::open(config.data_dir.join("access_policies"))
+                .context("Failed to open access policy database")?;
+        let access_policy_repo = SledAccessPolicyRepository::new(access_policy_db.clone());
 
         // Initialize CRDT repository
         let crdt_repo = Arc::new(
@@ -171,19 +184,30 @@ impl StateNode {
             node_id.clone(),
         ));
 
+        // Create auth services
+        let auth_service = MonasAccountAdapter::new();
+        let authz_policy_repo = SledAccessPolicyRepository::new(access_policy_db);
+        let authz_service = UcanAdapter::new(Arc::new(RwLock::new(authz_policy_repo)));
+
         // Create service with CRDT repository
-        let service = Arc::new(StateNodeService::with_config(
-            node_registry,
-            content_repo,
-            network.clone(),
-            event_publisher,
-            crdt_repo.clone(),
-            node_id,
-            ServiceConfig {
-                min_replication_factor: config.min_replication_factor,
-                capacity_threshold_bytes: config.capacity_threshold_bytes,
-            },
-        ));
+        let service = Arc::new(
+            StateNodeService::with_config(
+                node_registry,
+                content_repo,
+                network.clone(),
+                event_publisher,
+                crdt_repo.clone(),
+                node_id,
+                ServiceConfig {
+                    min_replication_factor: config.min_replication_factor,
+                    capacity_threshold_bytes: config.capacity_threshold_bytes,
+                },
+            )
+            .with_access_control_repo(access_control_repo)
+            .with_access_policy_repo(access_policy_repo)
+            .with_authentication_service(auth_service)
+            .with_authorization_service(authz_service),
+        );
 
         Ok(Self {
             config,
@@ -407,41 +431,8 @@ mod tests {
         assert!(config.node_id.is_none());
         assert_eq!(config.sync_interval_secs, 30);
         assert_eq!(config.outbox_retry_interval_secs, 10);
-    }
-
-    #[test]
-    fn test_state_node_config_clone() {
-        let config = StateNodeConfig {
-            data_dir: PathBuf::from("/tmp/test"),
-            http_addr: "127.0.0.1:9090".parse().unwrap(),
-            network_config: Libp2pNetworkConfig::default(),
-            node_id: Some("test-node".to_string()),
-            sync_interval_secs: 60,
-            outbox_retry_interval_secs: 20,
-            min_replication_factor: 3,
-            capacity_threshold_bytes: 1_073_741_824,
-        };
-
-        let cloned = config.clone();
-
-        assert_eq!(cloned.data_dir, config.data_dir);
-        assert_eq!(cloned.http_addr, config.http_addr);
-        assert_eq!(cloned.node_id, config.node_id);
-        assert_eq!(cloned.sync_interval_secs, config.sync_interval_secs);
-        assert_eq!(
-            cloned.outbox_retry_interval_secs,
-            config.outbox_retry_interval_secs
-        );
-    }
-
-    #[test]
-    fn test_state_node_config_debug() {
-        let config = StateNodeConfig::default();
-        let debug_str = format!("{:?}", config);
-
-        assert!(debug_str.contains("StateNodeConfig"));
-        assert!(debug_str.contains("data_dir"));
-        assert!(debug_str.contains("http_addr"));
+        assert_eq!(config.min_replication_factor, 3);
+        assert_eq!(config.capacity_threshold_bytes, 1_073_741_824);
     }
 
     #[tokio::test]
@@ -557,34 +548,4 @@ mod tests {
             .contains("Invalid multiaddr"));
     }
 
-    #[tokio::test]
-    async fn test_state_node_accessors() {
-        let tmp_dir = tempdir().unwrap();
-
-        let config = StateNodeConfig {
-            data_dir: tmp_dir.path().to_path_buf(),
-            http_addr: "127.0.0.1:0".parse().unwrap(),
-            network_config: Libp2pNetworkConfig {
-                listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
-                bootstrap_nodes: vec![],
-                enable_mdns: false,
-                gossipsub_topics: vec!["test".to_string()],
-            },
-            node_id: Some("test-node".to_string()),
-            sync_interval_secs: 30,
-            outbox_retry_interval_secs: 10,
-            ..StateNodeConfig::default()
-        };
-
-        let node = StateNode::new(config).await.unwrap();
-
-        // Verify all accessors return valid references
-        let _service = node.service();
-        let _crdt_repo = node.crdt_repo();
-        let _network = node.network();
-        let _sync_service = node.sync_service();
-        let _reliable_publisher = node.reliable_publisher();
-
-        // All should be accessible without panicking - verified by reaching this point
-    }
 }

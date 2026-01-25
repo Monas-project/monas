@@ -15,6 +15,10 @@ use monas_state_node::infrastructure::persistence::{
 };
 use monas_state_node::port::content_repository::ContentRepository;
 use monas_state_node::port::peer_network::PeerNetwork;
+use monas_state_node::port::{
+    auth_token::AuthToken, authentication_service::AuthenticationService,
+    authorization_service::{AuthorizationRequest, AuthorizationResult, AuthorizationService},
+};
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::sync::RwLock;
@@ -38,6 +42,62 @@ type TestServiceWithAC = StateNodeService<
     CrslCrdtRepository,
     SledAccessControlRepository,
 >;
+
+struct TestAuthService;
+
+#[async_trait::async_trait]
+impl AuthenticationService for TestAuthService {
+    async fn authenticate(&self, token: &AuthToken) -> anyhow::Result<monas_state_node::domain::identity::Identity> {
+        monas_state_node::domain::identity::Identity::user(token.as_str().to_string())
+            .map_err(|e| anyhow::anyhow!(e.to_string()))
+    }
+
+    async fn is_valid(&self, token: &AuthToken) -> anyhow::Result<bool> {
+        Ok(!token.is_empty())
+    }
+
+    async fn get_issuer(
+        &self,
+        token: &AuthToken,
+    ) -> anyhow::Result<Option<monas_state_node::domain::identity::Identity>> {
+        Ok(Some(
+            monas_state_node::domain::identity::Identity::user(token.as_str().to_string())
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?,
+        ))
+    }
+}
+
+struct AllowAllAuthorizationService;
+
+#[async_trait::async_trait]
+impl AuthorizationService for AllowAllAuthorizationService {
+    async fn authorize(&self, _request: &AuthorizationRequest) -> anyhow::Result<AuthorizationResult> {
+        Ok(AuthorizationResult::Granted)
+    }
+}
+
+fn test_token() -> AuthToken {
+    AuthToken::new("test-user".to_string())
+}
+
+fn test_request_signature() -> Vec<u8> {
+    vec![0x01]
+}
+
+fn sign_access_control_update(update: &AccessControlUpdate) -> (Vec<u8>, Vec<u8>) {
+    use p256::ecdsa::signature::DigestSigner;
+    use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
+    use p256::elliptic_curve::rand_core::OsRng;
+    use sha3::{Digest, Keccak256};
+
+    let signing_key = SigningKey::random(&mut OsRng);
+    let verifying_key = VerifyingKey::from(&signing_key);
+    let public_key_bytes = verifying_key.to_encoded_point(false).as_bytes().to_vec();
+    let message = update.signing_message();
+    let (signature, _): (Signature, _) =
+        signing_key.sign_digest(Keccak256::new_with_prefix(&message));
+    (signature.to_vec(), public_key_bytes)
+}
 
 /// Create a test service with temporary storage and real libp2p network.
 async fn create_test_service() -> (Arc<TestService>, Arc<CrslCrdtRepository>, TempDir) {
@@ -72,14 +132,18 @@ async fn create_test_service() -> (Arc<TestService>, Arc<CrslCrdtRepository>, Te
 
     let node_id = network.local_peer_id();
 
-    let service = Arc::new(StateNodeService::new(
-        node_registry,
-        content_repo,
-        network,
-        event_publisher,
-        crdt_repo.clone(),
-        node_id,
-    ));
+    let service = Arc::new(
+        StateNodeService::new(
+            node_registry,
+            content_repo,
+            network,
+            event_publisher,
+            crdt_repo.clone(),
+            node_id,
+        )
+        .with_authentication_service(TestAuthService)
+        .with_authorization_service(AllowAllAuthorizationService),
+    );
 
     (service, crdt_repo, temp_dir)
 }
@@ -111,7 +175,9 @@ async fn test_create_content() {
     // In isolated test environment, create_content will fail because no other peers are available.
     // This is expected behavior - content creation requires at least one other node to store the content.
     let data = b"Hello, World!";
-    let result = service.create_content(data, None).await;
+    let result = service
+        .create_content(data, Some(&test_token()), Some(&test_request_signature()))
+        .await;
 
     // Verify that it fails with the expected error in isolated environment
     assert!(result.is_err());
@@ -439,7 +505,9 @@ async fn create_test_service_with_ac() -> (Arc<TestServiceWithAC>, Arc<CrslCrdtR
             node_id,
             ServiceConfig::default(),
         )
-        .with_access_control_repo(access_control_repo),
+        .with_access_control_repo(access_control_repo)
+        .with_authentication_service(TestAuthService)
+        .with_authorization_service(AllowAllAuthorizationService),
     );
 
     (service, crdt_repo, temp_dir)
@@ -479,14 +547,15 @@ async fn test_access_control_update_and_verify() {
     service.init_access_control("content-1").await.unwrap();
 
     // Create a signed update (in real usage, signature would come from monas-account)
-    let signature = vec![0x01, 0x02, 0x03]; // Mock signature
-    let public_key = vec![0x04; 65]; // Mock public key (65 bytes for uncompressed)
-
-    let update = AccessControlUpdate::new("content-1".to_string(), 1000)
-        .with_signature(signature, public_key);
+    let update = AccessControlUpdate::new("content-1".to_string(), 1000);
+    let (signature, public_key) = sign_access_control_update(&update);
+    let update = update.with_signature(signature, public_key);
 
     // Apply the update
-    let updated_ac = service.update_access_control(&update).await.unwrap();
+    let updated_ac = service
+        .update_access_control(&update, Some(&test_token()), Some(&test_request_signature()))
+        .await
+        .unwrap();
     assert_eq!(updated_ac.min_valid_issued_at(), 1000);
 
     // Verify access with old token (should be denied)
@@ -529,7 +598,9 @@ async fn test_access_control_update_missing_signature() {
     let update = AccessControlUpdate::new("content-1".to_string(), 1000);
 
     // Update should fail due to missing signature
-    let result = service.update_access_control(&update).await;
+    let result = service
+        .update_access_control(&update, Some(&test_token()), Some(&test_request_signature()))
+        .await;
     assert!(result.is_err());
 }
 

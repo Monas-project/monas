@@ -11,6 +11,7 @@ use crate::domain::events::{current_timestamp, Event};
 use crate::domain::identity::Identity;
 use crate::domain::state_node::{self, NodeSnapshot};
 use crate::domain::value_objects::ContentId;
+use crate::infrastructure::crypto::verify_p256_signature;
 use crate::infrastructure::placement::compute_dht_key;
 use crate::port::auth_token::AuthToken;
 use crate::port::authentication_service::AuthenticationService;
@@ -23,6 +24,8 @@ use crate::port::persistence::{
     PersistentContentRepository, PersistentNodeRegistry,
 };
 use anyhow::Result;
+use cid::Cid;
+use multihash::Code;
 use std::sync::Arc;
 
 /// Result of applying an event.
@@ -122,6 +125,12 @@ where
     R: ContentRepository,
     A: PersistentAccessControlRepository,
 {
+    fn compute_content_id(data: &[u8]) -> Result<String, StateNodeError> {
+        let mh = Code::Sha2_256.digest(data);
+        let cid = Cid::new_v1(0x55, mh);
+        Ok(cid.to_string())
+    }
+
     /// Create a new StateNodeService.
     ///
     /// The `peer_network` is passed as an `Arc` to allow sharing with other components
@@ -255,28 +264,58 @@ where
     /// The content will be assigned to other nodes in the network (not the creator).
     /// At least one member node must be available for the content to be created.
     ///
-    /// If authentication is configured and a token is provided, the caller will be authenticated
-    /// and an access policy will be created with the authenticated identity as owner.
+    /// The caller must provide an authentication token and request signature.
+    /// The state node authenticates with monas-account and authorizes via UCAN,
+    /// then creates an access policy with the authenticated identity as owner.
     pub async fn create_content(
         &self,
         data: &[u8],
         token: Option<&AuthToken>,
+        request_signature: Option<&[u8]>,
     ) -> Result<Event, StateNodeError> {
-        // 1. Authenticate caller if token and auth service are provided
-        let owner_identity = if let (Some(token), Some(auth_service)) = (token, &self.auth_service)
-        {
-            // Authenticate the token to get the identity
-            let identity = auth_service
-                .authenticate(token)
-                .await
-                .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))?;
-            Some(identity)
-        } else {
-            // No authentication configured or no token provided
-            None
-        };
+        let token = token.ok_or_else(|| {
+            StateNodeError::AuthenticationFailed("Authentication token is required".to_string())
+        })?;
+        let request_signature = request_signature.ok_or_else(|| {
+            StateNodeError::AuthenticationFailed("Request signature is required".to_string())
+        })?;
+        let auth_service = self.auth_service.as_ref().ok_or_else(|| {
+            StateNodeError::InvalidConfiguration("Authentication not configured".to_string())
+        })?;
+        let authz_service = self.authz_service.as_ref().ok_or_else(|| {
+            StateNodeError::InvalidConfiguration("Authorization not configured".to_string())
+        })?;
 
-        // 2. Save content to CRDT repository first
+        // 1. Authenticate caller
+        let owner_identity = auth_service
+            .authenticate(token)
+            .await
+            .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))?;
+
+        // 2. Authorize creation for derived content ID
+        let content_id = Self::compute_content_id(data)?;
+        let content_id_vo = ContentId::new(content_id.clone())?;
+        let authz_request = AuthorizationRequest {
+            identity: owner_identity.clone(),
+            resource: content_id_vo,
+            capability: AuthCapability::WriteContent,
+            token: Some(token.clone()),
+            request_signature: Some(request_signature.to_vec()),
+        };
+        let authz_result = authz_service
+            .authorize(&authz_request)
+            .await
+            .map_err(|e| StateNodeError::AuthorizationFailed(e.to_string()))?;
+        if authz_result.is_denied() {
+            return Err(StateNodeError::AuthorizationFailed(
+                authz_result
+                    .denial_reason()
+                    .unwrap_or("Access denied")
+                    .to_string(),
+            ));
+        }
+
+        // 3. Save content to CRDT repository first
         let commit_result = self
             .crdt_repo
             .create_content(data, &self.local_node_id)
@@ -284,7 +323,7 @@ where
             .map_err(|e| StateNodeError::CrdtError(CrdtError::StorageError(e.to_string())))?;
         let content_id = commit_result.genesis_cid;
 
-        // 3. Find closest peers for content placement
+        // 4. Find closest peers for content placement
         let key = compute_dht_key(&content_id);
         let k = 3usize;
         let closest = self
@@ -316,7 +355,7 @@ where
             return Err(StateNodeError::NoAvailableMembers);
         }
 
-        // 4. Create content network
+        // 5. Create content network
         let network = ContentNetwork::from_strings(content_id.clone(), selected.clone())?;
         self.content_repo
             .write()
@@ -325,10 +364,10 @@ where
             .await
             .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
 
-        // 5. Create access policy if authentication was used
-        if let (Some(identity), Some(policy_repo)) = (owner_identity, &self.access_policy_repo) {
+        // 6. Create access policy for authenticated owner
+        if let Some(policy_repo) = &self.access_policy_repo {
             let content_id_vo = ContentId::new(content_id.clone())?;
-            let policy = AccessPolicy::new(content_id_vo, identity);
+            let policy = AccessPolicy::new(content_id_vo, owner_identity);
             policy_repo
                 .write()
                 .await
@@ -337,7 +376,7 @@ where
                 .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
         }
 
-        // 6. Create and publish event both locally and to the network
+        // 7. Create and publish event both locally and to the network
         let event = Event::ContentCreated {
             content_id,
             creator_node_id: self.local_node_id.clone(),
@@ -368,14 +407,28 @@ where
     /// - Offline nodes to receive deletion notification via event
     /// - Historical record keeping
     ///
-    /// If authentication/authorization are configured and a token is provided,
-    /// the caller's authorization to delete the content will be checked.
+    /// The caller must provide an authentication token and request signature.
+    /// The state node authenticates with monas-account and authorizes via UCAN
+    /// before deleting content.
     pub async fn delete_content(
         &self,
         content_id: &str,
         token: Option<&AuthToken>,
         request_signature: Option<&[u8]>,
     ) -> Result<Event, StateNodeError> {
+        let token = token.ok_or_else(|| {
+            StateNodeError::AuthenticationFailed("Authentication token is required".to_string())
+        })?;
+        let request_signature = request_signature.ok_or_else(|| {
+            StateNodeError::AuthenticationFailed("Request signature is required".to_string())
+        })?;
+        let auth_service = self.auth_service.as_ref().ok_or_else(|| {
+            StateNodeError::InvalidConfiguration("Authentication not configured".to_string())
+        })?;
+        let authz_service = self.authz_service.as_ref().ok_or_else(|| {
+            StateNodeError::InvalidConfiguration("Authorization not configured".to_string())
+        })?;
+
         // 1. Verify content network exists
         let content_id_vo = ContentId::new(content_id.to_string())?;
         let network = self
@@ -387,38 +440,32 @@ where
             .map_err(|e| StateNodeError::StorageError(e.to_string()))?
             .ok_or_else(|| StateNodeError::ContentNotFound(content_id_vo.clone()))?;
 
-        // 2. Check authorization if token and auth services are provided
-        if let (Some(token), Some(auth_service), Some(authz_service)) =
-            (token, &self.auth_service, &self.authz_service)
-        {
-            // Authenticate to get identity
-            let identity = auth_service
-                .authenticate(token)
-                .await
-                .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))?;
+        // 2. Authenticate and authorize
+        let identity = auth_service
+            .authenticate(token)
+            .await
+            .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))?;
 
-            // Check authorization
-            let authz_request = AuthorizationRequest {
-                identity,
-                resource: content_id_vo.clone(),
-                capability: AuthCapability::DeleteContent,
-                token: Some(token.clone()),
-                request_signature: request_signature.map(|s| s.to_vec()),
-            };
+        let authz_request = AuthorizationRequest {
+            identity,
+            resource: content_id_vo.clone(),
+            capability: AuthCapability::DeleteContent,
+            token: Some(token.clone()),
+            request_signature: Some(request_signature.to_vec()),
+        };
 
-            let authz_result = authz_service
-                .authorize(&authz_request)
-                .await
-                .map_err(|e| StateNodeError::AuthorizationFailed(e.to_string()))?;
+        let authz_result = authz_service
+            .authorize(&authz_request)
+            .await
+            .map_err(|e| StateNodeError::AuthorizationFailed(e.to_string()))?;
 
-            if authz_result.is_denied() {
-                return Err(StateNodeError::AuthorizationFailed(
-                    authz_result
-                        .denial_reason()
-                        .unwrap_or("Access denied")
-                        .to_string(),
-                ));
-            }
+        if authz_result.is_denied() {
+            return Err(StateNodeError::AuthorizationFailed(
+                authz_result
+                    .denial_reason()
+                    .unwrap_or("Access denied")
+                    .to_string(),
+            ));
         }
 
         // 3. Verify local node is a member (only members can delete)
@@ -466,8 +513,9 @@ where
 
     /// Update existing content.
     ///
-    /// If authentication/authorization are configured and a token is provided,
-    /// the caller's authorization to write the content will be checked.
+    /// The caller must provide an authentication token and request signature.
+    /// The state node authenticates with monas-account and authorizes via UCAN
+    /// before updating content.
     pub async fn update_content(
         &self,
         content_id: &str,
@@ -475,6 +523,19 @@ where
         token: Option<&AuthToken>,
         request_signature: Option<&[u8]>,
     ) -> Result<Event, StateNodeError> {
+        let token = token.ok_or_else(|| {
+            StateNodeError::AuthenticationFailed("Authentication token is required".to_string())
+        })?;
+        let request_signature = request_signature.ok_or_else(|| {
+            StateNodeError::AuthenticationFailed("Request signature is required".to_string())
+        })?;
+        let auth_service = self.auth_service.as_ref().ok_or_else(|| {
+            StateNodeError::InvalidConfiguration("Authentication not configured".to_string())
+        })?;
+        let authz_service = self.authz_service.as_ref().ok_or_else(|| {
+            StateNodeError::InvalidConfiguration("Authorization not configured".to_string())
+        })?;
+
         // 1. Verify content network exists
         let content_id_vo = ContentId::new(content_id.to_string())?;
         let network = self
@@ -486,38 +547,32 @@ where
             .map_err(|e| StateNodeError::StorageError(e.to_string()))?
             .ok_or_else(|| StateNodeError::ContentNotFound(content_id_vo.clone()))?;
 
-        // 2. Check authorization if token and auth services are provided
-        if let (Some(token), Some(auth_service), Some(authz_service)) =
-            (token, &self.auth_service, &self.authz_service)
-        {
-            // Authenticate to get identity
-            let identity = auth_service
-                .authenticate(token)
-                .await
-                .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))?;
+        // 2. Authenticate and authorize
+        let identity = auth_service
+            .authenticate(token)
+            .await
+            .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))?;
 
-            // Check authorization
-            let authz_request = AuthorizationRequest {
-                identity,
-                resource: content_id_vo.clone(),
-                capability: AuthCapability::WriteContent,
-                token: Some(token.clone()),
-                request_signature: request_signature.map(|s| s.to_vec()),
-            };
+        let authz_request = AuthorizationRequest {
+            identity,
+            resource: content_id_vo.clone(),
+            capability: AuthCapability::WriteContent,
+            token: Some(token.clone()),
+            request_signature: Some(request_signature.to_vec()),
+        };
 
-            let authz_result = authz_service
-                .authorize(&authz_request)
-                .await
-                .map_err(|e| StateNodeError::AuthorizationFailed(e.to_string()))?;
+        let authz_result = authz_service
+            .authorize(&authz_request)
+            .await
+            .map_err(|e| StateNodeError::AuthorizationFailed(e.to_string()))?;
 
-            if authz_result.is_denied() {
-                return Err(StateNodeError::AuthorizationFailed(
-                    authz_result
-                        .denial_reason()
-                        .unwrap_or("Access denied")
-                        .to_string(),
-                ));
-            }
+        if authz_result.is_denied() {
+            return Err(StateNodeError::AuthorizationFailed(
+                authz_result
+                    .denial_reason()
+                    .unwrap_or("Access denied")
+                    .to_string(),
+            ));
         }
 
         // 3. Verify local node is a member
@@ -640,7 +695,75 @@ where
     /// This uses the same node selection pattern as create_content:
     /// find closest peers via DHT and select by capacity.
     /// Only existing members can add new members.
+    /// The caller must provide an authentication token and request signature.
     pub async fn add_member_to_content(
+        &self,
+        content_id: &str,
+        count: usize,
+        token: Option<&AuthToken>,
+        request_signature: Option<&[u8]>,
+    ) -> Result<Event, StateNodeError> {
+        let token = token.ok_or_else(|| {
+            StateNodeError::AuthenticationFailed("Authentication token is required".to_string())
+        })?;
+        let request_signature = request_signature.ok_or_else(|| {
+            StateNodeError::AuthenticationFailed("Request signature is required".to_string())
+        })?;
+        let auth_service = self.auth_service.as_ref().ok_or_else(|| {
+            StateNodeError::InvalidConfiguration("Authentication not configured".to_string())
+        })?;
+        let authz_service = self.authz_service.as_ref().ok_or_else(|| {
+            StateNodeError::InvalidConfiguration("Authorization not configured".to_string())
+        })?;
+
+        // 1. Get content network
+        let content_id_vo = ContentId::new(content_id.to_string())?;
+        let network = self
+            .content_repo
+            .read()
+            .await
+            .get_content_network(content_id)
+            .await
+            .map_err(|e| StateNodeError::StorageError(e.to_string()))?
+            .ok_or_else(|| StateNodeError::ContentNotFound(content_id_vo.clone()))?;
+
+        // 2. Verify caller is a member
+        if !network.has_member_str(&self.local_node_id) {
+            return Err(StateNodeError::NotAMember {
+                node_id: self.local_node_id.clone(),
+                content_id: content_id_vo,
+            });
+        }
+
+        // 3. Authenticate and authorize
+        let identity = auth_service
+            .authenticate(token)
+            .await
+            .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))?;
+        let authz_request = AuthorizationRequest {
+            identity,
+            resource: content_id_vo.clone(),
+            capability: AuthCapability::ManageMembers,
+            token: Some(token.clone()),
+            request_signature: Some(request_signature.to_vec()),
+        };
+        let authz_result = authz_service
+            .authorize(&authz_request)
+            .await
+            .map_err(|e| StateNodeError::AuthorizationFailed(e.to_string()))?;
+        if authz_result.is_denied() {
+            return Err(StateNodeError::AuthorizationFailed(
+                authz_result
+                    .denial_reason()
+                    .unwrap_or("Access denied")
+                    .to_string(),
+            ));
+        }
+
+        self.add_member_to_content_internal(content_id, count)
+    }
+
+    async fn add_member_to_content_internal(
         &self,
         content_id: &str,
         count: usize,
@@ -800,7 +923,7 @@ where
             );
 
             // Try to add new members (ignore errors - best effort)
-            match self.add_member_to_content(content_id, needed).await {
+            match self.add_member_to_content_internal(content_id, needed).await {
                 Ok(event) => {
                     tracing::info!("Added new members to content {}: {:?}", content_id, event);
                 }
@@ -1161,18 +1284,15 @@ where
     /// Update access control for a content.
     ///
     /// This method:
-    /// 1. Verifies the signature on the update request
-    /// 2. Applies the update if valid
-    /// 3. Persists the new state
-    ///
-    /// Note: Authorization (checking if the signer is the owner) should be done
-    /// by the caller before invoking this method.
-    ///
-    /// Note: The caller is responsible for verifying the signature using `monas-account`
-    /// before calling this method. This method assumes the signature has already been verified.
+    /// 1. Verifies the signature on the update request (monas-account/P256)
+    /// 2. Authenticates and authorizes via UCAN
+    /// 3. Applies the update if valid
+    /// 4. Persists the new state
     pub async fn update_access_control(
         &self,
         update: &AccessControlUpdate,
+        token: Option<&AuthToken>,
+        request_signature: Option<&[u8]>,
     ) -> Result<ContentAccessControl, AccessControlError> {
         let ac_repo = match &self.access_control_repo {
             Some(repo) => repo,
@@ -1181,10 +1301,48 @@ where
             }
         };
 
-        // Note: Signature verification should be done by the caller using monas-account.
-        // This method assumes the update has been verified.
+        let token = token.ok_or(AccessControlError::InvalidSignature)?;
+        let request_signature = request_signature.ok_or(AccessControlError::InvalidSignature)?;
+        let auth_service = self
+            .auth_service
+            .as_ref()
+            .ok_or(AccessControlError::NotAuthorized)?;
+        let authz_service = self
+            .authz_service
+            .as_ref()
+            .ok_or(AccessControlError::NotAuthorized)?;
+
         if update.signature().is_empty() || update.signer_public_key().is_empty() {
             return Err(AccessControlError::InvalidSignature);
+        }
+
+        verify_p256_signature(
+            update.signing_message().as_slice(),
+            update.signature(),
+            update.signer_public_key(),
+        )
+        .map_err(|_| AccessControlError::InvalidSignature)?;
+
+        let identity = auth_service
+            .authenticate(token)
+            .await
+            .map_err(|_| AccessControlError::NotAuthorized)?;
+
+        let content_id_vo = ContentId::new(update.content_id.clone())
+            .map_err(|_| AccessControlError::NotAuthorized)?;
+        let authz_request = AuthorizationRequest {
+            identity,
+            resource: content_id_vo,
+            capability: AuthCapability::RevokeAccess,
+            token: Some(token.clone()),
+            request_signature: Some(request_signature.to_vec()),
+        };
+        let authz_result = authz_service
+            .authorize(&authz_request)
+            .await
+            .map_err(|_| AccessControlError::NotAuthorized)?;
+        if authz_result.is_denied() {
+            return Err(AccessControlError::NotAuthorized);
         }
 
         // 1. Get or create access control state
@@ -1240,12 +1398,52 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::port::authentication_service::AuthenticationService;
+    use crate::port::authorization_service::{AuthorizationResult, AuthorizationService};
     use crate::test_utils::{
         create_test_network, MockContentNetworkRepository, MockContentRepository,
         MockEventPublisher, MockNodeRegistry, MockPeerNetwork,
     };
     use std::collections::HashMap;
     use tokio::sync::RwLock;
+
+    struct TestAuthService;
+
+    #[async_trait::async_trait]
+    impl AuthenticationService for TestAuthService {
+        async fn authenticate(&self, token: &AuthToken) -> Result<Identity> {
+            Identity::user(token.as_str().to_string())
+                .map_err(|e| anyhow::anyhow!(e.to_string()))
+        }
+
+        async fn is_valid(&self, token: &AuthToken) -> Result<bool> {
+            Ok(!token.is_empty())
+        }
+
+        async fn get_issuer(&self, token: &AuthToken) -> Result<Option<Identity>> {
+            Ok(Some(
+                Identity::user(token.as_str().to_string())
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?,
+            ))
+        }
+    }
+
+    struct AllowAllAuthorizationService;
+
+    #[async_trait::async_trait]
+    impl AuthorizationService for AllowAllAuthorizationService {
+        async fn authorize(&self, _request: &AuthorizationRequest) -> Result<AuthorizationResult> {
+            Ok(AuthorizationResult::Granted)
+        }
+    }
+
+    fn test_token() -> AuthToken {
+        AuthToken::new("test-user".to_string())
+    }
+
+    fn test_request_signature() -> Vec<u8> {
+        vec![0x01]
+    }
 
     type TestService = StateNodeService<
         MockNodeRegistry,
@@ -1271,6 +1469,8 @@ mod tests {
             crdt_repo,
             local_node_id.to_string(),
         )
+        .with_authentication_service(TestAuthService)
+        .with_authorization_service(AllowAllAuthorizationService)
     }
 
     fn create_service_with_peers(
@@ -1297,6 +1497,8 @@ mod tests {
             crdt_repo,
             local_node_id.to_string(),
         )
+        .with_authentication_service(TestAuthService)
+        .with_authorization_service(AllowAllAuthorizationService)
     }
 
     #[tokio::test]
@@ -1356,7 +1558,10 @@ mod tests {
             capacities,
         );
 
-        let event = service.create_content(b"test data", None).await.unwrap();
+        let event = service
+            .create_content(b"test data", Some(&test_token()), Some(&test_request_signature()))
+            .await
+            .unwrap();
 
         match event {
             Event::ContentCreated {
@@ -1385,7 +1590,10 @@ mod tests {
             capacities,
         );
 
-        let event = service.create_content(b"test data", None).await.unwrap();
+        let event = service
+            .create_content(b"test data", Some(&test_token()), Some(&test_request_signature()))
+            .await
+            .unwrap();
 
         match event {
             Event::ContentCreated { member_nodes, .. } => {
@@ -1401,7 +1609,9 @@ mod tests {
     async fn test_create_content_fails_without_peers() {
         let service = create_test_service("node-1");
 
-        let result = service.create_content(b"test data", None).await;
+        let result = service
+            .create_content(b"test data", Some(&test_token()), Some(&test_request_signature()))
+            .await;
 
         assert!(result.is_err());
         assert!(result
@@ -1438,7 +1648,12 @@ mod tests {
         );
 
         let event = service
-            .update_content("content-1", b"new data", None, None)
+            .update_content(
+                "content-1",
+                b"new data",
+                Some(&test_token()),
+                Some(&test_request_signature()),
+            )
             .await
             .unwrap();
 
@@ -1476,7 +1691,12 @@ mod tests {
         );
 
         let result = service
-            .update_content("content-1", b"new data", None, None)
+            .update_content(
+                "content-1",
+                b"new data",
+                Some(&test_token()),
+                Some(&test_request_signature()),
+            )
             .await;
 
         assert!(result.is_err());
@@ -1488,7 +1708,12 @@ mod tests {
         let service = create_test_service("node-1");
 
         let result = service
-            .update_content("nonexistent", b"data", None, None)
+            .update_content(
+                "nonexistent",
+                b"data",
+                Some(&test_token()),
+                Some(&test_request_signature()),
+            )
             .await;
 
         assert!(result.is_err());
