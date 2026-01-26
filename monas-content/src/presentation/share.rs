@@ -59,6 +59,22 @@ pub struct UnwrapCekResponse {
 pub struct RevokeShareResponse {
     pub content_id: String,
     pub recipient_key_id: String,
+    pub new_envelopes: Vec<KeyEnvelopeResponse>,
+}
+
+#[derive(Serialize)]
+pub struct KeyEnvelopeResponse {
+    pub content_id: String,
+    pub sender_key_id: String,
+    pub recipient_key_id: String,
+    pub enc_base64: String,
+    pub wrapped_cek_base64: String,
+    pub ciphertext_base64: String,
+}
+
+#[derive(Deserialize)]
+pub struct RevokeShareQuery {
+    pub sender_key_id_base64: String,
 }
 
 #[derive(Serialize)]
@@ -188,8 +204,12 @@ async fn unwrap_cek(
 async fn revoke_share(
     State(state): State<Arc<AppState>>,
     Path((content_id_str, recipient_key_id_b64)): Path<(String, String)>,
+    axum::extract::Query(q): axum::extract::Query<RevokeShareQuery>,
 ) -> Result<Json<RevokeShareResponse>, (StatusCode, String)> {
     let content_id = ContentId::new(content_id_str.clone());
+
+    let sender_key_id =
+        decode_key_id_base64(&q.sender_key_id_base64, "sender_key_id_base64")?;
 
     let recipient_key_id = decode_key_id_base64(
         &recipient_key_id_b64,
@@ -198,6 +218,7 @@ async fn revoke_share(
 
     let cmd = RevokeShareCommand {
         content_id,
+        sender_key_id,
         recipient_key_id,
     };
 
@@ -206,9 +227,26 @@ async fn revoke_share(
         .revoke_share(cmd)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
+    let new_envelopes = result
+        .envelopes
+        .into_iter()
+        .map(|env| {
+            let recipient = env.recipient();
+            KeyEnvelopeResponse {
+                content_id: env.content_id().as_str().to_string(),
+                sender_key_id: BASE64_STANDARD.encode(env.sender_key_id().as_bytes()),
+                recipient_key_id: BASE64_STANDARD.encode(recipient.key_id().as_bytes()),
+                enc_base64: BASE64_STANDARD.encode(recipient.enc()),
+                wrapped_cek_base64: BASE64_STANDARD.encode(recipient.wrapped_cek()),
+                ciphertext_base64: BASE64_STANDARD.encode(env.ciphertext()),
+            }
+        })
+        .collect();
+
     Ok(Json(RevokeShareResponse {
         content_id: result.content_id.as_str().to_string(),
         recipient_key_id: recipient_key_id_b64,
+        new_envelopes,
     }))
 }
 

@@ -21,7 +21,7 @@ use crate::{
 };
 
 use super::{
-    AppState, decode_base64, decode_base64_optional, decode_cek_base64, decode_key_id_base64,
+    AppState, decode_base64, decode_base64_optional, decode_cek_base64,
 };
 
 #[derive(Deserialize)]
@@ -224,12 +224,6 @@ async fn decrypt_with_cek(
     Ok(Json(DecryptWithCekResponse { content_base64 }))
 }
 
-#[derive(Deserialize)]
-pub struct ReencryptContentRequest {
-    pub requester_key_id_base64: String,
-    pub revoked_key_id_base64: String,
-}
-
 #[derive(Serialize)]
 pub struct ReencryptContentResponse {
     pub content_id: String,
@@ -243,36 +237,17 @@ pub struct ReencryptContentResponse {
 async fn reencrypt_content(
     State(state): State<Arc<AppState>>,
     Path(content_id_str): Path<String>,
-    Json(req): Json<ReencryptContentRequest>,
 ) -> Result<Json<ReencryptContentResponse>, (StatusCode, String)> {
     let content_id = ContentId::new(content_id_str);
 
-    // requester_key_id_base64をbase64デコードしてKeyIdに変換
-    let requester_key_id = decode_key_id_base64(
-        &req.requester_key_id_base64,
-        "requester_key_id_base64",
-    )?;
-
-    // revoked_key_id_base64をbase64デコードしてKeyIdに変換
-    let revoked_key_id = decode_key_id_base64(
-        &req.revoked_key_id_base64,
-        "revoked_key_id_base64",
-    )?;
-
     // ReencryptContentCommandを構築
-    let cmd = ReencryptContentCommand {
-        content_id,
-        requester_key_id,
-        revoked_key_id,
-    };
+    let cmd = ReencryptContentCommand { content_id };
 
     // ContentService::reencrypt()を呼び出し
     let result = state.content_service.reencrypt(cmd).map_err(|e| {
         let status = match e {
             ReencryptError::ContentNotFound => StatusCode::NOT_FOUND,
             ReencryptError::ContentDeleted => StatusCode::NOT_FOUND,
-            ReencryptError::ShareNotFound => StatusCode::NOT_FOUND,
-            ReencryptError::OwnerPermissionDenied(..) => StatusCode::FORBIDDEN,
             _ => StatusCode::BAD_REQUEST,
         };
         (status, e.to_string())

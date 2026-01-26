@@ -179,6 +179,14 @@ impl Share {
         &self.content_id
     }
 
+    /// 同一の受信者リスト（ACL）を保ったまま、紐づく `content_id` を差し替えた Share を生成する。
+    pub fn with_new_content_id(&self, new_content_id: ContentId) -> Self {
+        Self {
+            content_id: new_content_id,
+            recipients: self.recipients.clone(),
+        }
+    }
+
     pub fn recipients(&self) -> &HashMap<KeyId, ShareRecipient> {
         &self.recipients
     }

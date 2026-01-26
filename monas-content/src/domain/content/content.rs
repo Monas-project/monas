@@ -29,6 +29,7 @@ pub enum ContentEvent {
 pub struct Content {
     id: ContentId,
     series_id: ContentId,
+    encrypted_id: ContentId,
     metadata: Metadata,
     raw_content: Option<Vec<u8>>,
     encrypted_content: Option<Vec<u8>>,
@@ -49,7 +50,8 @@ impl Content {
     ) -> Self {
         Self {
             id: id.clone(),
-            series_id: id,
+            series_id: id.clone(),
+            encrypted_id: id,
             metadata,
             raw_content,
             encrypted_content,
@@ -71,7 +73,6 @@ impl Content {
         E: ContentEncryption,
     {
         let cid = id_generator.generate(&raw_content);
-        let metadata = Metadata::new(name, path, cid.clone());
 
         if key.0.is_empty() {
             return Err(ContentError::EncryptionError(
@@ -80,10 +81,14 @@ impl Content {
         }
 
         let encrypted_content = encryption.encrypt(key, &raw_content)?;
+        // encCid は plainCid と暗号文から生成する（state-node 等が暗号文整合性を検証できるようにする）。
+        let enc_cid = id_generator.generate_encrypted(&cid, &encrypted_content);
+        let metadata = Metadata::new(name, path, cid.clone());
 
         let content = Self {
             id: cid.clone(),
             series_id: cid,
+            encrypted_id: enc_cid,
             metadata,
             raw_content: Some(raw_content),
             encrypted_content: Some(encrypted_content),
@@ -121,12 +126,15 @@ impl Content {
         let encrypted_content = encryption.encrypt(key, &raw_content)?;
 
         let new_id = id_generator.generate(&raw_content);
+        // encCid は plainCid と暗号文から生成する。
+        let new_enc_id = id_generator.generate_encrypted(&new_id, &encrypted_content);
 
         let new_metadata = self.metadata.with_new_id(new_id.clone());
 
         let content = Self {
             id: new_id,
             series_id: self.series_id.clone(),
+            encrypted_id: new_enc_id,
             metadata: new_metadata,
             raw_content: Some(raw_content),
             encrypted_content: Some(encrypted_content),
@@ -149,6 +157,7 @@ impl Content {
         let content = Self {
             id: self.id.clone(),
             series_id: self.series_id.clone(),
+            encrypted_id: self.encrypted_id.clone(),
             metadata: new_metadata,
             raw_content: self.raw_content.clone(),
             encrypted_content: self.encrypted_content.clone(),
@@ -169,6 +178,7 @@ impl Content {
         let content = Self {
             id: self.id.clone(),
             series_id: self.series_id.clone(),
+            encrypted_id: self.encrypted_id.clone(),
             metadata: new_metadata,
             raw_content: None,
             encrypted_content: None,
@@ -222,6 +232,10 @@ impl Content {
 
     pub fn series_id(&self) -> &ContentId {
         &self.series_id
+    }
+
+    pub fn encrypted_id(&self) -> &ContentId {
+        &self.encrypted_id
     }
 
     pub fn raw_content(&self) -> Option<&Vec<u8>> {
@@ -289,6 +303,14 @@ mod tests {
         fn generate(&self, raw_content: &[u8]) -> ContentId {
             // テスト用の単純な ID 生成: 長さに応じて異なる ID を返す。
             ContentId::new(format!("test-content-id-{}", raw_content.len()))
+        }
+
+        fn generate_encrypted(&self, plain_cid: &ContentId, ciphertext: &[u8]) -> ContentId {
+            ContentId::new(format!(
+                "test-enc-id-{}-{}",
+                plain_cid.as_str(),
+                ciphertext.len()
+            ))
         }
     }
 

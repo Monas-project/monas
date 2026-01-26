@@ -62,8 +62,6 @@ pub struct FetchContentResult {
 #[derive(Debug)]
 pub struct ReencryptContentCommand {
     pub content_id: ContentId,
-    pub requester_key_id: crate::domain::KeyId,
-    pub revoked_key_id: crate::domain::KeyId,
 }
 
 /// コンテンツ再暗号化ユースケースの出力。
