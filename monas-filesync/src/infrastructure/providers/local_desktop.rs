@@ -17,7 +17,6 @@ impl LocalDesktopProvider {
     }
 
     fn resolve_local_path(&self, path: &str) -> Result<PathBuf, FetchError> {
-        // TODO: This is a hack to get the path from the URI.
         const PREFIX: &str = "local://";
 
         if !path.starts_with(PREFIX) {
@@ -33,6 +32,12 @@ impl LocalDesktopProvider {
             });
         }
 
+        if Self::has_parent_dir(without_scheme) {
+            return Err(FetchError {
+                message: "invalid path: '..' is not allowed".into(),
+            });
+        }
+
         let mut resolved = PathBuf::from(without_scheme);
 
         if resolved.is_relative() {
@@ -42,6 +47,17 @@ impl LocalDesktopProvider {
         }
 
         Ok(resolved)
+    }
+
+    /// パスに親ディレクトリ参照（`..`）が含まれているかを判定する。
+    fn has_parent_dir(path: &str) -> bool {
+        let path_buf = PathBuf::from(path);
+        for component in path_buf.components() {
+            if let std::path::Component::ParentDir = component {
+                return true;
+            }
+        }
+        false
     }
 
     fn read_file_bytes(path: &Path) -> Result<Vec<u8>, FetchError> {
@@ -279,5 +295,68 @@ mod tests {
         let expected_path = dir.path().join("nested").join("file.txt");
         let saved_data = fs::read(expected_path).unwrap();
         assert_eq!(saved_data, data);
+    }
+
+    #[tokio::test]
+    async fn test_local_desktop_rejects_parent_dir_double_dot() {
+        let provider = make_provider();
+        let malicious_path = "local://content/../../../etc/passwd";
+
+        let result = provider.fetch(&make_auth(), malicious_path).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("'..' is not allowed"));
+    }
+
+    #[tokio::test]
+    async fn test_local_desktop_rejects_parent_dir_in_middle() {
+        let provider = make_provider();
+        let malicious_path = "local://foo/../bar/../../../etc/passwd";
+
+        let result = provider.fetch(&make_auth(), malicious_path).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("'..' is not allowed"));
+    }
+
+    #[tokio::test]
+    async fn test_local_desktop_rejects_parent_dir_on_save() {
+        let provider = make_provider();
+        let malicious_path = "local://content/../../../tmp/evil.txt";
+
+        let result = provider
+            .save(&make_auth(), malicious_path, b"malicious data")
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message.contains("'..' is not allowed"));
+    }
+
+    #[tokio::test]
+    async fn test_local_desktop_allows_valid_nested_path() {
+        let dir = TempDir::new().unwrap();
+        let config = LocalConfig {
+            base_path: Some(dir.path().to_string_lossy().into_owned()),
+        };
+        let provider = LocalDesktopProvider::new(&config);
+
+        let valid_path = "local://content/subdir/file.txt";
+        let data = b"valid content";
+
+        let result = provider.save(&make_auth(), valid_path, data).await;
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_has_parent_dir_detects_double_dot() {
+        assert!(LocalDesktopProvider::has_parent_dir("../foo"));
+        assert!(LocalDesktopProvider::has_parent_dir("foo/../bar"));
+        assert!(LocalDesktopProvider::has_parent_dir("foo/bar/.."));
+        assert!(LocalDesktopProvider::has_parent_dir(".."));
+    }
+
+    #[test]
+    fn test_has_parent_dir_allows_valid_paths() {
+        assert!(!LocalDesktopProvider::has_parent_dir("foo/bar"));
+        assert!(!LocalDesktopProvider::has_parent_dir("content/file.txt"));
+        assert!(!LocalDesktopProvider::has_parent_dir("a.b.c/d.e.f"));
+        assert!(!LocalDesktopProvider::has_parent_dir(".hidden/file"));
     }
 }

@@ -6,10 +6,11 @@ use crate::domain::{
 
 use super::{
     ContentCreatedOperation, ContentDeletedOperation, ContentEncryptionKeyStore,
-    ContentEncryptionKeyStoreError, ContentRepository, ContentRepositoryError,
-    ContentUpdatedOperation, CreateContentCommand, CreateContentResult, DeleteContentCommand,
-    DeleteContentResult, FetchContentResult, ReencryptContentCommand, ReencryptContentResult,
-    StateNodeClient, StateNodeClientError, UpdateContentCommand, UpdateContentResult,
+    ContentEncryptionKeyStoreError, ContentRepositoryError, ContentUpdatedOperation,
+    CreateContentCommand, CreateContentResult, DeleteContentCommand, DeleteContentResult,
+    FetchContentResult, MultiStorageContentRepository, ReencryptContentCommand,
+    ReencryptContentResult, StateNodeClient, StateNodeClientError, UpdateContentCommand,
+    UpdateContentResult,
 };
 
 /// コンテンツ作成ユースケースのアプリケーションサービス。
@@ -25,7 +26,7 @@ pub struct ContentService<G, R, C, K, E, S> {
 impl<G, R, C, K, E, S> ContentService<G, R, C, K, E, S>
 where
     G: ContentIdGenerator,
-    R: ContentRepository,
+    R: MultiStorageContentRepository,
     C: StateNodeClient,
     K: ContentEncryptionKeyGenerator,
     E: ContentEncryption,
@@ -43,6 +44,7 @@ where
             cmd.name,
             cmd.raw_content,
             cmd.path,
+            cmd.provider.clone(),
             &self.content_id_generator,
             &key,
             &self.encryptor,
@@ -54,10 +56,15 @@ where
             .save(content.id(), &key)
             .map_err(CreateError::KeyStore)?;
 
-        // コンテンツを永続化
-        self.content_repository
-            .save(content.id(), &content)
-            .map_err(CreateError::Repository)?;
+        // コンテンツを永続化（プロバイダー指定があればそちらに、なければデフォルト）
+        match &cmd.provider {
+            Some(provider) => {
+                self.content_repository
+                    .save_to(provider.as_str(), content.id(), &content)
+            }
+            None => self.content_repository.save(content.id(), &content),
+        }
+        .map_err(CreateError::Repository)?;
 
         // state-node に送る Operation を組み立て
         let metadata = content.metadata().clone();
@@ -108,12 +115,15 @@ where
         // 簡易バリデーション
         Self::validate_update_command(&cmd)?;
 
-        // 既存コンテンツの取得
-        let mut content = self
-            .content_repository
-            .find_by_id(&cmd.content_id)
-            .map_err(UpdateError::Repository)?
-            .ok_or(UpdateError::NotFound)?;
+        // 既存コンテンツの取得（プロバイダー指定があればそこから、なければデフォルト）
+        let mut content = match &cmd.provider {
+            Some(provider) => self
+                .content_repository
+                .find_from(provider.as_str(), &cmd.content_id),
+            None => self.content_repository.find_by_id(&cmd.content_id),
+        }
+        .map_err(UpdateError::Repository)?
+        .ok_or(UpdateError::NotFound)?;
 
         // バイナリ更新が指定されている場合
         if let Some(raw) = cmd.new_raw_content {
@@ -146,10 +156,15 @@ where
             content = updated;
         }
 
-        // state nodeの実装によるため仮置き
-        self.content_repository
-            .save(content.id(), &content)
-            .map_err(UpdateError::Repository)?;
+        // コンテンツを永続化（metadata の provider があればそこに、なければデフォルト）
+        match content.metadata().provider() {
+            Some(provider) => {
+                self.content_repository
+                    .save_to(provider.as_str(), content.id(), &content)
+            }
+            None => self.content_repository.save(content.id(), &content),
+        }
+        .map_err(UpdateError::Repository)?;
 
         // state-node に送る更新 Operation を組み立て
         let metadata = content.metadata().clone();
@@ -199,13 +214,19 @@ where
     /// コンテンツ本体を復号して取得するユースケース（fetch）。
     ///
     /// - `content_id` に対応するコンテンツを取得し、CEK を用いて復号したバイト列を返す。
+    /// - `provider` を指定した場合はそのプロバイダーから、指定しない場合はデフォルトプロバイダーから取得。
     /// - 削除済みコンテンツや CEK が存在しない場合はエラーとなる。
-    pub fn fetch(&self, content_id: ContentId) -> Result<FetchContentResult, FetchError> {
-        let content = self
-            .content_repository
-            .find_by_id(&content_id)
-            .map_err(FetchError::Repository)?
-            .ok_or(FetchError::NotFound)?;
+    pub fn fetch(
+        &self,
+        content_id: ContentId,
+        provider: Option<&str>,
+    ) -> Result<FetchContentResult, FetchError> {
+        let content = match provider {
+            Some(p) => self.content_repository.find_from(p, &content_id),
+            None => self.content_repository.find_by_id(&content_id),
+        }
+        .map_err(FetchError::Repository)?
+        .ok_or(FetchError::NotFound)?;
 
         if content.is_deleted() {
             return Err(FetchError::Deleted);
@@ -265,11 +286,14 @@ where
     /// - 物理削除ではなく、ドメインオブジェクト上で `is_deleted` フラグとバッファをクリアして保存する「論理削除」
     pub fn delete(&self, cmd: DeleteContentCommand) -> Result<DeleteContentResult, DeleteError> {
         // 既存コンテンツの取得
-        let content = self
-            .content_repository
-            .find_by_id(&cmd.content_id)
-            .map_err(DeleteError::Repository)?
-            .ok_or(DeleteError::NotFound)?;
+        let content = match &cmd.provider {
+            Some(provider) => self
+                .content_repository
+                .find_from(provider.as_str(), &cmd.content_id),
+            None => self.content_repository.find_by_id(&cmd.content_id),
+        }
+        .map_err(DeleteError::Repository)?
+        .ok_or(DeleteError::NotFound)?;
 
         // ドメインの削除処理（状態遷移とバリデーション）
         let (deleted_content, _event) = content.delete().map_err(DeleteError::Domain)?;
@@ -280,9 +304,17 @@ where
             .map_err(DeleteError::KeyStore)?;
 
         // 論理削除済みの状態を保存
-        self.content_repository
-            .save(deleted_content.id(), &deleted_content)
-            .map_err(DeleteError::Repository)?;
+        match deleted_content.metadata().provider() {
+            Some(provider) => self.content_repository.save_to(
+                provider.as_str(),
+                deleted_content.id(),
+                &deleted_content,
+            ),
+            None => self
+                .content_repository
+                .save(deleted_content.id(), &deleted_content),
+        }
+        .map_err(DeleteError::Repository)?;
 
         // state-node に送る削除 Operation を組み立て
         let metadata = deleted_content.metadata().clone();
@@ -382,6 +414,49 @@ where
             encrypted_content,
         })
     }
+
+    /// 接続済みのプロバイダー一覧を取得する。
+    pub fn connected_providers(&self) -> Result<Vec<String>, ContentRepositoryError> {
+        self.content_repository.connected_providers()
+    }
+
+    /// 現在のデフォルトプロバイダーを取得する。
+    pub fn default_provider(&self) -> Result<String, ContentRepositoryError> {
+        self.content_repository.default_provider()
+    }
+
+    /// ストレージプロバイダーを接続する（認証トークンを登録）。
+    pub fn connect_provider(
+        &self,
+        provider: String,
+        access_token: String,
+    ) -> Result<(), ContentRepositoryError> {
+        self.content_repository
+            .connect_provider(&provider, access_token)
+    }
+
+    /// ストレージプロバイダーを切断する（認証トークンを削除）。
+    pub fn disconnect_provider(&self, provider: String) -> Result<(), ContentRepositoryError> {
+        self.content_repository.disconnect_provider(&provider)
+    }
+
+    /// 既存コンテンツを別のプロバイダーにコピーする。
+    ///
+    /// 例：ローカルに保存されているコンテンツをクラウドにバックアップする場合など。
+    pub fn copy_to(
+        &self,
+        from_provider: &str,
+        to_provider: &str,
+        content_id: &ContentId,
+    ) -> Result<(), ContentRepositoryError> {
+        let content = self
+            .content_repository
+            .find_from(from_provider, content_id)?
+            .ok_or_else(|| ContentRepositoryError::Storage("content not found".to_string()))?;
+
+        self.content_repository
+            .save_to(to_provider, content_id, &content)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -473,6 +548,7 @@ pub enum ReencryptError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application_service::content_service::ContentRepository;
     use crate::domain::{
         content::encryption::{ContentEncryptionKey, ContentEncryptionKeyGenerator},
         content::ContentStatus,
@@ -695,6 +771,47 @@ mod tests {
         }
     }
 
+    impl MultiStorageContentRepository for TestContentRepository {
+        fn save_to(
+            &self,
+            _provider: &str,
+            content_id: &ContentId,
+            content: &Content,
+        ) -> Result<(), ContentRepositoryError> {
+            // テスト用：プロバイダーを無視して通常の save に委譲
+            self.save(content_id, content)
+        }
+
+        fn find_from(
+            &self,
+            _provider: &str,
+            content_id: &ContentId,
+        ) -> Result<Option<Content>, ContentRepositoryError> {
+            // テスト用：プロバイダーを無視して通常の find_by_id に委譲
+            self.find_by_id(content_id)
+        }
+
+        fn connected_providers(&self) -> Result<Vec<String>, ContentRepositoryError> {
+            Ok(vec!["test".to_string()])
+        }
+
+        fn default_provider(&self) -> Result<String, ContentRepositoryError> {
+            Ok("test".to_string())
+        }
+
+        fn connect_provider(
+            &self,
+            _provider: &str,
+            _access_token: String,
+        ) -> Result<(), ContentRepositoryError> {
+            Ok(())
+        }
+
+        fn disconnect_provider(&self, _provider: &str) -> Result<(), ContentRepositoryError> {
+            Ok(())
+        }
+    }
+
     #[derive(Clone, Default)]
     struct TestStateNodeClient {
         fail_on_created: bool,
@@ -826,7 +943,7 @@ mod tests {
         key_store: S,
     ) -> ContentService<TestIdGenerator, R, C, K, E, S>
     where
-        R: ContentRepository,
+        R: MultiStorageContentRepository,
         C: StateNodeClient,
         K: ContentEncryptionKeyGenerator,
         E: ContentEncryption,
@@ -895,6 +1012,47 @@ mod tests {
         }
     }
 
+    impl MultiStorageContentRepository for FailOnSecondSaveContentRepository {
+        fn save_to(
+            &self,
+            _provider: &str,
+            content_id: &ContentId,
+            content: &Content,
+        ) -> Result<(), ContentRepositoryError> {
+            // テスト用：プロバイダーを無視して通常の save に委譲（2回目で失敗させる挙動を共有）
+            self.save(content_id, content)
+        }
+
+        fn find_from(
+            &self,
+            _provider: &str,
+            content_id: &ContentId,
+        ) -> Result<Option<Content>, ContentRepositoryError> {
+            // テスト用：プロバイダーを無視して通常の find_by_id に委譲
+            self.find_by_id(content_id)
+        }
+
+        fn connected_providers(&self) -> Result<Vec<String>, ContentRepositoryError> {
+            Ok(vec!["test".to_string()])
+        }
+
+        fn default_provider(&self) -> Result<String, ContentRepositoryError> {
+            Ok("test".to_string())
+        }
+
+        fn connect_provider(
+            &self,
+            _provider: &str,
+            _access_token: String,
+        ) -> Result<(), ContentRepositoryError> {
+            Ok(())
+        }
+
+        fn disconnect_provider(&self, _provider: &str) -> Result<(), ContentRepositoryError> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn create_success_persists_and_notifies_state_node() {
         let (repo, storage) = TestContentRepository::new(false);
@@ -912,6 +1070,7 @@ mod tests {
             name: "test".into(),
             path: "path.txt".into(),
             raw_content: b"hello".to_vec(),
+            provider: None,
         };
 
         let result = service.create(cmd).expect("create should succeed");
@@ -944,6 +1103,7 @@ mod tests {
             name: "   ".into(),
             path: "path.txt".into(),
             raw_content: b"hello".to_vec(),
+            provider: None,
         };
 
         let err = match service.create(cmd) {
@@ -973,6 +1133,7 @@ mod tests {
             name: "test".into(),
             path: "path.txt".into(),
             raw_content: b"hello".to_vec(),
+            provider: None,
         };
 
         let err = match service.create(cmd) {
@@ -999,6 +1160,7 @@ mod tests {
             name: "old".into(),
             path: "path.txt".into(),
             raw_content: b"old-data".to_vec(),
+            provider: None,
         };
         let base_result = service
             .create(base_cmd)
@@ -1008,6 +1170,7 @@ mod tests {
             content_id: base_result.content_id.clone(),
             new_name: Some("new-name".into()),
             new_raw_content: Some(b"new-data".to_vec()),
+            provider: None,
         };
 
         let updated = service.update(update_cmd).expect("update should succeed");
@@ -1043,6 +1206,7 @@ mod tests {
             content_id: ContentId::new("unknown-id".into()),
             new_name: Some("name".into()),
             new_raw_content: None,
+            provider: None,
         };
 
         let err = match service.update(update_cmd) {
@@ -1072,6 +1236,7 @@ mod tests {
             name: "name".into(),
             path: "path.txt".into(),
             raw_content: b"data".to_vec(),
+            provider: None,
         };
         let base_result = service
             .create(base_cmd)
@@ -1081,6 +1246,7 @@ mod tests {
             content_id: base_result.content_id,
             new_name: Some("new".into()),
             new_raw_content: None,
+            provider: None,
         };
 
         let err = match service.update(update_cmd) {
@@ -1107,6 +1273,7 @@ mod tests {
             name: "name".into(),
             path: "path.txt".into(),
             raw_content: b"data".to_vec(),
+            provider: None,
         };
         let base_result = service
             .create(base_cmd)
@@ -1114,6 +1281,7 @@ mod tests {
 
         let delete_cmd = DeleteContentCommand {
             content_id: base_result.content_id.clone(),
+            provider: None,
         };
 
         let result = service.delete(delete_cmd).expect("delete should succeed");
@@ -1144,6 +1312,7 @@ mod tests {
 
         let delete_cmd = DeleteContentCommand {
             content_id: ContentId::new("unknown-id".into()),
+            provider: None,
         };
 
         let err = match service.delete(delete_cmd) {
@@ -1173,6 +1342,7 @@ mod tests {
             name: "name".into(),
             path: "path.txt".into(),
             raw_content: b"data".to_vec(),
+            provider: None,
         };
         let base_result = service
             .create(base_cmd)
@@ -1180,6 +1350,7 @@ mod tests {
 
         let delete_cmd = DeleteContentCommand {
             content_id: base_result.content_id,
+            provider: None,
         };
 
         let err = match service.delete(delete_cmd) {
@@ -1208,12 +1379,13 @@ mod tests {
             name: "fetch-test".into(),
             path: "path.txt".into(),
             raw_content: raw.clone(),
+            provider: None,
         };
 
         let created = service.create(cmd).expect("create should succeed");
 
         let fetched = service
-            .fetch(created.content_id.clone())
+            .fetch(created.content_id.clone(), None)
             .expect("fetch should succeed");
 
         assert_eq!(fetched.content_id, created.content_id);
@@ -1236,7 +1408,7 @@ mod tests {
 
         let unknown_id = ContentId::new("unknown-id".into());
 
-        let err = match service.fetch(unknown_id) {
+        let err = match service.fetch(unknown_id, None) {
             Err(e) => e,
             Ok(_) => panic!("expected not-found error but got Ok"),
         };
@@ -1260,15 +1432,17 @@ mod tests {
             name: "to-delete".into(),
             path: "path.txt".into(),
             raw_content: b"data".to_vec(),
+            provider: None,
         };
         let created = service.create(cmd).expect("create should succeed");
 
         let delete_cmd = DeleteContentCommand {
             content_id: created.content_id.clone(),
+            provider: None,
         };
         service.delete(delete_cmd).expect("delete should succeed");
 
-        let err = match service.fetch(created.content_id) {
+        let err = match service.fetch(created.content_id, None) {
             Err(e) => e,
             Ok(_) => panic!("expected deleted error but got Ok"),
         };
@@ -1292,6 +1466,7 @@ mod tests {
             name: "no-key".into(),
             path: "path.txt".into(),
             raw_content: b"data".to_vec(),
+            provider: None,
         };
         let created = service.create(cmd).expect("create should succeed");
 
@@ -1301,7 +1476,7 @@ mod tests {
             guard.remove(created.content_id.as_str());
         }
 
-        let err = match service.fetch(created.content_id) {
+        let err = match service.fetch(created.content_id, None) {
             Err(e) => e,
             Ok(_) => panic!("expected missing-key error but got Ok"),
         };
@@ -1384,6 +1559,7 @@ mod tests {
             name: "name".into(),
             path: "path.txt".into(),
             raw_content: b"same-plaintext".to_vec(),
+            provider: None,
         };
         let created = service.create(create_cmd).expect("create should succeed");
 
@@ -1443,6 +1619,7 @@ mod tests {
             name: "name".into(),
             path: "path.txt".into(),
             raw_content: b"same-plaintext".to_vec(),
+            provider: None,
         };
         let created = service.create(create_cmd).expect("create should succeed");
 
@@ -1482,6 +1659,7 @@ mod tests {
             name: "name".into(),
             path: "path.txt".into(),
             raw_content: b"data".to_vec(),
+            provider: None,
         };
         let created = service.create(create_cmd).expect("create should succeed");
 
