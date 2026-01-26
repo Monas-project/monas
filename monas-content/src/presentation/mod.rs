@@ -27,9 +27,9 @@ use crate::{
     },
 };
 
+mod base64_helpers;
 mod content;
 mod share;
-mod base64_helpers;
 
 use base64_helpers::{
     decode_base64, decode_base64_optional, decode_cek_base64, decode_key_id_base64,

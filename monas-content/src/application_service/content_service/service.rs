@@ -608,13 +608,12 @@ mod tests {
     impl ContentEncryptionKeyGenerator for ToggleKeyGenerator {
         fn generate(&self) -> ContentEncryptionKey {
             let mut guard = self.state.lock().expect("mutex poisoned");
-            let out = if !*guard {
+            if !*guard {
                 *guard = true;
                 self.first.clone()
             } else {
                 self.second.clone()
-            };
-            out
+            }
         }
     }
 
@@ -982,9 +981,10 @@ mod tests {
             content_id: &ContentId,
             content: &Content,
         ) -> Result<(), ContentRepositoryError> {
-            let mut cnt = self.save_count.lock().map_err(|e| {
-                ContentRepositoryError::Storage(format!("mutex poisoned: {e}"))
-            })?;
+            let mut cnt = self
+                .save_count
+                .lock()
+                .map_err(|e| ContentRepositoryError::Storage(format!("mutex poisoned: {e}")))?;
             *cnt += 1;
             if *cnt >= 2 {
                 return Err(ContentRepositoryError::Storage(
@@ -1058,13 +1058,7 @@ mod tests {
         let (repo, storage) = TestContentRepository::new(false);
         let client = TestStateNodeClient::default();
         let (key_store, _key_storage) = TestKeyStore::new(false, false);
-        let service = build_service(
-            repo,
-            client,
-            TestKeyGenerator,
-            TestEncryptor,
-            key_store,
-        );
+        let service = build_service(repo, client, TestKeyGenerator, TestEncryptor, key_store);
 
         let cmd = CreateContentCommand {
             name: "test".into(),
@@ -1091,13 +1085,7 @@ mod tests {
         let (repo, _) = TestContentRepository::new(false);
         let client = TestStateNodeClient::default();
         let (key_store, _) = TestKeyStore::new(false, false);
-        let service = build_service(
-            repo,
-            client,
-            TestKeyGenerator,
-            TestEncryptor,
-            key_store,
-        );
+        let service = build_service(repo, client, TestKeyGenerator, TestEncryptor, key_store);
 
         let cmd = CreateContentCommand {
             name: "   ".into(),
@@ -1121,13 +1109,7 @@ mod tests {
             ..Default::default()
         };
         let (key_store, _) = TestKeyStore::new(false, false);
-        let service = build_service(
-            repo,
-            client,
-            TestKeyGenerator,
-            TestEncryptor,
-            key_store,
-        );
+        let service = build_service(repo, client, TestKeyGenerator, TestEncryptor, key_store);
 
         let cmd = CreateContentCommand {
             name: "test".into(),
@@ -1194,13 +1176,7 @@ mod tests {
         let (repo, _) = TestContentRepository::new(false);
         let client = TestStateNodeClient::default();
         let (key_store, _) = TestKeyStore::new(false, false);
-        let service = build_service(
-            repo,
-            client,
-            TestKeyGenerator,
-            TestEncryptor,
-            key_store,
-        );
+        let service = build_service(repo, client, TestKeyGenerator, TestEncryptor, key_store);
 
         let update_cmd = UpdateContentCommand {
             content_id: ContentId::new("unknown-id".into()),
@@ -1302,13 +1278,7 @@ mod tests {
         let (repo, _) = TestContentRepository::new(false);
         let client = TestStateNodeClient::default();
         let (key_store, _) = TestKeyStore::new(false, false);
-        let service = build_service(
-            repo,
-            client,
-            TestKeyGenerator,
-            TestEncryptor,
-            key_store,
-        );
+        let service = build_service(repo, client, TestKeyGenerator, TestEncryptor, key_store);
 
         let delete_cmd = DeleteContentCommand {
             content_id: ContentId::new("unknown-id".into()),
@@ -1365,13 +1335,7 @@ mod tests {
         let (repo, _) = TestContentRepository::new(false);
         let client = TestStateNodeClient::default();
         let (key_store, _) = TestKeyStore::new(false, false);
-        let service = build_service(
-            repo,
-            client,
-            TestKeyGenerator,
-            TestEncryptor,
-            key_store,
-        );
+        let service = build_service(repo, client, TestKeyGenerator, TestEncryptor, key_store);
 
         let raw = b"hello-fetch".to_vec();
 
@@ -1398,13 +1362,7 @@ mod tests {
         let (repo, _) = TestContentRepository::new(false);
         let client = TestStateNodeClient::default();
         let (key_store, _) = TestKeyStore::new(false, false);
-        let service = build_service(
-            repo,
-            client,
-            TestKeyGenerator,
-            TestEncryptor,
-            key_store,
-        );
+        let service = build_service(repo, client, TestKeyGenerator, TestEncryptor, key_store);
 
         let unknown_id = ContentId::new("unknown-id".into());
 
@@ -1454,13 +1412,7 @@ mod tests {
         let (repo, _) = TestContentRepository::new(false);
         let client = TestStateNodeClient::default();
         let (key_store, key_storage) = TestKeyStore::new(false, false);
-        let service = build_service(
-            repo,
-            client,
-            TestKeyGenerator,
-            TestEncryptor,
-            key_store,
-        );
+        let service = build_service(repo, client, TestKeyGenerator, TestEncryptor, key_store);
 
         let cmd = CreateContentCommand {
             name: "no-key".into(),
@@ -1488,13 +1440,7 @@ mod tests {
         let (repo, _storage) = TestContentRepository::new(false);
         let client = TestStateNodeClient::default();
         let (key_store, _key_storage) = TestKeyStore::new(false, false);
-        let service = build_service(
-            repo,
-            client,
-            TestKeyGenerator,
-            TestEncryptor,
-            key_store,
-        );
+        let service = build_service(repo, client, TestKeyGenerator, TestEncryptor, key_store);
 
         let plaintext = b"decrypt-cek-success".to_vec();
         let expected_cid = service.content_id_generator.generate(&plaintext);
@@ -1514,13 +1460,7 @@ mod tests {
         let (repo, _storage) = TestContentRepository::new(false);
         let client = TestStateNodeClient::default();
         let (key_store, _key_storage) = TestKeyStore::new(false, false);
-        let service = build_service(
-            repo,
-            client,
-            TestKeyGenerator,
-            TestEncryptor,
-            key_store,
-        );
+        let service = build_service(repo, client, TestKeyGenerator, TestEncryptor, key_store);
 
         let plaintext = b"decrypt-cek-mismatch".to_vec();
         let actual_cid = service.content_id_generator.generate(&plaintext);
@@ -1597,7 +1537,9 @@ mod tests {
         // CEK も新しいものに更新されている
         let kguard = key_storage.lock().unwrap();
         assert_eq!(
-            kguard.get(created.content_id.as_str()).expect("cek should exist"),
+            kguard
+                .get(created.content_id.as_str())
+                .expect("cek should exist"),
             &new
         );
     }
@@ -1627,7 +1569,9 @@ mod tests {
         {
             let kguard = key_storage.lock().unwrap();
             assert_eq!(
-                kguard.get(created.content_id.as_str()).expect("cek should exist"),
+                kguard
+                    .get(created.content_id.as_str())
+                    .expect("cek should exist"),
                 &old
             );
         }
@@ -1643,7 +1587,9 @@ mod tests {
         // 失敗後も old CEK に戻っている（ロールバック）
         let kguard = key_storage.lock().unwrap();
         assert_eq!(
-            kguard.get(created.content_id.as_str()).expect("cek should still exist"),
+            kguard
+                .get(created.content_id.as_str())
+                .expect("cek should still exist"),
             &old
         );
     }

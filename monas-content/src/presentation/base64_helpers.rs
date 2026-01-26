@@ -82,4 +82,3 @@ pub(super) fn decode_base64_optional(
         None => Ok(None),
     }
 }
-

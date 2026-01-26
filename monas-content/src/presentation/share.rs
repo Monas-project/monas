@@ -12,13 +12,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     application_service::share_service::{GrantShareCommand, RevokeShareCommand},
-    domain::share::{
-        key_envelope::{KeyEnvelope, KeyWrapAlgorithm, WrappedRecipientKey},
-    },
+    domain::share::key_envelope::{KeyEnvelope, KeyWrapAlgorithm, WrappedRecipientKey},
     domain::{content_id::ContentId, share::Permission},
 };
 
-use super::{AppState, decode_base64, decode_key_id_base64};
+use super::{decode_base64, decode_key_id_base64, AppState};
 
 #[derive(Deserialize)]
 pub struct GrantShareRequest {
@@ -106,10 +104,7 @@ async fn grant_share(
 ) -> Result<Json<GrantShareResponse>, (StatusCode, String)> {
     let content_id = ContentId::new(req.content_id.clone());
 
-    let sender_key_id = decode_key_id_base64(
-        &req.sender_key_id_base64,
-        "sender_key_id_base64",
-    )?;
+    let sender_key_id = decode_key_id_base64(&req.sender_key_id_base64, "sender_key_id_base64")?;
 
     let recipient_pubkey = decode_base64(
         &req.recipient_public_key_base64,
@@ -165,15 +160,10 @@ async fn unwrap_cek(
 ) -> Result<Json<UnwrapCekResponse>, (StatusCode, String)> {
     let content_id = ContentId::new(req.content_id.clone());
 
-    let sender_key_id = decode_key_id_base64(
-        &req.sender_key_id_base64,
-        "sender_key_id_base64",
-    )?;
+    let sender_key_id = decode_key_id_base64(&req.sender_key_id_base64, "sender_key_id_base64")?;
 
-    let recipient_key_id = decode_key_id_base64(
-        &req.recipient_key_id_base64,
-        "recipient_key_id_base64",
-    )?;
+    let recipient_key_id =
+        decode_key_id_base64(&req.recipient_key_id_base64, "recipient_key_id_base64")?;
 
     let enc = decode_base64(&req.enc_base64, "enc_base64")?;
     let wrapped_cek = decode_base64(&req.wrapped_cek_base64, "wrapped_cek_base64")?;
@@ -208,13 +198,10 @@ async fn revoke_share(
 ) -> Result<Json<RevokeShareResponse>, (StatusCode, String)> {
     let content_id = ContentId::new(content_id_str.clone());
 
-    let sender_key_id =
-        decode_key_id_base64(&q.sender_key_id_base64, "sender_key_id_base64")?;
+    let sender_key_id = decode_key_id_base64(&q.sender_key_id_base64, "sender_key_id_base64")?;
 
-    let recipient_key_id = decode_key_id_base64(
-        &recipient_key_id_b64,
-        "recipient_key_id (base64)",
-    )?;
+    let recipient_key_id =
+        decode_key_id_base64(&recipient_key_id_b64, "recipient_key_id (base64)")?;
 
     let cmd = RevokeShareCommand {
         content_id,
