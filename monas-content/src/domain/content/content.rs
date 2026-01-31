@@ -29,7 +29,7 @@ pub enum ContentEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Content {
-    id: ContentId,
+    raw_id: ContentId,
     series_id: ContentId,
     encrypted_id: ContentId,
     metadata: Metadata,
@@ -53,7 +53,7 @@ impl Content {
         is_deleted: bool,
     ) -> Self {
         Self {
-            id: id.clone(),
+            raw_id: id.clone(),
             series_id: id.clone(),
             encrypted_id: id,
             metadata,
@@ -91,7 +91,7 @@ impl Content {
         let enc_cid = id_generator.generate_encrypted(&cid, &encrypted_content);
 
         let content = Self {
-            id: cid.clone(),
+            raw_id: cid.clone(),
             series_id: cid,
             encrypted_id: enc_cid,
             metadata,
@@ -107,7 +107,7 @@ impl Content {
     /// コンテンツ本体（バイナリ）のみを更新する。
     ///
     /// - name / path / series_id は変更しない
-    /// - `id` は新しいバイナリから再計算される（コンテンツアドレス化）
+    /// - `raw_id`（plainCid）は新しいバイナリから再計算される（コンテンツアドレス化）
     /// - `metadata.updated_at` は現在時刻に更新される
     pub fn update_content<G, E>(
         &self,
@@ -137,7 +137,7 @@ impl Content {
         let new_metadata = self.metadata.with_new_id(new_id.clone());
 
         let content = Self {
-            id: new_id,
+            raw_id: new_id,
             series_id: self.series_id.clone(),
             encrypted_id: new_enc_id,
             metadata: new_metadata,
@@ -160,7 +160,7 @@ impl Content {
         let new_metadata = self.metadata.rename(new_name);
 
         let content = Self {
-            id: self.id.clone(),
+            raw_id: self.raw_id.clone(),
             series_id: self.series_id.clone(),
             encrypted_id: self.encrypted_id.clone(),
             metadata: new_metadata,
@@ -181,7 +181,7 @@ impl Content {
         let new_metadata = self.metadata.touch();
 
         let content = Self {
-            id: self.id.clone(),
+            raw_id: self.raw_id.clone(),
             series_id: self.series_id.clone(),
             encrypted_id: self.encrypted_id.clone(),
             metadata: new_metadata,
@@ -232,8 +232,8 @@ impl Content {
         &self.metadata
     }
 
-    pub fn id(&self) -> &ContentId {
-        &self.id
+    pub fn raw_id(&self) -> &ContentId {
+        &self.raw_id
     }
 
     pub fn series_id(&self) -> &ContentId {
@@ -348,8 +348,8 @@ mod tests {
         assert_eq!(content.content_status(), &ContentStatus::Active);
         assert_eq!(event, ContentEvent::Created);
         assert!(content.encrypted_content().is_some());
-        assert!(content.id().as_str().starts_with("test-content-id-"));
-        assert_eq!(content.id(), content.series_id());
+        assert!(content.raw_id().as_str().starts_with("test-content-id-"));
+        assert_eq!(content.raw_id(), content.series_id());
     }
 
     #[test]
@@ -376,7 +376,7 @@ mod tests {
         assert_eq!(updated_content.raw_content().unwrap(), &updated_data);
         assert_eq!(event, ContentEvent::Updated);
         assert_eq!(updated_content.metadata().path(), content.metadata().path());
-        assert_ne!(updated_content.id(), content.id());
+        assert_ne!(updated_content.raw_id(), content.raw_id());
         assert_eq!(updated_content.series_id(), content.series_id());
     }
 

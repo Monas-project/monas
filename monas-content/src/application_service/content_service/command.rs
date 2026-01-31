@@ -73,8 +73,8 @@ pub struct ReencryptContentCommand {
 /// コンテンツ再暗号化ユースケースの出力。
 #[derive(Debug)]
 pub struct ReencryptContentResult {
-    pub content_id: ContentId,
-    pub series_id: ContentId,
+    pub encrypted_id: ContentId,
+    pub raw_id: ContentId,
     pub metadata: Metadata,
     pub encrypted_content: Vec<u8>,
 }

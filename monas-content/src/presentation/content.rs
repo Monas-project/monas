@@ -300,8 +300,8 @@ async fn decrypt_with_cek(
 
 #[derive(Serialize)]
 pub struct ReencryptContentResponse {
-    pub content_id: String,
-    pub series_id: String,
+    pub encrypted_id: String,
+    pub raw_id: String,
     pub name: String,
     pub path: String,
     pub updated_at: String,
@@ -332,8 +332,8 @@ async fn reencrypt_content(
     let encrypted_content_base64 = BASE64_STANDARD.encode(&result.encrypted_content);
 
     Ok(Json(ReencryptContentResponse {
-        content_id: result.content_id.as_str().to_string(),
-        series_id: result.series_id.as_str().to_string(),
+        encrypted_id: result.encrypted_id.as_str().to_string(),
+        raw_id: result.raw_id.as_str().to_string(),
         name: metadata.name().to_string(),
         path: metadata.path().to_string(),
         updated_at: metadata.updated_at().to_rfc3339(),

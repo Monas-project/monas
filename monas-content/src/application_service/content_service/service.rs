@@ -53,22 +53,22 @@ where
 
         // CEK を保存
         self.cek_store
-            .save(content.id(), &key)
+            .save(content.raw_id(), &key)
             .map_err(CreateError::KeyStore)?;
 
         // コンテンツを永続化（プロバイダー指定があればそちらに、なければデフォルト）
         match &cmd.provider {
             Some(provider) => {
                 self.content_repository
-                    .save_to(provider.as_str(), content.id(), &content)
+                    .save_to(provider.as_str(), content.raw_id(), &content)
             }
-            None => self.content_repository.save(content.id(), &content),
+            None => self.content_repository.save(content.raw_id(), &content),
         }
         .map_err(CreateError::Repository)?;
 
         // state-node に送る Operation を組み立て
         let metadata = content.metadata().clone();
-        let content_id = content.id().clone();
+        let content_id = content.raw_id().clone();
         let operation = ContentCreatedOperation {
             content_id: content_id.clone(),
             // state-node 側で `content_id` と `ciphertext` から検証可能な encCid
@@ -131,7 +131,7 @@ where
             // コンテンツごとに 1 つの CEK を持ち、暗号化のたびに IV のみランダムにする前提。
             let key = self
                 .cek_store
-                .load(content.id())
+                .load(content.raw_id())
                 .map_err(UpdateError::KeyStore)?
                 .ok_or_else(|| {
                     UpdateError::KeyStore(ContentEncryptionKeyStoreError::Storage(
@@ -144,7 +144,7 @@ where
                 .map_err(UpdateError::Domain)?;
 
             self.cek_store
-                .save(updated.id(), &key)
+                .save(updated.raw_id(), &key)
                 .map_err(UpdateError::KeyStore)?;
 
             content = updated;
@@ -160,15 +160,15 @@ where
         match content.metadata().provider() {
             Some(provider) => {
                 self.content_repository
-                    .save_to(provider.as_str(), content.id(), &content)
+                    .save_to(provider.as_str(), content.raw_id(), &content)
             }
-            None => self.content_repository.save(content.id(), &content),
+            None => self.content_repository.save(content.raw_id(), &content),
         }
         .map_err(UpdateError::Repository)?;
 
         // state-node に送る更新 Operation を組み立て
         let metadata = content.metadata().clone();
-        let content_id = content.id().clone();
+        let content_id = content.raw_id().clone();
         let operation = ContentUpdatedOperation {
             content_id: content_id.clone(),
             hash: content.encrypted_id().as_str().to_string(),
@@ -235,7 +235,7 @@ where
         // CEK をキーストアから取得
         let key = self
             .cek_store
-            .load(content.id())
+            .load(content.raw_id())
             .map_err(FetchError::KeyStore)?
             .ok_or(FetchError::MissingKey)?;
 
@@ -245,7 +245,7 @@ where
             .map_err(FetchError::Domain)?;
 
         Ok(FetchContentResult {
-            content_id: content.id().clone(),
+            content_id: content.raw_id().clone(),
             series_id: content.series_id().clone(),
             metadata: content.metadata().clone(),
             raw_content,
@@ -300,25 +300,25 @@ where
 
         // CEK を削除
         self.cek_store
-            .delete(deleted_content.id())
+            .delete(deleted_content.raw_id())
             .map_err(DeleteError::KeyStore)?;
 
         // 論理削除済みの状態を保存
         match deleted_content.metadata().provider() {
             Some(provider) => self.content_repository.save_to(
                 provider.as_str(),
-                deleted_content.id(),
+                deleted_content.raw_id(),
                 &deleted_content,
             ),
             None => self
                 .content_repository
-                .save(deleted_content.id(), &deleted_content),
+                .save(deleted_content.raw_id(), &deleted_content),
         }
         .map_err(DeleteError::Repository)?;
 
         // state-node に送る削除 Operation を組み立て
         let metadata = deleted_content.metadata().clone();
-        let content_id = deleted_content.id().clone();
+        let content_id = deleted_content.raw_id().clone();
         let operation = ContentDeletedOperation {
             content_id: content_id.clone(),
             path: metadata.path().to_string(),
@@ -353,7 +353,7 @@ where
 
         // Step 2: 既存のCEKで復号
         // reencrypt は「同じ content_id を維持したまま暗号化だけを更新する」前提。
-        let content_id = content.id().clone();
+        let content_id = content.raw_id().clone();
         let old_cek = self
             .cek_store
             .load(&content_id)
@@ -379,7 +379,7 @@ where
 
         // reencrypt では平文（復号結果）が同一なので、ContentId（plainCid）は変わらない前提。
         debug_assert_eq!(
-            reencrypted_content.id(),
+            reencrypted_content.raw_id(),
             &content_id,
             "plain content_id should not change during reencrypt"
         );
@@ -408,8 +408,8 @@ where
             .clone();
 
         Ok(ReencryptContentResult {
-            content_id,
-            series_id: reencrypted_content.series_id().clone(),
+            encrypted_id: reencrypted_content.encrypted_id().clone(),
+            raw_id: reencrypted_content.raw_id().clone(),
             metadata: reencrypted_content.metadata().clone(),
             encrypted_content,
         })
@@ -1518,7 +1518,7 @@ mod tests {
         let result = service.reencrypt(re_cmd).expect("reencrypt should succeed");
 
         // plainCid は変わらない
-        assert_eq!(result.content_id, created.content_id);
+        assert_eq!(result.raw_id, created.content_id);
 
         // ただし暗号文はCEK変更により変わる
         let after = {
@@ -1533,6 +1533,7 @@ mod tests {
             after.encrypted_content().unwrap()
         );
         assert_ne!(before.encrypted_id(), after.encrypted_id());
+        assert_eq!(&result.encrypted_id, after.encrypted_id());
 
         // CEK も新しいものに更新されている
         let kguard = key_storage.lock().unwrap();

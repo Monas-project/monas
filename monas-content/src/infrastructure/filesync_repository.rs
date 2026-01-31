@@ -475,7 +475,7 @@ base_path = "{}""#,
     /// テスト用の Content を作成する。
     fn create_test_content(id: &str) -> Content {
         serde_json::from_value(serde_json::json!({
-            "id": id,
+            "raw_id": id,
             "series_id": id,
             // v2: 暗号文由来の ContentId（encCid）
             // テストでは互換性確認が主目的のため、plainCid と同値で固定する。
@@ -533,7 +533,7 @@ base_path = "{}""#,
             .expect("failed to find content")
             .expect("content should exist");
 
-        assert_eq!(found.id(), content.id());
+        assert_eq!(found.raw_id(), content.raw_id());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -555,7 +555,7 @@ base_path = "{}""#,
             .expect("failed to find content")
             .expect("content should exist");
 
-        assert_eq!(found.id(), content.id());
+        assert_eq!(found.raw_id(), content.raw_id());
     }
 
     #[test]
