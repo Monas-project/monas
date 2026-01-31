@@ -65,7 +65,10 @@ impl IpfsProvider {
 
     #[cfg(feature = "cloud-connectivity")]
     fn http_client() -> reqwest::Client {
-        reqwest::Client::new()
+        reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("failed to build IPFS HTTP client")
     }
 
     #[cfg(feature = "cloud-connectivity")]

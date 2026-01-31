@@ -25,7 +25,7 @@ use crate::port::persistence::{
 };
 use anyhow::Result;
 use cid::Cid;
-use multihash::Code;
+use multihash_codetable::{Code, MultihashDigest};
 use std::sync::Arc;
 
 /// Result of applying an event.
@@ -760,7 +760,7 @@ where
             ));
         }
 
-        self.add_member_to_content_internal(content_id, count)
+        self.add_member_to_content_internal(content_id, count).await
     }
 
     async fn add_member_to_content_internal(
@@ -1645,7 +1645,9 @@ mod tests {
             event_publisher,
             crdt_repo,
             "node-1".to_string(),
-        );
+        )
+        .with_authentication_service(TestAuthService)
+        .with_authorization_service(AllowAllAuthorizationService);
 
         let event = service
             .update_content(
@@ -1688,7 +1690,9 @@ mod tests {
             event_publisher,
             crdt_repo,
             "node-1".to_string(),
-        );
+        )
+        .with_authentication_service(TestAuthService)
+        .with_authorization_service(AllowAllAuthorizationService);
 
         let result = service
             .update_content(

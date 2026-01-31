@@ -5,7 +5,9 @@ use crate::domain::errors::StateNodeError;
 use crate::infrastructure::crdt_repository::CrslCrdtRepository;
 use crate::infrastructure::gossipsub_publisher::GossipsubEventPublisher;
 use crate::infrastructure::network::Libp2pNetwork;
-use crate::infrastructure::persistence::{SledContentNetworkRepository, SledNodeRegistry};
+use crate::infrastructure::persistence::{
+    SledAccessControlRepository, SledContentNetworkRepository, SledNodeRegistry,
+};
 use crate::port::auth_token::AuthToken;
 use crate::port::content_repository::ContentRepository;
 use axum::{
@@ -27,6 +29,7 @@ pub type AppState = Arc<
         Libp2pNetwork,
         GossipsubEventPublisher<Libp2pNetwork>,
         CrslCrdtRepository,
+        SledAccessControlRepository,
     >,
 >;
 
