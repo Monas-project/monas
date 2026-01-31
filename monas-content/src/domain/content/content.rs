@@ -204,18 +204,19 @@ impl Content {
     {
         self.ensure_not_deleted()?;
 
-        if self.encrypted_content.is_none() {
-            Err(ContentError::DecryptionError(
+        let Some(encrypted) = self.encrypted_content.as_ref() else {
+            return Err(ContentError::DecryptionError(
                 "Missing encrypted content".to_string(),
-            ))
-        } else if key.0.is_empty() {
-            Err(ContentError::DecryptionError(
+            ));
+        };
+
+        if key.0.is_empty() {
+            return Err(ContentError::DecryptionError(
                 "Missing content encryption key".to_string(),
-            ))
-        } else {
-            let encrypted = self.encrypted_content.as_ref().unwrap();
-            encryption.decrypt(key, encrypted)
+            ));
         }
+
+        encryption.decrypt(key, encrypted)
     }
 
     /// - `is_deleted == true` の場合は `ContentError::AlreadyDeleted` を返す。
