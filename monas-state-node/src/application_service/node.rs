@@ -19,8 +19,6 @@ use crate::infrastructure::outbox_persistence::SledOutboxPersistence;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::infrastructure::persistence::{SledAccessControlRepository, SledAccessPolicyRepository};
 #[cfg(not(target_arch = "wasm32"))]
-use crate::port::persistence::PersistentAccessPolicyRepository;
-#[cfg(not(target_arch = "wasm32"))]
 use crate::infrastructure::persistence::{SledContentNetworkRepository, SledNodeRegistry};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::infrastructure::reliable_event_publisher::{
@@ -28,6 +26,8 @@ use crate::infrastructure::reliable_event_publisher::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 use crate::port::peer_network::PeerNetwork;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::port::persistence::PersistentAccessPolicyRepository;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::presentation::http_api::{create_router, AppState};
 #[cfg(not(target_arch = "wasm32"))]
@@ -133,9 +133,9 @@ impl StateNode {
             .context("Failed to open access policy database")?;
         // Create a single shared access policy repository instance
         // Both StateNodeService and UcanAdapter will use the same instance to avoid sync issues
-        let access_policy_repo: Arc<RwLock<dyn PersistentAccessPolicyRepository>> = Arc::new(RwLock::new(
-            SledAccessPolicyRepository::new(access_policy_db)
-        ));
+        let access_policy_repo: Arc<RwLock<dyn PersistentAccessPolicyRepository>> = Arc::new(
+            RwLock::new(SledAccessPolicyRepository::new(access_policy_db)),
+        );
 
         // Initialize CRDT repository
         let crdt_repo = Arc::new(
