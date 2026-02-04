@@ -19,6 +19,8 @@ use crate::infrastructure::outbox_persistence::SledOutboxPersistence;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::infrastructure::persistence::{SledAccessControlRepository, SledAccessPolicyRepository};
 #[cfg(not(target_arch = "wasm32"))]
+use crate::port::persistence::PersistentAccessPolicyRepository;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::infrastructure::persistence::{SledContentNetworkRepository, SledNodeRegistry};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::infrastructure::reliable_event_publisher::{
@@ -129,7 +131,11 @@ impl StateNode {
                 .context("Failed to open access control repository")?;
         let access_policy_db = sled::open(config.data_dir.join("access_policies"))
             .context("Failed to open access policy database")?;
-        let access_policy_repo = SledAccessPolicyRepository::new(access_policy_db.clone());
+        // Create a single shared access policy repository instance
+        // Both StateNodeService and UcanAdapter will use the same instance to avoid sync issues
+        let access_policy_repo: Arc<RwLock<dyn PersistentAccessPolicyRepository>> = Arc::new(RwLock::new(
+            SledAccessPolicyRepository::new(access_policy_db)
+        ));
 
         // Initialize CRDT repository
         let crdt_repo = Arc::new(
@@ -183,8 +189,7 @@ impl StateNode {
 
         // Create auth services
         let auth_service = MonasAccountAdapter::new();
-        let authz_policy_repo = SledAccessPolicyRepository::new(access_policy_db);
-        let authz_service = UcanAdapter::new(Arc::new(RwLock::new(authz_policy_repo)));
+        let authz_service = UcanAdapter::new_with_dyn_repo(access_policy_repo.clone());
 
         // Create service with CRDT repository
         let service = Arc::new(

@@ -214,11 +214,13 @@ where
     /// Set the access policy repository (builder pattern).
     ///
     /// This method allows adding access policy management after construction.
+    /// Accepts an already-wrapped Arc<RwLock<>> to allow sharing the same instance
+    /// with other components (e.g., UcanAdapter).
     pub fn with_access_policy_repo(
         mut self,
-        access_policy_repo: impl PersistentAccessPolicyRepository + 'static,
+        access_policy_repo: Arc<tokio::sync::RwLock<dyn PersistentAccessPolicyRepository>>,
     ) -> Self {
-        self.access_policy_repo = Some(Arc::new(tokio::sync::RwLock::new(access_policy_repo)));
+        self.access_policy_repo = Some(access_policy_repo);
         self
     }
 
