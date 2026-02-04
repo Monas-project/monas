@@ -13,15 +13,12 @@ use serde::{Deserialize, Serialize};
 use crate::{
     application_service::content_service::{
         ContentRepositoryError, CreateContentCommand, CreateContentResult, DecryptWithCekError,
-        DeleteContentCommand, UpdateContentCommand,
+        DeleteContentCommand, ReencryptContentCommand, ReencryptError, UpdateContentCommand,
     },
-    domain::{
-        content::encryption::ContentEncryptionKey, content::provider::StorageProvider,
-        content::ContentStatus, content_id::ContentId,
-    },
+    domain::{content::provider::StorageProvider, content::ContentStatus, content_id::ContentId},
 };
 
-use super::AppState;
+use super::{decode_base64, decode_base64_optional, decode_cek_base64, AppState};
 
 #[derive(Deserialize)]
 pub struct CreateContentRequest {
@@ -63,6 +60,7 @@ pub fn routes() -> Router<Arc<AppState>> {
         )
         .route("/contents/{id}/fetch", get(fetch_content))
         .route("/contents/{id}/decrypt", post(decrypt_with_cek))
+        .route("/contents/{id}/reencrypt", post(reencrypt_content))
         .route("/providers", get(list_providers))
         .route("/providers/{provider}/connect", post(connect_provider))
         .route(
@@ -75,15 +73,7 @@ async fn create_content(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateContentRequest>,
 ) -> Result<Json<CreateContentResponse>, (StatusCode, String)> {
-    let raw = match BASE64_STANDARD.decode(&req.content_base64) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!("invalid base64 content: {e}"),
-            ))
-        }
-    };
+    let raw = decode_base64(&req.content_base64, "content_base64")?;
 
     let provider = match req.provider {
         Some(p) => match p.parse::<StorageProvider>() {
@@ -131,28 +121,16 @@ async fn update_content(
     let content_id = ContentId::new(id);
 
     // content_base64 が指定されている場合のみデコード
-    let raw_opt = if let Some(b64) = req.content_base64 {
-        let bytes = match BASE64_STANDARD.decode(&b64) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                return Err((
-                    StatusCode::BAD_REQUEST,
-                    format!("invalid base64 content: {e}"),
-                ))
-            }
-        };
+    let raw_opt = decode_base64_optional(req.content_base64.as_deref(), "content_base64")?;
 
+    if let Some(ref bytes) = raw_opt {
         if bytes.is_empty() {
             return Err((
                 StatusCode::BAD_REQUEST,
                 "raw_content must not be empty".to_string(),
             ));
         }
-
-        Some(bytes)
-    } else {
-        None
-    };
+    }
 
     let provider = match req.provider {
         Some(p) => match p.parse::<StorageProvider>() {
@@ -300,19 +278,9 @@ async fn decrypt_with_cek(
 ) -> Result<Json<DecryptWithCekResponse>, (StatusCode, String)> {
     let content_id = ContentId::new(id);
 
-    let cek_bytes = BASE64_STANDARD
-        .decode(&req.cek_base64)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid cek_base64: {e}")))?;
-    let cek = ContentEncryptionKey(cek_bytes);
+    let cek = decode_cek_base64(&req.cek_base64, "cek_base64")?;
 
-    let ciphertext = BASE64_STANDARD
-        .decode(&req.ciphertext_base64)
-        .map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!("invalid ciphertext_base64: {e}"),
-            )
-        })?;
+    let ciphertext = decode_base64(&req.ciphertext_base64, "ciphertext_base64")?;
 
     let plaintext = state
         .content_service
@@ -328,6 +296,49 @@ async fn decrypt_with_cek(
     let content_base64 = BASE64_STANDARD.encode(&plaintext);
 
     Ok(Json(DecryptWithCekResponse { content_base64 }))
+}
+
+#[derive(Serialize)]
+pub struct ReencryptContentResponse {
+    pub encrypted_id: String,
+    pub raw_id: String,
+    pub name: String,
+    pub path: String,
+    pub updated_at: String,
+    pub encrypted_content_base64: String,
+}
+
+async fn reencrypt_content(
+    State(state): State<Arc<AppState>>,
+    Path(content_id_str): Path<String>,
+) -> Result<Json<ReencryptContentResponse>, (StatusCode, String)> {
+    let content_id = ContentId::new(content_id_str);
+
+    // ReencryptContentCommandを構築
+    let cmd = ReencryptContentCommand { content_id };
+
+    // ContentService::reencrypt()を呼び出し
+    let result = state.content_service.reencrypt(cmd).map_err(|e| {
+        let status = match e {
+            ReencryptError::ContentNotFound => StatusCode::NOT_FOUND,
+            ReencryptError::ContentDeleted => StatusCode::NOT_FOUND,
+            _ => StatusCode::BAD_REQUEST,
+        };
+        (status, e.to_string())
+    })?;
+
+    // ReencryptContentResponseに変換
+    let metadata = &result.metadata;
+    let encrypted_content_base64 = BASE64_STANDARD.encode(&result.encrypted_content);
+
+    Ok(Json(ReencryptContentResponse {
+        encrypted_id: result.encrypted_id.as_str().to_string(),
+        raw_id: result.raw_id.as_str().to_string(),
+        name: metadata.name().to_string(),
+        path: metadata.path().to_string(),
+        updated_at: metadata.updated_at().to_rfc3339(),
+        encrypted_content_base64,
+    }))
 }
 
 #[derive(Deserialize)]

@@ -27,8 +27,13 @@ use crate::{
     },
 };
 
+mod base64_helpers;
 mod content;
 mod share;
+
+use base64_helpers::{
+    decode_base64, decode_base64_optional, decode_cek_base64, decode_key_id_base64,
+};
 
 /// v1 用のダミー `StateNodeClient` 実装。
 /// 実際には何も送信せず、ログ出力だけ行う想定のため、ここでは単に `Ok(())` を返す。

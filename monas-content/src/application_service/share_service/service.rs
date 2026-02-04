@@ -28,6 +28,40 @@ where
     KD: PublicKeyDirectory,
     KW: KeyWrapping,
 {
+    fn build_envelope_for_recipient(
+        &self,
+        content_id: &crate::domain::content_id::ContentId,
+        sender_key_id: &crate::domain::share::KeyId,
+        recipient_key_id: &crate::domain::share::KeyId,
+        cek: &crate::domain::content::encryption::ContentEncryptionKey,
+        ciphertext: &[u8],
+    ) -> Result<KeyEnvelope, ShareApplicationError> {
+        let recipient_public_key = self
+            .public_key_directory
+            .find_public_key(recipient_key_id)
+            .map_err(ShareApplicationError::PublicKeyDirectory)?
+            .ok_or(ShareApplicationError::MissingPublicKey)?;
+
+        let (enc, wrapped_cek) = self
+            .key_wrapper
+            .wrap_cek(cek, &recipient_public_key, content_id)
+            .map_err(|e| ShareApplicationError::KeyWrapping(format!("{e:?}")))?;
+
+        let wrapped_recipient = crate::domain::share::WrappedRecipientKey::new(
+            recipient_key_id.clone(),
+            enc,
+            wrapped_cek,
+        );
+
+        Ok(KeyEnvelope::new(
+            content_id.clone(),
+            crate::domain::share::key_envelope::KeyWrapAlgorithm::HpkeV1,
+            sender_key_id.clone(),
+            wrapped_recipient,
+            ciphertext.to_vec(),
+        ))
+    }
+
     /// 指定されたコンテンツに対する現在の共有状態（ACL）を取得する。
     ///
     /// - Share がまだ一度も保存されていない場合は Ok(None) を返す。
@@ -84,6 +118,7 @@ where
         let event = match cmd.permission {
             crate::domain::share::Permission::Read => share.grant_read(recipient_key_id.clone()),
             crate::domain::share::Permission::Write => share.grant_write(recipient_key_id.clone()),
+            crate::domain::share::Permission::Owner => share.grant_owner(recipient_key_id.clone()),
         }
         .map_err(ShareApplicationError::Share)?;
 
@@ -137,6 +172,30 @@ where
         &self,
         cmd: RevokeShareCommand,
     ) -> Result<RevokeShareResult, ShareApplicationError> {
+        // 1. コンテンツ本体と暗号化状態の確認（KeyEnvelope 再発行に必要）
+        let content = self
+            .content_repository
+            .find_by_id(&cmd.content_id)
+            .map_err(ShareApplicationError::ContentRepository)?
+            .ok_or(ShareApplicationError::ContentNotFound)?;
+
+        if content.is_deleted() {
+            return Err(ShareApplicationError::ContentDeleted);
+        }
+
+        let ciphertext = content
+            .encrypted_content()
+            .cloned()
+            .ok_or(ShareApplicationError::MissingEncryptedContent)?;
+
+        // 2. CEK の取得（再暗号化後はここが新しい CEK になっている想定）
+        let cek = self
+            .cek_store
+            .load(&cmd.content_id)
+            .map_err(ShareApplicationError::ContentEncryptionKeyStore)?
+            .ok_or(ShareApplicationError::MissingContentEncryptionKey)?;
+
+        // 3. Share をロードして ACL を更新
         let mut share = self
             .share_repository
             .load(&cmd.content_id)
@@ -151,9 +210,26 @@ where
             .save(&share)
             .map_err(ShareApplicationError::ShareRepository)?;
 
+        // 4. 取り消し後に残っている受信者向けに KeyEnvelope を再発行
+        let mut recipient_key_ids: Vec<_> = share.recipients().keys().cloned().collect();
+        recipient_key_ids.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+
+        let mut envelopes = Vec::with_capacity(recipient_key_ids.len());
+        for recipient_key_id in recipient_key_ids {
+            let env = self.build_envelope_for_recipient(
+                &cmd.content_id,
+                &cmd.sender_key_id,
+                &recipient_key_id,
+                &cek,
+                &ciphertext,
+            )?;
+            envelopes.push(env);
+        }
+
         Ok(RevokeShareResult {
             content_id: cmd.content_id,
             recipient_key_id: cmd.recipient_key_id,
+            envelopes,
         })
     }
 
@@ -995,22 +1071,44 @@ mod tests {
 
     #[test]
     fn revoke_share_success_updates_acl() {
-        let (content_repo, _content_storage) = TestContentRepository::new();
-        let (key_store, _key_storage) = TestKeyStore::new();
+        let (content_repo, content_storage) = TestContentRepository::new();
+        let (key_store, key_storage) = TestKeyStore::new();
         let (share_repo, share_storage) = TestShareRepository::new();
         let public_key_dir = TestPublicKeyDirectory::default();
         let key_wrapper = TestKeyWrapper;
 
-        let cid = cid();
-        let kid = KeyId::new(vec![1, 2, 3]);
-        let mut share = Share::new(cid.clone());
+        let content_id = cid();
+        let revoked_kid = KeyId::new(vec![1, 2, 3]);
+        let remaining_kid = KeyId::new(vec![4, 5, 6]);
+        let sender = sender_key_id();
+
+        // revoke_share は KeyEnvelope 再発行のために content(ciphertext) と CEK を必要とする
+        let content = build_content(&content_id, Some(encrypted()), false);
+        {
+            let mut guard = content_storage.lock().unwrap();
+            guard.insert(content_id.as_str().to_string(), content);
+        }
+        {
+            let mut guard = key_storage.lock().unwrap();
+            guard.insert(content_id.as_str().to_string(), cek());
+        }
+
+        let mut share = Share::new(content_id.clone());
         share
-            .grant_read(kid.clone())
+            .grant_read(revoked_kid.clone())
+            .expect("initial grant_read (revoked) should succeed");
+        share
+            .grant_read(remaining_kid.clone())
             .expect("initial grant_read should succeed");
         {
             let mut guard = share_storage.lock().unwrap();
-            guard.insert(cid.as_str().to_string(), share);
+            guard.insert(content_id.as_str().to_string(), share);
         }
+
+        // build_envelope_for_recipient 内で公開鍵ディレクトリ参照が必要（実装上は first を返すだけ）
+        public_key_dir
+            .register_public_key(&[1, 2, 3, 4])
+            .expect("public key registration should succeed");
 
         let service = build_service(
             share_repo.clone(),
@@ -1021,30 +1119,52 @@ mod tests {
         );
 
         let cmd = RevokeShareCommand {
-            content_id: cid.clone(),
-            recipient_key_id: kid.clone(),
+            content_id: content_id.clone(),
+            sender_key_id: sender.clone(),
+            recipient_key_id: revoked_kid.clone(),
         };
 
         let result = service
             .revoke_share(cmd)
             .expect("revoke_share should succeed");
-        assert_eq!(result.content_id, cid);
-        assert_eq!(result.recipient_key_id, kid);
+        assert_eq!(result.content_id, content_id);
+        assert_eq!(result.recipient_key_id, revoked_kid);
+
+        // 取り消し後に残っている受信者向けの KeyEnvelope が再発行される
+        assert_eq!(result.envelopes.len(), 1);
+        let env = &result.envelopes[0];
+        assert_eq!(env.content_id(), &content_id);
+        assert_eq!(env.sender_key_id(), &sender);
+        assert_eq!(env.recipient().key_id(), &remaining_kid);
+        assert_eq!(env.ciphertext(), encrypted().as_slice());
 
         let guard = share_storage.lock().unwrap();
         let stored_share = guard
-            .get(cid.as_str())
+            .get(content_id.as_str())
             .expect("share should still exist after revoke");
-        assert!(stored_share.recipients().is_empty());
+        assert_eq!(stored_share.recipients().len(), 1);
+        assert!(stored_share.recipients().contains_key(&remaining_kid));
     }
 
     #[test]
     fn revoke_share_fails_when_share_not_found() {
-        let (content_repo, _content_storage) = TestContentRepository::new();
-        let (key_store, _key_storage) = TestKeyStore::new();
+        let (content_repo, content_storage) = TestContentRepository::new();
+        let (key_store, key_storage) = TestKeyStore::new();
         let (share_repo, _share_storage) = TestShareRepository::new();
         let public_key_dir = TestPublicKeyDirectory::default();
         let key_wrapper = TestKeyWrapper;
+
+        // revoke_share は share をロードする前に content/ciphertext と CEK を参照する
+        let cid = cid();
+        let content = build_content(&cid, Some(encrypted()), false);
+        {
+            let mut guard = content_storage.lock().unwrap();
+            guard.insert(cid.as_str().to_string(), content);
+        }
+        {
+            let mut guard = key_storage.lock().unwrap();
+            guard.insert(cid.as_str().to_string(), cek());
+        }
 
         let service = build_service(
             share_repo,
@@ -1055,7 +1175,8 @@ mod tests {
         );
 
         let cmd = RevokeShareCommand {
-            content_id: cid(),
+            content_id: cid.clone(),
+            sender_key_id: sender_key_id(),
             recipient_key_id: KeyId::new(vec![1]),
         };
 
