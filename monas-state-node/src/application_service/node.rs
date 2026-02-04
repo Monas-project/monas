@@ -5,6 +5,8 @@ use crate::application_service::content_sync_service::ContentSyncService;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::application_service::state_node_service::{ServiceConfig, StateNodeService};
 #[cfg(not(target_arch = "wasm32"))]
+use crate::infrastructure::auth::{MonasAccountAdapter, UcanAdapter};
+#[cfg(not(target_arch = "wasm32"))]
 use crate::infrastructure::crdt_repository::CrslCrdtRepository;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::infrastructure::gossipsub_publisher::GossipsubEventPublisher;
@@ -15,13 +17,9 @@ use crate::infrastructure::network::{Libp2pNetwork, Libp2pNetworkConfig};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::infrastructure::outbox_persistence::SledOutboxPersistence;
 #[cfg(not(target_arch = "wasm32"))]
+use crate::infrastructure::persistence::{SledAccessControlRepository, SledAccessPolicyRepository};
+#[cfg(not(target_arch = "wasm32"))]
 use crate::infrastructure::persistence::{SledContentNetworkRepository, SledNodeRegistry};
-#[cfg(not(target_arch = "wasm32"))]
-use crate::infrastructure::persistence::{
-    SledAccessControlRepository, SledAccessPolicyRepository,
-};
-#[cfg(not(target_arch = "wasm32"))]
-use crate::infrastructure::auth::{MonasAccountAdapter, UcanAdapter};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::infrastructure::reliable_event_publisher::{
     ReliableEventPublisher, ReliablePublisherConfig,
@@ -129,9 +127,8 @@ impl StateNode {
         let access_control_repo =
             SledAccessControlRepository::open(config.data_dir.join("access_control"))
                 .context("Failed to open access control repository")?;
-        let access_policy_db =
-            sled::open(config.data_dir.join("access_policies"))
-                .context("Failed to open access policy database")?;
+        let access_policy_db = sled::open(config.data_dir.join("access_policies"))
+            .context("Failed to open access policy database")?;
         let access_policy_repo = SledAccessPolicyRepository::new(access_policy_db.clone());
 
         // Initialize CRDT repository
@@ -547,5 +544,4 @@ mod tests {
             .to_string()
             .contains("Invalid multiaddr"));
     }
-
 }

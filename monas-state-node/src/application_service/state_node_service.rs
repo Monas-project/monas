@@ -923,7 +923,10 @@ where
             );
 
             // Try to add new members (ignore errors - best effort)
-            match self.add_member_to_content_internal(content_id, needed).await {
+            match self
+                .add_member_to_content_internal(content_id, needed)
+                .await
+            {
                 Ok(event) => {
                     tracing::info!("Added new members to content {}: {:?}", content_id, event);
                 }
@@ -1412,8 +1415,7 @@ mod tests {
     #[async_trait::async_trait]
     impl AuthenticationService for TestAuthService {
         async fn authenticate(&self, token: &AuthToken) -> Result<Identity> {
-            Identity::user(token.as_str().to_string())
-                .map_err(|e| anyhow::anyhow!(e.to_string()))
+            Identity::user(token.as_str().to_string()).map_err(|e| anyhow::anyhow!(e.to_string()))
         }
 
         async fn is_valid(&self, token: &AuthToken) -> Result<bool> {
@@ -1559,7 +1561,11 @@ mod tests {
         );
 
         let event = service
-            .create_content(b"test data", Some(&test_token()), Some(&test_request_signature()))
+            .create_content(
+                b"test data",
+                Some(&test_token()),
+                Some(&test_request_signature()),
+            )
             .await
             .unwrap();
 
@@ -1591,7 +1597,11 @@ mod tests {
         );
 
         let event = service
-            .create_content(b"test data", Some(&test_token()), Some(&test_request_signature()))
+            .create_content(
+                b"test data",
+                Some(&test_token()),
+                Some(&test_request_signature()),
+            )
             .await
             .unwrap();
 
@@ -1610,7 +1620,11 @@ mod tests {
         let service = create_test_service("node-1");
 
         let result = service
-            .create_content(b"test data", Some(&test_token()), Some(&test_request_signature()))
+            .create_content(
+                b"test data",
+                Some(&test_token()),
+                Some(&test_request_signature()),
+            )
             .await;
 
         assert!(result.is_err());

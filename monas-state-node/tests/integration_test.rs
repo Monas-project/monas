@@ -16,7 +16,8 @@ use monas_state_node::infrastructure::persistence::{
 use monas_state_node::port::content_repository::ContentRepository;
 use monas_state_node::port::peer_network::PeerNetwork;
 use monas_state_node::port::{
-    auth_token::AuthToken, authentication_service::AuthenticationService,
+    auth_token::AuthToken,
+    authentication_service::AuthenticationService,
     authorization_service::{AuthorizationRequest, AuthorizationResult, AuthorizationService},
 };
 use std::sync::Arc;
@@ -47,7 +48,10 @@ struct TestAuthService;
 
 #[async_trait::async_trait]
 impl AuthenticationService for TestAuthService {
-    async fn authenticate(&self, token: &AuthToken) -> anyhow::Result<monas_state_node::domain::identity::Identity> {
+    async fn authenticate(
+        &self,
+        token: &AuthToken,
+    ) -> anyhow::Result<monas_state_node::domain::identity::Identity> {
         monas_state_node::domain::identity::Identity::user(token.as_str().to_string())
             .map_err(|e| anyhow::anyhow!(e.to_string()))
     }
@@ -71,7 +75,10 @@ struct AllowAllAuthorizationService;
 
 #[async_trait::async_trait]
 impl AuthorizationService for AllowAllAuthorizationService {
-    async fn authorize(&self, _request: &AuthorizationRequest) -> anyhow::Result<AuthorizationResult> {
+    async fn authorize(
+        &self,
+        _request: &AuthorizationRequest,
+    ) -> anyhow::Result<AuthorizationResult> {
         Ok(AuthorizationResult::Granted)
     }
 }
@@ -553,7 +560,11 @@ async fn test_access_control_update_and_verify() {
 
     // Apply the update
     let updated_ac = service
-        .update_access_control(&update, Some(&test_token()), Some(&test_request_signature()))
+        .update_access_control(
+            &update,
+            Some(&test_token()),
+            Some(&test_request_signature()),
+        )
         .await
         .unwrap();
     assert_eq!(updated_ac.min_valid_issued_at(), 1000);
@@ -599,7 +610,11 @@ async fn test_access_control_update_missing_signature() {
 
     // Update should fail due to missing signature
     let result = service
-        .update_access_control(&update, Some(&test_token()), Some(&test_request_signature()))
+        .update_access_control(
+            &update,
+            Some(&test_token()),
+            Some(&test_request_signature()),
+        )
         .await;
     assert!(result.is_err());
 }
