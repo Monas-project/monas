@@ -159,6 +159,14 @@ mod tests {
         assert_eq!(retrieved, Some(network));
     }
 
+    fn generate_test_public_key() -> Vec<u8> {
+        use p256::ecdsa::SigningKey;
+        use rand::rngs::OsRng;
+        let signing_key = SigningKey::random(&mut OsRng);
+        let verifying_key = signing_key.verifying_key();
+        verifying_key.to_encoded_point(false).as_bytes().to_vec()
+    }
+
     #[tokio::test]
     async fn test_list_content_networks() {
         let temp_dir = TempDir::new().unwrap();
@@ -167,11 +175,15 @@ mod tests {
         let network1 = ContentNetwork::new(
             ContentId::new("cid-1".to_string()).unwrap(),
             NodeId::new("node-1".to_string()).unwrap(),
-        );
+            generate_test_public_key(),
+        )
+        .unwrap();
         let network2 = ContentNetwork::new(
             ContentId::new("cid-2".to_string()).unwrap(),
             NodeId::new("node-2".to_string()).unwrap(),
-        );
+            generate_test_public_key(),
+        )
+        .unwrap();
 
         repo.save_content_network(network1).await.unwrap();
         repo.save_content_network(network2).await.unwrap();
@@ -207,7 +219,9 @@ mod tests {
         let network = ContentNetwork::new(
             ContentId::new("cid-1".to_string()).unwrap(),
             NodeId::new("node-1".to_string()).unwrap(),
-        );
+            generate_test_public_key(),
+        )
+        .unwrap();
 
         repo.save_content_network(network).await.unwrap();
         assert!(repo.get_content_network("cid-1").await.unwrap().is_some());

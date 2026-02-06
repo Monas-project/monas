@@ -290,7 +290,7 @@ where
 
         // 1. Authenticate caller
         let owner_identity = auth_service
-            .authenticate(token)
+            .authenticate(token, None)
             .await
             .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))?;
 
@@ -444,7 +444,7 @@ where
 
         // 2. Authenticate and authorize
         let identity = auth_service
-            .authenticate(token)
+            .authenticate(token, None)
             .await
             .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))?;
 
@@ -551,7 +551,7 @@ where
 
         // 2. Authenticate and authorize
         let identity = auth_service
-            .authenticate(token)
+            .authenticate(token, None)
             .await
             .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))?;
 
@@ -655,7 +655,7 @@ where
 
         // 2. Authenticate caller
         let caller_identity = auth_service
-            .authenticate(token)
+            .authenticate(token, None)
             .await
             .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))?;
 
@@ -739,7 +739,7 @@ where
 
         // 3. Authenticate and authorize
         let identity = auth_service
-            .authenticate(token)
+            .authenticate(token, None)
             .await
             .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))?;
         let authz_request = AuthorizationRequest {
@@ -1329,7 +1329,7 @@ where
         .map_err(|_| AccessControlError::InvalidSignature)?;
 
         let identity = auth_service
-            .authenticate(token)
+            .authenticate(token, None)
             .await
             .map_err(|_| AccessControlError::NotAuthorized)?;
 
@@ -1416,7 +1416,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl AuthenticationService for TestAuthService {
-        async fn authenticate(&self, token: &AuthToken) -> Result<Identity> {
+        async fn authenticate(&self, token: &AuthToken, _context: Option<&crate::port::auth_token::AuthContext>) -> Result<Identity> {
             Identity::user(token.as_str().to_string()).map_err(|e| anyhow::anyhow!(e.to_string()))
         }
 

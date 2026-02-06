@@ -445,10 +445,39 @@ impl PersistentContentRepository for MockContentNetworkRepository {
 // ============================================================================
 
 /// Create a test ContentNetwork with the given members.
+///
+/// Generates dummy P-256 public keys for each member for testing purposes.
 pub fn create_test_network(content_id: &str, members: Vec<&str>) -> ContentNetwork {
-    let member_strings: Vec<String> = members.into_iter().map(|s| s.to_string()).collect();
-    ContentNetwork::from_strings(content_id.to_string(), member_strings)
-        .expect("Failed to create test network")
+    use crate::domain::value_objects::{ContentId, NodeId};
+    use p256::ecdsa::SigningKey;
+    use rand::rngs::OsRng;
+
+    if members.is_empty() {
+        panic!("Cannot create test network with no members");
+    }
+
+    // Generate test keypair for first member
+    let signing_key = SigningKey::random(&mut OsRng);
+    let verifying_key = signing_key.verifying_key();
+    let public_key = verifying_key.to_encoded_point(false).as_bytes().to_vec();
+
+    let content_id_vo = ContentId::new(content_id.to_string()).expect("Invalid content ID");
+    let first_member = NodeId::new(members[0].to_string()).expect("Invalid node ID");
+
+    let mut network = ContentNetwork::new(content_id_vo, first_member, public_key)
+        .expect("Failed to create test network");
+
+    // Add remaining members with their own public keys
+    for member in members.iter().skip(1) {
+        let signing_key = SigningKey::random(&mut OsRng);
+        let verifying_key = signing_key.verifying_key();
+        let public_key = verifying_key.to_encoded_point(false).as_bytes().to_vec();
+        let node_id = NodeId::new(member.to_string()).expect("Invalid node ID");
+        network.add_member_with_public_key(node_id, public_key)
+            .expect("Failed to add member to test network");
+    }
+
+    network
 }
 
 /// Create a test NodeSnapshot.

@@ -188,7 +188,7 @@ impl StateNode {
         ));
 
         // Create auth services
-        let auth_service = MonasAccountAdapter::new();
+        let auth_service = MonasAccountAdapter::new(content_repo.clone());
         let authz_service = UcanAdapter::new_with_dyn_repo(access_policy_repo.clone());
 
         // Create service with CRDT repository

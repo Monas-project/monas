@@ -216,6 +216,12 @@ pub enum ValueError {
 
     #[error("Member nodes cannot be empty")]
     EmptyMemberNodes,
+
+    #[error("Invalid public key format: {0}")]
+    InvalidPublicKeyFormat(String),
+
+    #[error("Node is not a member of the content network")]
+    NodeNotMember,
 }
 
 #[cfg(test)]

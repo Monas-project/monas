@@ -3,6 +3,8 @@
 //! This module provides an opaque authentication token type for the State Node domain.
 //! The actual token format (JWT, UCAN, etc.) is hidden from the domain layer.
 
+use serde::{Deserialize, Serialize};
+
 /// Authentication token (opaque type in domain)
 ///
 /// The actual format (JWT, UCAN, etc.) is hidden from the domain.
@@ -13,6 +15,63 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthToken {
     raw: String,
+}
+
+/// Authentication context for signature verification
+///
+/// Contains the context information needed to verify signatures and
+/// look up public keys from the content network.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthContext {
+    /// Content ID being accessed
+    pub content_id: String,
+    /// Operation being performed
+    pub operation: String,
+}
+
+impl AuthContext {
+    /// Create a new authentication context
+    pub fn new(content_id: String, operation: String) -> Self {
+        Self {
+            content_id,
+            operation,
+        }
+    }
+}
+
+/// Request metadata for replay attack prevention
+///
+/// This structure contains nonce and timestamp information to prevent
+/// replay attacks. It is used in conjunction with request signatures.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestMetadata {
+    /// Unique nonce (must be fresh)
+    pub nonce: String,
+    /// Unix timestamp (seconds since epoch)
+    pub timestamp: u64,
+    /// Operation being performed
+    pub operation: String,
+    /// Resource being accessed
+    pub resource: String,
+}
+
+impl RequestMetadata {
+    /// Create signing message for request signature
+    /// Format: "{operation}:{resource}:{timestamp}:{nonce}"
+    pub fn signing_message(&self) -> String {
+        format!(
+            "{}:{}:{}:{}",
+            self.operation, self.resource, self.timestamp, self.nonce
+        )
+    }
+
+    /// Generate a random nonce
+    pub fn generate_nonce() -> String {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let nonce_bytes: [u8; 32] = rng.gen();
+        hex::encode(nonce_bytes)
+    }
 }
 
 impl AuthToken {
