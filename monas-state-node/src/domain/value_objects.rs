@@ -52,7 +52,7 @@ impl AsRef<str> for ContentId {
 /// NodeId is a multihash of the node's public key, following libp2p's PeerId pattern.
 /// This ensures cryptographic binding between node identity and its public key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
-pub struct NodeId(String);  // Base58-encoded multihash
+pub struct NodeId(String); // Base58-encoded multihash
 
 impl NodeId {
     /// Create a NodeId from a P-256 public key.

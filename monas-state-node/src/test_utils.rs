@@ -487,8 +487,8 @@ pub fn create_test_network(content_id: &str, members: Vec<&str>) -> ContentNetwo
     let content_id_vo = ContentId::new(content_id.to_string()).expect("Invalid content ID");
     let first_member = NodeId::from_string(members[0].to_string()).expect("Invalid node ID");
 
-    let mut network = ContentNetwork::new(content_id_vo, first_member)
-        .expect("Failed to create test network");
+    let mut network =
+        ContentNetwork::new(content_id_vo, first_member).expect("Failed to create test network");
 
     // Add remaining members
     for member in members.iter().skip(1) {

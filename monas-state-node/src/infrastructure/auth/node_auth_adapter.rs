@@ -63,10 +63,7 @@ impl NodeAuthAdapter {
         }
 
         let signature = if parts.len() >= 3 && !parts[2].is_empty() {
-            Some(
-                hex::decode(parts[2])
-                    .context("Failed to decode signature from hex")?
-            )
+            Some(hex::decode(parts[2]).context("Failed to decode signature from hex")?)
         } else {
             None
         };
@@ -77,8 +74,8 @@ impl NodeAuthAdapter {
     /// Verify NodeId matches the public key hash.
     async fn verify_node_id(&self, node_id_str: &str) -> Result<Vec<u8>> {
         // Parse NodeId
-        let node_id = NodeId::from_string(node_id_str.to_string())
-            .context("Failed to parse NodeId")?;
+        let node_id =
+            NodeId::from_string(node_id_str.to_string()).context("Failed to parse NodeId")?;
 
         // Get public key from registry
         let public_key = self
@@ -104,19 +101,13 @@ impl NodeAuthAdapter {
     }
 
     /// Verify P-256 ECDSA signature.
-    fn verify_signature(
-        &self,
-        public_key: &[u8],
-        message: &[u8],
-        signature: &[u8],
-    ) -> Result<()> {
+    fn verify_signature(&self, public_key: &[u8], message: &[u8], signature: &[u8]) -> Result<()> {
         // Parse P-256 public key
         let verifying_key = VerifyingKey::from_sec1_bytes(public_key)
             .context("Failed to parse P-256 public key")?;
 
         // Parse signature
-        let sig = Signature::from_der(signature)
-            .context("Failed to parse P-256 signature")?;
+        let sig = Signature::from_der(signature).context("Failed to parse P-256 signature")?;
 
         // Verify signature
         verifying_key
@@ -162,12 +153,14 @@ impl AuthenticationService for NodeAuthAdapter {
                 ctx.content_id
             );
         } else {
-            tracing::debug!("Node {} authenticated without signature verification", node_id);
+            tracing::debug!(
+                "Node {} authenticated without signature verification",
+                node_id
+            );
         }
 
         // Create and return node identity
-        Identity::new(node_id, IdentityType::Node)
-            .context("Failed to create node Identity")
+        Identity::new(node_id, IdentityType::Node).context("Failed to create node Identity")
     }
 
     async fn is_valid(&self, token: &AuthToken) -> Result<bool> {
@@ -221,7 +214,10 @@ mod tests {
         let node_id = NodeId::from_public_key(&public_key).unwrap();
 
         // Register public key
-        registry.register_public_key(public_key.clone()).await.unwrap();
+        registry
+            .register_public_key(public_key.clone())
+            .await
+            .unwrap();
 
         // Create token
         let token = AuthToken::new(format!("node:{}", node_id.as_str()));
@@ -244,7 +240,10 @@ mod tests {
         let node_id = NodeId::from_public_key(&public_key).unwrap();
 
         // Register public key
-        registry.register_public_key(public_key.clone()).await.unwrap();
+        registry
+            .register_public_key(public_key.clone())
+            .await
+            .unwrap();
 
         // Create context
         let context = AuthContext {
@@ -290,7 +289,10 @@ mod tests {
         let node_id = NodeId::from_public_key(&public_key).unwrap();
 
         // Register public key
-        registry.register_public_key(public_key.clone()).await.unwrap();
+        registry
+            .register_public_key(public_key.clone())
+            .await
+            .unwrap();
 
         // Create context with expected message
         let context = AuthContext {

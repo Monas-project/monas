@@ -2,9 +2,9 @@
 
 #[cfg(test)]
 mod tests {
+    use monas_state_node::domain::value_objects::NodeId;
     use monas_state_node::infrastructure::key_management::NodeKeyPair;
     use monas_state_node::infrastructure::network::public_key_protocol::NodePublicKey;
-    use monas_state_node::domain::value_objects::NodeId;
 
     #[test]
     fn test_node_public_key_verify() {
@@ -19,14 +19,18 @@ mod tests {
             node_id.as_str().to_string(),
             public_key.clone(),
             signing_key,
-        ).expect("Failed to create NodePublicKey");
+        )
+        .expect("Failed to create NodePublicKey");
 
         // Verify it
-        assert!(node_pub_key.verify().is_ok(), "Failed to verify valid signature");
+        assert!(
+            node_pub_key.verify().is_ok(),
+            "Failed to verify valid signature"
+        );
 
         // Test that NodeId matches public key hash
-        let derived_node_id = NodeId::from_public_key(&node_pub_key.public_key)
-            .expect("Failed to derive NodeId");
+        let derived_node_id =
+            NodeId::from_public_key(&node_pub_key.public_key).expect("Failed to derive NodeId");
         assert_eq!(derived_node_id.as_str(), node_pub_key.node_id);
     }
 
@@ -47,10 +51,14 @@ mod tests {
             node_id.as_str().to_string(),
             public_key.clone(),
             &keypair2_signing,
-        ).expect("Failed to create NodePublicKey");
+        )
+        .expect("Failed to create NodePublicKey");
 
         // Verification should fail
-        assert!(wrong_node_key.verify().is_err(), "Should fail to verify invalid signature");
+        assert!(
+            wrong_node_key.verify().is_err(),
+            "Should fail to verify invalid signature"
+        );
     }
 
     #[test]
@@ -63,25 +71,29 @@ mod tests {
         let wrong_node_id = "wrong-node-id-12345";
 
         // Create NodePublicKey with mismatched NodeId
-        let node_pub_key = NodePublicKey::new(
-            wrong_node_id.to_string(),
-            public_key.clone(),
-            signing_key,
-        ).expect("Failed to create NodePublicKey");
+        let node_pub_key =
+            NodePublicKey::new(wrong_node_id.to_string(), public_key.clone(), signing_key)
+                .expect("Failed to create NodePublicKey");
 
         // Verification should fail due to NodeId mismatch
         let verify_result = node_pub_key.verify();
-        assert!(verify_result.is_err(), "Should fail when NodeId doesn't match public key");
+        assert!(
+            verify_result.is_err(),
+            "Should fail when NodeId doesn't match public key"
+        );
 
         if let Err(e) = verify_result {
-            assert!(e.to_string().contains("NodeId mismatch"), "Error should mention NodeId mismatch");
+            assert!(
+                e.to_string().contains("NodeId mismatch"),
+                "Error should mention NodeId mismatch"
+            );
         }
     }
 
     #[tokio::test]
     async fn test_public_key_exchange_integration() {
-        use monas_state_node::infrastructure::network::{Libp2pNetwork, Libp2pNetworkConfig};
         use monas_state_node::infrastructure::crdt_repository::CrslCrdtRepository;
+        use monas_state_node::infrastructure::network::{Libp2pNetwork, Libp2pNetworkConfig};
         use monas_state_node::port::content_repository::ContentRepository;
         use std::sync::Arc;
         use tempfile::tempdir;
@@ -109,17 +121,13 @@ mod tests {
             gossipsub_topics: vec!["test".to_string()],
         };
 
-        let network1 = Libp2pNetwork::new(
-            config1,
-            crdt_repo1,
-            tmp_dir1.path().to_path_buf(),
-        ).await.unwrap();
+        let network1 = Libp2pNetwork::new(config1, crdt_repo1, tmp_dir1.path().to_path_buf())
+            .await
+            .unwrap();
 
-        let network2 = Libp2pNetwork::new(
-            config2,
-            crdt_repo2,
-            tmp_dir2.path().to_path_buf(),
-        ).await.unwrap();
+        let network2 = Libp2pNetwork::new(config2, crdt_repo2, tmp_dir2.path().to_path_buf())
+            .await
+            .unwrap();
 
         // Get listen addresses
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -141,7 +149,10 @@ mod tests {
         let peer2_id = network2.local_peer_id();
 
         // Network1 queries Network2's public key
-        let keys = network1.query_node_public_keys_batch(std::slice::from_ref(&peer2_id)).await.unwrap();
+        let keys = network1
+            .query_node_public_keys_batch(std::slice::from_ref(&peer2_id))
+            .await
+            .unwrap();
 
         // Should get at least a placeholder key for now
         assert!(keys.contains_key(&peer2_id), "Should have key for peer2");

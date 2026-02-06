@@ -67,11 +67,14 @@ impl NodePublicKey {
 
         // Verify public key format
         if self.public_key.len() != 65 || self.public_key[0] != 0x04 {
-            return Err(anyhow::anyhow!("Invalid P-256 uncompressed public key format"));
+            return Err(anyhow::anyhow!(
+                "Invalid P-256 uncompressed public key format"
+            ));
         }
 
         // Verify NodeId matches public key hash
-        let expected_node_id = crate::domain::value_objects::NodeId::from_public_key(&self.public_key)?;
+        let expected_node_id =
+            crate::domain::value_objects::NodeId::from_public_key(&self.public_key)?;
         if expected_node_id.as_str() != self.node_id {
             return Err(anyhow::anyhow!(
                 "NodeId mismatch: expected {}, got {}",

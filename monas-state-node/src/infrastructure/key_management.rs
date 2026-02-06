@@ -40,7 +40,10 @@ impl NodeKeyPair {
 
         // The file contains the private key bytes (32 bytes)
         if key_bytes.len() != 32 {
-            anyhow::bail!("Invalid key file: expected 32 bytes, got {}", key_bytes.len());
+            anyhow::bail!(
+                "Invalid key file: expected 32 bytes, got {}",
+                key_bytes.len()
+            );
         }
 
         let signing_key = SigningKey::from_bytes((&key_bytes[..]).into())
@@ -78,7 +81,10 @@ impl NodeKeyPair {
 
     /// Get the public key in uncompressed SEC1 format (65 bytes).
     pub fn public_key_bytes(&self) -> Vec<u8> {
-        self.verifying_key.to_encoded_point(false).as_bytes().to_vec()
+        self.verifying_key
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec()
     }
 
     /// Get the signing key.

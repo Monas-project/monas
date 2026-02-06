@@ -36,10 +36,7 @@ impl ContentNetwork {
     }
 
     /// Create a new content network with a pre-computed NodeId.
-    pub fn new(
-        content_id: ContentId,
-        initial_member: NodeId,
-    ) -> Result<Self, ValueError> {
+    pub fn new(content_id: ContentId, initial_member: NodeId) -> Result<Self, ValueError> {
         let mut member_nodes = BTreeSet::new();
         member_nodes.insert(initial_member);
 
@@ -269,7 +266,10 @@ mod tests {
 
         let result = NodeId::from_public_key(&invalid_key);
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), ValueError::InvalidPublicKeyFormat(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            ValueError::InvalidPublicKeyFormat(_)
+        ));
     }
 
     #[test]

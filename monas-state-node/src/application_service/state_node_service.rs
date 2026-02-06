@@ -370,9 +370,10 @@ where
         // Verify all nodes have public keys
         for node_id in &selected {
             if !public_keys.contains_key(node_id) {
-                return Err(StateNodeError::Internal(
-                    format!("No public key found for node {}", node_id)
-                ));
+                return Err(StateNodeError::Internal(format!(
+                    "No public key found for node {}",
+                    node_id
+                )));
             }
         }
 
@@ -799,7 +800,6 @@ where
         content_id: &str,
         count: usize,
     ) -> Result<Event, StateNodeError> {
-
         // 1. Get content network
         let content_id_vo = ContentId::new(content_id.to_string())?;
         let network = self
@@ -873,7 +873,7 @@ where
             // Use add_member_node_from_public_key to ensure cryptographic binding
             let (net, events) = crate::domain::content_network::add_member_node_from_public_key(
                 updated_network,
-                public_key
+                public_key,
             )?;
             updated_network = net;
             // Publish each event
@@ -1098,11 +1098,13 @@ where
                 // When handling sync events, we create network with NodeIds directly
                 let content_id_vo = ContentId::new(content_id.clone())?;
 
-                let first_node = crate::domain::value_objects::NodeId::from_string(member_nodes[0].clone())?;
+                let first_node =
+                    crate::domain::value_objects::NodeId::from_string(member_nodes[0].clone())?;
                 let mut network = ContentNetwork::new(content_id_vo, first_node)?;
 
                 for node_id in member_nodes.iter().skip(1) {
-                    let node_id_vo = crate::domain::value_objects::NodeId::from_string(node_id.clone())?;
+                    let node_id_vo =
+                        crate::domain::value_objects::NodeId::from_string(node_id.clone())?;
                     network.add_member(node_id_vo);
                 }
                 self.content_repo
@@ -1132,11 +1134,13 @@ where
                 // When handling sync events, we create network with NodeIds directly
                 let content_id_vo = ContentId::new(content_id.clone())?;
 
-                let first_node = crate::domain::value_objects::NodeId::from_string(member_nodes[0].clone())?;
+                let first_node =
+                    crate::domain::value_objects::NodeId::from_string(member_nodes[0].clone())?;
                 let mut network = ContentNetwork::new(content_id_vo, first_node)?;
 
                 for node_id in member_nodes.iter().skip(1) {
-                    let node_id_vo = crate::domain::value_objects::NodeId::from_string(node_id.clone())?;
+                    let node_id_vo =
+                        crate::domain::value_objects::NodeId::from_string(node_id.clone())?;
                     network.add_member(node_id_vo);
                 }
                 self.content_repo
@@ -1166,11 +1170,13 @@ where
                 // When handling sync events, we create network with NodeIds directly
                 let content_id_vo = ContentId::new(content_id.clone())?;
 
-                let first_node = crate::domain::value_objects::NodeId::from_string(member_nodes[0].clone())?;
+                let first_node =
+                    crate::domain::value_objects::NodeId::from_string(member_nodes[0].clone())?;
                 let mut network = ContentNetwork::new(content_id_vo, first_node)?;
 
                 for node_id in member_nodes.iter().skip(1) {
-                    let node_id_vo = crate::domain::value_objects::NodeId::from_string(node_id.clone())?;
+                    let node_id_vo =
+                        crate::domain::value_objects::NodeId::from_string(node_id.clone())?;
                     network.add_member(node_id_vo);
                 }
                 self.content_repo

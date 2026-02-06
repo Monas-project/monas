@@ -21,4 +21,4 @@ pub use peer_network::PeerNetwork;
 pub use persistence::{
     PersistentAccessPolicyRepository, PersistentContentRepository, PersistentNodeRegistry,
 };
-pub use public_key_registry::{PublicKeyRegistry, InMemoryPublicKeyRegistry};
+pub use public_key_registry::{InMemoryPublicKeyRegistry, PublicKeyRegistry};

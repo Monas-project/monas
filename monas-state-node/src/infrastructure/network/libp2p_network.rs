@@ -9,7 +9,7 @@
 
 use super::behaviour::{BehaviourConfig, NodeBehaviour, NodeBehaviourEvent};
 use super::protocol::{ContentRequest, ContentResponse};
-use super::public_key_protocol::{PublicKeyRequest, PublicKeyResponse, NodePublicKey};
+use super::public_key_protocol::{NodePublicKey, PublicKeyRequest, PublicKeyResponse};
 use super::transport;
 use crate::domain::events::Event;
 use crate::infrastructure::disk_capacity;
@@ -453,7 +453,11 @@ impl Libp2pNetwork {
                 let query_id = swarm.behaviour_mut().kademlia.get_providers(key);
                 pending.kad_provider_queries.insert(query_id, reply);
             }
-            SwarmCommand::QueryPublicKeys { peer_id, node_ids, reply } => {
+            SwarmCommand::QueryPublicKeys {
+                peer_id,
+                node_ids,
+                reply,
+            } => {
                 let request = PublicKeyRequest {
                     requesting_node: swarm.local_peer_id().to_string(),
                     requested_nodes: node_ids,
@@ -491,7 +495,8 @@ impl Libp2pNetwork {
                     .await;
             }
             SwarmEvent::Behaviour(NodeBehaviourEvent::PublicKeyProtocol(pk_event)) => {
-                Self::handle_public_key_protocol_event(swarm, pending, p256_signing_key, pk_event).await;
+                Self::handle_public_key_protocol_event(swarm, pending, p256_signing_key, pk_event)
+                    .await;
             }
             SwarmEvent::Behaviour(NodeBehaviourEvent::Identify(identify_event)) => {
                 Self::handle_identify_event(swarm, *identify_event).await;
@@ -870,7 +875,8 @@ impl Libp2pNetwork {
                     // If no specific nodes requested, return our own key
                     if request.requested_nodes.is_empty() {
                         // Get our NodeId
-                        let node_id = p256_signing_key.node_id()
+                        let node_id = p256_signing_key
+                            .node_id()
                             .map(|id| id.as_str().to_string())
                             .unwrap_or_else(|_| swarm.local_peer_id().to_string());
 
@@ -884,7 +890,8 @@ impl Libp2pNetwork {
                         }
                     } else {
                         // If specific nodes requested, only return our key if we're in the list
-                        let our_node_id = p256_signing_key.node_id()
+                        let our_node_id = p256_signing_key
+                            .node_id()
                             .map(|id| id.as_str().to_string())
                             .unwrap_or_else(|_| swarm.local_peer_id().to_string());
 
@@ -937,7 +944,10 @@ impl Libp2pNetwork {
             } => {
                 error!("Public key request failed: {:?}", error);
                 if let Some(reply) = pending.public_key_queries.remove(&request_id) {
-                    let _ = reply.send(Err(anyhow::anyhow!("Public key request failed: {:?}", error)));
+                    let _ = reply.send(Err(anyhow::anyhow!(
+                        "Public key request failed: {:?}",
+                        error
+                    )));
                 }
             }
             _ => {}
@@ -1046,7 +1056,10 @@ impl PeerNetwork for Libp2pNetwork {
         Ok(results)
     }
 
-    async fn query_node_public_keys_batch(&self, peer_ids: &[String]) -> Result<HashMap<String, Vec<u8>>> {
+    async fn query_node_public_keys_batch(
+        &self,
+        peer_ids: &[String],
+    ) -> Result<HashMap<String, Vec<u8>>> {
         let mut results = HashMap::new();
 
         // For each NodeId, we need to find which peer to query
