@@ -147,11 +147,11 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let repo = SledContentNetworkRepository::open(temp_dir.path()).unwrap();
 
-        let network = ContentNetwork::from_strings(
-            "cid-1".to_string(),
-            vec!["node-1".to_string(), "node-2".to_string()],
-        )
-        .unwrap();
+        let content_id = ContentId::new("cid-1".to_string()).unwrap();
+        let node1 = NodeId::from_string("node-1".to_string()).unwrap();
+        let mut network = ContentNetwork::new(content_id, node1).unwrap();
+        let node2 = NodeId::from_string("node-2".to_string()).unwrap();
+        network.add_member(node2);
 
         repo.save_content_network(network.clone()).await.unwrap();
 
@@ -166,12 +166,14 @@ mod tests {
 
         let network1 = ContentNetwork::new(
             ContentId::new("cid-1".to_string()).unwrap(),
-            NodeId::new("node-1".to_string()).unwrap(),
-        );
+            NodeId::from_string("node-1".to_string()).unwrap(),
+        )
+        .unwrap();
         let network2 = ContentNetwork::new(
             ContentId::new("cid-2".to_string()).unwrap(),
-            NodeId::new("node-2".to_string()).unwrap(),
-        );
+            NodeId::from_string("node-2".to_string()).unwrap(),
+        )
+        .unwrap();
 
         repo.save_content_network(network1).await.unwrap();
         repo.save_content_network(network2).await.unwrap();
@@ -206,8 +208,9 @@ mod tests {
 
         let network = ContentNetwork::new(
             ContentId::new("cid-1".to_string()).unwrap(),
-            NodeId::new("node-1".to_string()).unwrap(),
-        );
+            NodeId::from_string("node-1".to_string()).unwrap(),
+        )
+        .unwrap();
 
         repo.save_content_network(network).await.unwrap();
         assert!(repo.get_content_network("cid-1").await.unwrap().is_some());

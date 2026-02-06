@@ -836,8 +836,12 @@ mod sled_persistence_tests {
     fn test_dead_letter_error_handling() {
         let (manager, _temp_dir) = create_temp_manager();
 
-        // Try to create manager with invalid path
-        let invalid_result = SledPersistenceManager::new("/invalid/path/that/does/not/exist");
+        // Try to create manager with invalid path (parent is a file)
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("not_a_dir");
+        std::fs::write(&file_path, b"not a dir").unwrap();
+        let invalid_path = file_path.join("child_db");
+        let invalid_result = SledPersistenceManager::new(invalid_path.to_str().unwrap());
         assert!(invalid_result.is_err());
 
         // Save message with valid manager

@@ -165,6 +165,24 @@ mod tests {
             Ok(HashMap::new())
         }
 
+        async fn query_node_public_keys_batch(
+            &self,
+            peer_ids: &[String],
+        ) -> Result<HashMap<String, Vec<u8>>> {
+            // Generate test P-256 public keys
+            use p256::ecdsa::SigningKey;
+            use rand::rngs::OsRng;
+
+            let mut results = HashMap::new();
+            for peer_id in peer_ids {
+                let signing_key = SigningKey::random(&mut OsRng);
+                let verifying_key = signing_key.verifying_key();
+                let public_key = verifying_key.to_encoded_point(false).as_bytes().to_vec();
+                results.insert(peer_id.clone(), public_key);
+            }
+            Ok(results)
+        }
+
         async fn publish_event(&self, topic: &str, event_data: &[u8]) -> Result<()> {
             self.published_events
                 .lock()

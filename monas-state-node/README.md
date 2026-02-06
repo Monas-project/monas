@@ -130,7 +130,28 @@ monas-state-node/
 | `/content` | POST | コンテンツ作成 |
 | `/content/:id` | GET | コンテンツ情報取得 |
 | `/content/:id` | PUT | コンテンツ更新 |
+| `/content/:id` | DELETE | コンテンツ削除 |
+| `/content/:id/members` | POST | コンテンツネットワークのメンバー追加 |
 | `/contents` | GET | 全コンテンツ一覧 |
+| `/content/:id/data` | GET | CRDTの最新データ取得 |
+| `/content/:id/history` | GET | CRDT履歴の取得 |
+| `/content/:id/version/:version` | GET | CRDTの指定バージョン取得 |
+
+## 認証・認可
+
+State Node は以下のヘッダーを用いて **monas-account の署名検証（認証）** と
+**UCAN/AuthToken の署名検証（認可）** を行う。
+
+- `Authorization: Bearer <token>` または `Authorization: <token>`
+  - AuthToken/UCAN の JWT 文字列を指定する。
+- `X-Request-Signature: <base64>`  
+  - リクエスト署名（P-256）を Base64 で指定する。
+
+**必須となる操作:**
+
+- `/content` (POST)
+- `/content/:id` (PUT/DELETE)
+- `/content/:id/members` (POST)
 
 ## 依存関係
 

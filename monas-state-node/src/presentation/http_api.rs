@@ -5,7 +5,9 @@ use crate::domain::errors::StateNodeError;
 use crate::infrastructure::crdt_repository::CrslCrdtRepository;
 use crate::infrastructure::gossipsub_publisher::GossipsubEventPublisher;
 use crate::infrastructure::network::Libp2pNetwork;
-use crate::infrastructure::persistence::{SledContentNetworkRepository, SledNodeRegistry};
+use crate::infrastructure::persistence::{
+    SledAccessControlRepository, SledContentNetworkRepository, SledNodeRegistry,
+};
 use crate::port::auth_token::AuthToken;
 use crate::port::content_repository::ContentRepository;
 use axum::{
@@ -27,6 +29,7 @@ pub type AppState = Arc<
         Libp2pNetwork,
         GossipsubEventPublisher<Libp2pNetwork>,
         CrslCrdtRepository,
+        SledAccessControlRepository,
     >,
 >;
 
@@ -267,10 +270,14 @@ async fn create_content(
         }
     };
 
-    // Extract authentication token from headers
+    // Extract authentication token and request signature from headers
     let token = extract_auth_token(&headers);
+    let request_signature = extract_request_signature(&headers);
 
-    match state.create_content(&data, token.as_ref()).await {
+    match state
+        .create_content(&data, token.as_ref(), request_signature.as_deref())
+        .await
+    {
         Ok(event) => {
             if let crate::domain::events::Event::ContentCreated { content_id, .. } = event {
                 Json(CreateContentResponse { content_id }).into_response()
@@ -363,11 +370,23 @@ async fn delete_content(
 async fn add_members(
     State(state): State<AppState>,
     Path(content_id): Path<String>,
+    headers: HeaderMap,
     Json(req): Json<AddMembersRequest>,
 ) -> impl IntoResponse {
     use crate::domain::events::Event;
 
-    match state.add_member_to_content(&content_id, req.count).await {
+    let token = extract_auth_token(&headers);
+    let request_signature = extract_request_signature(&headers);
+
+    match state
+        .add_member_to_content(
+            &content_id,
+            req.count,
+            token.as_ref(),
+            request_signature.as_deref(),
+        )
+        .await
+    {
         Ok(event) => {
             if let Event::ContentNetworkManagerAdded {
                 content_id,

@@ -15,6 +15,11 @@ use monas_state_node::infrastructure::persistence::{
 };
 use monas_state_node::port::content_repository::ContentRepository;
 use monas_state_node::port::peer_network::PeerNetwork;
+use monas_state_node::port::{
+    auth_token::AuthToken,
+    authentication_service::AuthenticationService,
+    authorization_service::{AuthorizationRequest, AuthorizationResult, AuthorizationService},
+};
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::sync::RwLock;
@@ -38,6 +43,69 @@ type TestServiceWithAC = StateNodeService<
     CrslCrdtRepository,
     SledAccessControlRepository,
 >;
+
+struct TestAuthService;
+
+#[async_trait::async_trait]
+impl AuthenticationService for TestAuthService {
+    async fn authenticate(
+        &self,
+        token: &AuthToken,
+        _context: Option<&monas_state_node::port::auth_token::AuthContext>,
+    ) -> anyhow::Result<monas_state_node::domain::identity::Identity> {
+        monas_state_node::domain::identity::Identity::user(token.as_str().to_string())
+            .map_err(|e| anyhow::anyhow!(e.to_string()))
+    }
+
+    async fn is_valid(&self, token: &AuthToken) -> anyhow::Result<bool> {
+        Ok(!token.is_empty())
+    }
+
+    async fn get_issuer(
+        &self,
+        token: &AuthToken,
+    ) -> anyhow::Result<Option<monas_state_node::domain::identity::Identity>> {
+        Ok(Some(
+            monas_state_node::domain::identity::Identity::user(token.as_str().to_string())
+                .map_err(|e| anyhow::anyhow!(e.to_string()))?,
+        ))
+    }
+}
+
+struct AllowAllAuthorizationService;
+
+#[async_trait::async_trait]
+impl AuthorizationService for AllowAllAuthorizationService {
+    async fn authorize(
+        &self,
+        _request: &AuthorizationRequest,
+    ) -> anyhow::Result<AuthorizationResult> {
+        Ok(AuthorizationResult::Granted)
+    }
+}
+
+fn test_token() -> AuthToken {
+    AuthToken::new("test-user".to_string())
+}
+
+fn test_request_signature() -> Vec<u8> {
+    vec![0x01]
+}
+
+fn sign_access_control_update(update: &AccessControlUpdate) -> (Vec<u8>, Vec<u8>) {
+    use p256::ecdsa::signature::DigestSigner;
+    use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
+    use p256::elliptic_curve::rand_core::OsRng;
+    use sha3::{Digest, Keccak256};
+
+    let signing_key = SigningKey::random(&mut OsRng);
+    let verifying_key = VerifyingKey::from(&signing_key);
+    let public_key_bytes = verifying_key.to_encoded_point(false).as_bytes().to_vec();
+    let message = update.signing_message();
+    let (signature, _): (Signature, _) =
+        signing_key.sign_digest(Keccak256::new_with_prefix(&message));
+    (signature.to_vec(), public_key_bytes)
+}
 
 /// Create a test service with temporary storage and real libp2p network.
 async fn create_test_service() -> (Arc<TestService>, Arc<CrslCrdtRepository>, TempDir) {
@@ -72,14 +140,18 @@ async fn create_test_service() -> (Arc<TestService>, Arc<CrslCrdtRepository>, Te
 
     let node_id = network.local_peer_id();
 
-    let service = Arc::new(StateNodeService::new(
-        node_registry,
-        content_repo,
-        network,
-        event_publisher,
-        crdt_repo.clone(),
-        node_id,
-    ));
+    let service = Arc::new(
+        StateNodeService::new(
+            node_registry,
+            content_repo,
+            network,
+            event_publisher,
+            crdt_repo.clone(),
+            node_id,
+        )
+        .with_authentication_service(TestAuthService)
+        .with_authorization_service(AllowAllAuthorizationService),
+    );
 
     (service, crdt_repo, temp_dir)
 }
@@ -111,7 +183,9 @@ async fn test_create_content() {
     // In isolated test environment, create_content will fail because no other peers are available.
     // This is expected behavior - content creation requires at least one other node to store the content.
     let data = b"Hello, World!";
-    let result = service.create_content(data, None).await;
+    let result = service
+        .create_content(data, Some(&test_token()), Some(&test_request_signature()))
+        .await;
 
     // Verify that it fails with the expected error in isolated environment
     assert!(result.is_err());
@@ -439,7 +513,9 @@ async fn create_test_service_with_ac() -> (Arc<TestServiceWithAC>, Arc<CrslCrdtR
             node_id,
             ServiceConfig::default(),
         )
-        .with_access_control_repo(access_control_repo),
+        .with_access_control_repo(access_control_repo)
+        .with_authentication_service(TestAuthService)
+        .with_authorization_service(AllowAllAuthorizationService),
     );
 
     (service, crdt_repo, temp_dir)
@@ -479,14 +555,19 @@ async fn test_access_control_update_and_verify() {
     service.init_access_control("content-1").await.unwrap();
 
     // Create a signed update (in real usage, signature would come from monas-account)
-    let signature = vec![0x01, 0x02, 0x03]; // Mock signature
-    let public_key = vec![0x04; 65]; // Mock public key (65 bytes for uncompressed)
-
-    let update = AccessControlUpdate::new("content-1".to_string(), 1000)
-        .with_signature(signature, public_key);
+    let update = AccessControlUpdate::new("content-1".to_string(), 1000);
+    let (signature, public_key) = sign_access_control_update(&update);
+    let update = update.with_signature(signature, public_key);
 
     // Apply the update
-    let updated_ac = service.update_access_control(&update).await.unwrap();
+    let updated_ac = service
+        .update_access_control(
+            &update,
+            Some(&test_token()),
+            Some(&test_request_signature()),
+        )
+        .await
+        .unwrap();
     assert_eq!(updated_ac.min_valid_issued_at(), 1000);
 
     // Verify access with old token (should be denied)
@@ -529,7 +610,13 @@ async fn test_access_control_update_missing_signature() {
     let update = AccessControlUpdate::new("content-1".to_string(), 1000);
 
     // Update should fail due to missing signature
-    let result = service.update_access_control(&update).await;
+    let result = service
+        .update_access_control(
+            &update,
+            Some(&test_token()),
+            Some(&test_request_signature()),
+        )
+        .await;
     assert!(result.is_err());
 }
 
@@ -906,4 +993,303 @@ mod auth_token_tests {
             Err(AuthTokenVerifyError::InsufficientCapability { .. })
         ));
     }
+}
+
+// ============================================================================
+// Authentication & Authorization Integration Tests (PR #33)
+// ============================================================================
+
+#[tokio::test]
+async fn test_create_content_requires_authentication() {
+    let (service, _crdt_repo, _temp_dir) = create_test_service().await;
+
+    // Register the local node
+    service.register_node(10000).await.unwrap();
+
+    let data = b"Test data";
+
+    // Without token - should fail
+    let result = service
+        .create_content(data, None, Some(&test_request_signature()))
+        .await;
+    assert!(result.is_err());
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("Authentication token is required"));
+
+    // Without signature - should fail
+    let result = service
+        .create_content(data, Some(&test_token()), None)
+        .await;
+    assert!(result.is_err());
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("Request signature is required"));
+}
+
+#[tokio::test]
+async fn test_update_content_requires_authentication() {
+    let (service, _crdt_repo, _temp_dir) = create_test_service().await;
+
+    service.register_node(10000).await.unwrap();
+
+    let data = b"Updated data";
+    let content_id = "test-content-123";
+
+    // Without token - should fail
+    let result = service
+        .update_content(content_id, data, None, Some(&test_request_signature()))
+        .await;
+    assert!(result.is_err());
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("Authentication token is required"));
+
+    // Without signature - should fail
+    let result = service
+        .update_content(content_id, data, Some(&test_token()), None)
+        .await;
+    assert!(result.is_err());
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("Request signature is required"));
+}
+
+#[tokio::test]
+async fn test_delete_content_requires_authentication() {
+    let (service, _crdt_repo, _temp_dir) = create_test_service().await;
+
+    service.register_node(10000).await.unwrap();
+
+    let content_id = "test-content-456";
+
+    // Without token - should fail
+    let result = service
+        .delete_content(content_id, None, Some(&test_request_signature()))
+        .await;
+    assert!(result.is_err());
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("Authentication token is required"));
+
+    // Without signature - should fail
+    let result = service
+        .delete_content(content_id, Some(&test_token()), None)
+        .await;
+    assert!(result.is_err());
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("Request signature is required"));
+}
+
+#[tokio::test]
+async fn test_add_member_to_content_requires_authentication() {
+    let (service, _crdt_repo, _temp_dir) = create_test_service().await;
+
+    service.register_node(10000).await.unwrap();
+
+    let content_id = "test-content-789";
+
+    // Without token - should fail
+    let result = service
+        .add_member_to_content(content_id, 1, None, Some(&test_request_signature()))
+        .await;
+    assert!(result.is_err());
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("Authentication token is required"));
+
+    // Without signature - should fail
+    let result = service
+        .add_member_to_content(content_id, 1, Some(&test_token()), None)
+        .await;
+    assert!(result.is_err());
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("Request signature is required"));
+}
+
+#[tokio::test]
+async fn test_update_access_control_requires_authentication() {
+    let (service, _crdt_repo, _temp_dir) = create_test_service_with_ac().await;
+
+    // Initialize access control
+    service.init_access_control("content-1").await.unwrap();
+
+    // Create a signed update
+    let update = AccessControlUpdate::new("content-1".to_string(), 1000);
+    let (signature, public_key) = sign_access_control_update(&update);
+    let update = update.with_signature(signature, public_key);
+
+    // Without token - should fail
+    let result = service
+        .update_access_control(&update, None, Some(&test_request_signature()))
+        .await;
+    assert!(result.is_err());
+
+    // Without signature - should fail
+    let result = service
+        .update_access_control(&update, Some(&test_token()), None)
+        .await;
+    assert!(result.is_err());
+}
+
+struct DenyAllAuthorizationService;
+
+#[async_trait::async_trait]
+impl AuthorizationService for DenyAllAuthorizationService {
+    async fn authorize(
+        &self,
+        _request: &AuthorizationRequest,
+    ) -> anyhow::Result<AuthorizationResult> {
+        Ok(AuthorizationResult::Denied {
+            reason: "Access denied".to_string(),
+        })
+    }
+}
+
+/// Create a test service with deny-all authorization.
+async fn create_test_service_deny_authz() -> (Arc<TestService>, Arc<CrslCrdtRepository>, TempDir) {
+    let temp_dir = TempDir::new().unwrap();
+
+    let node_registry = SledNodeRegistry::open(temp_dir.path().join("nodes")).unwrap();
+    let content_repo = Arc::new(RwLock::new(
+        SledContentNetworkRepository::open(temp_dir.path().join("content")).unwrap(),
+    ));
+
+    let crdt_repo = Arc::new(CrslCrdtRepository::open(temp_dir.path().join("crdt")).unwrap());
+    let crdt_repo_dyn: Arc<dyn ContentRepository> = crdt_repo.clone();
+    let data_dir = temp_dir.path().to_path_buf();
+
+    let network_config = Libp2pNetworkConfig {
+        listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
+        bootstrap_nodes: vec![],
+        enable_mdns: false,
+        gossipsub_topics: vec!["test-events".to_string()],
+    };
+
+    let network = Arc::new(
+        Libp2pNetwork::new(network_config, crdt_repo_dyn, data_dir)
+            .await
+            .unwrap(),
+    );
+
+    let event_publisher = EventBusPublisher::new();
+    event_publisher.register_event_type().await;
+
+    let node_id = network.local_peer_id();
+
+    let service = Arc::new(
+        StateNodeService::new(
+            node_registry,
+            content_repo,
+            network,
+            event_publisher,
+            crdt_repo.clone(),
+            node_id,
+        )
+        .with_authentication_service(TestAuthService)
+        .with_authorization_service(DenyAllAuthorizationService),
+    );
+
+    (service, crdt_repo, temp_dir)
+}
+
+#[tokio::test]
+async fn test_authorization_denied_prevents_create_content() {
+    let (service, _crdt_repo, _temp_dir) = create_test_service_deny_authz().await;
+
+    // Register the local node
+    service.register_node(10000).await.unwrap();
+
+    let data = b"Test data";
+
+    // With valid token and signature but authorization denied
+    let result = service
+        .create_content(data, Some(&test_token()), Some(&test_request_signature()))
+        .await;
+
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("Authorization"));
+}
+
+#[tokio::test]
+async fn test_authentication_service_validates_token() {
+    let auth_service = TestAuthService;
+
+    // Valid token
+    let token = test_token();
+    let result = auth_service.authenticate(&token, None).await;
+    assert!(result.is_ok());
+
+    // Empty token should still work for test service (implementation detail)
+    let empty_token = AuthToken::new("".to_string());
+    let is_valid = auth_service.is_valid(&empty_token).await.unwrap();
+    assert!(!is_valid);
+}
+
+#[tokio::test]
+async fn test_authorization_service_grants_access() {
+    use monas_state_node::domain::auth_capability::AuthCapability;
+    use monas_state_node::domain::identity::Identity;
+    use monas_state_node::domain::value_objects::ContentId;
+
+    let authz_service = AllowAllAuthorizationService;
+
+    let identity = Identity::user("test-user".to_string()).unwrap();
+    let content_id = ContentId::new("test-content".to_string()).unwrap();
+
+    let request = AuthorizationRequest {
+        identity,
+        resource: content_id,
+        capability: AuthCapability::WriteContent,
+        token: Some(test_token()),
+        request_signature: Some(test_request_signature()),
+    };
+
+    let result = authz_service.authorize(&request).await;
+    assert!(result.is_ok());
+    assert!(result.unwrap().is_granted());
+}
+
+#[tokio::test]
+async fn test_access_control_update_signature_verification() {
+    let (service, _crdt_repo, _temp_dir) = create_test_service_with_ac().await;
+
+    // Initialize access control
+    service.init_access_control("content-1").await.unwrap();
+
+    // Create an update with INVALID signature
+    let update = AccessControlUpdate::new("content-1".to_string(), 1000);
+    let invalid_signature = vec![0u8; 64]; // Invalid signature
+    let invalid_public_key = vec![0u8; 65]; // Invalid public key
+    let update = update.with_signature(invalid_signature, invalid_public_key);
+
+    // Should fail due to invalid signature
+    let result = service
+        .update_access_control(
+            &update,
+            Some(&test_token()),
+            Some(&test_request_signature()),
+        )
+        .await;
+
+    assert!(result.is_err());
+    // Error should mention signature verification failure
+    let err_msg = result.unwrap_err().to_string();
+    assert!(
+        err_msg.contains("Signature")
+            || err_msg.contains("signature")
+            || err_msg.contains("Invalid"),
+        "Error message should mention signature verification: {}",
+        err_msg
+    );
 }

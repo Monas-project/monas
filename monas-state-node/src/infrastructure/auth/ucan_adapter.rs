@@ -32,7 +32,7 @@ use tokio::sync::RwLock;
 ///          ↕
 /// UCAN (capability delegation)
 /// ```
-pub struct UcanAdapter<R>
+pub struct UcanAdapter<R: ?Sized = dyn PersistentAccessPolicyRepository>
 where
     R: PersistentAccessPolicyRepository,
 {
@@ -42,9 +42,23 @@ where
     public_keys: Arc<RwLock<HashMap<String, Vec<u8>>>>,
 }
 
+impl UcanAdapter<dyn PersistentAccessPolicyRepository> {
+    /// Create a new UcanAdapter with a dynamic repository (trait object)
+    ///
+    /// This is useful when you need to share the repository with other components.
+    pub fn new_with_dyn_repo(
+        policy_repo: Arc<RwLock<dyn PersistentAccessPolicyRepository>>,
+    ) -> Self {
+        Self {
+            policy_repo,
+            public_keys: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+}
+
 impl<R> UcanAdapter<R>
 where
-    R: PersistentAccessPolicyRepository,
+    R: PersistentAccessPolicyRepository + ?Sized,
 {
     pub fn new(policy_repo: Arc<RwLock<R>>) -> Self {
         Self {
@@ -473,7 +487,7 @@ where
 #[async_trait]
 impl<R> AuthorizationService for UcanAdapter<R>
 where
-    R: PersistentAccessPolicyRepository,
+    R: PersistentAccessPolicyRepository + ?Sized,
 {
     async fn authorize(&self, request: &AuthorizationRequest) -> Result<AuthorizationResult> {
         // 1. Get access policy from repository

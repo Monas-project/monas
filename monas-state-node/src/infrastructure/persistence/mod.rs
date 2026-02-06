@@ -15,12 +15,14 @@ pub mod sled_access_control_repository;
 pub mod sled_access_policy_repository;
 pub mod sled_content_network_repository;
 pub mod sled_node_registry;
+pub mod sled_public_key_repository;
 
 // Re-export sled implementations
 pub use sled_access_control_repository::SledAccessControlRepository;
 pub use sled_access_policy_repository::SledAccessPolicyRepository;
 pub use sled_content_network_repository::SledContentNetworkRepository;
 pub use sled_node_registry::SledNodeRegistry;
+pub use sled_public_key_repository::SledPublicKeyRepository;
 
 // Future WASM implementations (prepared but not compiled by default)
 // To enable, add cfg(target_arch = "wasm32") and required dependencies

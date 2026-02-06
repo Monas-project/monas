@@ -10,6 +10,7 @@
 pub mod behaviour;
 pub mod libp2p_network;
 pub mod protocol;
+pub mod public_key_protocol;
 pub mod transport;
 
 pub use behaviour::{BehaviourConfig, NodeBehaviour, NodeBehaviourEvent};

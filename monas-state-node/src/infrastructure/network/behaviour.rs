@@ -8,6 +8,7 @@
 //! - Identify for peer identification
 
 use super::protocol::{ContentRequest, ContentResponse};
+use super::public_key_protocol::{PublicKeyRequest, PublicKeyResponse};
 use libp2p::{
     gossipsub, identify, kad,
     request_response::{self, ProtocolSupport},
@@ -22,6 +23,9 @@ use libp2p::mdns;
 /// Protocol name for content requests.
 pub const CONTENT_PROTOCOL_NAME: &str = "/monas/content/1.0.0";
 
+/// Protocol name for public key exchange.
+pub const PUBLIC_KEY_PROTOCOL_NAME: &str = "/monas/public-key/1.0.0";
+
 /// Combined network behaviour for the state node.
 #[derive(NetworkBehaviour)]
 #[behaviour(to_swarm = "NodeBehaviourEvent")]
@@ -32,6 +36,8 @@ pub struct NodeBehaviour {
     pub gossipsub: gossipsub::Behaviour,
     /// RequestResponse for direct peer communication.
     pub request_response: request_response::cbor::Behaviour<ContentRequest, ContentResponse>,
+    /// RequestResponse for public key exchange.
+    pub public_key_protocol: request_response::cbor::Behaviour<PublicKeyRequest, PublicKeyResponse>,
     /// Identify for peer identification.
     pub identify: identify::Behaviour,
     /// mDNS for local peer discovery (native only).
@@ -45,6 +51,7 @@ pub enum NodeBehaviourEvent {
     Kademlia(kad::Event),
     Gossipsub(Box<gossipsub::Event>),
     RequestResponse(request_response::Event<ContentRequest, ContentResponse>),
+    PublicKeyProtocol(request_response::Event<PublicKeyRequest, PublicKeyResponse>),
     Identify(Box<identify::Event>),
     #[cfg(not(target_arch = "wasm32"))]
     Mdns(mdns::Event),
@@ -65,6 +72,12 @@ impl From<gossipsub::Event> for NodeBehaviourEvent {
 impl From<request_response::Event<ContentRequest, ContentResponse>> for NodeBehaviourEvent {
     fn from(event: request_response::Event<ContentRequest, ContentResponse>) -> Self {
         NodeBehaviourEvent::RequestResponse(event)
+    }
+}
+
+impl From<request_response::Event<PublicKeyRequest, PublicKeyResponse>> for NodeBehaviourEvent {
+    fn from(event: request_response::Event<PublicKeyRequest, PublicKeyResponse>) -> Self {
+        NodeBehaviourEvent::PublicKeyProtocol(event)
     }
 }
 
@@ -137,6 +150,15 @@ impl NodeBehaviour {
             request_response::Config::default(),
         );
 
+        // Public key protocol configuration using CBOR codec
+        let public_key_protocol = request_response::cbor::Behaviour::new(
+            [(
+                StreamProtocol::new(PUBLIC_KEY_PROTOCOL_NAME),
+                ProtocolSupport::Full,
+            )],
+            request_response::Config::default(),
+        );
+
         // Identify configuration
         let identify = identify::Behaviour::new(identify::Config::new(
             config.protocol_version,
@@ -150,6 +172,7 @@ impl NodeBehaviour {
             kademlia,
             gossipsub,
             request_response,
+            public_key_protocol,
             identify,
             mdns,
         })
@@ -192,6 +215,15 @@ impl NodeBehaviour {
             request_response::Config::default(),
         );
 
+        // Public key protocol configuration using CBOR codec
+        let public_key_protocol = request_response::cbor::Behaviour::new(
+            [(
+                StreamProtocol::new(PUBLIC_KEY_PROTOCOL_NAME),
+                ProtocolSupport::Full,
+            )],
+            request_response::Config::default(),
+        );
+
         // Identify configuration
         let identify = identify::Behaviour::new(identify::Config::new(
             config.protocol_version,
@@ -202,6 +234,7 @@ impl NodeBehaviour {
             kademlia,
             gossipsub,
             request_response,
+            public_key_protocol,
             identify,
         })
     }
@@ -273,6 +306,7 @@ mod tests {
         let _ = &behaviour.kademlia;
         let _ = &behaviour.gossipsub;
         let _ = &behaviour.request_response;
+        let _ = &behaviour.public_key_protocol;
         let _ = &behaviour.identify;
         let _ = &behaviour.mdns;
     }
