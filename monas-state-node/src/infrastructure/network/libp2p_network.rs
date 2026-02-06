@@ -889,13 +889,20 @@ impl Libp2pNetwork {
                             public_keys.push(node_key);
                         }
                     } else {
-                        // If specific nodes requested, only return our key if we're in the list
+                        // If specific nodes requested, return our key if we're in the list
+                        // Check both our NodeId and PeerId since tests may use either
                         let our_node_id = p256_signing_key
                             .node_id()
                             .map(|id| id.as_str().to_string())
                             .unwrap_or_else(|_| swarm.local_peer_id().to_string());
 
-                        if request.requested_nodes.contains(&our_node_id) {
+                        let our_peer_id = swarm.local_peer_id().to_string();
+
+                        // Check if either our NodeId or PeerId is in the requested list
+                        if request.requested_nodes.contains(&our_node_id)
+                            || request.requested_nodes.contains(&our_peer_id)
+                        {
+                            // Return key with our NodeId (even if queried by PeerId)
                             if let Ok(node_key) = NodePublicKey::new(
                                 our_node_id,
                                 p256_signing_key.public_key_bytes(),
@@ -1096,11 +1103,12 @@ impl PeerNetwork for Libp2pNetwork {
                     .is_ok()
                 {
                     if let Ok(Ok(keys)) = rx.await {
-                        for key in keys {
-                            if key.node_id == *node_id_str {
-                                results.insert(node_id_str.clone(), key.public_key);
-                                break;
-                            }
+                        // The returned key might have a different node_id (e.g., the actual NodeId)
+                        // than what we requested (e.g., a PeerId), but we should still store it
+                        // indexed by what was requested
+                        if !keys.is_empty() {
+                            // Take the first matching key (there should only be one for a specific peer)
+                            results.insert(node_id_str.clone(), keys[0].public_key.clone());
                         }
                     }
                 }
