@@ -25,4 +25,12 @@ impl ContentId {
 /// 実装は別ライブラリを呼び出す infra 層に置く想定。
 pub trait ContentIdGenerator {
     fn generate(&self, raw_content: &[u8]) -> ContentId;
+
+    /// 平文由来の ContentId と暗号文（IV等を含む暗号化結果）から、暗号文側の識別子（encCid）を生成する。
+    ///
+    /// 例: `encCid = H(plain_cid || ciphertext)`
+    ///
+    /// - state-node 側で `plain_cid` と `ciphertext` だけから整合性検証ができることを意図する。
+    /// - 平文そのものを state-node に渡さない前提。
+    fn generate_encrypted(&self, plain_cid: &ContentId, ciphertext: &[u8]) -> ContentId;
 }

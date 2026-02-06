@@ -23,6 +23,7 @@ pub struct GrantShareResult {
 #[derive(Debug)]
 pub struct RevokeShareCommand {
     pub content_id: ContentId,
+    pub sender_key_id: KeyId,
     pub recipient_key_id: KeyId,
 }
 
@@ -31,4 +32,5 @@ pub struct RevokeShareCommand {
 pub struct RevokeShareResult {
     pub content_id: ContentId,
     pub recipient_key_id: KeyId,
+    pub envelopes: Vec<KeyEnvelope>,
 }
