@@ -6,6 +6,7 @@ pub mod event_adapters;
 pub mod event_bus_publisher;
 pub mod gossipsub_publisher;
 pub mod inbox_persistence;
+pub mod key_management;
 pub mod network;
 pub mod outbox_persistence;
 pub mod persistence;

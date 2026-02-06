@@ -357,8 +357,37 @@ where
             return Err(StateNodeError::NoAvailableMembers);
         }
 
-        // 5. Create content network
-        let network = ContentNetwork::from_strings(content_id.clone(), selected.clone())?;
+        // 5. Query public keys for the selected nodes
+        let public_keys = self
+            .peer_network
+            .query_node_public_keys_batch(&selected)
+            .await
+            .map_err(|e| {
+                StateNodeError::NetworkError(NetworkError::ConnectionFailed(e.to_string()))
+            })?;
+
+        // 6. Create content network (validate public keys exist but don't store them)
+        // Verify all nodes have public keys
+        for node_id in &selected {
+            if !public_keys.contains_key(node_id) {
+                return Err(StateNodeError::Internal(
+                    format!("No public key found for node {}", node_id)
+                ));
+            }
+        }
+
+        let first_node = crate::domain::value_objects::NodeId::from_string(selected[0].clone())?;
+        let mut network = ContentNetwork::new(
+            crate::domain::value_objects::ContentId::new(content_id.clone())?,
+            first_node,
+        )?;
+
+        // Add remaining members
+        for node_id in selected.iter().skip(1) {
+            let node_id_vo = crate::domain::value_objects::NodeId::from_string(node_id.clone())?;
+            network.add_member(node_id_vo);
+        }
+
         self.content_repo
             .write()
             .await
@@ -366,7 +395,7 @@ where
             .await
             .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
 
-        // 6. Create access policy for authenticated owner
+        // 7. Create access policy for authenticated owner
         if let Some(policy_repo) = &self.access_policy_repo {
             let content_id_vo = ContentId::new(content_id.clone())?;
             let policy = AccessPolicy::new(content_id_vo, owner_identity);
@@ -378,7 +407,7 @@ where
                 .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
         }
 
-        // 7. Create and publish event both locally and to the network
+        // 8. Create and publish event both locally and to the network
         let event = Event::ContentCreated {
             content_id,
             creator_node_id: self.local_node_id.clone(),
@@ -770,7 +799,6 @@ where
         content_id: &str,
         count: usize,
     ) -> Result<Event, StateNodeError> {
-        use crate::domain::content_network::add_member_node;
 
         // 1. Get content network
         let content_id_vo = ContentId::new(content_id.to_string())?;
@@ -822,12 +850,31 @@ where
             return Err(StateNodeError::NoAvailableMembers);
         }
 
-        // 5. Add each node using domain function
+        // 5. Query public keys for the selected nodes
+        let public_keys = self
+            .peer_network
+            .query_node_public_keys_batch(&selected)
+            .await
+            .map_err(|e| {
+                StateNodeError::NetworkError(NetworkError::ConnectionFailed(e.to_string()))
+            })?;
+
+        // 6. Add each node using domain function with their actual public key
         let mut updated_network = network;
         let mut last_event = None;
         for node_id in &selected {
-            let node_id_vo = crate::domain::value_objects::NodeId::new(node_id.clone())?;
-            let (net, events) = add_member_node(updated_network, node_id_vo);
+            let public_key = public_keys
+                .get(node_id)
+                .ok_or_else(|| {
+                    StateNodeError::Internal(format!("No public key found for node {}", node_id))
+                })?
+                .clone();
+
+            // Use add_member_node_from_public_key to ensure cryptographic binding
+            let (net, events) = crate::domain::content_network::add_member_node_from_public_key(
+                updated_network,
+                public_key
+            )?;
             updated_network = net;
             // Publish each event
             for event in events {
@@ -965,7 +1012,7 @@ where
                 break;
             }
 
-            let node_id_vo = crate::domain::value_objects::NodeId::new(node_id.clone())?;
+            let node_id_vo = crate::domain::value_objects::NodeId::from_string(node_id.clone())?;
             let (net, events) =
                 remove_member_node(updated_network, node_id_vo, "low_capacity".to_string());
             updated_network = net;
@@ -1048,8 +1095,16 @@ where
                 member_nodes,
                 ..
             } => {
-                let network =
-                    ContentNetwork::from_strings(content_id.clone(), member_nodes.clone())?;
+                // When handling sync events, we create network with NodeIds directly
+                let content_id_vo = ContentId::new(content_id.clone())?;
+
+                let first_node = crate::domain::value_objects::NodeId::from_string(member_nodes[0].clone())?;
+                let mut network = ContentNetwork::new(content_id_vo, first_node)?;
+
+                for node_id in member_nodes.iter().skip(1) {
+                    let node_id_vo = crate::domain::value_objects::NodeId::from_string(node_id.clone())?;
+                    network.add_member(node_id_vo);
+                }
                 self.content_repo
                     .write()
                     .await
@@ -1074,8 +1129,16 @@ where
                 ..
             } => {
                 // Update local network with new member list
-                let network =
-                    ContentNetwork::from_strings(content_id.clone(), member_nodes.clone())?;
+                // When handling sync events, we create network with NodeIds directly
+                let content_id_vo = ContentId::new(content_id.clone())?;
+
+                let first_node = crate::domain::value_objects::NodeId::from_string(member_nodes[0].clone())?;
+                let mut network = ContentNetwork::new(content_id_vo, first_node)?;
+
+                for node_id in member_nodes.iter().skip(1) {
+                    let node_id_vo = crate::domain::value_objects::NodeId::from_string(node_id.clone())?;
+                    network.add_member(node_id_vo);
+                }
                 self.content_repo
                     .write()
                     .await
@@ -1100,8 +1163,16 @@ where
                 member_nodes,
                 ..
             } => {
-                let network =
-                    ContentNetwork::from_strings(content_id.clone(), member_nodes.clone())?;
+                // When handling sync events, we create network with NodeIds directly
+                let content_id_vo = ContentId::new(content_id.clone())?;
+
+                let first_node = crate::domain::value_objects::NodeId::from_string(member_nodes[0].clone())?;
+                let mut network = ContentNetwork::new(content_id_vo, first_node)?;
+
+                for node_id in member_nodes.iter().skip(1) {
+                    let node_id_vo = crate::domain::value_objects::NodeId::from_string(node_id.clone())?;
+                    network.add_member(node_id_vo);
+                }
                 self.content_repo
                     .write()
                     .await
@@ -1416,7 +1487,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl AuthenticationService for TestAuthService {
-        async fn authenticate(&self, token: &AuthToken, _context: Option<&crate::port::auth_token::AuthContext>) -> Result<Identity> {
+        async fn authenticate(
+            &self,
+            token: &AuthToken,
+            _context: Option<&crate::port::auth_token::AuthContext>,
+        ) -> Result<Identity> {
             Identity::user(token.as_str().to_string()).map_err(|e| anyhow::anyhow!(e.to_string()))
         }
 

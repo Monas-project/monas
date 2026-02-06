@@ -51,6 +51,7 @@ impl AuthenticationService for TestAuthService {
     async fn authenticate(
         &self,
         token: &AuthToken,
+        _context: Option<&monas_state_node::port::auth_token::AuthContext>,
     ) -> anyhow::Result<monas_state_node::domain::identity::Identity> {
         monas_state_node::domain::identity::Identity::user(token.as_str().to_string())
             .map_err(|e| anyhow::anyhow!(e.to_string()))
@@ -1226,7 +1227,7 @@ async fn test_authentication_service_validates_token() {
 
     // Valid token
     let token = test_token();
-    let result = auth_service.authenticate(&token).await;
+    let result = auth_service.authenticate(&token, None).await;
     assert!(result.is_ok());
 
     // Empty token should still work for test service (implementation detail)

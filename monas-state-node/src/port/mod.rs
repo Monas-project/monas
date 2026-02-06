@@ -10,6 +10,7 @@ pub mod content_repository;
 pub mod event_publisher;
 pub mod peer_network;
 pub mod persistence;
+pub mod public_key_registry;
 
 pub use auth_token::AuthToken;
 pub use authentication_service::AuthenticationService;
@@ -20,3 +21,4 @@ pub use peer_network::PeerNetwork;
 pub use persistence::{
     PersistentAccessPolicyRepository, PersistentContentRepository, PersistentNodeRegistry,
 };
+pub use public_key_registry::{PublicKeyRegistry, InMemoryPublicKeyRegistry};

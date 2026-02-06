@@ -47,20 +47,49 @@ impl AsRef<str> for ContentId {
     }
 }
 
-/// Node identifier.
+/// Node identifier based on public key hash.
 ///
-/// This value object ensures that node IDs are never empty.
+/// NodeId is a multihash of the node's public key, following libp2p's PeerId pattern.
+/// This ensures cryptographic binding between node identity and its public key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
-pub struct NodeId(String);
+pub struct NodeId(String);  // Base58-encoded multihash
 
 impl NodeId {
-    /// Create a new NodeId.
+    /// Create a NodeId from a P-256 public key.
     ///
-    /// Returns an error if the node ID is empty.
-    pub fn new(id: String) -> Result<Self, ValueError> {
+    /// The public key must be in SEC1 uncompressed format (65 bytes).
+    pub fn from_public_key(public_key: &[u8]) -> Result<Self, ValueError> {
+        if public_key.len() != 65 {
+            return Err(ValueError::InvalidPublicKeyFormat(format!(
+                "Expected 65 bytes (P-256 uncompressed), got {}",
+                public_key.len()
+            )));
+        }
+
+        // Validate it's a valid P-256 point
+        if let Err(e) = p256::PublicKey::from_sec1_bytes(public_key) {
+            return Err(ValueError::InvalidPublicKeyFormat(e.to_string()));
+        }
+
+        // Create multihash using SHA-256
+        use multihash_codetable::{Code, MultihashDigest};
+        let multihash = Code::Sha2_256.digest(public_key);
+
+        // Encode as Base58 for human-readable format
+        let peer_id = bs58::encode(multihash.to_bytes()).into_string();
+        Ok(Self(peer_id))
+    }
+
+    /// Create a NodeId from a string.
+    ///
+    /// The string should be a Base58-encoded multihash.
+    /// For testing, any non-empty string is accepted.
+    pub fn from_string(id: String) -> Result<Self, ValueError> {
         if id.is_empty() {
             return Err(ValueError::EmptyNodeId);
         }
+
+        // In production, we should validate this is a valid multihash
         Ok(Self(id))
     }
 
@@ -244,14 +273,14 @@ mod tests {
 
     #[test]
     fn test_node_id_creation() {
-        let node_id = NodeId::new("node-1".to_string()).unwrap();
+        let node_id = NodeId::from_string("node-1".to_string()).unwrap();
         assert_eq!(node_id.as_str(), "node-1");
         assert_eq!(node_id.to_string(), "node-1");
     }
 
     #[test]
     fn test_node_id_empty() {
-        let result = NodeId::new("".to_string());
+        let result = NodeId::from_string("".to_string());
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), ValueError::EmptyNodeId));
     }
@@ -361,7 +390,7 @@ mod tests {
 
     #[test]
     fn test_node_id_serialization() {
-        let node_id = NodeId::new("node-1".to_string()).unwrap();
+        let node_id = NodeId::from_string("node-1".to_string()).unwrap();
         let json = serde_json::to_string(&node_id).unwrap();
         assert_eq!(json, "\"node-1\"");
 

@@ -3188,6 +3188,7 @@ dependencies = [
  "async-trait",
  "axum 0.7.9",
  "base64 0.21.7",
+ "bs58 0.5.1",
  "cid 0.11.1",
  "clap",
  "crsl-lib",

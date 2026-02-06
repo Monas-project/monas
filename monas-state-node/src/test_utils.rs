@@ -29,6 +29,7 @@ pub struct MockPeerNetwork {
     pub published_events: PublishedEvents,
     pub closest_peers: Arc<Mutex<Vec<String>>>,
     pub capacities: Arc<Mutex<HashMap<String, u64>>>,
+    pub public_keys: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     pub providers: Arc<Mutex<Vec<String>>>,
     pub fetched_operations: Arc<Mutex<Vec<SerializedOperation>>>,
     pub local_peer_id: String,
@@ -40,6 +41,7 @@ impl MockPeerNetwork {
             published_events: Arc::new(Mutex::new(Vec::new())),
             closest_peers: Arc::new(Mutex::new(Vec::new())),
             capacities: Arc::new(Mutex::new(HashMap::new())),
+            public_keys: Arc::new(Mutex::new(HashMap::new())),
             providers: Arc::new(Mutex::new(Vec::new())),
             fetched_operations: Arc::new(Mutex::new(Vec::new())),
             local_peer_id: "mock-peer-id".to_string(),
@@ -61,6 +63,13 @@ impl MockPeerNetwork {
     pub fn with_capacities(self, caps: HashMap<String, u64>) -> Self {
         Self {
             capacities: Arc::new(Mutex::new(caps)),
+            ..self
+        }
+    }
+
+    pub fn with_public_keys(self, keys: HashMap<String, Vec<u8>>) -> Self {
+        Self {
+            public_keys: Arc::new(Mutex::new(keys)),
             ..self
         }
     }
@@ -91,6 +100,29 @@ impl PeerNetwork for MockPeerNetwork {
         _peer_ids: &[String],
     ) -> Result<HashMap<String, u64>> {
         Ok(self.capacities.lock().await.clone())
+    }
+
+    async fn query_node_public_keys_batch(
+        &self,
+        peer_ids: &[String],
+    ) -> Result<HashMap<String, Vec<u8>>> {
+        let mut result = HashMap::new();
+        let keys = self.public_keys.lock().await;
+
+        for peer_id in peer_ids {
+            if let Some(key) = keys.get(peer_id) {
+                result.insert(peer_id.clone(), key.clone());
+            } else {
+                // Generate a valid P-256 public key for testing
+                use p256::ecdsa::SigningKey;
+                use rand::rngs::OsRng;
+                let signing_key = SigningKey::random(&mut OsRng);
+                let verifying_key = signing_key.verifying_key();
+                let public_key = verifying_key.to_encoded_point(false).as_bytes().to_vec();
+                result.insert(peer_id.clone(), public_key);
+            }
+        }
+        Ok(result)
     }
 
     async fn publish_event(&self, topic: &str, event_data: &[u8]) -> Result<()> {
@@ -445,36 +477,23 @@ impl PersistentContentRepository for MockContentNetworkRepository {
 // ============================================================================
 
 /// Create a test ContentNetwork with the given members.
-///
-/// Generates dummy P-256 public keys for each member for testing purposes.
 pub fn create_test_network(content_id: &str, members: Vec<&str>) -> ContentNetwork {
     use crate::domain::value_objects::{ContentId, NodeId};
-    use p256::ecdsa::SigningKey;
-    use rand::rngs::OsRng;
 
     if members.is_empty() {
         panic!("Cannot create test network with no members");
     }
 
-    // Generate test keypair for first member
-    let signing_key = SigningKey::random(&mut OsRng);
-    let verifying_key = signing_key.verifying_key();
-    let public_key = verifying_key.to_encoded_point(false).as_bytes().to_vec();
-
     let content_id_vo = ContentId::new(content_id.to_string()).expect("Invalid content ID");
-    let first_member = NodeId::new(members[0].to_string()).expect("Invalid node ID");
+    let first_member = NodeId::from_string(members[0].to_string()).expect("Invalid node ID");
 
-    let mut network = ContentNetwork::new(content_id_vo, first_member, public_key)
+    let mut network = ContentNetwork::new(content_id_vo, first_member)
         .expect("Failed to create test network");
 
-    // Add remaining members with their own public keys
+    // Add remaining members
     for member in members.iter().skip(1) {
-        let signing_key = SigningKey::random(&mut OsRng);
-        let verifying_key = signing_key.verifying_key();
-        let public_key = verifying_key.to_encoded_point(false).as_bytes().to_vec();
-        let node_id = NodeId::new(member.to_string()).expect("Invalid node ID");
-        network.add_member_with_public_key(node_id, public_key)
-            .expect("Failed to add member to test network");
+        let node_id = NodeId::from_string(member.to_string()).expect("Invalid node ID");
+        network.add_member(node_id);
     }
 
     network

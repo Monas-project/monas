@@ -25,6 +25,12 @@ pub trait PeerNetwork: Send + Sync {
     /// Uses RequestResponse protocol to query multiple peers in parallel.
     async fn query_node_capacity_batch(&self, peer_ids: &[String]) -> Result<HashMap<String, u64>>;
 
+    /// Query node public keys (P-256, SEC1 uncompressed format) in batch.
+    ///
+    /// Uses RequestResponse protocol to query multiple peers in parallel.
+    /// Returns a map of peer_id -> public key (65 bytes).
+    async fn query_node_public_keys_batch(&self, peer_ids: &[String]) -> Result<HashMap<String, Vec<u8>>>;
+
     /// Publish an event to the network via Gossipsub.
     async fn publish_event(&self, topic: &str, event_data: &[u8]) -> Result<()>;
 

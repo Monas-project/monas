@@ -13,6 +13,8 @@ use crate::infrastructure::gossipsub_publisher::GossipsubEventPublisher;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::infrastructure::inbox_persistence::SledInboxPersistence;
 #[cfg(not(target_arch = "wasm32"))]
+use crate::infrastructure::key_management::{KeyStore, NodeKeyPair};
+#[cfg(not(target_arch = "wasm32"))]
 use crate::infrastructure::network::{Libp2pNetwork, Libp2pNetworkConfig};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::infrastructure::outbox_persistence::SledOutboxPersistence;
@@ -25,9 +27,9 @@ use crate::infrastructure::reliable_event_publisher::{
     ReliableEventPublisher, ReliablePublisherConfig,
 };
 #[cfg(not(target_arch = "wasm32"))]
-use crate::port::peer_network::PeerNetwork;
-#[cfg(not(target_arch = "wasm32"))]
 use crate::port::persistence::PersistentAccessPolicyRepository;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::port::public_key_registry::PublicKeyRegistry;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::presentation::http_api::{create_router, AppState};
 #[cfg(not(target_arch = "wasm32"))]
@@ -110,6 +112,10 @@ pub struct StateNode {
     sync_service: SyncService,
     /// Reliable event publisher with outbox/inbox pattern.
     reliable_publisher: Arc<ReliablePublisher>,
+    /// Node's P-256 key pair.
+    node_key_pair: NodeKeyPair,
+    /// Public key registry.
+    public_key_registry: Arc<dyn PublicKeyRegistry>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -160,11 +166,31 @@ impl StateNode {
         let event_publisher = GossipsubEventPublisher::new(network.clone(), None);
         event_publisher.register_event_type().await;
 
-        // Generate or use provided node ID
-        let node_id = config
-            .node_id
-            .clone()
-            .unwrap_or_else(|| PeerNetwork::local_peer_id(network.as_ref()));
+        // Initialize key store and load/generate P-256 key pair
+        let key_store = KeyStore::new(config.data_dir.join("keys"));
+        let node_key_pair = key_store
+            .get_default_node_key()
+            .context("Failed to load/generate node key")?;
+
+        // Generate NodeId from the P-256 public key
+        let node_id = if let Some(ref provided_id) = config.node_id {
+            // If a node ID is explicitly provided, use it (for backward compatibility)
+            provided_id.clone()
+        } else {
+            // Generate NodeId from P-256 public key hash
+            node_key_pair
+                .node_id()
+                .context("Failed to generate NodeId from public key")?
+                .into_inner()
+        };
+
+        // Initialize public key registry and register our key
+        let public_key_registry: Arc<dyn PublicKeyRegistry> =
+            Arc::new(crate::port::public_key_registry::InMemoryPublicKeyRegistry::new());
+        public_key_registry
+            .register_public_key(node_key_pair.public_key_bytes())
+            .await
+            .context("Failed to register public key")?;
 
         // Create sync service
         let sync_service = ContentSyncService::new(
@@ -188,7 +214,7 @@ impl StateNode {
         ));
 
         // Create auth services
-        let auth_service = MonasAccountAdapter::new(content_repo.clone());
+        let auth_service = MonasAccountAdapter::new();
         let authz_service = UcanAdapter::new_with_dyn_repo(access_policy_repo.clone());
 
         // Create service with CRDT repository
@@ -218,12 +244,29 @@ impl StateNode {
             crdt_repo,
             sync_service,
             reliable_publisher,
+            node_key_pair,
+            public_key_registry,
         })
     }
 
     /// Get the node ID.
     pub fn node_id(&self) -> &str {
         self.service.local_node_id()
+    }
+
+    /// Get the node's public key in uncompressed SEC1 format (65 bytes).
+    pub fn public_key(&self) -> Vec<u8> {
+        self.node_key_pair.public_key_bytes()
+    }
+
+    /// Get a reference to the node's key pair.
+    pub fn key_pair(&self) -> &NodeKeyPair {
+        &self.node_key_pair
+    }
+
+    /// Get a reference to the public key registry.
+    pub fn public_key_registry(&self) -> &Arc<dyn PublicKeyRegistry> {
+        &self.public_key_registry
     }
 
     /// Get a reference to the service.
@@ -422,6 +465,7 @@ impl StateNode {
 mod tests {
     use super::*;
     use crate::port::content_repository::ContentRepository;
+    use crate::port::peer_network::PeerNetwork;
     use tempfile::tempdir;
 
     #[test]
@@ -507,7 +551,7 @@ mod tests {
                 enable_mdns: false,
                 gossipsub_topics: vec!["test".to_string()],
             },
-            node_id: None, // Will be auto-generated
+            node_id: None, // Will be auto-generated from P-256 public key
             sync_interval_secs: 30,
             outbox_retry_interval_secs: 10,
             ..StateNodeConfig::default()
@@ -515,9 +559,19 @@ mod tests {
 
         let node = StateNode::new(config).await.unwrap();
 
-        // Node ID should be the peer ID when not explicitly set
+        // Node ID should be generated from the P-256 public key hash
+        let node_id = node.node_id();
+        assert!(!node_id.is_empty());
+
+        // Verify the node ID matches what's expected from the public key
+        use crate::domain::value_objects::NodeId;
+        let expected_node_id = NodeId::from_public_key(&node.public_key())
+            .expect("Failed to generate NodeId from public key");
+        assert_eq!(node_id, expected_node_id.as_str());
+
+        // The node ID should be different from the libp2p peer ID
         let peer_id = node.network().local_peer_id();
-        assert_eq!(node.node_id(), peer_id);
+        assert_ne!(node_id, peer_id);
     }
 
     #[tokio::test]
