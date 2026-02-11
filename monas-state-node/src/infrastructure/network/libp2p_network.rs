@@ -34,6 +34,29 @@ use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
 use tracing::{debug, error, info, warn};
 
+/// A relay request received from a remote peer via P2P protocol.
+/// The swarm loop sends these through a channel to the application layer (node.rs),
+/// which processes them using StateNodeService.
+pub struct RelayRequest {
+    pub kind: RelayRequestKind,
+    pub reply: oneshot::Sender<Result<()>>,
+}
+
+/// The kind of relay request.
+pub enum RelayRequestKind {
+    UpdateContent {
+        content_id: String,
+        data: Vec<u8>,
+        auth_token: String,
+        request_signature: Vec<u8>,
+    },
+    DeleteContent {
+        content_id: String,
+        auth_token: String,
+        request_signature: Vec<u8>,
+    },
+}
+
 /// Gossipsub message received from the network.
 #[derive(Debug, Clone)]
 pub struct GossipsubMessage {
@@ -143,6 +166,21 @@ enum SwarmCommand {
         node_ids: Vec<String>,
         reply: oneshot::Sender<Result<Vec<NodePublicKey>>>,
     },
+    RelayUpdateContent {
+        peer_id: PeerId,
+        content_id: String,
+        data: Vec<u8>,
+        auth_token: String,
+        request_signature: Vec<u8>,
+        reply: oneshot::Sender<Result<bool>>,
+    },
+    RelayDeleteContent {
+        peer_id: PeerId,
+        content_id: String,
+        auth_token: String,
+        request_signature: Vec<u8>,
+        reply: oneshot::Sender<Result<bool>>,
+    },
 }
 
 /// Pending requests tracking.
@@ -156,6 +194,8 @@ struct PendingRequests {
         HashMap<OutboundRequestId, oneshot::Sender<Result<Vec<SerializedOperation>>>>,
     operation_pushes: HashMap<OutboundRequestId, oneshot::Sender<Result<usize>>>,
     public_key_queries: HashMap<OutboundRequestId, oneshot::Sender<Result<Vec<NodePublicKey>>>>,
+    relay_update_queries: HashMap<OutboundRequestId, oneshot::Sender<Result<bool>>>,
+    relay_delete_queries: HashMap<OutboundRequestId, oneshot::Sender<Result<bool>>>,
 }
 
 /// libp2p-based network implementation.
@@ -186,6 +226,9 @@ pub struct Libp2pNetwork {
     /// Reserved for future use in public key exchange APIs.
     #[allow(dead_code)]
     p256_public_key: Vec<u8>,
+    /// Channel receiver for relay requests from remote peers.
+    /// Taken by node.rs run() to process relay requests via StateNodeService.
+    relay_request_rx: tokio::sync::Mutex<Option<mpsc::Receiver<RelayRequest>>>,
 }
 
 impl Libp2pNetwork {
@@ -268,6 +311,9 @@ impl Libp2pNetwork {
         let data_dir_clone = data_dir.clone();
         let p256_signing_key_clone = p256_signing_key.clone();
 
+        // Create relay request channel
+        let (relay_tx, relay_rx) = mpsc::channel::<RelayRequest>(64);
+
         // Spawn swarm event loop
         tokio::spawn(Self::run_swarm_loop(
             swarm,
@@ -277,6 +323,7 @@ impl Libp2pNetwork {
             crdt_repo_clone,
             data_dir_clone,
             p256_signing_key_clone,
+            relay_tx,
         ));
 
         Ok(Self {
@@ -287,6 +334,7 @@ impl Libp2pNetwork {
             crdt_repo,
             data_dir,
             p256_public_key,
+            relay_request_rx: tokio::sync::Mutex::new(Some(relay_rx)),
         })
     }
 
@@ -314,6 +362,14 @@ impl Libp2pNetwork {
             .map_err(|_| anyhow::anyhow!("Dial response channel closed"))?
     }
 
+    /// Take the relay request receiver.
+    ///
+    /// This can only be called once. Returns None on subsequent calls.
+    /// Used by node.rs run() to process incoming relay requests.
+    pub async fn take_relay_receiver(&self) -> Option<mpsc::Receiver<RelayRequest>> {
+        self.relay_request_rx.lock().await.take()
+    }
+
     /// Get the addresses this node is listening on.
     pub async fn listen_addrs(&self) -> Vec<Multiaddr> {
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -329,6 +385,7 @@ impl Libp2pNetwork {
     }
 
     /// Run the swarm event loop.
+    #[allow(clippy::too_many_arguments)]
     async fn run_swarm_loop(
         mut swarm: Swarm<NodeBehaviour>,
         mut command_rx: mpsc::Receiver<SwarmCommand>,
@@ -337,6 +394,7 @@ impl Libp2pNetwork {
         crdt_repo: Arc<dyn ContentRepository>,
         data_dir: PathBuf,
         p256_signing_key: Arc<crate::infrastructure::key_management::NodeKeyPair>,
+        relay_tx: mpsc::Sender<RelayRequest>,
     ) {
         let mut pending = PendingRequests::default();
 
@@ -348,7 +406,7 @@ impl Libp2pNetwork {
                 }
                 // Handle swarm events
                 event = swarm.select_next_some() => {
-                    Self::handle_swarm_event(&mut swarm, &mut pending, &connected_peers, &event_tx, &crdt_repo, &data_dir, &p256_signing_key, event).await;
+                    Self::handle_swarm_event(&mut swarm, &mut pending, &connected_peers, &event_tx, &crdt_repo, &data_dir, &p256_signing_key, &relay_tx, event).await;
                 }
             }
         }
@@ -468,6 +526,42 @@ impl Libp2pNetwork {
                     .send_request(&peer_id, request);
                 pending.public_key_queries.insert(request_id, reply);
             }
+            SwarmCommand::RelayUpdateContent {
+                peer_id,
+                content_id,
+                data,
+                auth_token,
+                request_signature,
+                reply,
+            } => {
+                let request_id = swarm.behaviour_mut().request_response.send_request(
+                    &peer_id,
+                    ContentRequest::UpdateContent {
+                        content_id,
+                        data,
+                        auth_token,
+                        request_signature,
+                    },
+                );
+                pending.relay_update_queries.insert(request_id, reply);
+            }
+            SwarmCommand::RelayDeleteContent {
+                peer_id,
+                content_id,
+                auth_token,
+                request_signature,
+                reply,
+            } => {
+                let request_id = swarm.behaviour_mut().request_response.send_request(
+                    &peer_id,
+                    ContentRequest::DeleteContent {
+                        content_id,
+                        auth_token,
+                        request_signature,
+                    },
+                );
+                pending.relay_delete_queries.insert(request_id, reply);
+            }
         }
     }
 
@@ -481,6 +575,7 @@ impl Libp2pNetwork {
         crdt_repo: &Arc<dyn ContentRepository>,
         data_dir: &std::path::Path,
         p256_signing_key: &Arc<crate::infrastructure::key_management::NodeKeyPair>,
+        relay_tx: &mpsc::Sender<RelayRequest>,
         event: SwarmEvent<NodeBehaviourEvent>,
     ) {
         match event {
@@ -491,8 +586,10 @@ impl Libp2pNetwork {
                 Self::handle_gossipsub_event(event_tx, *gossip_event).await;
             }
             SwarmEvent::Behaviour(NodeBehaviourEvent::RequestResponse(rr_event)) => {
-                Self::handle_request_response_event(swarm, pending, crdt_repo, data_dir, rr_event)
-                    .await;
+                Self::handle_request_response_event(
+                    swarm, pending, crdt_repo, data_dir, relay_tx, rr_event,
+                )
+                .await;
             }
             SwarmEvent::Behaviour(NodeBehaviourEvent::PublicKeyProtocol(pk_event)) => {
                 Self::handle_public_key_protocol_event(swarm, pending, p256_signing_key, pk_event)
@@ -632,6 +729,7 @@ impl Libp2pNetwork {
         pending: &mut PendingRequests,
         crdt_repo: &Arc<dyn ContentRepository>,
         data_dir: &std::path::Path,
+        relay_tx: &mpsc::Sender<RelayRequest>,
         event: request_response::Event<ContentRequest, ContentResponse>,
     ) {
         match event {
@@ -640,7 +738,7 @@ impl Libp2pNetwork {
                     request, channel, ..
                 } => {
                     Self::handle_incoming_request(
-                        swarm, peer, request, channel, crdt_repo, data_dir,
+                        swarm, peer, request, channel, crdt_repo, data_dir, relay_tx,
                     )
                     .await;
                 }
@@ -674,6 +772,7 @@ impl Libp2pNetwork {
         channel: ResponseChannel<ContentResponse>,
         crdt_repo: &Arc<dyn ContentRepository>,
         data_dir: &std::path::Path,
+        relay_tx: &mpsc::Sender<RelayRequest>,
     ) {
         debug!("Received request from {}: {:?}", peer, request);
 
@@ -756,6 +855,82 @@ impl Libp2pNetwork {
                     Err(e) => ContentResponse::Error {
                         message: format!("Failed to apply operations: {}", e),
                     },
+                }
+            }
+            ContentRequest::UpdateContent {
+                content_id,
+                data,
+                auth_token,
+                request_signature,
+            } => {
+                info!(
+                    "Received relayed UpdateContent for {} from {}",
+                    content_id, peer
+                );
+                let (reply_tx, reply_rx) = oneshot::channel();
+                let relay_req = RelayRequest {
+                    kind: RelayRequestKind::UpdateContent {
+                        content_id: content_id.clone(),
+                        data,
+                        auth_token,
+                        request_signature,
+                    },
+                    reply: reply_tx,
+                };
+                if relay_tx.send(relay_req).await.is_ok() {
+                    match reply_rx.await {
+                        Ok(Ok(())) => ContentResponse::UpdateResult {
+                            content_id,
+                            success: true,
+                        },
+                        Ok(Err(e)) => ContentResponse::Error {
+                            message: format!("Relay update failed: {}", e),
+                        },
+                        Err(_) => ContentResponse::Error {
+                            message: "Relay handler dropped".to_string(),
+                        },
+                    }
+                } else {
+                    ContentResponse::Error {
+                        message: "Relay channel closed".to_string(),
+                    }
+                }
+            }
+            ContentRequest::DeleteContent {
+                content_id,
+                auth_token,
+                request_signature,
+            } => {
+                info!(
+                    "Received relayed DeleteContent for {} from {}",
+                    content_id, peer
+                );
+                let (reply_tx, reply_rx) = oneshot::channel();
+                let relay_req = RelayRequest {
+                    kind: RelayRequestKind::DeleteContent {
+                        content_id: content_id.clone(),
+                        auth_token,
+                        request_signature,
+                    },
+                    reply: reply_tx,
+                };
+                if relay_tx.send(relay_req).await.is_ok() {
+                    match reply_rx.await {
+                        Ok(Ok(())) => ContentResponse::DeleteResult {
+                            content_id,
+                            success: true,
+                        },
+                        Ok(Err(e)) => ContentResponse::Error {
+                            message: format!("Relay delete failed: {}", e),
+                        },
+                        Err(_) => ContentResponse::Error {
+                            message: "Relay handler dropped".to_string(),
+                        },
+                    }
+                } else {
+                    ContentResponse::Error {
+                        message: "Relay channel closed".to_string(),
+                    }
                 }
             }
         };
@@ -847,6 +1022,38 @@ impl Libp2pNetwork {
                 }
                 ContentResponse::Error { message } => {
                     let _ = reply.send(Err(anyhow::anyhow!("Push operations error: {}", message)));
+                }
+                _ => {
+                    let _ = reply.send(Err(anyhow::anyhow!("Unexpected response type")));
+                }
+            }
+            return;
+        }
+
+        // Handle relay update response
+        if let Some(reply) = pending.relay_update_queries.remove(&request_id) {
+            match response {
+                ContentResponse::UpdateResult { success, .. } => {
+                    let _ = reply.send(Ok(success));
+                }
+                ContentResponse::Error { message } => {
+                    let _ = reply.send(Err(anyhow::anyhow!("Relay update error: {}", message)));
+                }
+                _ => {
+                    let _ = reply.send(Err(anyhow::anyhow!("Unexpected response type")));
+                }
+            }
+            return;
+        }
+
+        // Handle relay delete response
+        if let Some(reply) = pending.relay_delete_queries.remove(&request_id) {
+            match response {
+                ContentResponse::DeleteResult { success, .. } => {
+                    let _ = reply.send(Ok(success));
+                }
+                ContentResponse::Error { message } => {
+                    let _ = reply.send(Err(anyhow::anyhow!("Relay delete error: {}", message)));
                 }
                 _ => {
                     let _ = reply.send(Err(anyhow::anyhow!("Unexpected response type")));
@@ -1249,6 +1456,60 @@ impl PeerNetwork for Libp2pNetwork {
             .await
             .map_err(|_| anyhow::anyhow!("Failed to receive response"))??;
         Ok(peers.into_iter().map(|p| p.to_string()).collect())
+    }
+
+    async fn relay_update_content(
+        &self,
+        peer_id: &str,
+        content_id: &str,
+        data: &[u8],
+        auth_token: &str,
+        request_signature: &[u8],
+    ) -> Result<bool> {
+        let peer_id = PeerId::from_str(peer_id)
+            .map_err(|_| anyhow::anyhow!("Invalid peer ID: {}", peer_id))?;
+
+        let (tx, rx) = oneshot::channel();
+        self.command_tx
+            .send(SwarmCommand::RelayUpdateContent {
+                peer_id,
+                content_id: content_id.to_string(),
+                data: data.to_vec(),
+                auth_token: auth_token.to_string(),
+                request_signature: request_signature.to_vec(),
+                reply: tx,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("Failed to send command"))?;
+
+        rx.await
+            .map_err(|_| anyhow::anyhow!("Failed to receive response"))?
+    }
+
+    async fn relay_delete_content(
+        &self,
+        peer_id: &str,
+        content_id: &str,
+        auth_token: &str,
+        request_signature: &[u8],
+    ) -> Result<bool> {
+        let peer_id = PeerId::from_str(peer_id)
+            .map_err(|_| anyhow::anyhow!("Invalid peer ID: {}", peer_id))?;
+
+        let (tx, rx) = oneshot::channel();
+        self.command_tx
+            .send(SwarmCommand::RelayDeleteContent {
+                peer_id,
+                content_id: content_id.to_string(),
+                auth_token: auth_token.to_string(),
+                request_signature: request_signature.to_vec(),
+                reply: tx,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("Failed to send command"))?;
+
+        rx.await
+            .map_err(|_| anyhow::anyhow!("Failed to receive response"))?
     }
 }
 

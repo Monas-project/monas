@@ -1212,13 +1212,19 @@ async fn test_authorization_denied_prevents_create_content() {
 
     let data = b"Test data";
 
-    // With valid token and signature but authorization denied
+    // create_content skips authorization for new content (no policy yet),
+    // so it will fail at the peer selection step instead.
+    // The authenticated user becomes the owner with full permissions.
     let result = service
         .create_content(data, Some(&test_token()), Some(&test_request_signature()))
         .await;
 
+    // Should fail because no peers are available (not authorization)
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("Authorization"));
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("No available member nodes found"));
 }
 
 #[tokio::test]

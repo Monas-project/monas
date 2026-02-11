@@ -37,6 +37,19 @@ pub enum ContentRequest {
         /// Serialized operations (JSON-encoded)
         operations: Vec<Vec<u8>>,
     },
+    /// Relay an update request to a member node.
+    UpdateContent {
+        content_id: String,
+        data: Vec<u8>,
+        auth_token: String,
+        request_signature: Vec<u8>,
+    },
+    /// Relay a delete request to a member node.
+    DeleteContent {
+        content_id: String,
+        auth_token: String,
+        request_signature: Vec<u8>,
+    },
 }
 
 /// Response types for the content protocol.
@@ -66,6 +79,10 @@ pub enum ContentResponse {
         /// Number of operations accepted
         accepted_count: usize,
     },
+    /// Response to relayed update request.
+    UpdateResult { content_id: String, success: bool },
+    /// Response to relayed delete request.
+    DeleteResult { content_id: String, success: bool },
     /// Content not found.
     NotFound { content_id: String },
     /// Error response.

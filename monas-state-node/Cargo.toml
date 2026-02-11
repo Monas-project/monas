@@ -7,6 +7,10 @@ edition = "2021"
 name = "state-node"
 path = "src/bin/state_node.rs"
 
+[[bin]]
+name = "test-auth-generator"
+path = "src/bin/test_auth_generator.rs"
+
 [dependencies]
 anyhow = "1.0"
 async-trait = "0.1"
@@ -35,6 +39,12 @@ tokio = { version = "1", features = ["full"] }
 
 # monas-event-manager for EventBus integration
 monas-event-manager = { path = "../monas-event-manager" }
+
+# monas-account for auth token generation (used in test-auth-generator)
+monas-account = { path = "../monas-account" }
+
+# base64-url for URL-safe base64 encoding
+base64-url = "2.0"
 
 # UCAN for authorization (temporary until monas-ucan is available)
 ucan = "0.7.0-alpha.1"

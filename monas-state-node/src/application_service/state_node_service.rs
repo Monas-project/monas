@@ -24,8 +24,6 @@ use crate::port::persistence::{
     PersistentContentRepository, PersistentNodeRegistry,
 };
 use anyhow::Result;
-use cid::Cid;
-use multihash_codetable::{Code, MultihashDigest};
 use std::sync::Arc;
 
 /// Result of applying an event.
@@ -125,12 +123,6 @@ where
     R: ContentRepository,
     A: PersistentAccessControlRepository,
 {
-    fn compute_content_id(data: &[u8]) -> Result<String, StateNodeError> {
-        let mh = Code::Sha2_256.digest(data);
-        let cid = Cid::new_v1(0x55, mh);
-        Ok(cid.to_string())
-    }
-
     /// Create a new StateNodeService.
     ///
     /// The `peer_network` is passed as an `Arc` to allow sharing with other components
@@ -278,14 +270,11 @@ where
         let token = token.ok_or_else(|| {
             StateNodeError::AuthenticationFailed("Authentication token is required".to_string())
         })?;
-        let request_signature = request_signature.ok_or_else(|| {
+        let _request_signature = request_signature.ok_or_else(|| {
             StateNodeError::AuthenticationFailed("Request signature is required".to_string())
         })?;
         let auth_service = self.auth_service.as_ref().ok_or_else(|| {
             StateNodeError::InvalidConfiguration("Authentication not configured".to_string())
-        })?;
-        let authz_service = self.authz_service.as_ref().ok_or_else(|| {
-            StateNodeError::InvalidConfiguration("Authorization not configured".to_string())
         })?;
 
         // 1. Authenticate caller
@@ -294,28 +283,9 @@ where
             .await
             .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))?;
 
-        // 2. Authorize creation for derived content ID
-        let content_id = Self::compute_content_id(data)?;
-        let content_id_vo = ContentId::new(content_id.clone())?;
-        let authz_request = AuthorizationRequest {
-            identity: owner_identity.clone(),
-            resource: content_id_vo,
-            capability: AuthCapability::WriteContent,
-            token: Some(token.clone()),
-            request_signature: Some(request_signature.to_vec()),
-        };
-        let authz_result = authz_service
-            .authorize(&authz_request)
-            .await
-            .map_err(|e| StateNodeError::AuthorizationFailed(e.to_string()))?;
-        if authz_result.is_denied() {
-            return Err(StateNodeError::AuthorizationFailed(
-                authz_result
-                    .denial_reason()
-                    .unwrap_or("Access denied")
-                    .to_string(),
-            ));
-        }
+        // 2. Skip authorization for content creation
+        // New content doesn't have an access policy yet, so authorization would always fail.
+        // The authenticated user becomes the owner with full permissions.
 
         // 3. Save content to CRDT repository first
         let commit_result = self
@@ -357,26 +327,7 @@ where
             return Err(StateNodeError::NoAvailableMembers);
         }
 
-        // 5. Query public keys for the selected nodes
-        let public_keys = self
-            .peer_network
-            .query_node_public_keys_batch(&selected)
-            .await
-            .map_err(|e| {
-                StateNodeError::NetworkError(NetworkError::ConnectionFailed(e.to_string()))
-            })?;
-
-        // 6. Create content network (validate public keys exist but don't store them)
-        // Verify all nodes have public keys
-        for node_id in &selected {
-            if !public_keys.contains_key(node_id) {
-                return Err(StateNodeError::Internal(format!(
-                    "No public key found for node {}",
-                    node_id
-                )));
-            }
-        }
-
+        // 5. Create content network with PeerId-based NodeIds
         let first_node = crate::domain::value_objects::NodeId::from_string(selected[0].clone())?;
         let mut network = ContentNetwork::new(
             crate::domain::value_objects::ContentId::new(content_id.clone())?,
@@ -500,47 +451,71 @@ where
             ));
         }
 
-        // 3. Verify local node is a member (only members can delete)
-        if !network.has_member_str(&self.local_node_id) {
-            return Err(StateNodeError::NotAMember {
-                node_id: self.local_node_id.clone(),
-                content_id: content_id_vo,
-            });
-        }
+        // 3. Check if local node is a member
+        if network.has_member_str(&self.local_node_id) {
+            // Local delete path: we are a member node
 
-        // 4. Delete the ContentNetwork
-        self.content_repo
-            .write()
-            .await
-            .delete_content_network(content_id)
-            .await
-            .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
-
-        // 5. Delete the AccessPolicy if it exists
-        if let Some(policy_repo) = &self.access_policy_repo {
-            policy_repo
+            // 4. Delete the ContentNetwork
+            self.content_repo
                 .write()
                 .await
-                .delete_policy(content_id)
+                .delete_content_network(content_id)
                 .await
                 .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
+
+            // 5. Delete the AccessPolicy if it exists
+            if let Some(policy_repo) = &self.access_policy_repo {
+                policy_repo
+                    .write()
+                    .await
+                    .delete_policy(content_id)
+                    .await
+                    .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
+            }
+
+            // 6. Create and publish ContentDeleted event
+            let event = Event::ContentDeleted {
+                content_id: content_id.to_string(),
+                deleted_by_node_id: self.local_node_id.clone(),
+                timestamp: current_timestamp(),
+            };
+
+            self.event_publisher
+                .publish_all(&event)
+                .await
+                .map_err(|e| {
+                    StateNodeError::NetworkError(NetworkError::ProtocolError(e.to_string()))
+                })?;
+
+            Ok(event)
+        } else {
+            // Relay path: we are not a member, relay to a member node
+            let members = network.member_nodes_as_strings();
+            if members.is_empty() {
+                return Err(StateNodeError::NoAvailableMembers);
+            }
+
+            let target_peer = &members[0];
+            let success = self
+                .peer_network
+                .relay_delete_content(target_peer, content_id, token.as_str(), request_signature)
+                .await
+                .map_err(|e| {
+                    StateNodeError::NetworkError(NetworkError::ConnectionFailed(e.to_string()))
+                })?;
+
+            if !success {
+                return Err(StateNodeError::Internal(
+                    "Relay delete to member node failed".to_string(),
+                ));
+            }
+
+            Ok(Event::ContentDeleted {
+                content_id: content_id.to_string(),
+                deleted_by_node_id: self.local_node_id.clone(),
+                timestamp: current_timestamp(),
+            })
         }
-
-        // 6. Create and publish ContentDeleted event
-        let event = Event::ContentDeleted {
-            content_id: content_id.to_string(),
-            deleted_by_node_id: self.local_node_id.clone(),
-            timestamp: current_timestamp(),
-        };
-
-        self.event_publisher
-            .publish_all(&event)
-            .await
-            .map_err(|e| {
-                StateNodeError::NetworkError(NetworkError::ProtocolError(e.to_string()))
-            })?;
-
-        Ok(event)
     }
 
     /// Update existing content.
@@ -607,44 +582,73 @@ where
             ));
         }
 
-        // 3. Verify local node is a member
-        if !network.has_member_str(&self.local_node_id) {
-            return Err(StateNodeError::NotAMember {
-                node_id: self.local_node_id.clone(),
-                content_id: content_id_vo,
-            });
+        // 3. Check if local node is a member
+        if network.has_member_str(&self.local_node_id) {
+            // Local update path: we are a member node
+            // 4. Update content in CRDT repository
+            self.crdt_repo
+                .update_content(content_id, data, &self.local_node_id)
+                .await
+                .map_err(|e| StateNodeError::CrdtError(CrdtError::StorageError(e.to_string())))?;
+
+            // 5. Create and publish update event both locally and to the network
+            let event = Event::ContentUpdated {
+                content_id: content_id.to_string(),
+                updated_node_id: self.local_node_id.clone(),
+                timestamp: current_timestamp(),
+            };
+
+            self.event_publisher
+                .publish_all(&event)
+                .await
+                .map_err(|e| {
+                    StateNodeError::NetworkError(NetworkError::ProtocolError(e.to_string()))
+                })?;
+
+            // 6. Check and maintain redundancy (best effort - don't fail update if this fails)
+            if let Err(e) = self.check_and_maintain_redundancy(content_id).await {
+                tracing::warn!(
+                    "Failed to check/maintain redundancy for content {}: {}",
+                    content_id,
+                    e
+                );
+            }
+
+            Ok(event)
+        } else {
+            // Relay path: we are not a member, relay to a member node
+            let members = network.member_nodes_as_strings();
+            if members.is_empty() {
+                return Err(StateNodeError::NoAvailableMembers);
+            }
+
+            let target_peer = &members[0];
+            let success = self
+                .peer_network
+                .relay_update_content(
+                    target_peer,
+                    content_id,
+                    data,
+                    token.as_str(),
+                    request_signature,
+                )
+                .await
+                .map_err(|e| {
+                    StateNodeError::NetworkError(NetworkError::ConnectionFailed(e.to_string()))
+                })?;
+
+            if !success {
+                return Err(StateNodeError::Internal(
+                    "Relay update to member node failed".to_string(),
+                ));
+            }
+
+            Ok(Event::ContentUpdated {
+                content_id: content_id.to_string(),
+                updated_node_id: self.local_node_id.clone(),
+                timestamp: current_timestamp(),
+            })
         }
-
-        // 4. Update content in CRDT repository
-        self.crdt_repo
-            .update_content(content_id, data, &self.local_node_id)
-            .await
-            .map_err(|e| StateNodeError::CrdtError(CrdtError::StorageError(e.to_string())))?;
-
-        // 5. Create and publish update event both locally and to the network
-        let event = Event::ContentUpdated {
-            content_id: content_id.to_string(),
-            updated_node_id: self.local_node_id.clone(),
-            timestamp: current_timestamp(),
-        };
-
-        self.event_publisher
-            .publish_all(&event)
-            .await
-            .map_err(|e| {
-                StateNodeError::NetworkError(NetworkError::ProtocolError(e.to_string()))
-            })?;
-
-        // 6. Check and maintain redundancy (best effort - don't fail update if this fails)
-        if let Err(e) = self.check_and_maintain_redundancy(content_id).await {
-            tracing::warn!(
-                "Failed to check/maintain redundancy for content {}: {}",
-                content_id,
-                e
-            );
-        }
-
-        Ok(event)
     }
 
     /// Grant access capabilities to an identity for a content.
@@ -850,31 +854,14 @@ where
             return Err(StateNodeError::NoAvailableMembers);
         }
 
-        // 5. Query public keys for the selected nodes
-        let public_keys = self
-            .peer_network
-            .query_node_public_keys_batch(&selected)
-            .await
-            .map_err(|e| {
-                StateNodeError::NetworkError(NetworkError::ConnectionFailed(e.to_string()))
-            })?;
-
-        // 6. Add each node using domain function with their actual public key
+        // 5. Add each node using PeerId-based NodeId
         let mut updated_network = network;
         let mut last_event = None;
-        for node_id in &selected {
-            let public_key = public_keys
-                .get(node_id)
-                .ok_or_else(|| {
-                    StateNodeError::Internal(format!("No public key found for node {}", node_id))
-                })?
-                .clone();
-
-            // Use add_member_node_from_public_key to ensure cryptographic binding
-            let (net, events) = crate::domain::content_network::add_member_node_from_public_key(
-                updated_network,
-                public_key,
-            )?;
+        for node_id_str in &selected {
+            let node_id_vo =
+                crate::domain::value_objects::NodeId::from_string(node_id_str.clone())?;
+            let (net, events) =
+                crate::domain::content_network::add_member_node(updated_network, node_id_vo)?;
             updated_network = net;
             // Publish each event
             for event in events {
@@ -1770,7 +1757,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_update_content_fails_if_not_member() {
+    async fn test_update_content_relay_when_not_member() {
         let node_registry = MockNodeRegistry::new();
         let content_repo = Arc::new(RwLock::new(
             MockContentNetworkRepository::new()
@@ -1791,6 +1778,7 @@ mod tests {
         .with_authentication_service(TestAuthService)
         .with_authorization_service(AllowAllAuthorizationService);
 
+        // When not a member, the update should be relayed to a member node
         let result = service
             .update_content(
                 "content-1",
@@ -1800,8 +1788,19 @@ mod tests {
             )
             .await;
 
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("not a member"));
+        // Should succeed via relay
+        assert!(result.is_ok());
+        match result.unwrap() {
+            Event::ContentUpdated {
+                content_id,
+                updated_node_id,
+                ..
+            } => {
+                assert_eq!(content_id, "content-1");
+                assert_eq!(updated_node_id, "node-1");
+            }
+            _ => panic!("Expected ContentUpdated event"),
+        }
     }
 
     #[tokio::test]

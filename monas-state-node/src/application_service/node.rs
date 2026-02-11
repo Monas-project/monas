@@ -27,6 +27,8 @@ use crate::infrastructure::reliable_event_publisher::{
     ReliableEventPublisher, ReliablePublisherConfig,
 };
 #[cfg(not(target_arch = "wasm32"))]
+use crate::port::peer_network::PeerNetwork;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::port::persistence::PersistentAccessPolicyRepository;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::port::public_key_registry::PublicKeyRegistry;
@@ -172,16 +174,13 @@ impl StateNode {
             .get_default_node_key()
             .context("Failed to load/generate node key")?;
 
-        // Generate NodeId from the P-256 public key
+        // Use libp2p PeerId as NodeId for consistency with DHT peer discovery
         let node_id = if let Some(ref provided_id) = config.node_id {
             // If a node ID is explicitly provided, use it (for backward compatibility)
             provided_id.clone()
         } else {
-            // Generate NodeId from P-256 public key hash
-            node_key_pair
-                .node_id()
-                .context("Failed to generate NodeId from public key")?
-                .into_inner()
+            // Use the libp2p PeerId so that NodeId matches what find_closest_peers returns
+            network.local_peer_id()
         };
 
         // Initialize public key registry and register our key
@@ -319,6 +318,52 @@ impl StateNode {
             self.node_id(),
             self.config.http_addr
         );
+
+        // Spawn relay request handler
+        if let Some(mut relay_rx) = self.network.take_relay_receiver().await {
+            let service_for_relay = self.service.clone();
+            tokio::spawn(async move {
+                use crate::infrastructure::network::libp2p_network::RelayRequestKind;
+                use crate::port::auth_token::AuthToken;
+                tracing::info!("Started relay request handler");
+                while let Some(req) = relay_rx.recv().await {
+                    let result = match req.kind {
+                        RelayRequestKind::UpdateContent {
+                            content_id,
+                            data,
+                            auth_token,
+                            request_signature,
+                        } => {
+                            let token = AuthToken::new(auth_token);
+                            service_for_relay
+                                .update_content(
+                                    &content_id,
+                                    &data,
+                                    Some(&token),
+                                    Some(&request_signature),
+                                )
+                                .await
+                                .map(|_| ())
+                        }
+                        RelayRequestKind::DeleteContent {
+                            content_id,
+                            auth_token,
+                            request_signature,
+                        } => {
+                            let token = AuthToken::new(auth_token);
+                            service_for_relay
+                                .delete_content(&content_id, Some(&token), Some(&request_signature))
+                                .await
+                                .map(|_| ())
+                        }
+                    };
+                    let _ = req
+                        .reply
+                        .send(result.map_err(|e| anyhow::anyhow!(e.to_string())));
+                }
+                tracing::info!("Relay request handler stopped");
+            });
+        }
 
         // Subscribe to network events
         let mut event_rx = self.network.subscribe_events();
@@ -551,7 +596,7 @@ mod tests {
                 enable_mdns: false,
                 gossipsub_topics: vec!["test".to_string()],
             },
-            node_id: None, // Will be auto-generated from P-256 public key
+            node_id: None, // Will be auto-generated from libp2p PeerId
             sync_interval_secs: 30,
             outbox_retry_interval_secs: 10,
             ..StateNodeConfig::default()
@@ -559,19 +604,13 @@ mod tests {
 
         let node = StateNode::new(config).await.unwrap();
 
-        // Node ID should be generated from the P-256 public key hash
+        // Node ID should be generated from the libp2p PeerId
         let node_id = node.node_id();
         assert!(!node_id.is_empty());
 
-        // Verify the node ID matches what's expected from the public key
-        use crate::domain::value_objects::NodeId;
-        let expected_node_id = NodeId::from_public_key(&node.public_key())
-            .expect("Failed to generate NodeId from public key");
-        assert_eq!(node_id, expected_node_id.as_str());
-
-        // The node ID should be different from the libp2p peer ID
+        // The node ID should match the libp2p peer ID
         let peer_id = node.network().local_peer_id();
-        assert_ne!(node_id, peer_id);
+        assert_eq!(node_id, peer_id);
     }
 
     #[tokio::test]

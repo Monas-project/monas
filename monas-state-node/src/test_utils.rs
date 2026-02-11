@@ -33,6 +33,8 @@ pub struct MockPeerNetwork {
     pub providers: Arc<Mutex<Vec<String>>>,
     pub fetched_operations: Arc<Mutex<Vec<SerializedOperation>>>,
     pub local_peer_id: String,
+    pub relay_update_result: Arc<Mutex<Option<bool>>>,
+    pub relay_delete_result: Arc<Mutex<Option<bool>>>,
 }
 
 impl MockPeerNetwork {
@@ -45,6 +47,8 @@ impl MockPeerNetwork {
             providers: Arc::new(Mutex::new(Vec::new())),
             fetched_operations: Arc::new(Mutex::new(Vec::new())),
             local_peer_id: "mock-peer-id".to_string(),
+            relay_update_result: Arc::new(Mutex::new(Some(true))),
+            relay_delete_result: Arc::new(Mutex::new(Some(true))),
         }
     }
 
@@ -173,6 +177,27 @@ impl PeerNetwork for MockPeerNetwork {
 
     async fn find_content_providers(&self, _genesis_cid: &str) -> Result<Vec<String>> {
         Ok(self.providers.lock().await.clone())
+    }
+
+    async fn relay_update_content(
+        &self,
+        _peer_id: &str,
+        _content_id: &str,
+        _data: &[u8],
+        _auth_token: &str,
+        _request_signature: &[u8],
+    ) -> Result<bool> {
+        Ok(self.relay_update_result.lock().await.unwrap_or(true))
+    }
+
+    async fn relay_delete_content(
+        &self,
+        _peer_id: &str,
+        _content_id: &str,
+        _auth_token: &str,
+        _request_signature: &[u8],
+    ) -> Result<bool> {
+        Ok(self.relay_delete_result.lock().await.unwrap_or(true))
     }
 }
 
