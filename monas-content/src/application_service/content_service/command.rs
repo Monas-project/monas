@@ -1,14 +1,18 @@
+use crate::domain::content::provider::StorageProvider;
 use crate::domain::{content::metadata::Metadata, content_id::ContentId};
 
 /// コンテンツ作成ユースケースの入力。
 #[derive(Debug)]
 pub struct CreateContentCommand {
-    /// コンテンツの生データ
-    pub raw_content: Vec<u8>,
     /// コンテンツ名
     pub name: String,
-    /// コンテンツのパス
+    /// 論理パス
     pub path: String,
+    /// コンテンツの生データ
+    pub raw_content: Vec<u8>,
+    /// 保存先のストレージプロバイダー。
+    /// `None` の場合はデフォルトプロバイダーに保存される。
+    pub provider: Option<StorageProvider>,
 }
 
 /// コンテンツ作成ユースケースの出力。
@@ -28,6 +32,7 @@ pub struct UpdateContentCommand {
     pub content_id: ContentId,
     pub new_name: Option<String>,
     pub new_raw_content: Option<Vec<u8>>,
+    pub provider: Option<StorageProvider>,
 }
 
 /// コンテンツ更新ユースケースの出力。
@@ -42,6 +47,7 @@ pub struct UpdateContentResult {
 #[derive(Debug)]
 pub struct DeleteContentCommand {
     pub content_id: ContentId,
+    pub provider: Option<StorageProvider>,
 }
 
 /// コンテンツ削除ユースケースの出力。
@@ -61,4 +67,19 @@ pub struct FetchContentResult {
     pub series_id: ContentId,
     pub metadata: Metadata,
     pub raw_content: Vec<u8>,
+}
+
+/// コンテンツ再暗号化ユースケースの入力。
+#[derive(Debug)]
+pub struct ReencryptContentCommand {
+    pub content_id: ContentId,
+}
+
+/// コンテンツ再暗号化ユースケースの出力。
+#[derive(Debug)]
+pub struct ReencryptContentResult {
+    pub encrypted_id: ContentId,
+    pub raw_id: ContentId,
+    pub metadata: Metadata,
+    pub encrypted_content: Vec<u8>,
 }

@@ -5,9 +5,10 @@ use crate::domain::{
 };
 
 use super::{
-    ContentEncryptionKeyStore, ContentEncryptionKeyStoreError, ContentRepository,
-    ContentRepositoryError, CreateContentCommand, CreateContentResult, DeleteContentCommand,
-    DeleteContentResult, FetchContentResult, UpdateContentCommand, UpdateContentResult,
+    ContentEncryptionKeyStore, ContentEncryptionKeyStoreError, ContentRepositoryError,
+    CreateContentCommand, CreateContentResult, DeleteContentCommand, DeleteContentResult,
+    FetchContentResult, MultiStorageContentRepository, ReencryptContentCommand,
+    ReencryptContentResult, UpdateContentCommand, UpdateContentResult,
 };
 
 /// コンテンツ作成ユースケースのアプリケーションサービス。
@@ -22,7 +23,7 @@ pub struct ContentService<G, R, K, E, S> {
 impl<G, R, K, E, S> ContentService<G, R, K, E, S>
 where
     G: ContentIdGenerator,
-    R: ContentRepository,
+    R: MultiStorageContentRepository,
     K: ContentEncryptionKeyGenerator,
     E: ContentEncryption,
     S: ContentEncryptionKeyStore,
@@ -39,6 +40,7 @@ where
             cmd.name,
             cmd.raw_content,
             cmd.path,
+            cmd.provider.clone(),
             &self.content_id_generator,
             &key,
             &self.encryptor,
@@ -47,23 +49,25 @@ where
 
         // CEK を保存
         self.cek_store
-            .save(content.id(), &key)
+            .save(content.raw_id(), &key)
             .map_err(CreateError::KeyStore)?;
 
-        // コンテンツを永続化
-        self.content_repository
-            .save(content.id(), &content)
-            .map_err(CreateError::Repository)?;
+        // コンテンツを永続化（プロバイダー指定があればそちらに、なければデフォルト）
+        match &cmd.provider {
+            Some(provider) => {
+                self.content_repository
+                    .save_to(provider.as_str(), content.raw_id(), &content)
+            }
+            None => self.content_repository.save(content.raw_id(), &content),
+        }
+        .map_err(CreateError::Repository)?;
 
         let metadata = content.metadata().clone();
-        let content_id = content.id().clone();
+        let content_id = content.raw_id().clone();
+
         let encrypted_content = content
             .encrypted_content()
-            .ok_or_else(|| {
-                CreateError::Domain(ContentError::Other(
-                    "Encrypted content not found in created content".into(),
-                ))
-            })?
+            .ok_or(CreateError::MissingEncryptedContent)?
             .clone();
 
         Ok(CreateContentResult {
@@ -98,12 +102,15 @@ where
         // 簡易バリデーション
         Self::validate_update_command(&cmd)?;
 
-        // 既存コンテンツの取得
-        let mut content = self
-            .content_repository
-            .find_by_id(&cmd.content_id)
-            .map_err(UpdateError::Repository)?
-            .ok_or(UpdateError::NotFound)?;
+        // 既存コンテンツの取得（プロバイダー指定があればそこから、なければデフォルト）
+        let mut content = match &cmd.provider {
+            Some(provider) => self
+                .content_repository
+                .find_from(provider.as_str(), &cmd.content_id),
+            None => self.content_repository.find_by_id(&cmd.content_id),
+        }
+        .map_err(UpdateError::Repository)?
+        .ok_or(UpdateError::NotFound)?;
 
         // バイナリ更新が指定されている場合
         if let Some(raw) = cmd.new_raw_content {
@@ -111,7 +118,7 @@ where
             // コンテンツごとに 1 つの CEK を持ち、暗号化のたびに IV のみランダムにする前提。
             let key = self
                 .cek_store
-                .load(content.id())
+                .load(content.raw_id())
                 .map_err(UpdateError::KeyStore)?
                 .ok_or_else(|| {
                     UpdateError::KeyStore(ContentEncryptionKeyStoreError::Storage(
@@ -124,7 +131,7 @@ where
                 .map_err(UpdateError::Domain)?;
 
             self.cek_store
-                .save(updated.id(), &key)
+                .save(updated.raw_id(), &key)
                 .map_err(UpdateError::KeyStore)?;
 
             content = updated;
@@ -136,20 +143,22 @@ where
             content = updated;
         }
 
-        // state nodeの実装によるため仮置き
-        self.content_repository
-            .save(content.id(), &content)
-            .map_err(UpdateError::Repository)?;
+        // コンテンツを永続化（metadata の provider があればそこに、なければデフォルト）
+        match content.metadata().provider() {
+            Some(provider) => {
+                self.content_repository
+                    .save_to(provider.as_str(), content.raw_id(), &content)
+            }
+            None => self.content_repository.save(content.raw_id(), &content),
+        }
+        .map_err(UpdateError::Repository)?;
 
         let metadata = content.metadata().clone();
-        let content_id = content.id().clone();
+        let content_id = content.raw_id().clone();
+
         let encrypted_content = content
             .encrypted_content()
-            .ok_or_else(|| {
-                UpdateError::Domain(ContentError::Other(
-                    "Encrypted content not found in updated content".into(),
-                ))
-            })?
+            .ok_or(UpdateError::MissingEncryptedContent)?
             .clone();
 
         Ok(UpdateContentResult {
@@ -187,13 +196,19 @@ where
     /// コンテンツ本体を復号して取得するユースケース（fetch）。
     ///
     /// - `content_id` に対応するコンテンツを取得し、CEK を用いて復号したバイト列を返す。
+    /// - `provider` を指定した場合はそのプロバイダーから、指定しない場合はデフォルトプロバイダーから取得。
     /// - 削除済みコンテンツや CEK が存在しない場合はエラーとなる。
-    pub fn fetch(&self, content_id: ContentId) -> Result<FetchContentResult, FetchError> {
-        let content = self
-            .content_repository
-            .find_by_id(&content_id)
-            .map_err(FetchError::Repository)?
-            .ok_or(FetchError::NotFound)?;
+    pub fn fetch(
+        &self,
+        content_id: ContentId,
+        provider: Option<&str>,
+    ) -> Result<FetchContentResult, FetchError> {
+        let content = match provider {
+            Some(p) => self.content_repository.find_from(p, &content_id),
+            None => self.content_repository.find_by_id(&content_id),
+        }
+        .map_err(FetchError::Repository)?
+        .ok_or(FetchError::NotFound)?;
 
         if content.is_deleted() {
             return Err(FetchError::Deleted);
@@ -202,7 +217,7 @@ where
         // CEK をキーストアから取得
         let key = self
             .cek_store
-            .load(content.id())
+            .load(content.raw_id())
             .map_err(FetchError::KeyStore)?
             .ok_or(FetchError::MissingKey)?;
 
@@ -212,7 +227,7 @@ where
             .map_err(FetchError::Domain)?;
 
         Ok(FetchContentResult {
-            content_id: content.id().clone(),
+            content_id: content.raw_id().clone(),
             series_id: content.series_id().clone(),
             metadata: content.metadata().clone(),
             raw_content,
@@ -235,7 +250,8 @@ where
             .decrypt(&key, &ciphertext)
             .map_err(DecryptWithCekError::Domain)?;
 
-        // 復号したプレーンテキストから ContentId を再生成し、期待される ID と一致するか確認する。
+        // 復号したプレーンテキストから ContentId(plainCid) を再生成し、
+        // 期待される ID と一致するか確認する（改ざん検知）。
         let actual_id = self.content_id_generator.generate(&plaintext);
         if actual_id != expected_content_id {
             return Err(DecryptWithCekError::ContentIdMismatch {
@@ -252,29 +268,165 @@ where
     /// - 物理削除ではなく、ドメインオブジェクト上で `is_deleted` フラグとバッファをクリアして保存する「論理削除」
     pub fn delete(&self, cmd: DeleteContentCommand) -> Result<DeleteContentResult, DeleteError> {
         // 既存コンテンツの取得
-        let content = self
-            .content_repository
-            .find_by_id(&cmd.content_id)
-            .map_err(DeleteError::Repository)?
-            .ok_or(DeleteError::NotFound)?;
+        let content = match &cmd.provider {
+            Some(provider) => self
+                .content_repository
+                .find_from(provider.as_str(), &cmd.content_id),
+            None => self.content_repository.find_by_id(&cmd.content_id),
+        }
+        .map_err(DeleteError::Repository)?
+        .ok_or(DeleteError::NotFound)?;
 
         // ドメインの削除処理（状態遷移とバリデーション）
         let (deleted_content, _event) = content.delete().map_err(DeleteError::Domain)?;
 
         // CEK を削除
         self.cek_store
-            .delete(deleted_content.id())
+            .delete(deleted_content.raw_id())
             .map_err(DeleteError::KeyStore)?;
 
         // 論理削除済みの状態を保存
-        self.content_repository
-            .save(deleted_content.id(), &deleted_content)
-            .map_err(DeleteError::Repository)?;
+        match deleted_content.metadata().provider() {
+            Some(provider) => self.content_repository.save_to(
+                provider.as_str(),
+                deleted_content.raw_id(),
+                &deleted_content,
+            ),
+            None => self
+                .content_repository
+                .save(deleted_content.raw_id(), &deleted_content),
+        }
+        .map_err(DeleteError::Repository)?;
 
-        // State Nodeは内部でEventを生成するため、ここでOperationを作成する必要はない
-        let content_id = deleted_content.id().clone();
+        let content_id = deleted_content.raw_id().clone();
 
         Ok(DeleteContentResult { content_id })
+    }
+
+    /// コンテンツ再暗号化ユースケース。
+    ///
+    /// Owner権限を持つユーザが、特定のReadまたはWrite権限ユーザのアクセスを拒否するために、
+    /// コンテンツを再暗号化する機能。
+    pub fn reencrypt(
+        &self,
+        cmd: ReencryptContentCommand,
+    ) -> Result<ReencryptContentResult, ReencryptError> {
+        // Step 1: コンテンツの取得と検証
+        let content = self
+            .content_repository
+            .find_by_id(&cmd.content_id)
+            .map_err(ReencryptError::ContentRepository)?
+            .ok_or(ReencryptError::ContentNotFound)?;
+
+        if content.is_deleted() {
+            return Err(ReencryptError::ContentDeleted);
+        }
+
+        // Step 2: 既存のCEKで復号
+        // reencrypt は「同じ content_id を維持したまま暗号化だけを更新する」前提。
+        let content_id = content.raw_id().clone();
+        let old_cek = self
+            .cek_store
+            .load(&content_id)
+            .map_err(ReencryptError::KeyStore)?
+            .ok_or(ReencryptError::MissingContentEncryptionKey)?;
+
+        let plaintext = content
+            .decrypt(&old_cek, &self.encryptor)
+            .map_err(ReencryptError::Domain)?;
+
+        // Step 3: 新しいCEKを生成
+        let new_cek = self.key_generator.generate();
+
+        // Step 4: 再暗号化されたContentを作成
+        let (reencrypted_content, _event) = content
+            .update_content(
+                plaintext,
+                &self.content_id_generator,
+                &new_cek,
+                &self.encryptor,
+            )
+            .map_err(ReencryptError::Domain)?;
+
+        // reencrypt では平文（復号結果）が同一なので、ContentId（plainCid）は変わらない前提。
+        debug_assert_eq!(
+            reencrypted_content.raw_id(),
+            &content_id,
+            "plain content_id should not change during reencrypt"
+        );
+
+        // Step 5: 新しいContentIdでCEKを保存
+        self.cek_store
+            .save(&content_id, &new_cek)
+            .map_err(ReencryptError::KeyStore)?;
+
+        // Step 6: content_idでContentを保存
+        if let Err(e) = self
+            .content_repository
+            .save(&content_id, &reencrypted_content)
+        {
+            // ロールバック:
+            // - このケースでは content_id が変わらない前提なので delete は危険（旧CEKまで消える）
+            // - 旧CEKへ戻して整合性を保つ
+            let _ = self.cek_store.save(&content_id, &old_cek);
+            return Err(ReencryptError::ContentRepository(e));
+        }
+
+        // Step 7: 結果を返す
+        let encrypted_content = reencrypted_content
+            .encrypted_content()
+            .ok_or(ReencryptError::MissingEncryptedContent)?
+            .clone();
+
+        Ok(ReencryptContentResult {
+            encrypted_id: reencrypted_content.encrypted_id().clone(),
+            raw_id: reencrypted_content.raw_id().clone(),
+            metadata: reencrypted_content.metadata().clone(),
+            encrypted_content,
+        })
+    }
+
+    /// 接続済みのプロバイダー一覧を取得する。
+    pub fn connected_providers(&self) -> Result<Vec<String>, ContentRepositoryError> {
+        self.content_repository.connected_providers()
+    }
+
+    /// 現在のデフォルトプロバイダーを取得する。
+    pub fn default_provider(&self) -> Result<String, ContentRepositoryError> {
+        self.content_repository.default_provider()
+    }
+
+    /// ストレージプロバイダーを接続する（認証トークンを登録）。
+    pub fn connect_provider(
+        &self,
+        provider: String,
+        access_token: String,
+    ) -> Result<(), ContentRepositoryError> {
+        self.content_repository
+            .connect_provider(&provider, access_token)
+    }
+
+    /// ストレージプロバイダーを切断する（認証トークンを削除）。
+    pub fn disconnect_provider(&self, provider: String) -> Result<(), ContentRepositoryError> {
+        self.content_repository.disconnect_provider(&provider)
+    }
+
+    /// 既存コンテンツを別のプロバイダーにコピーする。
+    ///
+    /// 例：ローカルに保存されているコンテンツをクラウドにバックアップする場合など。
+    pub fn copy_to(
+        &self,
+        from_provider: &str,
+        to_provider: &str,
+        content_id: &ContentId,
+    ) -> Result<(), ContentRepositoryError> {
+        let content = self
+            .content_repository
+            .find_from(from_provider, content_id)?
+            .ok_or_else(|| ContentRepositoryError::Storage("content not found".to_string()))?;
+
+        self.content_repository
+            .save_to(to_provider, content_id, &content)
     }
 }
 
@@ -300,6 +452,8 @@ pub enum CreateError {
     Repository(ContentRepositoryError),
     #[error("key-store error: {0}")]
     KeyStore(ContentEncryptionKeyStoreError),
+    #[error("missing encrypted content")]
+    MissingEncryptedContent,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -314,6 +468,8 @@ pub enum UpdateError {
     Repository(ContentRepositoryError),
     #[error("key-store error: {0}")]
     KeyStore(ContentEncryptionKeyStoreError),
+    #[error("missing encrypted content")]
+    MissingEncryptedContent,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -340,14 +496,34 @@ pub enum DecryptWithCekError {
     Domain(ContentError),
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum ReencryptError {
+    #[error("content not found")]
+    ContentNotFound,
+    #[error("content is deleted")]
+    ContentDeleted,
+    #[error("missing content encryption key")]
+    MissingContentEncryptionKey,
+    #[error("domain error: {0:?}")]
+    Domain(ContentError),
+    #[error("content repository error: {0}")]
+    ContentRepository(ContentRepositoryError),
+    #[error("key-store error: {0}")]
+    KeyStore(ContentEncryptionKeyStoreError),
+    #[error("missing encrypted content")]
+    MissingEncryptedContent,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application_service::content_service::ContentRepository;
     use crate::domain::{
         content::encryption::{ContentEncryptionKey, ContentEncryptionKeyGenerator},
         content::ContentStatus,
         content_id::{ContentId, ContentIdGenerator},
     };
+    use sha2::{Digest, Sha256};
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
@@ -359,6 +535,15 @@ mod tests {
         fn generate(&self, raw_content: &[u8]) -> ContentId {
             ContentId::new(format!("test-id-{}", raw_content.len()))
         }
+
+        fn generate_encrypted(&self, plain_cid: &ContentId, ciphertext: &[u8]) -> ContentId {
+            let mut hasher = Sha256::new();
+            hasher.update(plain_cid.as_str().as_bytes());
+            hasher.update([0u8]);
+            hasher.update(ciphertext);
+            let digest = hasher.finalize();
+            ContentId::new(format!("test-enc-id-{}", hex::encode(digest)))
+        }
     }
 
     /// テスト用の固定キー生成器。
@@ -368,6 +553,36 @@ mod tests {
     impl ContentEncryptionKeyGenerator for TestKeyGenerator {
         fn generate(&self) -> ContentEncryptionKey {
             ContentEncryptionKey(vec![1, 2, 3])
+        }
+    }
+
+    /// 呼び出しごとに異なるCEKを返すテスト用キー生成器（create と reencrypt で鍵が変わることを再現）。
+    #[derive(Clone)]
+    struct ToggleKeyGenerator {
+        state: Arc<Mutex<bool>>,
+        first: ContentEncryptionKey,
+        second: ContentEncryptionKey,
+    }
+
+    impl ToggleKeyGenerator {
+        fn new(first: ContentEncryptionKey, second: ContentEncryptionKey) -> Self {
+            Self {
+                state: Arc::new(Mutex::new(false)),
+                first,
+                second,
+            }
+        }
+    }
+
+    impl ContentEncryptionKeyGenerator for ToggleKeyGenerator {
+        fn generate(&self) -> ContentEncryptionKey {
+            let mut guard = self.state.lock().expect("mutex poisoned");
+            if !*guard {
+                *guard = true;
+                self.first.clone()
+            } else {
+                self.second.clone()
+            }
         }
     }
 
@@ -391,6 +606,55 @@ mod tests {
             ciphertext: &[u8],
         ) -> Result<Vec<u8>, ContentError> {
             Ok(ciphertext.to_vec())
+        }
+    }
+
+    /// CEKに依存して暗号文が変わるテスト用暗号化。
+    ///
+    /// - encrypt: `ciphertext = key_bytes || plaintext`
+    /// - decrypt: 先頭 `key_len` を捨てて残りを平文として返す
+    ///
+    /// ※ セキュリティ目的ではなく、テストで「CEKが変われば暗号文も変わる」を再現するための実装。
+    #[derive(Clone)]
+    struct KeyPrefixEncryptor {
+        key_len: usize,
+    }
+
+    impl KeyPrefixEncryptor {
+        fn new(key_len: usize) -> Self {
+            Self { key_len }
+        }
+    }
+
+    impl ContentEncryption for KeyPrefixEncryptor {
+        fn encrypt(
+            &self,
+            key: &ContentEncryptionKey,
+            plaintext: &[u8],
+        ) -> Result<Vec<u8>, ContentError> {
+            let mut out = Vec::with_capacity(self.key_len + plaintext.len());
+            // keyが短い場合は0埋めして一定長にする（テストの都合）
+            if key.0.len() >= self.key_len {
+                out.extend_from_slice(&key.0[..self.key_len]);
+            } else {
+                out.extend_from_slice(&key.0);
+                out.extend(std::iter::repeat_n(0u8, self.key_len - key.0.len()));
+            }
+            out.extend_from_slice(plaintext);
+            Ok(out)
+        }
+
+        fn decrypt(
+            &self,
+            _key: &ContentEncryptionKey,
+            ciphertext: &[u8],
+        ) -> Result<Vec<u8>, ContentError> {
+            if ciphertext.len() < self.key_len {
+                return Err(ContentError::DecryptionError(
+                    "ciphertext too short for key prefix".into(),
+                ));
+            }
+            Ok(ciphertext[self.key_len..].to_vec())
         }
     }
 
@@ -472,6 +736,47 @@ mod tests {
                 .map_err(|e| ContentRepositoryError::Storage(e.to_string()))?;
 
             Ok(guard.get(content_id.as_str()).cloned())
+        }
+    }
+
+    impl MultiStorageContentRepository for TestContentRepository {
+        fn save_to(
+            &self,
+            _provider: &str,
+            content_id: &ContentId,
+            content: &Content,
+        ) -> Result<(), ContentRepositoryError> {
+            // テスト用：プロバイダーを無視して通常の save に委譲
+            self.save(content_id, content)
+        }
+
+        fn find_from(
+            &self,
+            _provider: &str,
+            content_id: &ContentId,
+        ) -> Result<Option<Content>, ContentRepositoryError> {
+            // テスト用：プロバイダーを無視して通常の find_by_id に委譲
+            self.find_by_id(content_id)
+        }
+
+        fn connected_providers(&self) -> Result<Vec<String>, ContentRepositoryError> {
+            Ok(vec!["test".to_string()])
+        }
+
+        fn default_provider(&self) -> Result<String, ContentRepositoryError> {
+            Ok("test".to_string())
+        }
+
+        fn connect_provider(
+            &self,
+            _provider: &str,
+            _access_token: String,
+        ) -> Result<(), ContentRepositoryError> {
+            Ok(())
+        }
+
+        fn disconnect_provider(&self, _provider: &str) -> Result<(), ContentRepositoryError> {
+            Ok(())
         }
     }
 
@@ -557,7 +862,7 @@ mod tests {
         key_store: S,
     ) -> ContentService<TestIdGenerator, R, K, E, S>
     where
-        R: ContentRepository,
+        R: MultiStorageContentRepository,
         K: ContentEncryptionKeyGenerator,
         E: ContentEncryption,
         S: ContentEncryptionKeyStore,
@@ -571,8 +876,103 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct FailOnSecondSaveContentRepository {
+        inner: Arc<Mutex<HashMap<String, Content>>>,
+        save_count: Arc<Mutex<usize>>,
+    }
+
+    impl FailOnSecondSaveContentRepository {
+        fn new() -> (Self, Arc<Mutex<HashMap<String, Content>>>) {
+            let inner = Arc::new(Mutex::new(HashMap::new()));
+            let repo = Self {
+                inner: inner.clone(),
+                save_count: Arc::new(Mutex::new(0)),
+            };
+            (repo, inner)
+        }
+    }
+
+    impl ContentRepository for FailOnSecondSaveContentRepository {
+        fn save(
+            &self,
+            content_id: &ContentId,
+            content: &Content,
+        ) -> Result<(), ContentRepositoryError> {
+            let mut cnt = self
+                .save_count
+                .lock()
+                .map_err(|e| ContentRepositoryError::Storage(format!("mutex poisoned: {e}")))?;
+            *cnt += 1;
+            if *cnt >= 2 {
+                return Err(ContentRepositoryError::Storage(
+                    "save failed on second call (test)".into(),
+                ));
+            }
+
+            let mut guard = self
+                .inner
+                .lock()
+                .map_err(|e| ContentRepositoryError::Storage(e.to_string()))?;
+            guard.insert(content_id.as_str().to_string(), content.clone());
+            Ok(())
+        }
+
+        fn find_by_id(
+            &self,
+            content_id: &ContentId,
+        ) -> Result<Option<Content>, ContentRepositoryError> {
+            let guard = self
+                .inner
+                .lock()
+                .map_err(|e| ContentRepositoryError::Storage(e.to_string()))?;
+            Ok(guard.get(content_id.as_str()).cloned())
+        }
+    }
+
+    impl MultiStorageContentRepository for FailOnSecondSaveContentRepository {
+        fn save_to(
+            &self,
+            _provider: &str,
+            content_id: &ContentId,
+            content: &Content,
+        ) -> Result<(), ContentRepositoryError> {
+            // テスト用：プロバイダーを無視して通常の save に委譲（2回目で失敗させる挙動を共有）
+            self.save(content_id, content)
+        }
+
+        fn find_from(
+            &self,
+            _provider: &str,
+            content_id: &ContentId,
+        ) -> Result<Option<Content>, ContentRepositoryError> {
+            // テスト用：プロバイダーを無視して通常の find_by_id に委譲
+            self.find_by_id(content_id)
+        }
+
+        fn connected_providers(&self) -> Result<Vec<String>, ContentRepositoryError> {
+            Ok(vec!["test".to_string()])
+        }
+
+        fn default_provider(&self) -> Result<String, ContentRepositoryError> {
+            Ok("test".to_string())
+        }
+
+        fn connect_provider(
+            &self,
+            _provider: &str,
+            _access_token: String,
+        ) -> Result<(), ContentRepositoryError> {
+            Ok(())
+        }
+
+        fn disconnect_provider(&self, _provider: &str) -> Result<(), ContentRepositoryError> {
+            Ok(())
+        }
+    }
+
     #[test]
-    fn create_success_persists_and_notifies_state_node() {
+    fn create_success_persists_content() {
         let (repo, storage) = TestContentRepository::new(false);
         let (key_store, _key_storage) = TestKeyStore::new(false, false);
         let service = build_service(repo, TestKeyGenerator, TestEncryptor, key_store);
@@ -581,6 +981,7 @@ mod tests {
             name: "test".into(),
             path: "path.txt".into(),
             raw_content: b"hello".to_vec(),
+            provider: None,
         };
 
         let result = service.create(cmd).expect("create should succeed");
@@ -606,6 +1007,7 @@ mod tests {
             name: "   ".into(),
             path: "path.txt".into(),
             raw_content: b"hello".to_vec(),
+            provider: None,
         };
 
         let err = match service.create(cmd) {
@@ -625,6 +1027,7 @@ mod tests {
             name: "old".into(),
             path: "path.txt".into(),
             raw_content: b"old-data".to_vec(),
+            provider: None,
         };
         let base_result = service
             .create(base_cmd)
@@ -634,6 +1037,7 @@ mod tests {
             content_id: base_result.content_id.clone(),
             new_name: Some("new-name".into()),
             new_raw_content: Some(b"new-data".to_vec()),
+            provider: None,
         };
 
         let updated = service.update(update_cmd).expect("update should succeed");
@@ -662,6 +1066,7 @@ mod tests {
             content_id: ContentId::new("unknown-id".into()),
             new_name: Some("name".into()),
             new_raw_content: None,
+            provider: None,
         };
 
         let err = match service.update(update_cmd) {
@@ -672,7 +1077,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_success_marks_content_deleted_and_notifies_state_node() {
+    fn delete_success_marks_content_deleted() {
         let (repo, storage) = TestContentRepository::new(false);
         let (key_store, _) = TestKeyStore::new(false, false);
         let service = build_service(repo.clone(), TestKeyGenerator, TestEncryptor, key_store);
@@ -681,6 +1086,7 @@ mod tests {
             name: "name".into(),
             path: "path.txt".into(),
             raw_content: b"data".to_vec(),
+            provider: None,
         };
         let base_result = service
             .create(base_cmd)
@@ -688,6 +1094,7 @@ mod tests {
 
         let delete_cmd = DeleteContentCommand {
             content_id: base_result.content_id.clone(),
+            provider: None,
         };
 
         let result = service.delete(delete_cmd).expect("delete should succeed");
@@ -711,6 +1118,7 @@ mod tests {
 
         let delete_cmd = DeleteContentCommand {
             content_id: ContentId::new("unknown-id".into()),
+            provider: None,
         };
 
         let err = match service.delete(delete_cmd) {
@@ -732,12 +1140,13 @@ mod tests {
             name: "fetch-test".into(),
             path: "path.txt".into(),
             raw_content: raw.clone(),
+            provider: None,
         };
 
         let created = service.create(cmd).expect("create should succeed");
 
         let fetched = service
-            .fetch(created.content_id.clone())
+            .fetch(created.content_id.clone(), None)
             .expect("fetch should succeed");
 
         assert_eq!(fetched.content_id, created.content_id);
@@ -753,7 +1162,7 @@ mod tests {
 
         let unknown_id = ContentId::new("unknown-id".into());
 
-        let err = match service.fetch(unknown_id) {
+        let err = match service.fetch(unknown_id, None) {
             Err(e) => e,
             Ok(_) => panic!("expected not-found error but got Ok"),
         };
@@ -770,15 +1179,17 @@ mod tests {
             name: "to-delete".into(),
             path: "path.txt".into(),
             raw_content: b"data".to_vec(),
+            provider: None,
         };
         let created = service.create(cmd).expect("create should succeed");
 
         let delete_cmd = DeleteContentCommand {
             content_id: created.content_id.clone(),
+            provider: None,
         };
         service.delete(delete_cmd).expect("delete should succeed");
 
-        let err = match service.fetch(created.content_id) {
+        let err = match service.fetch(created.content_id, None) {
             Err(e) => e,
             Ok(_) => panic!("expected deleted error but got Ok"),
         };
@@ -795,6 +1206,7 @@ mod tests {
             name: "no-key".into(),
             path: "path.txt".into(),
             raw_content: b"data".to_vec(),
+            provider: None,
         };
         let created = service.create(cmd).expect("create should succeed");
 
@@ -804,7 +1216,7 @@ mod tests {
             guard.remove(created.content_id.as_str());
         }
 
-        let err = match service.fetch(created.content_id) {
+        let err = match service.fetch(created.content_id, None) {
             Err(e) => e,
             Ok(_) => panic!("expected missing-key error but got Ok"),
         };
@@ -854,5 +1266,145 @@ mod tests {
             }
             other => panic!("unexpected error variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn reencrypt_success_keeps_plain_content_id_but_updates_cek_and_encrypted_content() {
+        let (repo, storage) = TestContentRepository::new(false);
+        let (key_store, key_storage) = TestKeyStore::new(false, false);
+
+        let old = ContentEncryptionKey(vec![1, 2, 3]);
+        let new = ContentEncryptionKey(vec![9, 9, 9]);
+        let key_gen = ToggleKeyGenerator::new(old.clone(), new.clone());
+        let encryptor = KeyPrefixEncryptor::new(3);
+
+        let service = build_service(repo, key_gen, encryptor, key_store);
+
+        let create_cmd = CreateContentCommand {
+            name: "name".into(),
+            path: "path.txt".into(),
+            raw_content: b"same-plaintext".to_vec(),
+            provider: None,
+        };
+        let created = service.create(create_cmd).expect("create should succeed");
+
+        let before = {
+            let guard = storage.lock().unwrap();
+            guard
+                .get(created.content_id.as_str())
+                .expect("content should be stored")
+                .clone()
+        };
+
+        // reencrypt（ボディ無し想定）
+        let re_cmd = ReencryptContentCommand {
+            content_id: created.content_id.clone(),
+        };
+        let result = service.reencrypt(re_cmd).expect("reencrypt should succeed");
+
+        // plainCid は変わらない
+        assert_eq!(result.raw_id, created.content_id);
+
+        // ただし暗号文はCEK変更により変わる
+        let after = {
+            let guard = storage.lock().unwrap();
+            guard
+                .get(created.content_id.as_str())
+                .expect("content should still be stored")
+                .clone()
+        };
+        assert_ne!(
+            before.encrypted_content().unwrap(),
+            after.encrypted_content().unwrap()
+        );
+        assert_ne!(before.encrypted_id(), after.encrypted_id());
+        assert_eq!(&result.encrypted_id, after.encrypted_id());
+
+        // CEK も新しいものに更新されている
+        let kguard = key_storage.lock().unwrap();
+        assert_eq!(
+            kguard
+                .get(created.content_id.as_str())
+                .expect("cek should exist"),
+            &new
+        );
+    }
+
+    #[test]
+    fn reencrypt_rolls_back_cek_when_content_save_fails() {
+        let (repo, _storage) = FailOnSecondSaveContentRepository::new();
+        let (key_store, key_storage) = TestKeyStore::new(false, false);
+
+        let old = ContentEncryptionKey(vec![1, 2, 3]);
+        let new = ContentEncryptionKey(vec![9, 9, 9]);
+        let key_gen = ToggleKeyGenerator::new(old.clone(), new.clone());
+        let encryptor = KeyPrefixEncryptor::new(3);
+
+        let service = build_service(repo, key_gen, encryptor, key_store);
+
+        let create_cmd = CreateContentCommand {
+            name: "name".into(),
+            path: "path.txt".into(),
+            raw_content: b"same-plaintext".to_vec(),
+            provider: None,
+        };
+        let created = service.create(create_cmd).expect("create should succeed");
+
+        // create後は old CEK
+        {
+            let kguard = key_storage.lock().unwrap();
+            assert_eq!(
+                kguard
+                    .get(created.content_id.as_str())
+                    .expect("cek should exist"),
+                &old
+            );
+        }
+
+        let re_cmd = ReencryptContentCommand {
+            content_id: created.content_id.clone(),
+        };
+        let err = service
+            .reencrypt(re_cmd)
+            .expect_err("reencrypt should fail when repository save fails");
+        assert!(matches!(err, ReencryptError::ContentRepository(_)));
+
+        // 失敗後も old CEK に戻っている（ロールバック）
+        let kguard = key_storage.lock().unwrap();
+        assert_eq!(
+            kguard
+                .get(created.content_id.as_str())
+                .expect("cek should still exist"),
+            &old
+        );
+    }
+
+    #[test]
+    fn reencrypt_missing_key_returns_error() {
+        let (repo, _storage) = TestContentRepository::new(false);
+        let (key_store, key_storage) = TestKeyStore::new(false, false);
+        let service = build_service(repo, TestKeyGenerator, TestEncryptor, key_store);
+
+        let create_cmd = CreateContentCommand {
+            name: "name".into(),
+            path: "path.txt".into(),
+            raw_content: b"data".to_vec(),
+            provider: None,
+        };
+        let created = service.create(create_cmd).expect("create should succeed");
+
+        // CEK を消して MissingContentEncryptionKey を再現
+        {
+            let mut guard = key_storage.lock().unwrap();
+            guard.remove(created.content_id.as_str());
+        }
+
+        let re_cmd = ReencryptContentCommand {
+            content_id: created.content_id,
+        };
+        let err = service
+            .reencrypt(re_cmd)
+            .expect_err("reencrypt should fail when CEK is missing");
+        assert!(matches!(err, ReencryptError::MissingContentEncryptionKey));
     }
 }

@@ -6,10 +6,12 @@ use crate::domain::KeyId;
 /// コンテンツに対するアクセス権限。
 ///
 /// - `Write` は常に `Read` を内包するものとして扱う。
+/// - `Owner` は `Read` と `Write` を内包し、権限管理が可能。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Permission {
     Read,
     Write,
+    Owner,
 }
 
 impl Permission {
@@ -17,12 +19,19 @@ impl Permission {
     pub fn can_read(perms: &[Permission]) -> bool {
         perms
             .iter()
-            .any(|p| matches!(p, Permission::Read | Permission::Write))
+            .any(|p| matches!(p, Permission::Read | Permission::Write | Permission::Owner))
     }
 
     /// 書き込み可能かを判定するヘルパ。
     pub fn can_write(perms: &[Permission]) -> bool {
-        perms.iter().any(|p| matches!(p, Permission::Write))
+        perms
+            .iter()
+            .any(|p| matches!(p, Permission::Write | Permission::Owner))
+    }
+
+    /// 権限管理可能かを判定するヘルパ（Owner権限のみ）。
+    pub fn can_manage_permissions(perms: &[Permission]) -> bool {
+        perms.iter().any(|p| matches!(p, Permission::Owner))
     }
 }
 
@@ -170,12 +179,60 @@ impl Share {
         &self.content_id
     }
 
+    /// 同一の受信者リスト（ACL）を保ったまま、紐づく `content_id` を差し替えた Share を生成する。
+    pub fn with_new_content_id(&self, new_content_id: ContentId) -> Self {
+        Self {
+            content_id: new_content_id,
+            recipients: self.recipients.clone(),
+        }
+    }
+
     pub fn recipients(&self) -> &HashMap<KeyId, ShareRecipient> {
         &self.recipients
     }
 
     pub fn is_empty(&self) -> bool {
         self.recipients.is_empty()
+    }
+
+    /// Owner権限を付与。
+    ///
+    /// - 既にOwner権限を持つユーザが存在する場合は `InvalidOperation` を返す。
+    pub fn grant_owner(&mut self, key_id: KeyId) -> Result<ShareEvent, ShareError> {
+        // 既にOwner権限を持つユーザが存在するか確認
+        if self.owner_key_id().is_some() {
+            return Err(ShareError::InvalidOperation(
+                "Owner already exists".to_string(),
+            ));
+        }
+
+        // ShareRecipientにOwner権限を追加
+        if let Some(recipient) = self.recipients.get_mut(&key_id) {
+            // 既存のShareRecipientにOwner権限を追加
+            if !recipient.permissions().contains(&Permission::Owner) {
+                let mut perms = recipient.permissions().to_vec();
+                perms.push(Permission::Owner);
+                recipient.update_permissions(perms);
+            }
+        } else {
+            // 新しいShareRecipientを作成してOwner権限を付与
+            let recipient = ShareRecipient::new(key_id.clone(), vec![Permission::Owner]);
+            self.recipients.insert(key_id.clone(), recipient);
+        }
+
+        Ok(ShareEvent::RecipientGranted {
+            content_id: self.content_id.clone(),
+            key_id,
+            permissions: vec![Permission::Owner],
+        })
+    }
+
+    /// Owner権限を持つKeyIdを取得（ShareRecipientから導出）。
+    pub fn owner_key_id(&self) -> Option<&KeyId> {
+        self.recipients
+            .iter()
+            .find(|(_, recipient)| Permission::can_manage_permissions(recipient.permissions()))
+            .map(|(key_id, _)| key_id)
     }
 }
 
@@ -259,5 +316,81 @@ mod tests {
 
         let err = share.revoke(&kid).expect_err("revoke should fail");
         assert!(matches!(err, ShareError::RecipientNotFound));
+    }
+
+    #[test]
+    fn permission_can_read_includes_owner() {
+        assert!(Permission::can_read(&[Permission::Owner]));
+        assert!(Permission::can_read(&[Permission::Read]));
+        assert!(Permission::can_read(&[Permission::Write]));
+        assert!(!Permission::can_read(&[]));
+    }
+
+    #[test]
+    fn permission_can_write_includes_owner() {
+        assert!(Permission::can_write(&[Permission::Owner]));
+        assert!(!Permission::can_write(&[Permission::Read]));
+        assert!(Permission::can_write(&[Permission::Write]));
+        assert!(!Permission::can_write(&[]));
+    }
+
+    #[test]
+    fn permission_can_manage_permissions_only_owner() {
+        assert!(Permission::can_manage_permissions(&[Permission::Owner]));
+        assert!(!Permission::can_manage_permissions(&[Permission::Read]));
+        assert!(!Permission::can_manage_permissions(&[Permission::Write]));
+        assert!(!Permission::can_manage_permissions(&[]));
+    }
+
+    #[test]
+    fn grant_owner_adds_recipient() {
+        let mut share = Share::new(cid());
+        let kid = key_id(&[1, 2, 3]);
+
+        let event = share
+            .grant_owner(kid.clone())
+            .expect("grant_owner should succeed");
+
+        assert!(matches!(event, ShareEvent::RecipientGranted { .. }));
+        let recipient = share.recipient(&kid).expect("recipient should exist");
+        assert_eq!(recipient.key_id(), &kid);
+        assert!(recipient.permissions().contains(&Permission::Owner));
+        assert!(Permission::can_manage_permissions(recipient.permissions()));
+    }
+
+    #[test]
+    fn grant_owner_when_owner_exists_returns_error() {
+        let mut share = Share::new(cid());
+        let kid1 = key_id(&[1, 2, 3]);
+        let kid2 = key_id(&[4, 5, 6]);
+
+        share
+            .grant_owner(kid1.clone())
+            .expect("first grant_owner should succeed");
+        let err = share
+            .grant_owner(kid2.clone())
+            .expect_err("second grant_owner should fail");
+
+        assert!(matches!(err, ShareError::InvalidOperation(_)));
+    }
+
+    #[test]
+    fn owner_key_id_returns_correct_key_id() {
+        let mut share = Share::new(cid());
+        let kid = key_id(&[1, 2, 3]);
+
+        assert!(share.owner_key_id().is_none());
+
+        share
+            .grant_owner(kid.clone())
+            .expect("grant_owner should succeed");
+
+        assert_eq!(share.owner_key_id(), Some(&kid));
+    }
+
+    #[test]
+    fn owner_key_id_returns_none_when_no_owner() {
+        let share = Share::new(cid());
+        assert!(share.owner_key_id().is_none());
     }
 }

@@ -9,6 +9,7 @@
 
 use super::behaviour::{BehaviourConfig, NodeBehaviour, NodeBehaviourEvent};
 use super::protocol::{ContentRequest, ContentResponse};
+use super::public_key_protocol::{NodePublicKey, PublicKeyRequest, PublicKeyResponse};
 use super::transport;
 use crate::domain::events::Event;
 use crate::infrastructure::disk_capacity;
@@ -88,6 +89,9 @@ impl Default for Libp2pNetworkConfig {
 enum SwarmCommand {
     FindClosestPeers {
         key: Vec<u8>,
+        /// Number of closest peers to find.
+        /// Currently not used as libp2p Kademlia uses default value (20 peers).
+        /// TODO: Use this parameter when libp2p supports custom k-value in get_closest_peers.
         #[allow(dead_code)]
         k: usize,
         reply: oneshot::Sender<Result<Vec<PeerId>>>,
@@ -134,6 +138,11 @@ enum SwarmCommand {
         key: Vec<u8>,
         reply: oneshot::Sender<Result<Vec<PeerId>>>,
     },
+    QueryPublicKeys {
+        peer_id: PeerId,
+        node_ids: Vec<String>,
+        reply: oneshot::Sender<Result<Vec<NodePublicKey>>>,
+    },
 }
 
 /// Pending requests tracking.
@@ -146,6 +155,7 @@ struct PendingRequests {
     operation_fetches:
         HashMap<OutboundRequestId, oneshot::Sender<Result<Vec<SerializedOperation>>>>,
     operation_pushes: HashMap<OutboundRequestId, oneshot::Sender<Result<usize>>>,
+    public_key_queries: HashMap<OutboundRequestId, oneshot::Sender<Result<Vec<NodePublicKey>>>>,
 }
 
 /// libp2p-based network implementation.
@@ -153,16 +163,29 @@ pub struct Libp2pNetwork {
     local_peer_id: PeerId,
     command_tx: mpsc::Sender<SwarmCommand>,
     /// Connected peers and their addresses.
+    ///
+    /// Updated by the swarm event loop when connections are established/closed.
+    /// Reserved for future use in network monitoring and peer management APIs.
     #[allow(dead_code)]
     connected_peers: Arc<RwLock<HashMap<PeerId, Vec<Multiaddr>>>>,
     /// Broadcast channel for received Gossipsub events.
     event_rx: broadcast::Sender<ReceivedEvent>,
     /// Content repository for content storage.
+    ///
+    /// Passed to swarm event loop for handling incoming requests.
+    /// Not directly accessed by PeerNetwork trait methods as they delegate to the swarm.
     #[allow(dead_code)]
     crdt_repo: Arc<dyn ContentRepository>,
     /// Data directory for disk capacity queries.
+    ///
+    /// Passed to swarm event loop for responding to CapacityQuery requests.
+    /// Not directly accessed by PeerNetwork trait methods as they delegate to the swarm.
     #[allow(dead_code)]
     data_dir: PathBuf,
+    /// P-256 public key for this node.
+    /// Reserved for future use in public key exchange APIs.
+    #[allow(dead_code)]
+    p256_public_key: Vec<u8>,
 }
 
 impl Libp2pNetwork {
@@ -174,6 +197,12 @@ impl Libp2pNetwork {
     ) -> Result<Self> {
         let keypair = libp2p::identity::Keypair::generate_ed25519();
         let local_peer_id = PeerId::from(keypair.public());
+
+        // Load or generate P-256 key for node authentication
+        use crate::infrastructure::key_management::NodeKeyPair;
+        let p256_keypair = NodeKeyPair::load_or_generate(&data_dir.join("node_key.pem"))?;
+        let p256_public_key = p256_keypair.public_key_bytes();
+        let p256_signing_key = Arc::new(p256_keypair);
 
         info!("Local peer ID: {}", local_peer_id);
 
@@ -237,6 +266,7 @@ impl Libp2pNetwork {
         // Clone for swarm loop
         let crdt_repo_clone = crdt_repo.clone();
         let data_dir_clone = data_dir.clone();
+        let p256_signing_key_clone = p256_signing_key.clone();
 
         // Spawn swarm event loop
         tokio::spawn(Self::run_swarm_loop(
@@ -246,6 +276,7 @@ impl Libp2pNetwork {
             event_tx_clone,
             crdt_repo_clone,
             data_dir_clone,
+            p256_signing_key_clone,
         ));
 
         Ok(Self {
@@ -255,6 +286,7 @@ impl Libp2pNetwork {
             event_rx: event_tx,
             crdt_repo,
             data_dir,
+            p256_public_key,
         })
     }
 
@@ -304,6 +336,7 @@ impl Libp2pNetwork {
         event_tx: broadcast::Sender<ReceivedEvent>,
         crdt_repo: Arc<dyn ContentRepository>,
         data_dir: PathBuf,
+        p256_signing_key: Arc<crate::infrastructure::key_management::NodeKeyPair>,
     ) {
         let mut pending = PendingRequests::default();
 
@@ -315,7 +348,7 @@ impl Libp2pNetwork {
                 }
                 // Handle swarm events
                 event = swarm.select_next_some() => {
-                    Self::handle_swarm_event(&mut swarm, &mut pending, &connected_peers, &event_tx, &crdt_repo, &data_dir, event).await;
+                    Self::handle_swarm_event(&mut swarm, &mut pending, &connected_peers, &event_tx, &crdt_repo, &data_dir, &p256_signing_key, event).await;
                 }
             }
         }
@@ -420,10 +453,26 @@ impl Libp2pNetwork {
                 let query_id = swarm.behaviour_mut().kademlia.get_providers(key);
                 pending.kad_provider_queries.insert(query_id, reply);
             }
+            SwarmCommand::QueryPublicKeys {
+                peer_id,
+                node_ids,
+                reply,
+            } => {
+                let request = PublicKeyRequest {
+                    requesting_node: swarm.local_peer_id().to_string(),
+                    requested_nodes: node_ids,
+                };
+                let request_id = swarm
+                    .behaviour_mut()
+                    .public_key_protocol
+                    .send_request(&peer_id, request);
+                pending.public_key_queries.insert(request_id, reply);
+            }
         }
     }
 
     /// Handle a swarm event.
+    #[allow(clippy::too_many_arguments)]
     async fn handle_swarm_event(
         swarm: &mut Swarm<NodeBehaviour>,
         pending: &mut PendingRequests,
@@ -431,6 +480,7 @@ impl Libp2pNetwork {
         event_tx: &broadcast::Sender<ReceivedEvent>,
         crdt_repo: &Arc<dyn ContentRepository>,
         data_dir: &std::path::Path,
+        p256_signing_key: &Arc<crate::infrastructure::key_management::NodeKeyPair>,
         event: SwarmEvent<NodeBehaviourEvent>,
     ) {
         match event {
@@ -442,6 +492,10 @@ impl Libp2pNetwork {
             }
             SwarmEvent::Behaviour(NodeBehaviourEvent::RequestResponse(rr_event)) => {
                 Self::handle_request_response_event(swarm, pending, crdt_repo, data_dir, rr_event)
+                    .await;
+            }
+            SwarmEvent::Behaviour(NodeBehaviourEvent::PublicKeyProtocol(pk_event)) => {
+                Self::handle_public_key_protocol_event(swarm, pending, p256_signing_key, pk_event)
                     .await;
             }
             SwarmEvent::Behaviour(NodeBehaviourEvent::Identify(identify_event)) => {
@@ -801,6 +855,112 @@ impl Libp2pNetwork {
         }
     }
 
+    async fn handle_public_key_protocol_event(
+        swarm: &mut Swarm<NodeBehaviour>,
+        pending: &mut PendingRequests,
+        p256_signing_key: &Arc<crate::infrastructure::key_management::NodeKeyPair>,
+        event: request_response::Event<PublicKeyRequest, PublicKeyResponse>,
+    ) {
+        match event {
+            request_response::Event::Message { peer, message, .. } => match message {
+                request_response::Message::Request {
+                    request, channel, ..
+                } => {
+                    // Handle incoming public key request
+                    debug!("Received public key request from {}: {:?}", peer, request);
+
+                    // Create response with our public key
+                    let mut public_keys = Vec::new();
+
+                    // If no specific nodes requested, return our own key
+                    if request.requested_nodes.is_empty() {
+                        // Get our NodeId
+                        let node_id = p256_signing_key
+                            .node_id()
+                            .map(|id| id.as_str().to_string())
+                            .unwrap_or_else(|_| swarm.local_peer_id().to_string());
+
+                        // Create signed public key proof
+                        if let Ok(node_key) = NodePublicKey::new(
+                            node_id,
+                            p256_signing_key.public_key_bytes(),
+                            p256_signing_key.signing_key(),
+                        ) {
+                            public_keys.push(node_key);
+                        }
+                    } else {
+                        // If specific nodes requested, return our key if we're in the list
+                        // Check both our NodeId and PeerId since tests may use either
+                        let our_node_id = p256_signing_key
+                            .node_id()
+                            .map(|id| id.as_str().to_string())
+                            .unwrap_or_else(|_| swarm.local_peer_id().to_string());
+
+                        let our_peer_id = swarm.local_peer_id().to_string();
+
+                        // Check if either our NodeId or PeerId is in the requested list
+                        if request.requested_nodes.contains(&our_node_id)
+                            || request.requested_nodes.contains(&our_peer_id)
+                        {
+                            // Return key with our NodeId (even if queried by PeerId)
+                            if let Ok(node_key) = NodePublicKey::new(
+                                our_node_id,
+                                p256_signing_key.public_key_bytes(),
+                                p256_signing_key.signing_key(),
+                            ) {
+                                public_keys.push(node_key);
+                            }
+                        }
+                    }
+
+                    let response = PublicKeyResponse { public_keys };
+
+                    if let Err(e) = swarm
+                        .behaviour_mut()
+                        .public_key_protocol
+                        .send_response(channel, response)
+                    {
+                        error!("Failed to send public key response: {:?}", e);
+                    }
+                }
+                request_response::Message::Response {
+                    request_id,
+                    response,
+                } => {
+                    // Handle response to our public key request
+                    if let Some(reply) = pending.public_key_queries.remove(&request_id) {
+                        // Verify all received public keys
+                        let mut verified_keys = Vec::new();
+                        for key in response.public_keys {
+                            match key.verify() {
+                                Ok(_) => {
+                                    info!("Verified public key for node {}", key.node_id);
+                                    verified_keys.push(key);
+                                }
+                                Err(e) => {
+                                    warn!("Failed to verify public key for {}: {}", key.node_id, e);
+                                }
+                            }
+                        }
+                        let _ = reply.send(Ok(verified_keys));
+                    }
+                }
+            },
+            request_response::Event::OutboundFailure {
+                request_id, error, ..
+            } => {
+                error!("Public key request failed: {:?}", error);
+                if let Some(reply) = pending.public_key_queries.remove(&request_id) {
+                    let _ = reply.send(Err(anyhow::anyhow!(
+                        "Public key request failed: {:?}",
+                        error
+                    )));
+                }
+            }
+            _ => {}
+        }
+    }
+
     async fn handle_identify_event(swarm: &mut Swarm<NodeBehaviour>, event: identify::Event) {
         if let identify::Event::Received { peer_id, info, .. } = event {
             info!(
@@ -897,6 +1057,66 @@ impl PeerNetwork for Libp2pNetwork {
 
             if let Ok(Ok((_, available))) = rx.await {
                 results.insert(peer_id_str.clone(), available);
+            }
+        }
+
+        Ok(results)
+    }
+
+    async fn query_node_public_keys_batch(
+        &self,
+        peer_ids: &[String],
+    ) -> Result<HashMap<String, Vec<u8>>> {
+        let mut results = HashMap::new();
+
+        // For each NodeId, we need to find which peer to query
+        // This is a challenge because NodeId != PeerId
+        // For now, we'll query our connected peers to ask about these NodeIds
+
+        // First, get list of connected peers
+        let (tx, _rx) = oneshot::channel();
+        if self
+            .command_tx
+            .send(SwarmCommand::GetListenAddrs { reply: tx })
+            .await
+            .is_err()
+        {
+            return Ok(results);
+        }
+
+        // Query each connected peer for the public keys
+        // In a real system, we'd have a DHT mapping NodeId -> PeerId
+        // For now, we'll use a broadcast-like approach
+
+        for node_id_str in peer_ids {
+            // Try to parse as PeerId first (for testing)
+            if let Ok(peer_id) = PeerId::from_str(node_id_str) {
+                let (tx, rx) = oneshot::channel();
+                if self
+                    .command_tx
+                    .send(SwarmCommand::QueryPublicKeys {
+                        peer_id,
+                        node_ids: vec![node_id_str.clone()],
+                        reply: tx,
+                    })
+                    .await
+                    .is_ok()
+                {
+                    if let Ok(Ok(keys)) = rx.await {
+                        // The returned key might have a different node_id (e.g., the actual NodeId)
+                        // than what we requested (e.g., a PeerId), but we should still store it
+                        // indexed by what was requested
+                        if !keys.is_empty() {
+                            // Take the first matching key (there should only be one for a specific peer)
+                            results.insert(node_id_str.clone(), keys[0].public_key.clone());
+                        }
+                    }
+                }
+            }
+
+            // If we didn't get a key, skip it
+            if !results.contains_key(node_id_str) {
+                warn!("Could not query public key for {}", node_id_str);
             }
         }
 

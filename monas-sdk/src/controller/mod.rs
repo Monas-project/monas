@@ -53,10 +53,10 @@ impl MonasController {
     }
 
     /// ContentRepositoryのインスタンスを作成するヘルパーメソッド
-    fn create_content_repository(
-    ) -> monas_content::infrastructure::repository::InMemoryContentRepository {
-        use monas_content::infrastructure::repository::InMemoryContentRepository;
-        InMemoryContentRepository::default()
+    fn create_content_repository() -> monas_content::infrastructure::MultiStorageRepository {
+        use monas_content::infrastructure::MultiStorageRepository;
+        let registry = std::sync::Arc::new(monas_filesync::init_registry_default());
+        MultiStorageRepository::in_memory(registry, "local")
     }
 
     /// ContentEncryptionKeyStoreのインスタンスを作成するヘルパーメソッド
@@ -68,7 +68,7 @@ impl MonasController {
 
     /// ContentServiceのインスタンスを作成するヘルパーメソッド
     fn create_content_service(
-        content_repository: monas_content::infrastructure::repository::InMemoryContentRepository,
+        content_repository: monas_content::infrastructure::MultiStorageRepository,
         cek_store: monas_content::infrastructure::key_store::InMemoryContentEncryptionKeyStore,
     ) -> ContentServiceInstance {
         use monas_content::application_service::content_service::ContentService;
@@ -88,7 +88,7 @@ impl MonasController {
 
     /// ShareServiceのインスタンスを作成するヘルパーメソッド
     fn create_share_service(
-        content_repository: monas_content::infrastructure::repository::InMemoryContentRepository,
+        content_repository: monas_content::infrastructure::MultiStorageRepository,
         cek_store: monas_content::infrastructure::key_store::InMemoryContentEncryptionKeyStore,
     ) -> ShareServiceInstance {
         use monas_content::application_service::share_service::ShareService;

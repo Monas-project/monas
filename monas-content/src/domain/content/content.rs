@@ -1,8 +1,10 @@
 use crate::domain::content::encryption::{ContentEncryption, ContentEncryptionKey};
+use crate::domain::content::provider::StorageProvider;
 use crate::domain::content::Metadata;
 use crate::domain::content_id::{ContentId, ContentIdGenerator};
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ContentStatus {
     Active,
     Deleting,
@@ -25,11 +27,14 @@ pub enum ContentEvent {
     Deleted,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Content {
-    id: ContentId,
+    raw_id: ContentId,
     series_id: ContentId,
+    encrypted_id: ContentId,
     metadata: Metadata,
+    /// 永続化時は含めない（暗号化済みデータのみ保存）
+    #[serde(skip)]
     raw_content: Option<Vec<u8>>,
     encrypted_content: Option<Vec<u8>>,
     is_deleted: bool,
@@ -48,8 +53,9 @@ impl Content {
         is_deleted: bool,
     ) -> Self {
         Self {
-            id: id.clone(),
-            series_id: id,
+            raw_id: id.clone(),
+            series_id: id.clone(),
+            encrypted_id: id,
             metadata,
             raw_content,
             encrypted_content,
@@ -62,6 +68,7 @@ impl Content {
         name: String,
         raw_content: Vec<u8>,
         path: String,
+        provider: Option<StorageProvider>,
         id_generator: &G,
         key: &ContentEncryptionKey,
         encryption: &E,
@@ -71,7 +78,7 @@ impl Content {
         E: ContentEncryption,
     {
         let cid = id_generator.generate(&raw_content);
-        let metadata = Metadata::new(name, path, cid.clone());
+        let metadata = Metadata::new(name, path, cid.clone(), provider);
 
         if key.0.is_empty() {
             return Err(ContentError::EncryptionError(
@@ -80,10 +87,13 @@ impl Content {
         }
 
         let encrypted_content = encryption.encrypt(key, &raw_content)?;
+        // encCid は plainCid と暗号文から生成する（state-node 等が暗号文整合性を検証できるようにする）。
+        let enc_cid = id_generator.generate_encrypted(&cid, &encrypted_content);
 
         let content = Self {
-            id: cid.clone(),
+            raw_id: cid.clone(),
             series_id: cid,
+            encrypted_id: enc_cid,
             metadata,
             raw_content: Some(raw_content),
             encrypted_content: Some(encrypted_content),
@@ -97,7 +107,7 @@ impl Content {
     /// コンテンツ本体（バイナリ）のみを更新する。
     ///
     /// - name / path / series_id は変更しない
-    /// - `id` は新しいバイナリから再計算される（コンテンツアドレス化）
+    /// - `raw_id`（plainCid）は新しいバイナリから再計算される（コンテンツアドレス化）
     /// - `metadata.updated_at` は現在時刻に更新される
     pub fn update_content<G, E>(
         &self,
@@ -121,12 +131,15 @@ impl Content {
         let encrypted_content = encryption.encrypt(key, &raw_content)?;
 
         let new_id = id_generator.generate(&raw_content);
+        // encCid は plainCid と暗号文から生成する。
+        let new_enc_id = id_generator.generate_encrypted(&new_id, &encrypted_content);
 
         let new_metadata = self.metadata.with_new_id(new_id.clone());
 
         let content = Self {
-            id: new_id,
+            raw_id: new_id,
             series_id: self.series_id.clone(),
+            encrypted_id: new_enc_id,
             metadata: new_metadata,
             raw_content: Some(raw_content),
             encrypted_content: Some(encrypted_content),
@@ -147,8 +160,9 @@ impl Content {
         let new_metadata = self.metadata.rename(new_name);
 
         let content = Self {
-            id: self.id.clone(),
+            raw_id: self.raw_id.clone(),
             series_id: self.series_id.clone(),
+            encrypted_id: self.encrypted_id.clone(),
             metadata: new_metadata,
             raw_content: self.raw_content.clone(),
             encrypted_content: self.encrypted_content.clone(),
@@ -167,8 +181,9 @@ impl Content {
         let new_metadata = self.metadata.touch();
 
         let content = Self {
-            id: self.id.clone(),
+            raw_id: self.raw_id.clone(),
             series_id: self.series_id.clone(),
+            encrypted_id: self.encrypted_id.clone(),
             metadata: new_metadata,
             raw_content: None,
             encrypted_content: None,
@@ -189,18 +204,19 @@ impl Content {
     {
         self.ensure_not_deleted()?;
 
-        if self.encrypted_content.is_none() {
-            Err(ContentError::DecryptionError(
+        let Some(encrypted) = self.encrypted_content.as_ref() else {
+            return Err(ContentError::DecryptionError(
                 "Missing encrypted content".to_string(),
-            ))
-        } else if key.0.is_empty() {
-            Err(ContentError::DecryptionError(
+            ));
+        };
+
+        if key.0.is_empty() {
+            return Err(ContentError::DecryptionError(
                 "Missing content encryption key".to_string(),
-            ))
-        } else {
-            let encrypted = self.encrypted_content.as_ref().unwrap();
-            encryption.decrypt(key, encrypted)
+            ));
         }
+
+        encryption.decrypt(key, encrypted)
     }
 
     /// - `is_deleted == true` の場合は `ContentError::AlreadyDeleted` を返す。
@@ -216,12 +232,16 @@ impl Content {
         &self.metadata
     }
 
-    pub fn id(&self) -> &ContentId {
-        &self.id
+    pub fn raw_id(&self) -> &ContentId {
+        &self.raw_id
     }
 
     pub fn series_id(&self) -> &ContentId {
         &self.series_id
+    }
+
+    pub fn encrypted_id(&self) -> &ContentId {
+        &self.encrypted_id
     }
 
     pub fn raw_content(&self) -> Option<&Vec<u8>> {
@@ -275,6 +295,7 @@ mod tests {
             "test_content".to_string(),
             "test/path".to_string(),
             ContentId::new("test-content-id".into()),
+            None,
         )
     }
 
@@ -289,6 +310,14 @@ mod tests {
         fn generate(&self, raw_content: &[u8]) -> ContentId {
             // テスト用の単純な ID 生成: 長さに応じて異なる ID を返す。
             ContentId::new(format!("test-content-id-{}", raw_content.len()))
+        }
+
+        fn generate_encrypted(&self, plain_cid: &ContentId, ciphertext: &[u8]) -> ContentId {
+            ContentId::new(format!(
+                "test-enc-id-{}-{}",
+                plain_cid.as_str(),
+                ciphertext.len()
+            ))
         }
     }
 
@@ -305,6 +334,7 @@ mod tests {
             name.clone(),
             raw_data.clone(),
             path.clone(),
+            None,
             &id_gen,
             &key,
             &encryption,
@@ -318,8 +348,8 @@ mod tests {
         assert_eq!(content.content_status(), &ContentStatus::Active);
         assert_eq!(event, ContentEvent::Created);
         assert!(content.encrypted_content().is_some());
-        assert!(content.id().as_str().starts_with("test-content-id-"));
-        assert_eq!(content.id(), content.series_id());
+        assert!(content.raw_id().as_str().starts_with("test-content-id-"));
+        assert_eq!(content.raw_id(), content.series_id());
     }
 
     #[test]
@@ -331,6 +361,7 @@ mod tests {
             "test".to_string(),
             b"old".to_vec(),
             "path.txt".to_string(),
+            None,
             &id_gen,
             &key,
             &encryption,
@@ -345,7 +376,7 @@ mod tests {
         assert_eq!(updated_content.raw_content().unwrap(), &updated_data);
         assert_eq!(event, ContentEvent::Updated);
         assert_eq!(updated_content.metadata().path(), content.metadata().path());
-        assert_ne!(updated_content.id(), content.id());
+        assert_ne!(updated_content.raw_id(), content.raw_id());
         assert_eq!(updated_content.series_id(), content.series_id());
     }
 
@@ -378,6 +409,7 @@ mod tests {
             "test".to_string(),
             b"data".to_vec(),
             "path.txt".to_string(),
+            None,
             &id_gen,
             &key,
             &encryption,
@@ -452,8 +484,16 @@ mod tests {
         let raw_data = b"Sensitive information".to_vec();
         let path = "documents/secrets.txt".to_string();
 
-        let (content, _) =
-            Content::create(name, raw_data.clone(), path, &id_gen, &key, &encryption).unwrap();
+        let (content, _) = Content::create(
+            name,
+            raw_data.clone(),
+            path,
+            None,
+            &id_gen,
+            &key,
+            &encryption,
+        )
+        .unwrap();
 
         assert!(content.encrypted_content().is_some());
 

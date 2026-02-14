@@ -32,6 +32,17 @@ pub enum Event {
         timestamp: u64,
     },
 
+    /// A node has been removed from a content network.
+    ContentNetworkManagerRemoved {
+        content_id: String,
+        removed_node_id: String,
+        /// Remaining member nodes after removal.
+        member_nodes: Vec<String>,
+        /// Reason for removal (e.g., "low_capacity", "offline").
+        reason: String,
+        timestamp: u64,
+    },
+
     /// Content has been updated on a node.
     ContentUpdated {
         content_id: String,
@@ -64,6 +75,20 @@ pub enum Event {
         /// Request timestamp.
         timestamp: u64,
     },
+
+    /// Content has been deleted.
+    ///
+    /// The actual content data is physically deleted from storage,
+    /// but this event and the content history/CID are preserved
+    /// to notify offline nodes about the deletion.
+    ContentDeleted {
+        /// The content ID (CID) of the deleted content.
+        content_id: String,
+        /// The node that initiated the deletion.
+        deleted_by_node_id: String,
+        /// Deletion timestamp.
+        timestamp: u64,
+    },
 }
 
 impl Event {
@@ -73,9 +98,11 @@ impl Event {
             Event::NodeCreated { .. } => "NodeCreated",
             Event::AssignmentDecided { .. } => "AssignmentDecided",
             Event::ContentNetworkManagerAdded { .. } => "ContentNetworkManagerAdded",
+            Event::ContentNetworkManagerRemoved { .. } => "ContentNetworkManagerRemoved",
             Event::ContentUpdated { .. } => "ContentUpdated",
             Event::ContentCreated { .. } => "ContentCreated",
             Event::ContentSyncRequested { .. } => "ContentSyncRequested",
+            Event::ContentDeleted { .. } => "ContentDeleted",
         }
     }
 
@@ -84,9 +111,11 @@ impl Event {
         match self {
             Event::AssignmentDecided { content_id, .. } => Some(content_id),
             Event::ContentNetworkManagerAdded { content_id, .. } => Some(content_id),
+            Event::ContentNetworkManagerRemoved { content_id, .. } => Some(content_id),
             Event::ContentUpdated { content_id, .. } => Some(content_id),
             Event::ContentCreated { content_id, .. } => Some(content_id),
             Event::ContentSyncRequested { content_id, .. } => Some(content_id),
+            Event::ContentDeleted { content_id, .. } => Some(content_id),
             Event::NodeCreated { .. } => None,
         }
     }
@@ -97,9 +126,11 @@ impl Event {
             Event::NodeCreated { timestamp, .. } => *timestamp,
             Event::AssignmentDecided { timestamp, .. } => *timestamp,
             Event::ContentNetworkManagerAdded { timestamp, .. } => *timestamp,
+            Event::ContentNetworkManagerRemoved { timestamp, .. } => *timestamp,
             Event::ContentUpdated { timestamp, .. } => *timestamp,
             Event::ContentCreated { timestamp, .. } => *timestamp,
             Event::ContentSyncRequested { timestamp, .. } => *timestamp,
+            Event::ContentDeleted { timestamp, .. } => *timestamp,
         }
     }
 }

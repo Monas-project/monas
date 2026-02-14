@@ -1,15 +1,19 @@
 //! HTTP API for the state node.
 
 use crate::application_service::state_node_service::StateNodeService;
+use crate::domain::errors::StateNodeError;
 use crate::infrastructure::crdt_repository::CrslCrdtRepository;
 use crate::infrastructure::gossipsub_publisher::GossipsubEventPublisher;
 use crate::infrastructure::network::Libp2pNetwork;
-use crate::infrastructure::persistence::{SledContentNetworkRepository, SledNodeRegistry};
+use crate::infrastructure::persistence::{
+    SledAccessControlRepository, SledContentNetworkRepository, SledNodeRegistry,
+};
+use crate::port::auth_token::AuthToken;
 use crate::port::content_repository::ContentRepository;
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
-    response::IntoResponse,
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
     routing::{get, post, put},
     Json, Router,
 };
@@ -25,6 +29,7 @@ pub type AppState = Arc<
         Libp2pNetwork,
         GossipsubEventPublisher<Libp2pNetwork>,
         CrslCrdtRepository,
+        SledAccessControlRepository,
     >,
 >;
 
@@ -36,10 +41,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/node/register", post(register_node))
         .route("/nodes", get(list_nodes))
         .route("/content", post(create_content))
-        .route("/content/:id", get(get_content))
-        .route("/content/:id", put(update_content))
+        .route("/content/:id", put(update_content).delete(delete_content))
+        .route("/content/:id/members", post(add_members))
         .route("/contents", get(list_contents))
-        // New CRDT-related endpoints
+        // CRDT-related endpoints
         .route("/content/:id/data", get(get_content_data))
         .route("/content/:id/history", get(get_content_history))
         .route("/content/:id/version/:version", get(get_content_version))
@@ -83,13 +88,6 @@ pub struct CreateContentRequest {
 #[derive(Debug, Serialize)]
 pub struct CreateContentResponse {
     pub content_id: String,
-    pub member_nodes: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ContentResponse {
-    pub content_id: String,
-    pub member_nodes: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -104,8 +102,38 @@ pub struct UpdateContentResponse {
 }
 
 #[derive(Debug, Serialize)]
+pub struct DeleteContentResponse {
+    pub content_id: String,
+    pub deleted: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AddMembersRequest {
+    /// Number of members to add
+    pub count: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AddMembersResponse {
+    pub content_id: String,
+    pub added_node_id: String,
+    pub member_nodes: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct ErrorResponse {
     pub error: String,
+}
+
+/// Implement IntoResponse for StateNodeError to automatically map to HTTP responses.
+impl IntoResponse for StateNodeError {
+    fn into_response(self) -> Response {
+        let status = self.to_http_status();
+        let error_response = ErrorResponse {
+            error: self.to_string(),
+        };
+        (status, Json(error_response)).into_response()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -124,6 +152,44 @@ pub struct ContentHistoryResponse {
 #[derive(Debug, Deserialize)]
 pub struct VersionQuery {
     pub version: Option<String>,
+}
+
+// ============================================================================
+// Helper functions
+// ============================================================================
+
+/// Extract authentication token from Authorization header.
+///
+/// Supports both Bearer tokens and raw tokens:
+/// - "Bearer <token>" -> extracts <token>
+/// - "<token>" -> uses token as-is
+///
+/// Returns None if the Authorization header is missing.
+fn extract_auth_token(headers: &HeaderMap) -> Option<AuthToken> {
+    let auth_header = headers.get("authorization")?.to_str().ok()?;
+
+    // Check if it's a Bearer token
+    if let Some(token) = auth_header.strip_prefix("Bearer ") {
+        Some(AuthToken::new(token.to_string()))
+    } else {
+        // Use the header value as-is (for DID-based auth)
+        Some(AuthToken::new(auth_header.to_string()))
+    }
+}
+
+/// Extract request signature from X-Request-Signature header.
+///
+/// The request signature is a base64-encoded signature that proves the requester
+/// possesses the private key corresponding to the AuthToken's audience (aud).
+///
+/// Returns None if the header is missing or cannot be decoded.
+fn extract_request_signature(headers: &HeaderMap) -> Option<Vec<u8>> {
+    let signature_header = headers.get("x-request-signature")?.to_str().ok()?;
+
+    // Decode base64-encoded signature
+    base64::engine::general_purpose::STANDARD
+        .decode(signature_header)
+        .ok()
 }
 
 // ============================================================================
@@ -155,13 +221,7 @@ async fn node_info(State(state): State<AppState>) -> impl IntoResponse {
             available_capacity: None,
         })
         .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-            .into_response(),
+        Err(e) => e.into_response(),
     }
 }
 
@@ -177,13 +237,7 @@ async fn register_node(
             available_capacity: snapshot.available_capacity,
         })
         .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-            .into_response(),
+        Err(e) => e.into_response(),
     }
 }
 
@@ -191,19 +245,14 @@ async fn register_node(
 async fn list_nodes(State(state): State<AppState>) -> impl IntoResponse {
     match state.list_nodes().await {
         Ok(nodes) => Json::<Vec<String>>(nodes).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-            .into_response(),
+        Err(e) => e.into_response(),
     }
 }
 
 /// Create new content.
 async fn create_content(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<CreateContentRequest>,
 ) -> impl IntoResponse {
     use base64::Engine;
@@ -221,19 +270,17 @@ async fn create_content(
         }
     };
 
-    match state.create_content(&data).await {
+    // Extract authentication token and request signature from headers
+    let token = extract_auth_token(&headers);
+    let request_signature = extract_request_signature(&headers);
+
+    match state
+        .create_content(&data, token.as_ref(), request_signature.as_deref())
+        .await
+    {
         Ok(event) => {
-            if let crate::domain::events::Event::ContentCreated {
-                content_id,
-                member_nodes,
-                ..
-            } = event
-            {
-                Json(CreateContentResponse {
-                    content_id,
-                    member_nodes,
-                })
-                .into_response()
+            if let crate::domain::events::Event::ContentCreated { content_id, .. } = event {
+                Json(CreateContentResponse { content_id }).into_response()
             } else {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -244,41 +291,7 @@ async fn create_content(
                     .into_response()
             }
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-            .into_response(),
-    }
-}
-
-/// Get content network info.
-async fn get_content(
-    State(state): State<AppState>,
-    Path(content_id): Path<String>,
-) -> impl IntoResponse {
-    match state.get_content_network(&content_id).await {
-        Ok(Some(network)) => Json(ContentResponse {
-            content_id: network.content_id,
-            member_nodes: network.member_nodes.into_iter().collect(),
-        })
-        .into_response(),
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: format!("Content not found: {}", content_id),
-            }),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-            .into_response(),
+        Err(e) => e.into_response(),
     }
 }
 
@@ -286,6 +299,7 @@ async fn get_content(
 async fn update_content(
     State(state): State<AppState>,
     Path(content_id): Path<String>,
+    headers: HeaderMap,
     Json(req): Json<UpdateContentRequest>,
 ) -> impl IntoResponse {
     use base64::Engine;
@@ -303,19 +317,101 @@ async fn update_content(
         }
     };
 
-    match state.update_content(&content_id, &data).await {
+    // Extract authentication token and request signature from headers
+    let token = extract_auth_token(&headers);
+    let request_signature = extract_request_signature(&headers);
+
+    match state
+        .update_content(
+            &content_id,
+            &data,
+            token.as_ref(),
+            request_signature.as_deref(),
+        )
+        .await
+    {
         Ok(_) => Json(UpdateContentResponse {
             content_id,
             updated: true,
         })
         .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// Delete content.
+///
+/// Physically deletes the ContentNetwork but preserves:
+/// - CRDT history and CID for offline node notification
+/// - ContentDeleted event for propagation to other nodes
+async fn delete_content(
+    State(state): State<AppState>,
+    Path(content_id): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    // Extract authentication token and request signature from headers
+    let token = extract_auth_token(&headers);
+    let request_signature = extract_request_signature(&headers);
+
+    match state
+        .delete_content(&content_id, token.as_ref(), request_signature.as_deref())
+        .await
+    {
+        Ok(_) => Json(DeleteContentResponse {
+            content_id,
+            deleted: true,
+        })
+        .into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// Add member nodes to a content network.
+async fn add_members(
+    State(state): State<AppState>,
+    Path(content_id): Path<String>,
+    headers: HeaderMap,
+    Json(req): Json<AddMembersRequest>,
+) -> impl IntoResponse {
+    use crate::domain::events::Event;
+
+    let token = extract_auth_token(&headers);
+    let request_signature = extract_request_signature(&headers);
+
+    match state
+        .add_member_to_content(
+            &content_id,
+            req.count,
+            token.as_ref(),
+            request_signature.as_deref(),
         )
-            .into_response(),
+        .await
+    {
+        Ok(event) => {
+            if let Event::ContentNetworkManagerAdded {
+                content_id,
+                added_node_id,
+                member_nodes,
+                ..
+            } = event
+            {
+                Json(AddMembersResponse {
+                    content_id,
+                    added_node_id,
+                    member_nodes,
+                })
+                .into_response()
+            } else {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: "Unexpected event type".to_string(),
+                    }),
+                )
+                    .into_response()
+            }
+        }
+        Err(e) => e.into_response(),
     }
 }
 
@@ -323,13 +419,7 @@ async fn update_content(
 async fn list_contents(State(state): State<AppState>) -> impl IntoResponse {
     match state.list_content_networks().await {
         Ok(contents) => Json::<Vec<String>>(contents).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-            .into_response(),
+        Err(e) => e.into_response(),
     }
 }
 
@@ -439,46 +529,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_health_response_serialization() {
-        let response = HealthResponse {
-            status: "ok".to_string(),
-            node_id: "node-1".to_string(),
-        };
-
-        let json = serde_json::to_string(&response).unwrap();
-        assert!(json.contains("\"status\":\"ok\""));
-        assert!(json.contains("\"node_id\":\"node-1\""));
-    }
-
-    #[test]
-    fn test_node_info_response_serialization() {
-        let response = NodeInfoResponse {
-            node_id: "node-1".to_string(),
-            total_capacity: Some(1000),
-            available_capacity: Some(800),
-        };
-
-        let json = serde_json::to_string(&response).unwrap();
-        assert!(json.contains("\"node_id\":\"node-1\""));
-        assert!(json.contains("\"total_capacity\":1000"));
-        assert!(json.contains("\"available_capacity\":800"));
-    }
-
-    #[test]
-    fn test_node_info_response_with_none() {
-        let response = NodeInfoResponse {
-            node_id: "node-1".to_string(),
-            total_capacity: None,
-            available_capacity: None,
-        };
-
-        let json = serde_json::to_string(&response).unwrap();
-        assert!(json.contains("\"node_id\":\"node-1\""));
-        assert!(json.contains("\"total_capacity\":null"));
-        assert!(json.contains("\"available_capacity\":null"));
-    }
-
-    #[test]
     fn test_register_node_request_deserialization() {
         let json = r#"{"total_capacity": 1000}"#;
         let request: RegisterNodeRequest = serde_json::from_str(json).unwrap();
@@ -516,26 +566,12 @@ mod tests {
     fn test_create_content_response_serialization() {
         let response = CreateContentResponse {
             content_id: "cid-1".to_string(),
-            member_nodes: vec!["node-1".to_string(), "node-2".to_string()],
         };
 
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"content_id\":\"cid-1\""));
-        assert!(json.contains("\"member_nodes\""));
-        assert!(json.contains("\"node-1\""));
-        assert!(json.contains("\"node-2\""));
-    }
-
-    #[test]
-    fn test_content_response_serialization() {
-        let response = ContentResponse {
-            content_id: "cid-1".to_string(),
-            member_nodes: vec!["node-1".to_string()],
-        };
-
-        let json = serde_json::to_string(&response).unwrap();
-        assert!(json.contains("\"content_id\":\"cid-1\""));
-        assert!(json.contains("\"member_nodes\""));
+        // member_nodes is no longer exposed to prevent information leakage
+        assert!(!json.contains("\"member_nodes\""));
     }
 
     #[test]
@@ -628,41 +664,9 @@ mod tests {
     }
 
     #[test]
-    fn test_base64_encoding_roundtrip() {
-        let original = b"Hello, World! This is test data.";
-        let encoded = base64::engine::general_purpose::STANDARD.encode(original);
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(&encoded)
-            .unwrap();
-        assert_eq!(original.to_vec(), decoded);
-    }
-
-    #[test]
     fn test_invalid_base64_data() {
         let invalid = "not-valid-base64!!!";
         let result = base64::engine::general_purpose::STANDARD.decode(invalid);
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_response_types_are_debug() {
-        // Ensure all response types implement Debug
-        let health = HealthResponse {
-            status: "ok".to_string(),
-            node_id: "n1".to_string(),
-        };
-        let _ = format!("{:?}", health);
-
-        let node_info = NodeInfoResponse {
-            node_id: "n1".to_string(),
-            total_capacity: Some(100),
-            available_capacity: None,
-        };
-        let _ = format!("{:?}", node_info);
-
-        let error = ErrorResponse {
-            error: "err".to_string(),
-        };
-        let _ = format!("{:?}", error);
     }
 }

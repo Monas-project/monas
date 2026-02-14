@@ -262,7 +262,23 @@ impl<P: PeerNetwork> ReliableEventPublisher<P> {
                 content_id.hash(&mut hasher);
                 timestamp.hash(&mut hasher);
             }
+            Event::ContentNetworkManagerRemoved {
+                content_id,
+                timestamp,
+                ..
+            } => {
+                content_id.hash(&mut hasher);
+                timestamp.hash(&mut hasher);
+            }
             Event::ContentSyncRequested {
+                content_id,
+                timestamp,
+                ..
+            } => {
+                content_id.hash(&mut hasher);
+                timestamp.hash(&mut hasher);
+            }
+            Event::ContentDeleted {
                 content_id,
                 timestamp,
                 ..

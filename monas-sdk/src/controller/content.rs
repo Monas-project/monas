@@ -20,7 +20,7 @@ use monas_content::infrastructure::{
     content_id::Sha256ContentIdGenerator,
     encryption::{Aes256CtrContentEncryption, OsRngContentEncryptionKeyGenerator},
     key_store::InMemoryContentEncryptionKeyStore,
-    repository::InMemoryContentRepository,
+    MultiStorageRepository,
 };
 
 use super::MonasController;
@@ -28,7 +28,7 @@ use super::MonasController;
 /// ContentServiceの型エイリアス（可読性向上のため）
 pub(super) type ContentServiceInstance = ContentService<
     Sha256ContentIdGenerator,
-    InMemoryContentRepository,
+    MultiStorageRepository,
     OsRngContentEncryptionKeyGenerator,
     Aes256CtrContentEncryption,
     InMemoryContentEncryptionKeyStore,
@@ -57,6 +57,9 @@ impl MonasController {
             UpdateError::Domain(err) => ApiError::Internal(format!("Domain error: {err:?}")),
             UpdateError::Repository(err) => ApiError::Internal(format!("Repository error: {err}")),
             UpdateError::KeyStore(err) => ApiError::Internal(format!("Key store error: {err}")),
+            UpdateError::MissingEncryptedContent => {
+                ApiError::Internal("Missing encrypted content".into())
+            }
         }
     }
 
@@ -214,6 +217,7 @@ impl MonasController {
             raw_content: content_bytes,
             name,
             path,
+            provider: None,
         };
 
         let result = match content_service.create(cmd) {
@@ -263,7 +267,7 @@ impl MonasController {
 
         let content_service = &self.content_service;
 
-        let result = match content_service.fetch(content_id) {
+        let result = match content_service.fetch(content_id, None) {
             Ok(result) => result,
             Err(e) => {
                 return ApiResponse::error(Self::map_fetch_error(e), trace_id);
@@ -343,6 +347,7 @@ impl MonasController {
             content_id,
             new_name,
             new_raw_content,
+            provider: None,
         };
 
         let result = match content_service.update(cmd) {
@@ -395,7 +400,10 @@ impl MonasController {
         let content_service = &self.content_service;
 
         // 4. DeleteContentCommandを作成
-        let cmd = DeleteContentCommand { content_id };
+        let cmd = DeleteContentCommand {
+            content_id,
+            provider: None,
+        };
 
         // 5. ContentService::deleteを呼び出してコンテンツを削除
         let result = match content_service.delete(cmd) {

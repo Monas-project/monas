@@ -1,29 +1,43 @@
+//! プレゼンテーション層（API ルーター）。
+//!
+//! `filesync` feature が有効な場合のみコンパイルされる。
+
+#![cfg(feature = "filesync")]
+
 use std::sync::Arc;
 
 use axum::{routing::get, Router};
 
 use crate::{
-    application_service::{content_service::ContentService, share_service::ShareService},
+    application_service::{
+        content_service::ContentService,
+        share_service::ShareService,
+    },
     infrastructure::{
         content_id::Sha256ContentIdGenerator,
         encryption::{Aes256CtrContentEncryption, OsRngContentEncryptionKeyGenerator},
         key_store::InMemoryContentEncryptionKeyStore,
         key_wrapping::HpkeV1KeyWrapping,
         public_key_directory::InMemoryPublicKeyDirectory,
-        repository::InMemoryContentRepository,
         share_repository::InMemoryShareRepository,
+        MultiStorageRepository,
     },
 };
 
+mod base64_helpers;
 mod content;
 mod share;
+
+use base64_helpers::{
+    decode_base64, decode_base64_optional, decode_cek_base64, decode_key_id_base64,
+};
 
 #[derive(Clone)]
 struct AppState {
     pub content_service: Arc<
         ContentService<
             Sha256ContentIdGenerator,
-            InMemoryContentRepository,
+            MultiStorageRepository,
             OsRngContentEncryptionKeyGenerator,
             Aes256CtrContentEncryption,
             InMemoryContentEncryptionKeyStore,
@@ -32,7 +46,7 @@ struct AppState {
     pub share_service: Arc<
         ShareService<
             InMemoryShareRepository,
-            InMemoryContentRepository,
+            MultiStorageRepository,
             InMemoryContentEncryptionKeyStore,
             InMemoryPublicKeyDirectory,
             HpkeV1KeyWrapping,
@@ -46,7 +60,9 @@ async fn health() -> &'static str {
 
 pub fn create_router() -> Router {
     // 共通の infra 実装を生成し、ContentService / ShareService の両方で共有する。
-    let content_repository = InMemoryContentRepository::default();
+    let registry = Arc::new(monas_filesync::init_registry_default());
+    let content_repository = MultiStorageRepository::in_memory(registry, "local");
+
     let cek_store = InMemoryContentEncryptionKeyStore::default();
     let public_key_directory = InMemoryPublicKeyDirectory::default();
     let share_repository = InMemoryShareRepository::default();

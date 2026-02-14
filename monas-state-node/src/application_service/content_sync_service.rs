@@ -1,9 +1,9 @@
 //! Content Sync Service - Handles synchronization of CRDT content between nodes.
 
+use crate::domain::errors::{NetworkError, StateNodeError};
 use crate::port::content_repository::ContentRepository;
 use crate::port::peer_network::PeerNetwork;
 use crate::port::persistence::PersistentContentRepository;
-use anyhow::Result;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -71,7 +71,7 @@ where
     /// Sync content from other nodes (pull-based).
     ///
     /// This fetches operations from content providers and applies them locally.
-    pub async fn sync_from_peers(&self, genesis_cid: &str) -> Result<SyncResult> {
+    pub async fn sync_from_peers(&self, genesis_cid: &str) -> Result<SyncResult, StateNodeError> {
         let mut result = SyncResult {
             operations_applied: 0,
             providers_contacted: 0,
@@ -153,7 +153,7 @@ where
     /// Push local operations to other nodes.
     ///
     /// This sends operations to all member nodes in the content network.
-    pub async fn push_to_peers(&self, genesis_cid: &str) -> Result<PushResult> {
+    pub async fn push_to_peers(&self, genesis_cid: &str) -> Result<PushResult, StateNodeError> {
         let mut result = PushResult {
             nodes_pushed: 0,
             operations_sent: 0,
@@ -199,14 +199,15 @@ where
         }
 
         // 3. Push to each member node
-        for node_id in network.member_nodes {
-            if node_id == self.local_node_id {
+        for node_id in network.member_nodes() {
+            let node_id_str = node_id.as_str();
+            if node_id_str == self.local_node_id {
                 continue; // Skip self
             }
 
             match self
                 .peer_network
-                .push_operations(&node_id, genesis_cid, &operations)
+                .push_operations(node_id_str, genesis_cid, &operations)
                 .await
             {
                 Ok(accepted) => {
@@ -233,7 +234,7 @@ where
     /// Sync all content that this node is a member of.
     ///
     /// This is useful for periodic background synchronization.
-    pub async fn sync_all_content(&self) -> Result<Vec<(String, SyncResult)>> {
+    pub async fn sync_all_content(&self) -> Result<Vec<(String, SyncResult)>, StateNodeError> {
         let mut results = Vec::new();
 
         // Get all content networks
@@ -242,7 +243,8 @@ where
             .read()
             .await
             .list_content_networks()
-            .await?;
+            .await
+            .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
 
         for content_id in content_ids {
             // Check if we're a member
@@ -253,7 +255,7 @@ where
                 .get_content_network(&content_id)
                 .await
             {
-                if network.member_nodes.contains(&self.local_node_id) {
+                if network.has_member_str(&self.local_node_id) {
                     match self.sync_from_peers(&content_id).await {
                         Ok(result) => {
                             results.push((content_id, result));
@@ -276,10 +278,11 @@ where
         &self,
         genesis_cid: &str,
         operation: &crate::port::content_repository::SerializedOperation,
-    ) -> Result<()> {
+    ) -> Result<(), StateNodeError> {
         self.peer_network
             .broadcast_operation(genesis_cid, operation)
             .await
+            .map_err(|e| StateNodeError::NetworkError(NetworkError::ProtocolError(e.to_string())))
     }
 }
 

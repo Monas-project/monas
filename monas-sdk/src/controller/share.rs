@@ -18,8 +18,8 @@ use monas_content::domain::share::{
 };
 use monas_content::infrastructure::{
     key_store::InMemoryContentEncryptionKeyStore, key_wrapping::HpkeV1KeyWrapping,
-    public_key_directory::InMemoryPublicKeyDirectory, repository::InMemoryContentRepository,
-    share_repository::InMemoryShareRepository,
+    public_key_directory::InMemoryPublicKeyDirectory, share_repository::InMemoryShareRepository,
+    MultiStorageRepository,
 };
 
 use super::MonasController;
@@ -27,7 +27,7 @@ use super::MonasController;
 /// ShareServiceの型エイリアス（可読性向上のため）
 pub(super) type ShareServiceInstance = ShareService<
     InMemoryShareRepository,
-    InMemoryContentRepository,
+    MultiStorageRepository,
     InMemoryContentEncryptionKeyStore,
     InMemoryPublicKeyDirectory,
     HpkeV1KeyWrapping,
@@ -245,10 +245,13 @@ impl MonasController {
             };
 
         let recipient_key_id = Self::compute_key_id_from_public_key(&recipient_public_key_bytes);
+        // 現行の SDK 入力モデルには sender 情報がないため、暫定的に recipient 由来で補う。
+        let sender_key_id = recipient_key_id.clone();
 
         // 4. ShareService::revoke_shareを呼び出し
         let cmd = RevokeShareCommand {
             content_id,
+            sender_key_id,
             recipient_key_id,
         };
 
@@ -379,7 +382,7 @@ impl MonasController {
         };
 
         // 8. ContentService::decrypt_with_cekを呼び出してコンテンツを復号
-        let raw_content =
+        let raw_content: Vec<u8> =
             match self
                 .content_service
                 .decrypt_with_cek(content_id.clone(), cek, ciphertext)
