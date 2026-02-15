@@ -378,7 +378,8 @@ test_auth_request \
 
 # 更新データの確認
 if [ "$LAST_STATUS" = "200" ]; then
-    sleep 2
+    log_step "gossipsubによる伝播を待機 (5秒)..."
+    sleep 5
     log_test "account2の更新データが反映されていることを確認"
 
     VERIFIED_UPDATE=false
@@ -387,16 +388,19 @@ if [ "$LAST_STATUS" = "200" ]; then
         if echo "$DATA_RESPONSE" | jq -e '.data' > /dev/null 2>&1; then
             FETCHED_DATA=$(echo "$DATA_RESPONSE" | jq -r '.data' 2>/dev/null)
             DECODED=$(echo "$FETCHED_DATA" | base64 -d 2>/dev/null || echo "(decode failed)")
+            log_info "  ノード (ポート $port): data=$DECODED"
             if [ "$DECODED" = "Content updated by account2!" ]; then
                 VERIFIED_UPDATE=true
-                log_success "account2の更新データを確認: '$DECODED' (ポート $port)"
-                ((TESTS_PASSED++))
-                break
             fi
+        else
+            log_info "  ノード (ポート $port): データ取得不可"
         fi
     done
 
-    if [ "$VERIFIED_UPDATE" = false ]; then
+    if [ "$VERIFIED_UPDATE" = true ]; then
+        log_success "account2の更新データを確認"
+        ((TESTS_PASSED++))
+    else
         log_fail "account2の更新データが確認できませんでした"
         ((TESTS_FAILED++))
     fi

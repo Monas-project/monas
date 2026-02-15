@@ -50,6 +50,14 @@ pub enum ContentRequest {
         auth_token: String,
         request_signature: Vec<u8>,
     },
+    /// Relay a grant_access request to a member node.
+    GrantAccess {
+        content_id: String,
+        grantee_id: String,
+        capabilities: Vec<String>,
+        auth_token: String,
+        request_signature: Vec<u8>,
+    },
 }
 
 /// Response types for the content protocol.
@@ -83,6 +91,8 @@ pub enum ContentResponse {
     UpdateResult { content_id: String, success: bool },
     /// Response to relayed delete request.
     DeleteResult { content_id: String, success: bool },
+    /// Response to relayed grant_access request.
+    GrantAccessResult { content_id: String, success: bool },
     /// Content not found.
     NotFound { content_id: String },
     /// Error response.

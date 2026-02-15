@@ -646,9 +646,16 @@ async fn grant_access_handler(
     }
 
     let granted_capabilities: Vec<String> = req.capabilities.clone();
+    let request_signature = extract_request_signature(&headers);
 
     match state
-        .grant_access(&content_id, grantee_identity, capabilities, &token)
+        .grant_access(
+            &content_id,
+            grantee_identity,
+            capabilities,
+            &token,
+            request_signature.as_deref(),
+        )
         .await
     {
         Ok(()) => Json(GrantAccessResponse {

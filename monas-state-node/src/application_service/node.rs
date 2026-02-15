@@ -19,7 +19,7 @@ use crate::infrastructure::network::{Libp2pNetwork, Libp2pNetworkConfig};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::infrastructure::outbox_persistence::SledOutboxPersistence;
 #[cfg(not(target_arch = "wasm32"))]
-use crate::infrastructure::persistence::{SledAccessControlRepository, SledAccessPolicyRepository};
+use crate::infrastructure::persistence::SledAccessControlRepository;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::infrastructure::persistence::{SledContentNetworkRepository, SledNodeRegistry};
 #[cfg(not(target_arch = "wasm32"))]
@@ -28,8 +28,6 @@ use crate::infrastructure::reliable_event_publisher::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 use crate::port::peer_network::PeerNetwork;
-#[cfg(not(target_arch = "wasm32"))]
-use crate::port::persistence::PersistentAccessPolicyRepository;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::port::public_key_registry::PublicKeyRegistry;
 #[cfg(not(target_arch = "wasm32"))]
@@ -137,13 +135,6 @@ impl StateNode {
         let access_control_repo =
             SledAccessControlRepository::open(config.data_dir.join("access_control"))
                 .context("Failed to open access control repository")?;
-        let access_policy_db = sled::open(config.data_dir.join("access_policies"))
-            .context("Failed to open access policy database")?;
-        // Create a single shared access policy repository instance
-        // Both StateNodeService and UcanAdapter will use the same instance to avoid sync issues
-        let access_policy_repo: Arc<RwLock<dyn PersistentAccessPolicyRepository>> = Arc::new(
-            RwLock::new(SledAccessPolicyRepository::new(access_policy_db)),
-        );
 
         // Initialize CRDT repository
         let crdt_repo = Arc::new(
@@ -157,7 +148,7 @@ impl StateNode {
         let network = Arc::new(
             Libp2pNetwork::new(
                 config.network_config.clone(),
-                crdt_repo_dyn,
+                crdt_repo_dyn.clone(),
                 config.data_dir.clone(),
             )
             .await
@@ -214,7 +205,7 @@ impl StateNode {
 
         // Create auth services
         let auth_service = MonasAccountAdapter::new();
-        let authz_service = UcanAdapter::new_with_dyn_repo(access_policy_repo.clone());
+        let authz_service = UcanAdapter::new(crdt_repo_dyn.clone());
 
         // Create service with CRDT repository
         let service = Arc::new(
@@ -231,7 +222,6 @@ impl StateNode {
                 },
             )
             .with_access_control_repo(access_control_repo)
-            .with_access_policy_repo(access_policy_repo)
             .with_authentication_service(auth_service)
             .with_authorization_service(authz_service),
         );
@@ -355,6 +345,64 @@ impl StateNode {
                                 .delete_content(&content_id, Some(&token), Some(&request_signature))
                                 .await
                                 .map(|_| ())
+                        }
+                        RelayRequestKind::GrantAccess {
+                            content_id,
+                            grantee_id,
+                            capabilities,
+                            auth_token,
+                            request_signature,
+                        } => {
+                            let token = AuthToken::new(auth_token);
+                            // Parse grantee identity
+                            let grantee = if let Some((type_str, id)) = grantee_id.split_once(':') {
+                                match type_str {
+                                    "user" => {
+                                        crate::domain::identity::Identity::user(id.to_string()).ok()
+                                    }
+                                    "node" => {
+                                        crate::domain::identity::Identity::node(id.to_string()).ok()
+                                    }
+                                    "service" => {
+                                        crate::domain::identity::Identity::service(id.to_string())
+                                            .ok()
+                                    }
+                                    _ => None,
+                                }
+                            } else {
+                                None
+                            };
+                            match grantee {
+                                Some(grantee_identity) => {
+                                    // Parse capabilities
+                                    let caps: Vec<crate::domain::auth_capability::AuthCapability> = capabilities
+                                        .iter()
+                                        .filter_map(|c| match c.as_str() {
+                                            "ReadContent" => Some(crate::domain::auth_capability::AuthCapability::ReadContent),
+                                            "WriteContent" => Some(crate::domain::auth_capability::AuthCapability::WriteContent),
+                                            "DeleteContent" => Some(crate::domain::auth_capability::AuthCapability::DeleteContent),
+                                            "ManageMembers" => Some(crate::domain::auth_capability::AuthCapability::ManageMembers),
+                                            "ShareContent" => Some(crate::domain::auth_capability::AuthCapability::ShareContent),
+                                            "RevokeAccess" => Some(crate::domain::auth_capability::AuthCapability::RevokeAccess),
+                                            "ReadMetadata" => Some(crate::domain::auth_capability::AuthCapability::ReadMetadata),
+                                            _ => None,
+                                        })
+                                        .collect();
+                                    service_for_relay
+                                        .grant_access(
+                                            &content_id,
+                                            grantee_identity,
+                                            caps,
+                                            &token,
+                                            Some(&request_signature),
+                                        )
+                                        .await
+                                        .map(|_| ())
+                                }
+                                None => Err(crate::domain::errors::StateNodeError::Internal(
+                                    format!("Invalid grantee identity: {}", grantee_id),
+                                )),
+                            }
                         }
                     };
                     let _ = req

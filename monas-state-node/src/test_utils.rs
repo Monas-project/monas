@@ -3,6 +3,7 @@
 //! This module provides mock implementations of the main traits
 //! to enable unit testing without real infrastructure dependencies.
 
+use crate::domain::access_policy::AccessPolicy;
 use crate::domain::content_network::ContentNetwork;
 use crate::domain::events::Event;
 use crate::domain::state_node::NodeSnapshot;
@@ -35,6 +36,7 @@ pub struct MockPeerNetwork {
     pub local_peer_id: String,
     pub relay_update_result: Arc<Mutex<Option<bool>>>,
     pub relay_delete_result: Arc<Mutex<Option<bool>>>,
+    pub relay_grant_access_result: Arc<Mutex<Option<bool>>>,
 }
 
 impl MockPeerNetwork {
@@ -49,6 +51,7 @@ impl MockPeerNetwork {
             local_peer_id: "mock-peer-id".to_string(),
             relay_update_result: Arc::new(Mutex::new(Some(true))),
             relay_delete_result: Arc::new(Mutex::new(Some(true))),
+            relay_grant_access_result: Arc::new(Mutex::new(Some(true))),
         }
     }
 
@@ -199,6 +202,18 @@ impl PeerNetwork for MockPeerNetwork {
     ) -> Result<bool> {
         Ok(self.relay_delete_result.lock().await.unwrap_or(true))
     }
+
+    async fn relay_grant_access(
+        &self,
+        _peer_id: &str,
+        _content_id: &str,
+        _grantee_id: &str,
+        _capabilities: &[String],
+        _auth_token: &str,
+        _request_signature: &[u8],
+    ) -> Result<bool> {
+        Ok(self.relay_grant_access_result.lock().await.unwrap_or(true))
+    }
 }
 
 // ============================================================================
@@ -252,6 +267,7 @@ pub struct MockContentRepository {
     pub history: Arc<Mutex<HashMap<String, Vec<String>>>>,
     pub operations: Arc<Mutex<Vec<SerializedOperation>>>,
     pub next_cid: Arc<Mutex<u64>>,
+    pub access_policies: Arc<Mutex<HashMap<String, AccessPolicy>>>,
 }
 
 impl MockContentRepository {
@@ -261,13 +277,19 @@ impl MockContentRepository {
             history: Arc::new(Mutex::new(HashMap::new())),
             operations: Arc::new(Mutex::new(Vec::new())),
             next_cid: Arc::new(Mutex::new(1)),
+            access_policies: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
 
 #[async_trait]
 impl ContentRepository for MockContentRepository {
-    async fn create_content(&self, data: &[u8], _author: &str) -> Result<CommitResult> {
+    async fn create_content(
+        &self,
+        data: &[u8],
+        _author: &str,
+        _access_policy: Option<AccessPolicy>,
+    ) -> Result<CommitResult> {
         let mut next = self.next_cid.lock().await;
         let genesis_cid = format!("genesis-cid-{}", *next);
         let version_cid = format!("version-cid-{}", *next);
@@ -294,6 +316,7 @@ impl ContentRepository for MockContentRepository {
         genesis_cid: &str,
         data: &[u8],
         _author: &str,
+        _access_policy: Option<AccessPolicy>,
     ) -> Result<CommitResult> {
         let mut next = self.next_cid.lock().await;
         let version_cid = format!("version-cid-{}", *next);
@@ -381,6 +404,30 @@ impl ContentRepository for MockContentRepository {
 
     async fn list_contents(&self) -> Result<Vec<String>> {
         Ok(self.contents.lock().await.keys().cloned().collect())
+    }
+
+    async fn get_access_policy(&self, genesis_cid: &str) -> Result<Option<AccessPolicy>> {
+        Ok(self.access_policies.lock().await.get(genesis_cid).cloned())
+    }
+
+    async fn update_access_policy(
+        &self,
+        genesis_cid: &str,
+        access_policy: AccessPolicy,
+        _author: &str,
+    ) -> Result<CommitResult> {
+        self.access_policies
+            .lock()
+            .await
+            .insert(genesis_cid.to_string(), access_policy);
+        let mut next = self.next_cid.lock().await;
+        let version_cid = format!("version-cid-{}", *next);
+        *next += 1;
+        Ok(CommitResult {
+            genesis_cid: genesis_cid.to_string(),
+            version_cid,
+            is_new: false,
+        })
     }
 }
 

@@ -317,7 +317,10 @@ async fn test_crdt_create_and_get_content() {
 
     // Create content directly in CRDT repository
     let data = b"Test CRDT content";
-    let result = crdt_repo.create_content(data, "test-author").await.unwrap();
+    let result = crdt_repo
+        .create_content(data, "test-author", None)
+        .await
+        .unwrap();
 
     assert!(result.is_new);
     assert!(!result.genesis_cid.is_empty());
@@ -334,14 +337,14 @@ async fn test_crdt_update_content() {
     // Create initial content
     let initial_data = b"Initial content";
     let result = crdt_repo
-        .create_content(initial_data, "author1")
+        .create_content(initial_data, "author1", None)
         .await
         .unwrap();
 
     // Update the content
     let updated_data = b"Updated content";
     let update_result = crdt_repo
-        .update_content(&result.genesis_cid, updated_data, "author1")
+        .update_content(&result.genesis_cid, updated_data, "author1", None)
         .await
         .unwrap();
 
@@ -359,7 +362,10 @@ async fn test_crdt_version_history() {
 
     // Create content
     let data1 = b"Version 1";
-    let result = crdt_repo.create_content(data1, "author").await.unwrap();
+    let result = crdt_repo
+        .create_content(data1, "author", None)
+        .await
+        .unwrap();
 
     // Small delay to ensure different timestamps
     tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -367,7 +373,7 @@ async fn test_crdt_version_history() {
     // Update content
     let data2 = b"Version 2";
     crdt_repo
-        .update_content(&result.genesis_cid, data2, "author")
+        .update_content(&result.genesis_cid, data2, "author", None)
         .await
         .unwrap();
 
@@ -382,7 +388,10 @@ async fn test_crdt_get_operations() {
 
     // Create content
     let data = b"Test content";
-    let result = crdt_repo.create_content(data, "author").await.unwrap();
+    let result = crdt_repo
+        .create_content(data, "author", None)
+        .await
+        .unwrap();
 
     // Get operations
     let operations = crdt_repo
@@ -404,7 +413,7 @@ async fn test_crdt_apply_operations() {
 
     // Create content in repo1
     let data = b"Shared content";
-    let result = repo1.create_content(data, "node1").await.unwrap();
+    let result = repo1.create_content(data, "node1", None).await.unwrap();
 
     // Get operations from repo1
     let operations = repo1
@@ -427,14 +436,17 @@ async fn test_crdt_since_version_filtering() {
 
     // Create content with multiple versions
     let data1 = b"Version 1";
-    let result = crdt_repo.create_content(data1, "author").await.unwrap();
+    let result = crdt_repo
+        .create_content(data1, "author", None)
+        .await
+        .unwrap();
     let first_version = result.version_cid.clone();
 
     tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
     let data2 = b"Version 2";
     crdt_repo
-        .update_content(&result.genesis_cid, data2, "author")
+        .update_content(&result.genesis_cid, data2, "author", None)
         .await
         .unwrap();
 
@@ -442,7 +454,7 @@ async fn test_crdt_since_version_filtering() {
 
     let data3 = b"Version 3";
     crdt_repo
-        .update_content(&result.genesis_cid, data3, "author")
+        .update_content(&result.genesis_cid, data3, "author", None)
         .await
         .unwrap();
 

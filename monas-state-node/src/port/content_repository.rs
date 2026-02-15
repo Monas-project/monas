@@ -3,6 +3,7 @@
 //! This module defines the interface for storing and synchronizing content
 //! with version history and multi-node synchronization support.
 
+use crate::domain::access_policy::AccessPolicy;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -47,10 +48,16 @@ pub trait ContentRepository: Send + Sync {
     /// # Arguments
     /// * `data` - The content data to store
     /// * `author` - The author/node ID creating this content
+    /// * `access_policy` - Optional access policy to embed in the content
     ///
     /// # Returns
     /// The commit result containing genesis and version CIDs.
-    async fn create_content(&self, data: &[u8], author: &str) -> Result<CommitResult>;
+    async fn create_content(
+        &self,
+        data: &[u8],
+        author: &str,
+        access_policy: Option<AccessPolicy>,
+    ) -> Result<CommitResult>;
 
     /// Update existing content.
     ///
@@ -58,6 +65,7 @@ pub trait ContentRepository: Send + Sync {
     /// * `genesis_cid` - The genesis CID of the content to update
     /// * `data` - The new content data
     /// * `author` - The author/node ID making this update
+    /// * `access_policy` - Optional access policy. If None, preserves the existing policy.
     ///
     /// # Returns
     /// The commit result containing the new version CID.
@@ -66,6 +74,7 @@ pub trait ContentRepository: Send + Sync {
         genesis_cid: &str,
         data: &[u8],
         author: &str,
+        access_policy: Option<AccessPolicy>,
     ) -> Result<CommitResult>;
 
     /// Get the latest version of content.
@@ -142,4 +151,29 @@ pub trait ContentRepository: Send + Sync {
     /// # Returns
     /// List of all genesis CIDs in the repository.
     async fn list_contents(&self) -> Result<Vec<String>>;
+
+    /// Get the access policy for content.
+    ///
+    /// # Arguments
+    /// * `genesis_cid` - The genesis CID of the content
+    ///
+    /// # Returns
+    /// The access policy if one exists.
+    async fn get_access_policy(&self, genesis_cid: &str) -> Result<Option<AccessPolicy>>;
+
+    /// Update only the access policy for content, preserving data.
+    ///
+    /// # Arguments
+    /// * `genesis_cid` - The genesis CID of the content
+    /// * `access_policy` - The new access policy
+    /// * `author` - The author/node ID making this update
+    ///
+    /// # Returns
+    /// The commit result containing the new version CID.
+    async fn update_access_policy(
+        &self,
+        genesis_cid: &str,
+        access_policy: AccessPolicy,
+        author: &str,
+    ) -> Result<CommitResult>;
 }

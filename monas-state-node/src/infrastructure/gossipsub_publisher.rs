@@ -253,6 +253,18 @@ mod tests {
         ) -> Result<bool> {
             Ok(true)
         }
+
+        async fn relay_grant_access(
+            &self,
+            _peer_id: &str,
+            _content_id: &str,
+            _grantee_id: &str,
+            _capabilities: &[String],
+            _auth_token: &str,
+            _request_signature: &[u8],
+        ) -> Result<bool> {
+            Ok(true)
+        }
     }
 
     #[tokio::test]

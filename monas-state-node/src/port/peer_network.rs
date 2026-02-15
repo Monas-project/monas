@@ -114,4 +114,18 @@ pub trait PeerNetwork: Send + Sync {
         auth_token: &str,
         request_signature: &[u8],
     ) -> Result<bool>;
+
+    /// Relay a grant_access request to a member node.
+    ///
+    /// Used when the creator node (non-member) receives a grant_access request
+    /// and needs to forward it to a member node for processing.
+    async fn relay_grant_access(
+        &self,
+        peer_id: &str,
+        content_id: &str,
+        grantee_id: &str,
+        capabilities: &[String],
+        auth_token: &str,
+        request_signature: &[u8],
+    ) -> Result<bool>;
 }
