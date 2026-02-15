@@ -11,7 +11,7 @@ use crate::port::auth_token::AuthToken;
 use crate::port::authorization_service::{
     AuthorizationRequest, AuthorizationResult, AuthorizationService,
 };
-use crate::port::persistence::PersistentAccessPolicyRepository;
+use crate::port::content_repository::ContentRepository;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -32,37 +32,18 @@ use tokio::sync::RwLock;
 ///          ↕
 /// UCAN (capability delegation)
 /// ```
-pub struct UcanAdapter<R: ?Sized = dyn PersistentAccessPolicyRepository>
-where
-    R: PersistentAccessPolicyRepository,
-{
-    policy_repo: Arc<RwLock<R>>,
+pub struct UcanAdapter {
+    content_repo: Arc<dyn ContentRepository>,
     /// Public key registry for key ID resolution (Phase 1 mock implementation)
     /// Maps key ID -> Public Key (65 bytes, uncompressed P256 format)
     public_keys: Arc<RwLock<HashMap<String, Vec<u8>>>>,
 }
 
-impl UcanAdapter<dyn PersistentAccessPolicyRepository> {
-    /// Create a new UcanAdapter with a dynamic repository (trait object)
-    ///
-    /// This is useful when you need to share the repository with other components.
-    pub fn new_with_dyn_repo(
-        policy_repo: Arc<RwLock<dyn PersistentAccessPolicyRepository>>,
-    ) -> Self {
+impl UcanAdapter {
+    /// Create a new UcanAdapter with a ContentRepository
+    pub fn new(content_repo: Arc<dyn ContentRepository>) -> Self {
         Self {
-            policy_repo,
-            public_keys: Arc::new(RwLock::new(HashMap::new())),
-        }
-    }
-}
-
-impl<R> UcanAdapter<R>
-where
-    R: PersistentAccessPolicyRepository + ?Sized,
-{
-    pub fn new(policy_repo: Arc<RwLock<R>>) -> Self {
-        Self {
-            policy_repo,
+            content_repo,
             public_keys: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -119,21 +100,6 @@ where
     }
 
     /// Parse UCAN token from JWT string.
-    ///
-    /// # Implementation Status
-    ///
-    /// Currently performs basic JWT format validation.
-    ///
-    /// # TODO: Full UCAN Parsing
-    ///
-    /// When monas-ucan crate becomes available:
-    /// 1. Parse JWT header, payload, and signature
-    /// 2. Extract UCAN fields: iss (issuer), aud (audience), att (attenuations), exp, nbf, etc.
-    /// 3. Validate UCAN structure according to spec: https://ucan.xyz/
-    /// 4. Extract proof chain (prf field)
-    /// 5. Extract capabilities (att field)
-    ///
-    /// Alternative: Use external `ucan` crate (0.7.0-alpha.1) for parsing.
     fn parse_ucan(&self, token: &str) -> Result<UcanToken> {
         if token.is_empty() {
             return Err(anyhow::anyhow!("Empty UCAN token"));
@@ -155,61 +121,16 @@ where
             }
         }
 
-        // TODO: Decode and validate JWT structure using ucan crate
-        // For now, store raw token for future processing
         Ok(UcanToken {
             raw: token.to_string(),
         })
     }
 
     /// Verify UCAN token signature and proof chain.
-    ///
-    /// # Implementation Status
-    ///
-    /// Currently performs minimal validation (non-empty check).
-    /// **WARNING**: This is NOT secure for production use.
-    ///
-    /// # TODO: Full UCAN Verification
-    ///
-    /// When monas-ucan crate becomes available, implement:
-    ///
-    /// 1. **Signature Verification**
-    ///    - Extract public key from issuer
-    ///    - Verify signature matches header + payload
-    ///    - Use appropriate signature algorithm (EdDSA, ECDSA, RSA)
-    ///
-    /// 2. **Expiration Check**
-    ///    - Verify exp (expiration time) > current time
-    ///    - Verify nbf (not-before time) <= current time
-    ///
-    /// 3. **Proof Chain Validation**
-    ///    - Recursively validate all UCANs in prf (proofs) field
-    ///    - Ensure delegation chain is valid
-    ///    - Verify each UCAN's audience matches next UCAN's issuer
-    ///
-    /// 4. **Issuer/Audience Validation**
-    ///    - Verify issuer (iss) is valid
-    ///    - Verify audience (aud) matches expected recipient
-    ///
-    /// 5. **Revocation Check**
-    ///    - Check against revocation list if available
-    ///
-    /// Reference: https://ucan.xyz/#verification
     fn verify_ucan(&self, ucan: &UcanToken) -> Result<()> {
         if ucan.raw.is_empty() {
             return Err(anyhow::anyhow!("Invalid UCAN: empty token"));
         }
-
-        // TODO: Implement full verification using ucan crate or monas-ucan
-        //
-        // Example with ucan crate (0.7.0-alpha.1):
-        // ```
-        // use ucan::Ucan;
-        // let parsed_ucan = Ucan::try_from_token_string(&ucan.raw)?;
-        // parsed_ucan.validate()?;
-        // ```
-        //
-        // For now, return Ok to allow testing, but log warning
 
         tracing::warn!(
             "UCAN verification is not fully implemented - allowing all UCANs (INSECURE)"
@@ -219,39 +140,6 @@ where
     }
 
     /// Check if UCAN grants a specific capability for a resource.
-    ///
-    /// # Implementation Status
-    ///
-    /// Currently uses simplified string matching.
-    /// **WARNING**: This is NOT secure for production use.
-    ///
-    /// # TODO: Full Capability Checking
-    ///
-    /// When monas-ucan crate becomes available, implement:
-    ///
-    /// 1. **Parse Capabilities from UCAN**
-    ///    - Extract att (attenuations) field from UCAN payload
-    ///    - Parse capability objects: { "with": "resource-uri", "can": "action" }
-    ///
-    /// 2. **Resource URI Matching**
-    ///    - Support exact matching: "content://abc123"
-    ///    - Support wildcard matching: "content://*", "content://abc*"
-    ///    - Support hierarchical matching: "content://parent/*"
-    ///
-    /// 3. **Capability Hierarchies**
-    ///    - ADMIN > DELETE > WRITE > READ
-    ///    - If UCAN grants WRITE, it also grants READ
-    ///    - If UCAN grants *, it grants all capabilities
-    ///
-    /// 4. **Attenuation Handling**
-    ///    - Verify delegated capabilities are subset of parent UCAN
-    ///    - Ensure no privilege escalation in delegation chain
-    ///
-    /// 5. **Proof Chain Capability Aggregation**
-    ///    - Collect capabilities from all UCANs in proof chain
-    ///    - Validate each delegation step
-    ///
-    /// Reference: https://ucan.xyz/#capabilities
     fn check_ucan_capability(
         &self,
         ucan: &UcanToken,
@@ -259,22 +147,6 @@ where
         capability: &AuthCapability,
     ) -> Result<bool> {
         let ucan_cap = Self::map_capability_to_ucan(capability);
-
-        // TODO: Implement proper capability checking using ucan crate
-        //
-        // Example with ucan crate (0.7.0-alpha.1):
-        // ```
-        // use ucan::Ucan;
-        // let parsed_ucan = Ucan::try_from_token_string(&ucan.raw)?;
-        // let capabilities = parsed_ucan.attenuations();
-        // for cap in capabilities {
-        //     if cap.resource() == resource && cap.can_do(ucan_cap) {
-        //         return Ok(true);
-        //     }
-        // }
-        // ```
-        //
-        // For now, use simple string matching (INSECURE)
 
         let expected = format!("{}:{}", resource, ucan_cap);
         let has_capability = ucan.raw.contains(&expected);
@@ -309,32 +181,11 @@ where
     }
 
     /// Parse AuthToken from JWT string
-    ///
-    /// # Arguments
-    /// * `token_str` - JWT string in format "header.payload.signature"
-    ///
-    /// # Returns
-    /// Parsed AuthToken or error if parsing fails
     fn parse_auth_token(&self, token_str: &str) -> Result<InfraAuthToken> {
         InfraAuthToken::from_jwt(token_str).context("Failed to parse AuthToken")
     }
 
     /// Get public key for a key ID
-    ///
-    /// # Implementation Status
-    ///
-    /// Currently uses mock implementation with in-memory registry.
-    /// **WARNING**: This is NOT secure for production use.
-    ///
-    /// # TODO: Full Public Key Resolution
-    ///
-    /// When account registry becomes available:
-    /// 1. Query account registry for public key
-    /// 2. Support multiple key types (P256, Ed25519, etc.)
-    /// 3. Handle key rotation and revocation
-    /// 4. Cache public keys for performance
-    ///
-    /// For now, uses in-memory registry (Phase 1 mock implementation)
     async fn get_public_key(&self, key_id: &str) -> Result<Option<Vec<u8>>> {
         // Phase 1: Use in-memory public key registry
         let public_keys = self.public_keys.read().await;
@@ -347,31 +198,6 @@ where
     }
 
     /// Verify AuthToken with dual signature verification
-    ///
-    /// # Arguments
-    /// * `token` - The AuthToken to verify
-    /// * `request` - The authorization request containing request signature
-    ///
-    /// # Returns
-    /// Ok(()) if all verifications pass, Err otherwise
-    ///
-    /// # Verification Steps
-    ///
-    /// 1. **AuthToken Signature Verification**
-    ///    - Get owner's public key from issuer key ID (iss)
-    ///    - Verify AuthToken signature using owner's public key
-    ///
-    /// 2. **Request Signature Verification**
-    ///    - Verify request signature is provided
-    ///    - Get requester's public key from audience key ID (aud)
-    ///    - Construct request message: "{iss}:{aud}:{jti}"
-    ///    - Verify request signature using requester's public key
-    ///
-    /// 3. **Expiration Check**
-    ///    - Verify token has not expired
-    ///
-    /// 4. **Audience Validation**
-    ///    - Verify audience (aud) matches requester identity
     async fn verify_auth_token(
         &self,
         token: &InfraAuthToken,
@@ -441,14 +267,6 @@ where
     }
 
     /// Check if AuthToken grants a specific capability for a resource
-    ///
-    /// # Arguments
-    /// * `token` - The AuthToken to check
-    /// * `resource` - The resource URI (e.g., "monas://content/abc123")
-    /// * `capability` - The required capability
-    ///
-    /// # Returns
-    /// true if token grants the capability, false otherwise
     fn check_auth_token_capability(
         &self,
         token: &InfraAuthToken,
@@ -485,17 +303,12 @@ where
 }
 
 #[async_trait]
-impl<R> AuthorizationService for UcanAdapter<R>
-where
-    R: PersistentAccessPolicyRepository + ?Sized,
-{
+impl AuthorizationService for UcanAdapter {
     async fn authorize(&self, request: &AuthorizationRequest) -> Result<AuthorizationResult> {
-        // 1. Get access policy from repository
+        // 1. Get access policy from CRDT repository
         let policy = self
-            .policy_repo
-            .read()
-            .await
-            .get_policy(request.resource.as_str())
+            .content_repo
+            .get_access_policy(request.resource.as_str())
             .await
             .context("Failed to get access policy")?;
 
@@ -582,14 +395,15 @@ mod tests {
     use crate::domain::access_policy::AccessPolicy;
     use crate::domain::identity::Identity;
     use crate::domain::value_objects::ContentId;
+    use crate::port::content_repository::{CommitResult, SerializedOperation};
     use std::collections::HashMap;
 
-    // Mock repository for testing
-    struct MockAccessPolicyRepository {
+    // Mock content repository for testing
+    struct MockContentRepo {
         policies: Arc<RwLock<HashMap<String, AccessPolicy>>>,
     }
 
-    impl MockAccessPolicyRepository {
+    impl MockContentRepo {
         fn new() -> Self {
             Self {
                 policies: Arc::new(RwLock::new(HashMap::new())),
@@ -598,36 +412,79 @@ mod tests {
     }
 
     #[async_trait]
-    impl PersistentAccessPolicyRepository for MockAccessPolicyRepository {
-        async fn get_policy(&self, content_id: &str) -> Result<Option<AccessPolicy>> {
-            Ok(self.policies.read().await.get(content_id).cloned())
+    impl ContentRepository for MockContentRepo {
+        async fn create_content(
+            &self,
+            _data: &[u8],
+            _author: &str,
+            _access_policy: Option<AccessPolicy>,
+        ) -> Result<CommitResult> {
+            unimplemented!()
         }
-
-        async fn save_policy(&self, policy: &AccessPolicy) -> Result<()> {
+        async fn update_content(
+            &self,
+            _genesis_cid: &str,
+            _data: &[u8],
+            _author: &str,
+            _access_policy: Option<AccessPolicy>,
+        ) -> Result<CommitResult> {
+            unimplemented!()
+        }
+        async fn get_latest(&self, _genesis_cid: &str) -> Result<Option<Vec<u8>>> {
+            unimplemented!()
+        }
+        async fn get_latest_with_version(
+            &self,
+            _genesis_cid: &str,
+        ) -> Result<Option<(Vec<u8>, String)>> {
+            unimplemented!()
+        }
+        async fn get_version(&self, _version_cid: &str) -> Result<Option<Vec<u8>>> {
+            unimplemented!()
+        }
+        async fn get_history(&self, _genesis_cid: &str) -> Result<Vec<String>> {
+            unimplemented!()
+        }
+        async fn get_operations(
+            &self,
+            _genesis_cid: &str,
+            _since_version: Option<&str>,
+        ) -> Result<Vec<SerializedOperation>> {
+            unimplemented!()
+        }
+        async fn apply_operations(&self, _operations: &[SerializedOperation]) -> Result<usize> {
+            unimplemented!()
+        }
+        async fn exists(&self, _genesis_cid: &str) -> Result<bool> {
+            unimplemented!()
+        }
+        async fn list_contents(&self) -> Result<Vec<String>> {
+            unimplemented!()
+        }
+        async fn get_access_policy(&self, genesis_cid: &str) -> Result<Option<AccessPolicy>> {
+            Ok(self.policies.read().await.get(genesis_cid).cloned())
+        }
+        async fn update_access_policy(
+            &self,
+            genesis_cid: &str,
+            access_policy: AccessPolicy,
+            _author: &str,
+        ) -> Result<CommitResult> {
             self.policies
                 .write()
                 .await
-                .insert(policy.content_id().as_str().to_string(), policy.clone());
-            Ok(())
-        }
-
-        async fn delete_policy(&self, content_id: &str) -> Result<()> {
-            self.policies.write().await.remove(content_id);
-            Ok(())
-        }
-
-        async fn list_policies(&self) -> Result<Vec<String>> {
-            Ok(self.policies.read().await.keys().cloned().collect())
-        }
-
-        async fn flush(&self) -> Result<()> {
-            Ok(())
+                .insert(genesis_cid.to_string(), access_policy);
+            Ok(CommitResult {
+                genesis_cid: genesis_cid.to_string(),
+                version_cid: "mock-version".to_string(),
+                is_new: false,
+            })
         }
     }
 
     #[tokio::test]
     async fn test_authorize_owner() {
-        let repo = Arc::new(RwLock::new(MockAccessPolicyRepository::new()));
+        let repo = Arc::new(MockContentRepo::new());
         let adapter = UcanAdapter::new(repo.clone());
 
         let content_id = ContentId::new("content-1".to_string()).unwrap();
@@ -635,7 +492,10 @@ mod tests {
 
         // Create policy with owner
         let policy = AccessPolicy::new(content_id.clone(), owner.clone());
-        repo.read().await.save_policy(&policy).await.unwrap();
+        repo.policies
+            .write()
+            .await
+            .insert("content-1".to_string(), policy);
 
         let request = AuthorizationRequest {
             identity: owner,
@@ -652,7 +512,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_authorize_non_owner_no_grant() {
-        let repo = Arc::new(RwLock::new(MockAccessPolicyRepository::new()));
+        let repo = Arc::new(MockContentRepo::new());
         let adapter = UcanAdapter::new(repo.clone());
 
         let content_id = ContentId::new("content-1".to_string()).unwrap();
@@ -661,7 +521,10 @@ mod tests {
 
         // Create policy with owner (bob has no grants)
         let policy = AccessPolicy::new(content_id.clone(), owner);
-        repo.read().await.save_policy(&policy).await.unwrap();
+        repo.policies
+            .write()
+            .await
+            .insert("content-1".to_string(), policy);
 
         let request = AuthorizationRequest {
             identity: other,
@@ -678,7 +541,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_authorize_with_grant() {
-        let repo = Arc::new(RwLock::new(MockAccessPolicyRepository::new()));
+        let repo = Arc::new(MockContentRepo::new());
         let adapter = UcanAdapter::new(repo.clone());
 
         let content_id = ContentId::new("content-1".to_string()).unwrap();
@@ -690,7 +553,10 @@ mod tests {
         policy
             .grant(bob.clone(), vec![AuthCapability::ReadContent])
             .unwrap();
-        repo.read().await.save_policy(&policy).await.unwrap();
+        repo.policies
+            .write()
+            .await
+            .insert("content-1".to_string(), policy);
 
         let request = AuthorizationRequest {
             identity: bob,
@@ -707,7 +573,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_authorize_no_policy() {
-        let repo = Arc::new(RwLock::new(MockAccessPolicyRepository::new()));
+        let repo = Arc::new(MockContentRepo::new());
         let adapter = UcanAdapter::new(repo);
 
         let content_id = ContentId::new("content-1".to_string()).unwrap();
@@ -732,14 +598,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_authorize_batch() {
-        let repo = Arc::new(RwLock::new(MockAccessPolicyRepository::new()));
+        let repo = Arc::new(MockContentRepo::new());
         let adapter = UcanAdapter::new(repo.clone());
 
         let content_id = ContentId::new("content-1".to_string()).unwrap();
         let owner = Identity::user("alice".to_string()).unwrap();
 
         let policy = AccessPolicy::new(content_id.clone(), owner.clone());
-        repo.read().await.save_policy(&policy).await.unwrap();
+        repo.policies
+            .write()
+            .await
+            .insert("content-1".to_string(), policy);
 
         let requests = vec![
             AuthorizationRequest {
@@ -767,21 +636,15 @@ mod tests {
     #[tokio::test]
     async fn test_map_capability_to_ucan() {
         assert_eq!(
-            UcanAdapter::<MockAccessPolicyRepository>::map_capability_to_ucan(
-                &AuthCapability::ReadContent
-            ),
+            UcanAdapter::map_capability_to_ucan(&AuthCapability::ReadContent),
             "content/read"
         );
         assert_eq!(
-            UcanAdapter::<MockAccessPolicyRepository>::map_capability_to_ucan(
-                &AuthCapability::WriteContent
-            ),
+            UcanAdapter::map_capability_to_ucan(&AuthCapability::WriteContent),
             "content/write"
         );
         assert_eq!(
-            UcanAdapter::<MockAccessPolicyRepository>::map_capability_to_ucan(
-                &AuthCapability::DeleteContent
-            ),
+            UcanAdapter::map_capability_to_ucan(&AuthCapability::DeleteContent),
             "content/delete"
         );
     }
@@ -796,7 +659,7 @@ mod tests {
         let bob = TestKeyPair::generate("user", "bob");
 
         // 2. Setup: Create repository and adapter
-        let repo = Arc::new(RwLock::new(MockAccessPolicyRepository::new()));
+        let repo = Arc::new(MockContentRepo::new());
         let adapter = UcanAdapter::new(repo.clone());
 
         // 3. Register public keys
@@ -811,7 +674,10 @@ mod tests {
         let content_id = ContentId::new("test-content-123".to_string()).unwrap();
         let alice_identity = Identity::user("alice".to_string()).unwrap();
         let policy = AccessPolicy::new(content_id.clone(), alice_identity.clone());
-        repo.read().await.save_policy(&policy).await.unwrap();
+        repo.policies
+            .write()
+            .await
+            .insert("test-content-123".to_string(), policy);
 
         // 5. Alice creates a AuthToken for Bob with Read capability
         let auth_token = alice.create_auth_token(
@@ -852,7 +718,7 @@ mod tests {
         // Setup
         let alice = TestKeyPair::generate("user", "alice");
         let bob = TestKeyPair::generate("user", "bob");
-        let repo = Arc::new(RwLock::new(MockAccessPolicyRepository::new()));
+        let repo = Arc::new(MockContentRepo::new());
         let adapter = UcanAdapter::new(repo.clone());
 
         adapter
@@ -865,7 +731,10 @@ mod tests {
         let content_id = ContentId::new("test-content-456".to_string()).unwrap();
         let alice_identity = Identity::user("alice".to_string()).unwrap();
         let policy = AccessPolicy::new(content_id.clone(), alice_identity.clone());
-        repo.read().await.save_policy(&policy).await.unwrap();
+        repo.policies
+            .write()
+            .await
+            .insert("test-content-456".to_string(), policy);
 
         // Alice grants Bob only Read capability
         let auth_token = alice.create_auth_token(
@@ -904,7 +773,7 @@ mod tests {
         // Setup
         let alice = TestKeyPair::generate("user", "alice");
         let bob = TestKeyPair::generate("user", "bob");
-        let repo = Arc::new(RwLock::new(MockAccessPolicyRepository::new()));
+        let repo = Arc::new(MockContentRepo::new());
         let adapter = UcanAdapter::new(repo.clone());
 
         adapter
@@ -917,7 +786,10 @@ mod tests {
         let content_id = ContentId::new("test-content-789".to_string()).unwrap();
         let alice_identity = Identity::user("alice".to_string()).unwrap();
         let policy = AccessPolicy::new(content_id.clone(), alice_identity.clone());
-        repo.read().await.save_policy(&policy).await.unwrap();
+        repo.policies
+            .write()
+            .await
+            .insert("test-content-789".to_string(), policy);
 
         // Create an already-expired token (0 seconds = already expired)
         let auth_token = alice.create_auth_token(

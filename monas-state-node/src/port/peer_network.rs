@@ -87,4 +87,45 @@ pub trait PeerNetwork: Send + Sync {
     ///
     /// Uses Kademlia's get_providers to find content providers.
     async fn find_content_providers(&self, genesis_cid: &str) -> Result<Vec<String>>;
+
+    // ========== Relay Methods ==========
+
+    /// Relay an update request to a member node.
+    ///
+    /// Used when the creator node (non-member) receives an update request
+    /// and needs to forward it to a member node for processing.
+    async fn relay_update_content(
+        &self,
+        peer_id: &str,
+        content_id: &str,
+        data: &[u8],
+        auth_token: &str,
+        request_signature: &[u8],
+    ) -> Result<bool>;
+
+    /// Relay a delete request to a member node.
+    ///
+    /// Used when the creator node (non-member) receives a delete request
+    /// and needs to forward it to a member node for processing.
+    async fn relay_delete_content(
+        &self,
+        peer_id: &str,
+        content_id: &str,
+        auth_token: &str,
+        request_signature: &[u8],
+    ) -> Result<bool>;
+
+    /// Relay a grant_access request to a member node.
+    ///
+    /// Used when the creator node (non-member) receives a grant_access request
+    /// and needs to forward it to a member node for processing.
+    async fn relay_grant_access(
+        &self,
+        peer_id: &str,
+        content_id: &str,
+        grantee_id: &str,
+        capabilities: &[String],
+        auth_token: &str,
+        request_signature: &[u8],
+    ) -> Result<bool>;
 }

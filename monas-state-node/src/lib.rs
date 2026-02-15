@@ -21,8 +21,7 @@ pub use domain::{
 pub use port::{
     auth_token::AuthToken as PortAuthToken, AuthenticationService, AuthorizationRequest,
     AuthorizationResult, AuthorizationService, CommitResult, ContentRepository, EventPublisher,
-    PeerNetwork, PersistentAccessPolicyRepository, PersistentContentRepository,
-    PersistentNodeRegistry, SerializedOperation,
+    PeerNetwork, PersistentContentRepository, PersistentNodeRegistry, SerializedOperation,
 };
 
 #[cfg(not(target_arch = "wasm32"))]

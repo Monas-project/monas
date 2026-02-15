@@ -1,7 +1,9 @@
 //! HTTP API for the state node.
 
 use crate::application_service::state_node_service::StateNodeService;
+use crate::domain::auth_capability::AuthCapability;
 use crate::domain::errors::StateNodeError;
+use crate::domain::identity::Identity;
 use crate::infrastructure::crdt_repository::CrslCrdtRepository;
 use crate::infrastructure::gossipsub_publisher::GossipsubEventPublisher;
 use crate::infrastructure::network::Libp2pNetwork;
@@ -48,6 +50,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/content/:id/data", get(get_content_data))
         .route("/content/:id/history", get(get_content_history))
         .route("/content/:id/version/:version", get(get_content_version))
+        .route("/content/:id/access/grant", post(grant_access_handler))
         .with_state(state)
 }
 
@@ -134,6 +137,19 @@ impl IntoResponse for StateNodeError {
         };
         (status, Json(error_response)).into_response()
     }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GrantAccessRequest {
+    pub grantee_id: String,
+    pub capabilities: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GrantAccessResponse {
+    pub content_id: String,
+    pub grantee_id: String,
+    pub granted_capabilities: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -280,7 +296,11 @@ async fn create_content(
     {
         Ok(event) => {
             if let crate::domain::events::Event::ContentCreated { content_id, .. } = event {
-                Json(CreateContentResponse { content_id }).into_response()
+                (
+                    StatusCode::CREATED,
+                    Json(CreateContentResponse { content_id }),
+                )
+                    .into_response()
             } else {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -521,6 +541,130 @@ async fn get_content_version(
             }),
         )
             .into_response(),
+    }
+}
+
+/// Parse a capability string into an AuthCapability enum variant.
+fn parse_capability(s: &str) -> Option<AuthCapability> {
+    match s {
+        "ReadContent" => Some(AuthCapability::ReadContent),
+        "WriteContent" => Some(AuthCapability::WriteContent),
+        "DeleteContent" => Some(AuthCapability::DeleteContent),
+        "ManageMembers" => Some(AuthCapability::ManageMembers),
+        "ShareContent" => Some(AuthCapability::ShareContent),
+        "RevokeAccess" => Some(AuthCapability::RevokeAccess),
+        "ReadMetadata" => Some(AuthCapability::ReadMetadata),
+        _ => None,
+    }
+}
+
+/// Grant access to a content for a specific identity.
+async fn grant_access_handler(
+    State(state): State<AppState>,
+    Path(content_id): Path<String>,
+    headers: HeaderMap,
+    Json(req): Json<GrantAccessRequest>,
+) -> impl IntoResponse {
+    // Extract authentication token
+    let token = match extract_auth_token(&headers) {
+        Some(t) => t,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorResponse {
+                    error: "Authentication token is required".to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    // Parse grantee identity from "type:id" format
+    let grantee_identity = if let Some((type_str, id)) = req.grantee_id.split_once(':') {
+        match type_str {
+            "user" => Identity::user(id.to_string()),
+            "node" => Identity::node(id.to_string()),
+            "service" => Identity::service(id.to_string()),
+            _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: format!("Invalid grantee_id format: unknown type '{}'", type_str),
+                    }),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "grantee_id must be in 'type:id' format (e.g., 'user:account2')".to_string(),
+            }),
+        )
+            .into_response();
+    };
+
+    let grantee_identity = match grantee_identity {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!("Invalid grantee identity: {}", e),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    // Parse capabilities
+    let mut capabilities = Vec::new();
+    for cap_str in &req.capabilities {
+        match parse_capability(cap_str) {
+            Some(cap) => capabilities.push(cap),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: format!("Unknown capability: '{}'", cap_str),
+                    }),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    if capabilities.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "At least one capability is required".to_string(),
+            }),
+        )
+            .into_response();
+    }
+
+    let granted_capabilities: Vec<String> = req.capabilities.clone();
+    let request_signature = extract_request_signature(&headers);
+
+    match state
+        .grant_access(
+            &content_id,
+            grantee_identity,
+            capabilities,
+            &token,
+            request_signature.as_deref(),
+        )
+        .await
+    {
+        Ok(()) => Json(GrantAccessResponse {
+            content_id,
+            grantee_id: req.grantee_id,
+            granted_capabilities,
+        })
+        .into_response(),
+        Err(e) => e.into_response(),
     }
 }
 

@@ -232,6 +232,39 @@ mod tests {
         async fn find_content_providers(&self, _genesis_cid: &str) -> Result<Vec<String>> {
             Ok(vec![])
         }
+
+        async fn relay_update_content(
+            &self,
+            _peer_id: &str,
+            _content_id: &str,
+            _data: &[u8],
+            _auth_token: &str,
+            _request_signature: &[u8],
+        ) -> Result<bool> {
+            Ok(true)
+        }
+
+        async fn relay_delete_content(
+            &self,
+            _peer_id: &str,
+            _content_id: &str,
+            _auth_token: &str,
+            _request_signature: &[u8],
+        ) -> Result<bool> {
+            Ok(true)
+        }
+
+        async fn relay_grant_access(
+            &self,
+            _peer_id: &str,
+            _content_id: &str,
+            _grantee_id: &str,
+            _capabilities: &[String],
+            _auth_token: &str,
+            _request_signature: &[u8],
+        ) -> Result<bool> {
+            Ok(true)
+        }
     }
 
     #[tokio::test]

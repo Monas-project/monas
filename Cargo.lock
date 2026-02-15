@@ -559,6 +559,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "base64-url"
+version = "2.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb9fb9fb058cc3063b5fc88d9a21eefa2735871498a04e1650da76ed511c8569"
+dependencies = [
+ "base64 0.21.7",
+]
+
+[[package]]
 name = "base64ct"
 version = "1.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3188,6 +3197,7 @@ dependencies = [
  "async-trait",
  "axum 0.7.9",
  "base64 0.21.7",
+ "base64-url",
  "bs58 0.5.1",
  "cid 0.11.1",
  "clap",
@@ -3197,6 +3207,7 @@ dependencies = [
  "hex",
  "libp2p",
  "libp2p-webrtc",
+ "monas-account",
  "monas-event-manager",
  "multihash 0.19.3",
  "multihash-codetable",

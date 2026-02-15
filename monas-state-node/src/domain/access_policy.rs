@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Grant entry for an identity
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct Grant {
     identity: Identity,
     capabilities: Vec<AuthCapability>,
@@ -21,7 +21,7 @@ struct Grant {
 ///
 /// This represents the access control rules for a specific piece of content.
 /// It is independent of the underlying authorization mechanism.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AccessPolicy {
     content_id: ContentId,
     owner: Identity,
