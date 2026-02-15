@@ -9,10 +9,7 @@ use std::sync::Arc;
 use axum::{routing::get, Router};
 
 use crate::{
-    application_service::{
-        content_service::ContentService,
-        share_service::ShareService,
-    },
+    application_service::{content_service::ContentService, share_service::ShareService},
     infrastructure::{
         content_id::Sha256ContentIdGenerator,
         encryption::{Aes256CtrContentEncryption, OsRngContentEncryptionKeyGenerator},
