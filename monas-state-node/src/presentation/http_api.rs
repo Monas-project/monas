@@ -145,11 +145,39 @@ pub struct ErrorResponse {
 }
 
 /// Implement IntoResponse for StateNodeError to automatically map to HTTP responses.
+///
+/// Internal error details are sanitized to prevent information leakage.
+/// Only client-facing error categories are returned; detailed messages are logged server-side.
 impl IntoResponse for StateNodeError {
     fn into_response(self) -> Response {
         let status = self.to_http_status();
+        let error_message = match &self {
+            // Client errors: safe to expose the message
+            StateNodeError::ContentNotFound(_) => self.to_string(),
+            StateNodeError::ContentAlreadyExists(_) => self.to_string(),
+            StateNodeError::NodeNotFound(_) => self.to_string(),
+            StateNodeError::InsufficientCapacity { .. } => self.to_string(),
+            StateNodeError::NoAvailableMembers => self.to_string(),
+            StateNodeError::NotAMember { .. } => self.to_string(),
+            StateNodeError::PermissionDenied(_) => "Permission denied".to_string(),
+            StateNodeError::InvalidUcanToken(_) => "Invalid authentication token".to_string(),
+            StateNodeError::AuthenticationFailed(_) => "Authentication failed".to_string(),
+            StateNodeError::AuthorizationFailed(_) => "Authorization failed".to_string(),
+            StateNodeError::InvalidCid(_) => "Invalid content identifier".to_string(),
+            StateNodeError::InvalidConfiguration(_) => "Invalid request".to_string(),
+            StateNodeError::ValueError(_) => "Invalid input value".to_string(),
+            // Server errors: log details but return generic message
+            StateNodeError::NetworkError(_)
+            | StateNodeError::PeerNotReachable(_)
+            | StateNodeError::CrdtError(_)
+            | StateNodeError::StorageError(_)
+            | StateNodeError::Internal(_) => {
+                tracing::error!("Internal error: {}", self);
+                "Internal server error".to_string()
+            }
+        };
         let error_response = ErrorResponse {
-            error: self.to_string(),
+            error: error_message,
         };
         (status, Json(error_response)).into_response()
     }

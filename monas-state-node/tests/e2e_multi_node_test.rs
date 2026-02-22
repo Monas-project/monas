@@ -15,15 +15,18 @@ use tempfile::TempDir;
 /// Must match GossipsubEventPublisher::DEFAULT_EVENT_TOPIC
 const EVENTS_TOPIC: &str = "monas-events";
 
-/// Create a test node with a unique data directory and port.
-async fn create_test_node(port: u16) -> (StateNode, TempDir) {
+/// Create a test node with a unique data directory and OS-assigned ports.
+///
+/// Uses port 0 for both TCP and HTTP to let the OS assign free ports,
+/// avoiding port conflicts when tests run in parallel.
+async fn create_test_node() -> (StateNode, TempDir) {
     let temp_dir = TempDir::new().unwrap();
 
     let config = StateNodeConfig {
         data_dir: temp_dir.path().to_path_buf(),
-        http_addr: format!("127.0.0.1:{}", port + 1000).parse().unwrap(),
+        http_addr: "127.0.0.1:0".parse().unwrap(),
         network_config: Libp2pNetworkConfig {
-            listen_addrs: vec![format!("/ip4/127.0.0.1/tcp/{}", port).parse().unwrap()],
+            listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
             bootstrap_nodes: vec![],
             enable_mdns: false, // Disable mDNS to avoid interference between tests
             gossipsub_topics: vec![EVENTS_TOPIC.to_string()],
@@ -48,8 +51,8 @@ async fn wait_for_gossipsub_mesh() {
 #[tokio::test]
 async fn test_two_nodes_can_connect() {
     // Create two nodes
-    let (node1, _temp1) = create_test_node(19001).await;
-    let (node2, _temp2) = create_test_node(19002).await;
+    let (node1, _temp1) = create_test_node().await;
+    let (node2, _temp2) = create_test_node().await;
 
     // Wait for node1 to get its listen address
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -80,9 +83,9 @@ async fn test_two_nodes_can_connect() {
 #[tokio::test]
 async fn test_three_nodes_mesh_connection() {
     // Create three nodes
-    let (node1, _temp1) = create_test_node(19011).await;
-    let (node2, _temp2) = create_test_node(19012).await;
-    let (node3, _temp3) = create_test_node(19013).await;
+    let (node1, _temp1) = create_test_node().await;
+    let (node2, _temp2) = create_test_node().await;
+    let (node3, _temp3) = create_test_node().await;
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -106,8 +109,8 @@ async fn test_three_nodes_mesh_connection() {
 #[tokio::test]
 async fn test_node_registration_propagates() {
     // Create two nodes
-    let (node1, _temp1) = create_test_node(19021).await;
-    let (node2, _temp2) = create_test_node(19022).await;
+    let (node1, _temp1) = create_test_node().await;
+    let (node2, _temp2) = create_test_node().await;
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -152,8 +155,8 @@ async fn test_node_registration_propagates() {
 #[tokio::test]
 async fn test_content_network_sync_via_event() {
     // Create two nodes
-    let (node1, _temp1) = create_test_node(19031).await;
-    let (node2, _temp2) = create_test_node(19032).await;
+    let (node1, _temp1) = create_test_node().await;
+    let (node2, _temp2) = create_test_node().await;
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -193,8 +196,8 @@ async fn test_content_network_sync_via_event() {
 #[tokio::test]
 async fn test_handle_sync_event_across_nodes() {
     // Create two nodes with unique ports
-    let (node1, _temp1) = create_test_node(19051).await;
-    let (node2, _temp2) = create_test_node(19052).await;
+    let (node1, _temp1) = create_test_node().await;
+    let (node2, _temp2) = create_test_node().await;
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 

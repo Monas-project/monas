@@ -355,21 +355,50 @@ where
             network.add_member(node_id_vo);
         }
 
-        self.content_repo
+        if let Err(e) = self
+            .content_repo
             .write()
             .await
             .save_content_network(network)
             .await
-            .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
+        {
+            // Rollback: CRDT content was created but network save failed.
+            // Log the orphaned CRDT entry for cleanup. The CRDT data is append-only
+            // so we can't delete it, but without a ContentNetwork it won't be served.
+            tracing::error!(
+                "Failed to save content network for {}, CRDT entry orphaned: {}",
+                content_id,
+                e
+            );
+            return Err(StateNodeError::StorageError(e.to_string()));
+        }
 
         // 7. Create access policy for authenticated owner and embed in CRDT
-        {
+        if let Err(e) = async {
             let content_id_vo = ContentId::new(content_id.clone())?;
             let policy = AccessPolicy::new(content_id_vo, owner_identity);
             self.crdt_repo
                 .update_access_policy(&content_id, policy, &self.local_node_id)
                 .await
-                .map_err(|e| StateNodeError::CrdtError(CrdtError::StorageError(e.to_string())))?;
+                .map_err(|e| StateNodeError::CrdtError(CrdtError::StorageError(e.to_string())))
+        }
+        .await
+        {
+            // Rollback: remove the content network since access policy failed
+            if let Err(cleanup_err) = self
+                .content_repo
+                .write()
+                .await
+                .delete_content_network(&content_id)
+                .await
+            {
+                tracing::error!(
+                    "Failed to rollback content network for {}: {}",
+                    content_id,
+                    cleanup_err
+                );
+            }
+            return Err(e);
         }
 
         // 7.5. Push CRDT operations (including AccessPolicy) to member nodes

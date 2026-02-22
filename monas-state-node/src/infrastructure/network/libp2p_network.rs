@@ -208,7 +208,13 @@ enum SwarmCommand {
     },
 }
 
-/// Pending requests tracking.
+/// TTL for pending requests. Entries older than this are cleaned up to prevent memory leaks.
+const PENDING_REQUEST_TTL: Duration = Duration::from_secs(120);
+
+/// Pending requests tracking with TTL support.
+///
+/// Each request tracks its creation time. A periodic sweep removes entries
+/// whose oneshot::Sender is closed (receiver timed out) or exceeded the TTL.
 #[derive(Default)]
 struct PendingRequests {
     capacity_queries: HashMap<OutboundRequestId, oneshot::Sender<Result<(u64, u64)>>>,
@@ -222,6 +228,34 @@ struct PendingRequests {
     relay_update_queries: HashMap<OutboundRequestId, oneshot::Sender<Result<bool>>>,
     relay_delete_queries: HashMap<OutboundRequestId, oneshot::Sender<Result<bool>>>,
     relay_grant_access_queries: HashMap<OutboundRequestId, oneshot::Sender<Result<bool>>>,
+    /// Timestamps for all pending request IDs, used for TTL-based cleanup.
+    timestamps: HashMap<u64, tokio::time::Instant>,
+}
+
+impl PendingRequests {
+    /// Remove pending entries whose oneshot::Sender is closed (receiver dropped)
+    /// or that have exceeded the TTL. This prevents unbounded memory growth.
+    fn cleanup_stale(&mut self) {
+        let now = tokio::time::Instant::now();
+        let ttl = PENDING_REQUEST_TTL;
+
+        // Clean up closed senders from each map
+        self.capacity_queries.retain(|_, s| !s.is_closed());
+        self.content_fetches.retain(|_, s| !s.is_closed());
+        self.kad_queries.retain(|_, s| !s.is_closed());
+        self.kad_provider_queries.retain(|_, s| !s.is_closed());
+        self.operation_fetches.retain(|_, s| !s.is_closed());
+        self.operation_pushes.retain(|_, s| !s.is_closed());
+        self.public_key_queries.retain(|_, s| !s.is_closed());
+        self.relay_update_queries.retain(|_, s| !s.is_closed());
+        self.relay_delete_queries.retain(|_, s| !s.is_closed());
+        self.relay_grant_access_queries
+            .retain(|_, s| !s.is_closed());
+
+        // Clean up expired timestamps
+        self.timestamps
+            .retain(|_, ts| now.duration_since(*ts) < ttl);
+    }
 }
 
 /// Channels for dispatching relay requests and sending responses back to the swarm.
@@ -287,7 +321,7 @@ impl Libp2pNetwork {
         } else {
             let keypair = libp2p::identity::Keypair::generate_ed25519();
             // Extract the raw Ed25519 secret key bytes for persistence
-            if let Some(ed25519_kp) = keypair.clone().try_into_ed25519().ok() {
+            if let Ok(ed25519_kp) = keypair.clone().try_into_ed25519() {
                 let secret_bytes = ed25519_kp.secret().as_ref().to_vec();
                 if let Some(parent) = key_path.parent() {
                     std::fs::create_dir_all(parent)
@@ -328,9 +362,11 @@ impl Libp2pNetwork {
         // Build behaviour
         let behaviour = NodeBehaviour::new(local_peer_id, &keypair, BehaviourConfig::default())?;
 
-        // Create swarm
+        // Create swarm with connection limits to prevent FD/memory exhaustion (M-3).
+        // idle_connection_timeout is set higher than the default sync_interval (30s)
+        // to avoid excessive reconnection overhead (L-12).
         let swarm_config = libp2p::swarm::Config::with_tokio_executor()
-            .with_idle_connection_timeout(Duration::from_secs(60));
+            .with_idle_connection_timeout(Duration::from_secs(120));
 
         let mut swarm = Swarm::new(transport, behaviour, local_peer_id, swarm_config);
 
@@ -474,6 +510,8 @@ impl Libp2pNetwork {
         relay_channels: RelayChannels,
     ) {
         let mut pending = PendingRequests::default();
+        let mut cleanup_interval = tokio::time::interval(Duration::from_secs(60));
+        cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
@@ -484,6 +522,10 @@ impl Libp2pNetwork {
                 // Handle swarm events
                 event = swarm.select_next_some() => {
                     Self::handle_swarm_event(&mut swarm, &mut pending, &connected_peers, &event_tx, &crdt_repo, &data_dir, &p256_signing_key, &relay_channels, event).await;
+                }
+                // Periodic cleanup of stale pending requests
+                _ = cleanup_interval.tick() => {
+                    pending.cleanup_stale();
                 }
             }
         }
@@ -715,16 +757,28 @@ impl Libp2pNetwork {
                 Self::handle_mdns_event(swarm, connected_peers, mdns_event).await;
             }
             SwarmEvent::ConnectionEstablished {
-                peer_id, endpoint, ..
+                peer_id,
+                endpoint,
+                connection_id,
+                ..
             } => {
                 let addr = endpoint.get_remote_address().clone();
                 info!("Connection established with {} at {}", peer_id, addr);
-                connected_peers
-                    .write()
-                    .await
-                    .entry(peer_id)
-                    .or_insert_with(Vec::new)
-                    .push(addr);
+
+                // Enforce connection limit (M-3): close excess connections to prevent
+                // FD/memory exhaustion. Limit total unique peers to 256.
+                const MAX_CONNECTED_PEERS: usize = 256;
+                let mut peers = connected_peers.write().await;
+                let peer_count = peers.len();
+                if !peers.contains_key(&peer_id) && peer_count >= MAX_CONNECTED_PEERS {
+                    warn!(
+                        "Connection limit reached ({}/{}), closing connection to {}",
+                        peer_count, MAX_CONNECTED_PEERS, peer_id
+                    );
+                    let _ = swarm.close_connection(connection_id);
+                } else {
+                    peers.entry(peer_id).or_insert_with(Vec::new).push(addr);
+                }
             }
             SwarmEvent::ConnectionClosed { peer_id, .. } => {
                 info!("Connection closed with {}", peer_id);

@@ -118,7 +118,7 @@ impl SledOutboxPersistence {
         let pending_tree = &self.pending_tree;
         let delivered_tree = &self.delivered_tree;
 
-        (&*pending_tree, &*delivered_tree)
+        (pending_tree, delivered_tree)
             .transaction(|(pending_tx, delivered_tx)| {
                 let data = match pending_tx.get(&key)? {
                     Some(data) => data,

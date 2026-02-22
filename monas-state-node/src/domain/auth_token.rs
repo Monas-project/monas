@@ -149,11 +149,24 @@ impl CapabilityAction {
     }
 
     /// Check if this action satisfies the required action.
-    /// Write satisfies Read.
+    ///
+    /// Capability hierarchy (aligned with AuthCapability::implies):
+    /// - Delete → Write, Read
+    /// - Write → Read
+    /// - Share → Read
+    /// - Revoke → Share, Read
     pub fn satisfies(&self, required: &CapabilityAction) -> bool {
         match (self, required) {
-            // Write satisfies Read and Write
+            // Write satisfies Read
             (CapabilityAction::Write, CapabilityAction::Read) => true,
+            // Delete satisfies Write and Read
+            (CapabilityAction::Delete, CapabilityAction::Write) => true,
+            (CapabilityAction::Delete, CapabilityAction::Read) => true,
+            // Share satisfies Read
+            (CapabilityAction::Share, CapabilityAction::Read) => true,
+            // Revoke satisfies Share and Read
+            (CapabilityAction::Revoke, CapabilityAction::Share) => true,
+            (CapabilityAction::Revoke, CapabilityAction::Read) => true,
             // Same action satisfies itself
             (a, b) if a == b => true,
             // Everything else is not satisfied
@@ -258,11 +271,29 @@ mod tests {
 
     #[test]
     fn capability_action_satisfies() {
+        // Same action satisfies itself
         assert!(CapabilityAction::Read.satisfies(&CapabilityAction::Read));
         assert!(CapabilityAction::Write.satisfies(&CapabilityAction::Write));
+        assert!(CapabilityAction::Delete.satisfies(&CapabilityAction::Delete));
+        assert!(CapabilityAction::Share.satisfies(&CapabilityAction::Share));
+        assert!(CapabilityAction::Revoke.satisfies(&CapabilityAction::Revoke));
+
+        // Write → Read
         assert!(CapabilityAction::Write.satisfies(&CapabilityAction::Read));
         assert!(!CapabilityAction::Read.satisfies(&CapabilityAction::Write));
-        assert!(!CapabilityAction::Delete.satisfies(&CapabilityAction::Read));
+
+        // Delete → Write, Read
+        assert!(CapabilityAction::Delete.satisfies(&CapabilityAction::Write));
+        assert!(CapabilityAction::Delete.satisfies(&CapabilityAction::Read));
+
+        // Share → Read
+        assert!(CapabilityAction::Share.satisfies(&CapabilityAction::Read));
+        assert!(!CapabilityAction::Share.satisfies(&CapabilityAction::Write));
+
+        // Revoke → Share, Read
+        assert!(CapabilityAction::Revoke.satisfies(&CapabilityAction::Share));
+        assert!(CapabilityAction::Revoke.satisfies(&CapabilityAction::Read));
+        assert!(!CapabilityAction::Revoke.satisfies(&CapabilityAction::Write));
     }
 
     #[test]
