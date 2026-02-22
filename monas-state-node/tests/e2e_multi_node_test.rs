@@ -175,7 +175,11 @@ async fn test_content_network_sync_via_event() {
     };
 
     // Apply event to node1 (local handling)
-    node1.service().handle_sync_event(&event).await.unwrap();
+    node1
+        .service()
+        .handle_sync_event(&event, None)
+        .await
+        .unwrap();
 
     // Verify node1 has the content network
     let networks = node1.service().list_content_networks().await.unwrap();
@@ -217,7 +221,10 @@ async fn test_handle_sync_event_across_nodes() {
                     println!("Received event: {:?}", received.event.event_type());
                     if let Event::NodeCreated { .. } = &received.event {
                         // Handle the sync event
-                        return node2.service().handle_sync_event(&received.event).await;
+                        return node2
+                            .service()
+                            .handle_sync_event(&received.event, None)
+                            .await;
                     }
                 }
                 Err(e) => {

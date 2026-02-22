@@ -34,6 +34,9 @@ use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
 use tracing::{debug, error, info, warn};
 
+/// Default timeout for PeerNetwork operations (30 seconds).
+const PEER_NETWORK_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// A relay request received from a remote peer via P2P protocol.
 /// The swarm loop sends these through a channel to the application layer (node.rs),
 /// which processes them using StateNodeService.
@@ -268,12 +271,46 @@ pub struct Libp2pNetwork {
 
 impl Libp2pNetwork {
     /// Create a new libp2p network with the given configuration.
+    /// Load an Ed25519 keypair from disk, or generate a new one and save it.
+    fn load_or_generate_peer_keypair(
+        data_dir: &std::path::Path,
+    ) -> Result<libp2p::identity::Keypair> {
+        let key_path = data_dir.join("peer_key.ed25519");
+
+        if key_path.exists() {
+            let key_bytes =
+                std::fs::read(&key_path).context("Failed to read peer keypair from disk")?;
+            let keypair = libp2p::identity::Keypair::ed25519_from_bytes(key_bytes)
+                .map_err(|e| anyhow::anyhow!("Failed to decode peer keypair: {:?}", e))?;
+            info!("Loaded peer keypair from {}", key_path.display());
+            Ok(keypair)
+        } else {
+            let keypair = libp2p::identity::Keypair::generate_ed25519();
+            // Extract the raw Ed25519 secret key bytes for persistence
+            if let Some(ed25519_kp) = keypair.clone().try_into_ed25519().ok() {
+                let secret_bytes = ed25519_kp.secret().as_ref().to_vec();
+                if let Some(parent) = key_path.parent() {
+                    std::fs::create_dir_all(parent)
+                        .context("Failed to create data directory for peer key")?;
+                }
+                std::fs::write(&key_path, &secret_bytes)
+                    .context("Failed to write peer keypair to disk")?;
+                info!(
+                    "Generated and saved new peer keypair to {}",
+                    key_path.display()
+                );
+            }
+            Ok(keypair)
+        }
+    }
+
+    /// Create a new libp2p network with the given configuration.
     pub async fn new(
         config: Libp2pNetworkConfig,
         crdt_repo: Arc<dyn ContentRepository>,
         data_dir: PathBuf,
     ) -> Result<Self> {
-        let keypair = libp2p::identity::Keypair::generate_ed25519();
+        let keypair = Self::load_or_generate_peer_keypair(&data_dir)?;
         let local_peer_id = PeerId::from(keypair.public());
 
         // Load or generate P-256 key for node authentication
@@ -396,8 +433,9 @@ impl Libp2pNetwork {
             })
             .await
             .map_err(|_| anyhow::anyhow!("Failed to send dial command"))?;
-        reply_rx
+        tokio::time::timeout(PEER_NETWORK_TIMEOUT, reply_rx)
             .await
+            .map_err(|_| anyhow::anyhow!("dial timed out"))?
             .map_err(|_| anyhow::anyhow!("Dial response channel closed"))?
     }
 
@@ -1453,8 +1491,9 @@ impl PeerNetwork for Libp2pNetwork {
             .await
             .map_err(|_| anyhow::anyhow!("Failed to send command"))?;
 
-        let peers = rx
+        let peers = tokio::time::timeout(PEER_NETWORK_TIMEOUT, rx)
             .await
+            .map_err(|_| anyhow::anyhow!("find_closest_peers timed out"))?
             .map_err(|_| anyhow::anyhow!("Failed to receive response"))??;
         Ok(peers.into_iter().map(|p| p.to_string()).collect())
     }
@@ -1478,7 +1517,8 @@ impl PeerNetwork for Libp2pNetwork {
                 continue;
             }
 
-            if let Ok(Ok((_, available))) = rx.await {
+            if let Ok(Ok(Ok((_, available)))) = tokio::time::timeout(PEER_NETWORK_TIMEOUT, rx).await
+            {
                 results.insert(peer_id_str.clone(), available);
             }
         }
@@ -1525,7 +1565,7 @@ impl PeerNetwork for Libp2pNetwork {
                     .await
                     .is_ok()
                 {
-                    if let Ok(Ok(keys)) = rx.await {
+                    if let Ok(Ok(Ok(keys))) = tokio::time::timeout(PEER_NETWORK_TIMEOUT, rx).await {
                         // The returned key might have a different node_id (e.g., the actual NodeId)
                         // than what we requested (e.g., a PeerId), but we should still store it
                         // indexed by what was requested
@@ -1557,7 +1597,9 @@ impl PeerNetwork for Libp2pNetwork {
             .await
             .map_err(|_| anyhow::anyhow!("Failed to send command"))?;
 
-        rx.await
+        tokio::time::timeout(PEER_NETWORK_TIMEOUT, rx)
+            .await
+            .map_err(|_| anyhow::anyhow!("publish_event timed out"))?
             .map_err(|_| anyhow::anyhow!("Failed to receive response"))?
     }
 
@@ -1575,7 +1617,9 @@ impl PeerNetwork for Libp2pNetwork {
             .await
             .map_err(|_| anyhow::anyhow!("Failed to send command"))?;
 
-        rx.await
+        tokio::time::timeout(PEER_NETWORK_TIMEOUT, rx)
+            .await
+            .map_err(|_| anyhow::anyhow!("fetch_content timed out"))?
             .map_err(|_| anyhow::anyhow!("Failed to receive response"))?
     }
 
@@ -1586,7 +1630,9 @@ impl PeerNetwork for Libp2pNetwork {
             .await
             .map_err(|_| anyhow::anyhow!("Failed to send command"))?;
 
-        rx.await
+        tokio::time::timeout(PEER_NETWORK_TIMEOUT, rx)
+            .await
+            .map_err(|_| anyhow::anyhow!("publish_provider timed out"))?
             .map_err(|_| anyhow::anyhow!("Failed to receive response"))?
     }
 
@@ -1614,7 +1660,9 @@ impl PeerNetwork for Libp2pNetwork {
             .await
             .map_err(|_| anyhow::anyhow!("Failed to send command"))?;
 
-        rx.await
+        tokio::time::timeout(PEER_NETWORK_TIMEOUT, rx)
+            .await
+            .map_err(|_| anyhow::anyhow!("fetch_operations timed out"))?
             .map_err(|_| anyhow::anyhow!("Failed to receive response"))?
     }
 
@@ -1638,7 +1686,9 @@ impl PeerNetwork for Libp2pNetwork {
             .await
             .map_err(|_| anyhow::anyhow!("Failed to send command"))?;
 
-        rx.await
+        tokio::time::timeout(PEER_NETWORK_TIMEOUT, rx)
+            .await
+            .map_err(|_| anyhow::anyhow!("push_operations timed out"))?
             .map_err(|_| anyhow::anyhow!("Failed to receive response"))?
     }
 
@@ -1668,8 +1718,9 @@ impl PeerNetwork for Libp2pNetwork {
             .await
             .map_err(|_| anyhow::anyhow!("Failed to send command"))?;
 
-        let peers = rx
+        let peers = tokio::time::timeout(PEER_NETWORK_TIMEOUT, rx)
             .await
+            .map_err(|_| anyhow::anyhow!("find_content_providers timed out"))?
             .map_err(|_| anyhow::anyhow!("Failed to receive response"))??;
         Ok(peers.into_iter().map(|p| p.to_string()).collect())
     }
@@ -1698,7 +1749,9 @@ impl PeerNetwork for Libp2pNetwork {
             .await
             .map_err(|_| anyhow::anyhow!("Failed to send command"))?;
 
-        rx.await
+        tokio::time::timeout(PEER_NETWORK_TIMEOUT, rx)
+            .await
+            .map_err(|_| anyhow::anyhow!("relay_update_content timed out"))?
             .map_err(|_| anyhow::anyhow!("Failed to receive response"))?
     }
 
@@ -1724,7 +1777,9 @@ impl PeerNetwork for Libp2pNetwork {
             .await
             .map_err(|_| anyhow::anyhow!("Failed to send command"))?;
 
-        rx.await
+        tokio::time::timeout(PEER_NETWORK_TIMEOUT, rx)
+            .await
+            .map_err(|_| anyhow::anyhow!("relay_delete_content timed out"))?
             .map_err(|_| anyhow::anyhow!("Failed to receive response"))?
     }
 
@@ -1754,7 +1809,9 @@ impl PeerNetwork for Libp2pNetwork {
             .await
             .map_err(|_| anyhow::anyhow!("Failed to send command"))?;
 
-        rx.await
+        tokio::time::timeout(PEER_NETWORK_TIMEOUT, rx)
+            .await
+            .map_err(|_| anyhow::anyhow!("relay_grant_access timed out"))?
             .map_err(|_| anyhow::anyhow!("Failed to receive response"))?
     }
 }

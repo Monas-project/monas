@@ -51,7 +51,7 @@ ucan = "0.7.0-alpha.1"
 ucan-key-support = "0.7.0-alpha.1"
 
 # crsl-lib for CRDT-based content versioning
-crsl-lib = { git = "https://github.com/Monas-project/crsl-lib"}
+crsl-lib = { git = "https://github.com/Monas-project/crsl-lib", rev = "e13b86ce6d6a9c27ebd01a9b4fe82d6bc18f8a01" }
 
 # sled for persistence
 sled = "0.34"

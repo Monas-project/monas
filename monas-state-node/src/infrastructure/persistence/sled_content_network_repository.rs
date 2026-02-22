@@ -5,6 +5,7 @@ use crate::port::persistence::PersistentContentRepository;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use sled::Db;
+use sled::Transactional;
 use std::path::Path;
 
 const CONTENT_NETWORK_TREE_NAME: &str = "content_networks";
@@ -101,10 +102,19 @@ impl PersistentContentRepository for SledContentNetworkRepository {
     }
 
     async fn save_content_network(&self, net: ContentNetwork) -> Result<()> {
-        let tree = self.content_tree()?;
+        let content_tree = self.content_tree()?;
+        let capacity_tree = self.capacity_tree()?;
+        let content_id = net.content_id().as_str().to_string();
         let value = serde_json::to_vec(&net).context("Failed to serialize content network")?;
-        tree.insert(net.content_id().as_str().as_bytes(), value)
-            .context("Failed to insert content network")?;
+
+        (&content_tree, &capacity_tree)
+            .transaction(
+                |(content_tx, _capacity_tx)| -> sled::transaction::ConflictableTransactionResult<(), ()> {
+                    content_tx.insert(content_id.as_bytes(), value.as_slice())?;
+                    Ok(())
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("Transaction failed: {:?}", e))?;
         Ok(())
     }
 

@@ -69,15 +69,17 @@ pub struct AuthTokenPayload {
 
 impl AuthTokenPayload {
     /// Check if the token has expired.
+    /// Tokens without an expiration are always considered expired.
     pub fn is_expired(&self) -> bool {
-        if let Some(exp) = self.exp {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("Time went backwards")
-                .as_secs();
-            now > exp
-        } else {
-            false
+        match self.exp {
+            Some(exp) => {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("Time went backwards")
+                    .as_secs();
+                now > exp
+            }
+            None => true,
         }
     }
 

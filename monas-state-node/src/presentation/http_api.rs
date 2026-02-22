@@ -459,14 +459,70 @@ async fn list_contents(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
+/// Verify that the caller has read access to the given content.
+///
+/// Extracts a Bearer token from the Authorization header, then checks the
+/// CRDT-embedded access policy for read permission.
+async fn verify_read_access(
+    state: &AppState,
+    headers: &HeaderMap,
+    content_id: &str,
+) -> Result<(), Response> {
+    let token = extract_auth_token(headers).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "Authorization header is required".to_string(),
+            }),
+        )
+            .into_response()
+    })?;
+
+    // Authenticate the caller
+    let _identity = state.authenticate_for_read(&token).await.map_err(|e| {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: format!("Authentication failed: {}", e),
+            }),
+        )
+            .into_response()
+    })?;
+
+    // Check access policy for read permission
+    let crdt_repo = state.crdt_repo();
+    if let Ok(Some(policy)) = crdt_repo.get_access_policy(content_id).await {
+        if !policy.has_capability(
+            &_identity,
+            &crate::domain::auth_capability::AuthCapability::ReadContent,
+        ) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(ErrorResponse {
+                    error: "Insufficient permissions: read access required".to_string(),
+                }),
+            )
+                .into_response());
+        }
+    }
+    // If no policy exists, allow access (content may not have a policy yet)
+
+    Ok(())
+}
+
 /// Get content data from CRDT repository.
 ///
-/// Returns the latest version of the content data.
+/// Requires authentication. Returns the latest version of the content data.
 async fn get_content_data(
     State(state): State<AppState>,
     Path(content_id): Path<String>,
+    headers: HeaderMap,
     Query(query): Query<VersionQuery>,
 ) -> impl IntoResponse {
+    if let Err(response) = verify_read_access(&state, &headers, &content_id).await {
+        return response;
+    }
+
     let crdt_repo = state.crdt_repo();
 
     // Get data based on version parameter
@@ -504,10 +560,17 @@ async fn get_content_data(
 }
 
 /// Get content version history from CRDT repository.
+///
+/// Requires authentication.
 async fn get_content_history(
     State(state): State<AppState>,
     Path(content_id): Path<String>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
+    if let Err(response) = verify_read_access(&state, &headers, &content_id).await {
+        return response;
+    }
+
     let crdt_repo = state.crdt_repo();
 
     match crdt_repo.get_history(&content_id).await {
@@ -527,10 +590,17 @@ async fn get_content_history(
 }
 
 /// Get a specific version of content data.
+///
+/// Requires authentication.
 async fn get_content_version(
     State(state): State<AppState>,
     Path((content_id, version)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
+    if let Err(response) = verify_read_access(&state, &headers, &content_id).await {
+        return response;
+    }
+
     let crdt_repo = state.crdt_repo();
 
     match crdt_repo.get_version(&version).await {

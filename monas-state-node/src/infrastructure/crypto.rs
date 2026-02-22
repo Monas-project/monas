@@ -5,7 +5,7 @@
 
 use p256::ecdsa::signature::DigestVerifier;
 use p256::ecdsa::{Signature, VerifyingKey};
-use sha3::{Digest, Keccak256};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 /// Error type for signature verification failures.
@@ -44,9 +44,9 @@ pub fn verify_p256_signature(
     let sig = Signature::from_slice(signature)
         .map_err(|e| SignatureVerifyError::InvalidSignature(e.to_string()))?;
 
-    // Verify using Keccak256 digest (matching monas-account's P256KeyPair implementation)
+    // Verify using SHA-256 digest (matching monas-account's P256KeyPair implementation)
     verifying_key
-        .verify_digest(Keccak256::new_with_prefix(message), &sig)
+        .verify_digest(Sha256::new_with_prefix(message), &sig)
         .map_err(|_| SignatureVerifyError::VerificationFailed)
 }
 
@@ -66,7 +66,7 @@ mod tests {
 
     fn sign_message(signing_key: &SigningKey, message: &[u8]) -> Vec<u8> {
         let (signature, _): (Signature, _) =
-            signing_key.sign_digest(Keccak256::new_with_prefix(message));
+            signing_key.sign_digest(Sha256::new_with_prefix(message));
         signature.to_vec()
     }
 

@@ -204,6 +204,23 @@ where
         &self.crdt_repo
     }
 
+    /// Authenticate a caller for read operations.
+    ///
+    /// Returns the authenticated identity on success.
+    pub async fn authenticate_for_read(
+        &self,
+        token: &AuthToken,
+    ) -> Result<Identity, StateNodeError> {
+        let auth_service = self.auth_service.as_ref().ok_or_else(|| {
+            StateNodeError::InvalidConfiguration("Authentication not configured".to_string())
+        })?;
+
+        auth_service
+            .authenticate(token, None)
+            .await
+            .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))
+    }
+
     /// Get the local node ID.
     pub fn local_node_id(&self) -> &str {
         &self.local_node_id
@@ -1120,17 +1137,49 @@ where
         Ok(())
     }
 
+    /// Verify that the event's claimed node ID matches the source peer ID.
+    /// Returns an error if there is a mismatch.
+    fn verify_source_peer_id(
+        source_peer_id: Option<&str>,
+        claimed_node_id: &str,
+    ) -> Result<(), StateNodeError> {
+        if let Some(source) = source_peer_id {
+            if source != claimed_node_id {
+                tracing::warn!(
+                    "Source PeerID mismatch: event claims node_id={}, but source={}",
+                    claimed_node_id,
+                    source
+                );
+                return Err(StateNodeError::Internal(format!(
+                    "Source PeerID mismatch: claimed={}, actual={}",
+                    claimed_node_id, source
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Handle a sync event from another node.
+    ///
+    /// The `source_peer_id` parameter is used to verify that events claiming
+    /// to be from a particular node actually came from that peer's PeerID.
     ///
     /// Returns `ApplyOutcome::NeedsSync` when the caller should perform content
     /// synchronization (e.g., call `ContentSyncService::sync_from_peers`).
-    pub async fn handle_sync_event(&self, event: &Event) -> Result<ApplyOutcome, StateNodeError> {
+    pub async fn handle_sync_event(
+        &self,
+        event: &Event,
+        source_peer_id: Option<&str>,
+    ) -> Result<ApplyOutcome, StateNodeError> {
         match event {
             Event::ContentUpdated {
                 content_id,
                 updated_node_id,
                 ..
             } => {
+                // Verify source PeerID matches claimed node ID
+                Self::verify_source_peer_id(source_peer_id, updated_node_id)?;
+
                 // Skip if we sent this update ourselves
                 if updated_node_id == &self.local_node_id {
                     return Ok(ApplyOutcome::Ignored);
@@ -1298,6 +1347,9 @@ where
                 deleted_by_node_id,
                 ..
             } => {
+                // Verify source PeerID matches claimed node ID
+                Self::verify_source_peer_id(source_peer_id, deleted_by_node_id)?;
+
                 // Skip if we initiated the deletion
                 if deleted_by_node_id == &self.local_node_id {
                     return Ok(ApplyOutcome::Ignored);
@@ -1924,7 +1976,7 @@ mod tests {
             timestamp: 12345,
         };
 
-        let outcome = service.handle_sync_event(&event).await.unwrap();
+        let outcome = service.handle_sync_event(&event, None).await.unwrap();
         assert_eq!(outcome, ApplyOutcome::Applied);
 
         // Verify node was stored
@@ -1945,7 +1997,7 @@ mod tests {
             timestamp: 12345,
         };
 
-        let outcome = service.handle_sync_event(&event).await.unwrap();
+        let outcome = service.handle_sync_event(&event, None).await.unwrap();
         // node-1 is a member, so it should need sync
         assert_eq!(
             outcome,
@@ -1976,7 +2028,7 @@ mod tests {
             timestamp: 12345,
         };
 
-        let outcome = service.handle_sync_event(&event).await.unwrap();
+        let outcome = service.handle_sync_event(&event, None).await.unwrap();
         // node-1 is NOT a member, so just Applied
         assert_eq!(outcome, ApplyOutcome::Applied);
 
@@ -2000,7 +2052,7 @@ mod tests {
             timestamp: 12345,
         };
 
-        let outcome = service.handle_sync_event(&event).await.unwrap();
+        let outcome = service.handle_sync_event(&event, None).await.unwrap();
         // Network doesn't exist locally = we're not a member, just ignore
         assert_eq!(outcome, ApplyOutcome::Ignored);
 
@@ -2040,7 +2092,7 @@ mod tests {
             timestamp: 12345,
         };
 
-        let outcome = service.handle_sync_event(&event).await.unwrap();
+        let outcome = service.handle_sync_event(&event, None).await.unwrap();
         // node-1 is a member, so it should need sync
         assert_eq!(
             outcome,
@@ -2078,7 +2130,7 @@ mod tests {
             timestamp: 12345,
         };
 
-        let outcome = service.handle_sync_event(&event).await.unwrap();
+        let outcome = service.handle_sync_event(&event, None).await.unwrap();
         // Should be ignored since we sent it
         assert_eq!(outcome, ApplyOutcome::Ignored);
     }
@@ -2110,7 +2162,7 @@ mod tests {
             timestamp: 12345,
         };
 
-        let outcome = service.handle_sync_event(&event).await.unwrap();
+        let outcome = service.handle_sync_event(&event, None).await.unwrap();
         // node-1 is NOT a member, so just Applied (no sync needed)
         assert_eq!(outcome, ApplyOutcome::Applied);
     }
@@ -2130,7 +2182,7 @@ mod tests {
             timestamp: 12345,
         };
 
-        let outcome = service.handle_sync_event(&event).await.unwrap();
+        let outcome = service.handle_sync_event(&event, None).await.unwrap();
         // node-1 is a member, so it should need sync
         assert_eq!(
             outcome,
@@ -2158,7 +2210,7 @@ mod tests {
             timestamp: 12345,
         };
 
-        let outcome = service.handle_sync_event(&event).await.unwrap();
+        let outcome = service.handle_sync_event(&event, None).await.unwrap();
         // node-1 is NOT a member
         assert_eq!(outcome, ApplyOutcome::Applied);
 
@@ -2181,7 +2233,7 @@ mod tests {
             timestamp: 12345,
         };
 
-        let outcome = service.handle_sync_event(&event).await.unwrap();
+        let outcome = service.handle_sync_event(&event, None).await.unwrap();
         assert_eq!(outcome, ApplyOutcome::Ignored);
     }
 
@@ -2199,7 +2251,7 @@ mod tests {
             available_capacity: 2000,
             timestamp: 12345,
         };
-        service.handle_sync_event(&event).await.unwrap();
+        service.handle_sync_event(&event, None).await.unwrap();
 
         let nodes = service.list_nodes().await.unwrap();
         assert!(nodes.contains(&"node-1".to_string()));
@@ -2226,8 +2278,8 @@ mod tests {
             timestamp: 12346,
         };
 
-        service.handle_sync_event(&event1).await.unwrap();
-        service.handle_sync_event(&event2).await.unwrap();
+        service.handle_sync_event(&event1, None).await.unwrap();
+        service.handle_sync_event(&event2, None).await.unwrap();
 
         let networks = service.list_content_networks().await.unwrap();
         assert!(networks.contains(&"content-1".to_string()));

@@ -22,6 +22,12 @@ pub enum AuthTokenVerifyError {
     #[error("Token has expired")]
     Expired,
 
+    #[error("Token is missing required expiration (exp) claim")]
+    MissingExpiration,
+
+    #[error("Token expiration is too far in the future (max 24 hours)")]
+    ExpirationTooFar,
+
     #[error("Token has been invalidated (issued_at < min_valid_issued_at)")]
     Invalidated,
 
@@ -86,7 +92,7 @@ impl AuthTokenVerifier {
     pub fn verify(
         jwt: &str,
         issuer_public_key: &[u8],
-        expected_audience: Option<&KeyId>,
+        expected_audience: &KeyId,
         content_id: &str,
         required_action: CapabilityAction,
         access_control: Option<&ContentAccessControl>,
@@ -108,7 +114,18 @@ impl AuthTokenVerifier {
             issuer_public_key,
         )?;
 
-        // 4. Check expiration
+        // 4. Check expiration: exp is required
+        let exp = token
+            .payload
+            .exp
+            .ok_or(AuthTokenVerifyError::MissingExpiration)?;
+
+        // Check max TTL (24 hours from iat)
+        const MAX_TTL_SECS: u64 = 24 * 60 * 60;
+        if exp > token.payload.iat + MAX_TTL_SECS {
+            return Err(AuthTokenVerifyError::ExpirationTooFar);
+        }
+
         if token.payload.is_expired() {
             return Err(AuthTokenVerifyError::Expired);
         }
@@ -120,14 +137,12 @@ impl AuthTokenVerifier {
             }
         }
 
-        // 6. Check audience if specified
-        if let Some(expected_aud) = expected_audience {
-            if &token.payload.aud != expected_aud {
-                return Err(AuthTokenVerifyError::AudienceMismatch {
-                    expected: expected_aud.to_string(),
-                    actual: token.payload.aud.to_string(),
-                });
-            }
+        // 6. Check audience (mandatory)
+        if &token.payload.aud != expected_audience {
+            return Err(AuthTokenVerifyError::AudienceMismatch {
+                expected: expected_audience.to_string(),
+                actual: token.payload.aud.to_string(),
+            });
         }
 
         // 7. Check capability
@@ -206,7 +221,7 @@ mod tests {
     use p256::ecdsa::signature::DigestSigner;
     use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
     use p256::elliptic_curve::rand_core::OsRng;
-    use sha3::{Digest, Keccak256};
+    use sha2::{Digest, Sha256};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn generate_test_keypair() -> (SigningKey, Vec<u8>) {
@@ -255,7 +270,7 @@ mod tests {
         let signing_input = format!("{}.{}", header_b64, payload_b64);
 
         let (signature, _): (Signature, _) =
-            signing_key.sign_digest(Keccak256::new_with_prefix(signing_input.as_bytes()));
+            signing_key.sign_digest(Sha256::new_with_prefix(signing_input.as_bytes()));
         let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_vec());
 
         format!("{}.{}", signing_input, sig_b64)
@@ -307,7 +322,7 @@ mod tests {
         let signing_input = format!("{}.{}", header_b64, payload_b64);
 
         let (signature, _): (Signature, _) =
-            signing_key.sign_digest(Keccak256::new_with_prefix(signing_input.as_bytes()));
+            signing_key.sign_digest(Sha256::new_with_prefix(signing_input.as_bytes()));
         let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_vec());
 
         format!("{}.{}", signing_input, sig_b64)
@@ -333,10 +348,11 @@ mod tests {
             Some(now + 3600),
         );
 
+        let aud_key = KeyId::new(audience_pk.clone());
         let result = AuthTokenVerifier::verify(
             &jwt,
             &issuer_pk,
-            Some(&KeyId::new(audience_pk.clone())),
+            &aud_key,
             content_id,
             CapabilityAction::Read,
             None,
@@ -369,10 +385,11 @@ mod tests {
             Some(now + 3600),
         );
 
+        let aud_key = KeyId::new(audience_pk.clone());
         let result = AuthTokenVerifier::verify(
             &jwt,
             &wrong_pk,
-            None,
+            &aud_key,
             content_id,
             CapabilityAction::Read,
             None,
@@ -390,19 +407,26 @@ mod tests {
         let (_, audience_pk) = generate_test_keypair();
         let content_id = "test-content-123";
 
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Use iat close to exp so it passes ExpirationTooFar check
         let jwt = create_and_sign_token(
             &signing_key,
             &issuer_pk,
             &audience_pk,
             content_id,
             CapabilityAction::Read,
-            Some(1), // Expired (Unix timestamp 1)
+            Some(now - 1), // Already expired
         );
 
+        let aud_key = KeyId::new(audience_pk.clone());
         let result = AuthTokenVerifier::verify(
             &jwt,
             &issuer_pk,
-            None,
+            &aud_key,
             content_id,
             CapabilityAction::Read,
             None,
@@ -435,10 +459,11 @@ mod tests {
         let mut access_control = ContentAccessControl::new(content_id.to_string());
         access_control.invalidate_before(now + 3600).unwrap();
 
+        let aud_key = KeyId::new(audience_pk.clone());
         let result = AuthTokenVerifier::verify(
             &jwt,
             &issuer_pk,
-            None,
+            &aud_key,
             content_id,
             CapabilityAction::Read,
             Some(&access_control),
@@ -469,10 +494,11 @@ mod tests {
         );
 
         // But we require Write
+        let aud_key = KeyId::new(audience_pk.clone());
         let result = AuthTokenVerifier::verify(
             &jwt,
             &issuer_pk,
-            None,
+            &aud_key,
             content_id,
             CapabilityAction::Write,
             None,
@@ -506,10 +532,11 @@ mod tests {
         );
 
         // Require Read - should succeed because Write satisfies Read
+        let aud_key = KeyId::new(audience_pk.clone());
         let result = AuthTokenVerifier::verify(
             &jwt,
             &issuer_pk,
-            None,
+            &aud_key,
             content_id,
             CapabilityAction::Read,
             None,
@@ -539,10 +566,11 @@ mod tests {
             Some(now + 3600),
         );
 
+        let wrong_aud_key = KeyId::new(wrong_audience_pk);
         let result = AuthTokenVerifier::verify(
             &jwt,
             &issuer_pk,
-            Some(&KeyId::new(wrong_audience_pk)),
+            &wrong_aud_key,
             content_id,
             CapabilityAction::Read,
             None,
@@ -574,10 +602,11 @@ mod tests {
         );
 
         // Try to use token for different content
+        let aud_key = KeyId::new(audience_pk.clone());
         let result = AuthTokenVerifier::verify(
             &jwt,
             &issuer_pk,
-            None,
+            &aud_key,
             "content-B",
             CapabilityAction::Read,
             None,
@@ -586,6 +615,74 @@ mod tests {
         assert!(matches!(
             result,
             Err(AuthTokenVerifyError::InsufficientCapability { .. })
+        ));
+    }
+
+    #[test]
+    fn verify_fails_with_missing_expiration() {
+        let (signing_key, issuer_pk) = generate_test_keypair();
+        let (_, audience_pk) = generate_test_keypair();
+        let content_id = "test-content-123";
+
+        let jwt = create_and_sign_token(
+            &signing_key,
+            &issuer_pk,
+            &audience_pk,
+            content_id,
+            CapabilityAction::Read,
+            None, // No expiration
+        );
+
+        let aud_key = KeyId::new(audience_pk.clone());
+        let result = AuthTokenVerifier::verify(
+            &jwt,
+            &issuer_pk,
+            &aud_key,
+            content_id,
+            CapabilityAction::Read,
+            None,
+        );
+
+        assert!(matches!(
+            result,
+            Err(AuthTokenVerifyError::MissingExpiration)
+        ));
+    }
+
+    #[test]
+    fn verify_fails_with_expiration_too_far() {
+        let (signing_key, issuer_pk) = generate_test_keypair();
+        let (_, audience_pk) = generate_test_keypair();
+        let content_id = "test-content-123";
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // Token expires in 48 hours (> 24h max)
+        let jwt = create_and_sign_token(
+            &signing_key,
+            &issuer_pk,
+            &audience_pk,
+            content_id,
+            CapabilityAction::Read,
+            Some(now + 48 * 3600),
+        );
+
+        let aud_key = KeyId::new(audience_pk.clone());
+        let result = AuthTokenVerifier::verify(
+            &jwt,
+            &issuer_pk,
+            &aud_key,
+            content_id,
+            CapabilityAction::Read,
+            None,
+        );
+
+        assert!(matches!(
+            result,
+            Err(AuthTokenVerifyError::ExpirationTooFar)
         ));
     }
 
@@ -634,9 +731,10 @@ mod tests {
         );
 
         // Verify all owner actions are granted
+        let aud_key = KeyId::new(audience_pk.clone());
         for action in CapabilityAction::owner_actions() {
             let result =
-                AuthTokenVerifier::verify(&jwt, &issuer_pk, None, content_id, action, None);
+                AuthTokenVerifier::verify(&jwt, &issuer_pk, &aud_key, content_id, action, None);
             assert!(result.is_ok(), "Owner should have {:?} capability", action);
         }
     }
@@ -661,11 +759,13 @@ mod tests {
             Some(now + 3600),
         );
 
+        let aud_key = KeyId::new(audience_pk.clone());
+
         // Editor should have Read and Write
         let read_result = AuthTokenVerifier::verify(
             &jwt,
             &issuer_pk,
-            None,
+            &aud_key,
             content_id,
             CapabilityAction::Read,
             None,
@@ -675,7 +775,7 @@ mod tests {
         let write_result = AuthTokenVerifier::verify(
             &jwt,
             &issuer_pk,
-            None,
+            &aud_key,
             content_id,
             CapabilityAction::Write,
             None,
@@ -686,7 +786,7 @@ mod tests {
         let delete_result = AuthTokenVerifier::verify(
             &jwt,
             &issuer_pk,
-            None,
+            &aud_key,
             content_id,
             CapabilityAction::Delete,
             None,

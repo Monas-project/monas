@@ -5,7 +5,7 @@ use p256::ecdsa::signature::DigestSigner;
 use p256::ecdsa::{SigningKey, VerifyingKey};
 use p256::elliptic_curve::rand_core::OsRng;
 use p256::{EncodedPoint, FieldBytes};
-use sha3::Keccak256;
+use sha2::Sha256;
 
 #[derive(Clone)]
 pub struct P256KeyPair {
@@ -62,7 +62,7 @@ impl AccountKeyPair for P256KeyPair {
     fn sign(&self, message: &[u8]) -> (Vec<u8>, Option<u8>) {
         let (signature, _) = self
             .secret_key
-            .sign_digest(Keccak256::new_with_prefix(message));
+            .sign_digest(Sha256::new_with_prefix(message));
         (signature.to_vec(), None)
     }
 
@@ -87,7 +87,7 @@ mod p256_key_pair_tests {
     use crate::infrastructure::key_pair::p256_key_pair::P256KeyPair;
     use p256::ecdsa::signature::DigestVerifier;
     use p256::ecdsa::{Signature, VerifyingKey};
-    use sha3::{Digest, Keccak256};
+    use sha2::{Digest, Sha256};
 
     #[test]
     fn generate_has_valid_sizes() {
@@ -111,7 +111,7 @@ mod p256_key_pair_tests {
             .expect("invalid public key bytes");
 
         verifying_key
-            .verify_digest(Keccak256::new_with_prefix(message), &signature)
+            .verify_digest(Sha256::new_with_prefix(message), &signature)
             .expect("signature should verify");
     }
 

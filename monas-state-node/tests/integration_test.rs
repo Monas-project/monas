@@ -96,14 +96,13 @@ fn sign_access_control_update(update: &AccessControlUpdate) -> (Vec<u8>, Vec<u8>
     use p256::ecdsa::signature::DigestSigner;
     use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
     use p256::elliptic_curve::rand_core::OsRng;
-    use sha3::{Digest, Keccak256};
+    use sha2::{Digest, Sha256};
 
     let signing_key = SigningKey::random(&mut OsRng);
     let verifying_key = VerifyingKey::from(&signing_key);
     let public_key_bytes = verifying_key.to_encoded_point(false).as_bytes().to_vec();
     let message = update.signing_message();
-    let (signature, _): (Signature, _) =
-        signing_key.sign_digest(Keccak256::new_with_prefix(&message));
+    let (signature, _): (Signature, _) = signing_key.sign_digest(Sha256::new_with_prefix(&message));
     (signature.to_vec(), public_key_bytes)
 }
 
@@ -201,7 +200,7 @@ async fn test_create_content() {
         timestamp: 12345,
     };
 
-    let outcome = service.handle_sync_event(&event).await.unwrap();
+    let outcome = service.handle_sync_event(&event, None).await.unwrap();
     assert_eq!(
         outcome,
         monas_state_node::application_service::state_node_service::ApplyOutcome::Applied
@@ -249,8 +248,8 @@ async fn test_list_content_networks() {
         timestamp: 12346,
     };
 
-    service.handle_sync_event(&event1).await.unwrap();
-    service.handle_sync_event(&event2).await.unwrap();
+    service.handle_sync_event(&event1, None).await.unwrap();
+    service.handle_sync_event(&event2, None).await.unwrap();
 
     // List content networks
     let networks = service.list_content_networks().await.unwrap();
@@ -270,7 +269,7 @@ async fn test_handle_sync_event() {
     };
 
     // Handle the sync event
-    let outcome = service.handle_sync_event(&event).await.unwrap();
+    let outcome = service.handle_sync_event(&event, None).await.unwrap();
     assert_eq!(
         outcome,
         monas_state_node::application_service::state_node_service::ApplyOutcome::Applied
@@ -296,7 +295,7 @@ async fn test_handle_content_created_sync() {
     };
 
     // Handle the sync event
-    let outcome = service.handle_sync_event(&event).await.unwrap();
+    let outcome = service.handle_sync_event(&event, None).await.unwrap();
     assert_eq!(
         outcome,
         monas_state_node::application_service::state_node_service::ApplyOutcome::Applied
@@ -643,7 +642,7 @@ mod auth_token_tests {
     use p256::ecdsa::signature::DigestSigner;
     use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
     use p256::elliptic_curve::rand_core::OsRng;
-    use sha3::{Digest, Keccak256};
+    use sha2::{Digest, Sha256};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn generate_test_keypair() -> (SigningKey, Vec<u8>) {
@@ -693,7 +692,7 @@ mod auth_token_tests {
         let signing_input = format!("{}.{}", header_b64, payload_b64);
 
         let (signature, _): (Signature, _) =
-            signing_key.sign_digest(Keccak256::new_with_prefix(signing_input.as_bytes()));
+            signing_key.sign_digest(Sha256::new_with_prefix(signing_input.as_bytes()));
         let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_vec());
 
         format!("{}.{}", signing_input, sig_b64)
@@ -745,7 +744,7 @@ mod auth_token_tests {
         let signing_input = format!("{}.{}", header_b64, payload_b64);
 
         let (signature, _): (Signature, _) =
-            signing_key.sign_digest(Keccak256::new_with_prefix(signing_input.as_bytes()));
+            signing_key.sign_digest(Sha256::new_with_prefix(signing_input.as_bytes()));
         let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_vec());
 
         format!("{}.{}", signing_input, sig_b64)
@@ -777,7 +776,7 @@ mod auth_token_tests {
         let result = AuthTokenVerifier::verify(
             &jwt,
             &owner_pk,
-            Some(&KeyId::new(recipient_pk.clone())),
+            &KeyId::new(recipient_pk.clone()),
             content_id,
             CapabilityAction::Read,
             None,
@@ -818,7 +817,7 @@ mod auth_token_tests {
         let result = AuthTokenVerifier::verify(
             &jwt,
             &owner_pk,
-            None,
+            &KeyId::new(recipient_pk.clone()),
             content_id,
             CapabilityAction::Read,
             Some(&access_control),
@@ -850,7 +849,14 @@ mod auth_token_tests {
 
         // Verify all owner actions are granted
         for action in CapabilityAction::owner_actions() {
-            let result = AuthTokenVerifier::verify(&jwt, &owner_pk, None, content_id, action, None);
+            let result = AuthTokenVerifier::verify(
+                &jwt,
+                &owner_pk,
+                &KeyId::new(recipient_pk.clone()),
+                content_id,
+                action,
+                None,
+            );
             assert!(result.is_ok(), "Owner should have {:?} capability", action);
         }
     }
@@ -880,7 +886,7 @@ mod auth_token_tests {
         let read_result = AuthTokenVerifier::verify(
             &jwt,
             &owner_pk,
-            None,
+            &KeyId::new(recipient_pk.clone()),
             content_id,
             CapabilityAction::Read,
             None,
@@ -890,7 +896,7 @@ mod auth_token_tests {
         let write_result = AuthTokenVerifier::verify(
             &jwt,
             &owner_pk,
-            None,
+            &KeyId::new(recipient_pk.clone()),
             content_id,
             CapabilityAction::Write,
             None,
@@ -901,7 +907,7 @@ mod auth_token_tests {
         let delete_result = AuthTokenVerifier::verify(
             &jwt,
             &owner_pk,
-            None,
+            &KeyId::new(recipient_pk.clone()),
             content_id,
             CapabilityAction::Delete,
             None,
@@ -937,7 +943,7 @@ mod auth_token_tests {
         let read_result = AuthTokenVerifier::verify(
             &jwt,
             &owner_pk,
-            None,
+            &KeyId::new(recipient_pk.clone()),
             content_id,
             CapabilityAction::Read,
             None,
@@ -948,7 +954,7 @@ mod auth_token_tests {
         let write_result = AuthTokenVerifier::verify(
             &jwt,
             &owner_pk,
-            None,
+            &KeyId::new(recipient_pk.clone()),
             content_id,
             CapabilityAction::Write,
             None,
@@ -984,7 +990,7 @@ mod auth_token_tests {
         let result = AuthTokenVerifier::verify(
             &jwt,
             &owner_pk,
-            None,
+            &KeyId::new(recipient_pk.clone()),
             content_id,
             CapabilityAction::Reencrypt,
             None,
@@ -995,7 +1001,7 @@ mod auth_token_tests {
         let read_result = AuthTokenVerifier::verify(
             &jwt,
             &owner_pk,
-            None,
+            &KeyId::new(recipient_pk.clone()),
             content_id,
             CapabilityAction::Read,
             None,

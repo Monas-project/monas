@@ -6,6 +6,7 @@
 use crate::domain::events::Event;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use sled::Transactional;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -110,40 +111,44 @@ impl SledOutboxPersistence {
     /// Mark delivery as successful for a specific node.
     ///
     /// If all targets have been delivered, moves the event to the delivered tree.
+    /// Uses a sled transaction to ensure atomicity of the get→modify→insert/remove cycle.
     pub fn mark_delivered(&self, event_id: &str, node_id: &str) -> Result<()> {
-        let key = event_id.as_bytes();
+        let key = event_id.as_bytes().to_vec();
+        let node_id = node_id.to_string();
+        let pending_tree = &self.pending_tree;
+        let delivered_tree = &self.delivered_tree;
 
-        if let Some(data) = self
-            .pending_tree
-            .get(key)
-            .context("Failed to get pending event")?
-        {
-            let mut pending: PendingEvent =
-                serde_json::from_slice(&data).context("Failed to deserialize pending event")?;
+        (&*pending_tree, &*delivered_tree)
+            .transaction(|(pending_tx, delivered_tx)| {
+                let data = match pending_tx.get(&key)? {
+                    Some(data) => data,
+                    None => return Ok(()),
+                };
 
-            // Remove the node from remaining targets
-            pending.remaining_targets.retain(|n| n != node_id);
+                let mut pending: PendingEvent = serde_json::from_slice(&data).map_err(|e| {
+                    sled::transaction::ConflictableTransactionError::Abort(e.to_string())
+                })?;
 
-            if pending.remaining_targets.is_empty() {
-                // All targets delivered, move to delivered tree
-                self.pending_tree
-                    .remove(key)
-                    .context("Failed to remove from pending")?;
+                pending.remaining_targets.retain(|n| n != &node_id);
 
-                let serialized =
-                    serde_json::to_vec(&pending).context("Failed to serialize delivered event")?;
-                self.delivered_tree
-                    .insert(key, serialized)
-                    .context("Failed to save to delivered")?;
-            } else {
-                // Update remaining targets
-                let serialized =
-                    serde_json::to_vec(&pending).context("Failed to serialize pending event")?;
-                self.pending_tree
-                    .insert(key, serialized)
-                    .context("Failed to update pending event")?;
-            }
-        }
+                if pending.remaining_targets.is_empty() {
+                    // All targets delivered: remove from pending, insert to delivered
+                    pending_tx.remove(key.as_slice())?;
+                    let serialized = serde_json::to_vec(&pending).map_err(|e| {
+                        sled::transaction::ConflictableTransactionError::Abort(e.to_string())
+                    })?;
+                    delivered_tx.insert(key.as_slice(), serialized)?;
+                } else {
+                    // Update remaining targets
+                    let serialized = serde_json::to_vec(&pending).map_err(|e| {
+                        sled::transaction::ConflictableTransactionError::Abort(e.to_string())
+                    })?;
+                    pending_tx.insert(key.as_slice(), serialized)?;
+                }
+
+                Ok(())
+            })
+            .map_err(|e| anyhow::anyhow!("Transaction failed: {}", e))?;
 
         Ok(())
     }

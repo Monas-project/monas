@@ -436,8 +436,11 @@ impl StateNode {
                             received.event.event_type()
                         );
 
-                        // Forward to service for processing
-                        match service.handle_sync_event(&received.event).await {
+                        // Forward to service for processing (with source PeerID for verification)
+                        match service
+                            .handle_sync_event(&received.event, Some(&received.source))
+                            .await
+                        {
                             Ok(outcome) => {
                                 tracing::debug!("Processed sync event: {:?}", outcome);
 
