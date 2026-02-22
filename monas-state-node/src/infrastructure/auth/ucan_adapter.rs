@@ -7,6 +7,7 @@ use crate::domain::auth_capability::AuthCapability;
 use crate::domain::identity::{Identity, IdentityType};
 use crate::infrastructure::auth::auth_token::{AuthToken as InfraAuthToken, CapabilityAction};
 use crate::infrastructure::auth::signature_verifier::SignatureVerifier;
+use crate::infrastructure::persistence::SledPublicKeyRepository;
 use crate::port::auth_token::AuthToken;
 use crate::port::authorization_service::{
     AuthorizationRequest, AuthorizationResult, AuthorizationService,
@@ -37,6 +38,8 @@ pub struct UcanAdapter {
     /// Public key registry for key ID resolution (Phase 1 mock implementation)
     /// Maps key ID -> Public Key (65 bytes, uncompressed P256 format)
     public_keys: Arc<RwLock<HashMap<String, Vec<u8>>>>,
+    /// Nonce store for replay attack prevention (JTI uniqueness check)
+    nonce_store: Option<Arc<SledPublicKeyRepository>>,
 }
 
 impl UcanAdapter {
@@ -45,7 +48,14 @@ impl UcanAdapter {
         Self {
             content_repo,
             public_keys: Arc::new(RwLock::new(HashMap::new())),
+            nonce_store: None,
         }
+    }
+
+    /// Set the nonce store for replay attack prevention (builder pattern)
+    pub fn with_nonce_store(mut self, nonce_store: Arc<SledPublicKeyRepository>) -> Self {
+        self.nonce_store = Some(nonce_store);
+        self
     }
 
     /// Register a public key for a key ID (for testing and Phase 1 mock implementation)
@@ -203,7 +213,7 @@ impl UcanAdapter {
         }
     }
 
-    /// Verify AuthToken with dual signature verification
+    /// Verify AuthToken with dual signature verification and replay protection
     async fn verify_auth_token(
         &self,
         token: &InfraAuthToken,
@@ -222,6 +232,16 @@ impl UcanAdapter {
                 requester_key_id,
                 token.payload.aud
             );
+        }
+
+        // 2.5. Check JTI uniqueness (replay attack prevention)
+        if let Some(nonce_store) = &self.nonce_store {
+            if !nonce_store
+                .check_and_record_nonce(&token.payload.jti)
+                .await?
+            {
+                anyhow::bail!("AuthToken JTI already used (replay attack prevented)");
+            }
         }
 
         // 3. Get owner's public key and verify AuthToken signature
@@ -754,6 +774,74 @@ mod tests {
         assert!(
             result.is_denied(),
             "AuthToken authorization should be denied for wrong capability"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_auth_token_authorization_denied_replay() {
+        use crate::infrastructure::auth::test_helpers::TestKeyPair;
+        use crate::infrastructure::persistence::SledPublicKeyRepository;
+        use crate::port::auth_token::AuthToken;
+
+        // Setup
+        let alice = TestKeyPair::generate("user", "alice");
+        let bob = TestKeyPair::generate("user", "bob");
+        let repo = Arc::new(MockContentRepo::new());
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let nonce_store = Arc::new(SledPublicKeyRepository::open(temp_dir.path()).unwrap());
+        let adapter = UcanAdapter::new(repo.clone()).with_nonce_store(nonce_store);
+
+        adapter
+            .register_public_key(alice.key_id().to_string(), alice.public_key().to_vec())
+            .await;
+        adapter
+            .register_public_key(bob.key_id().to_string(), bob.public_key().to_vec())
+            .await;
+
+        let content_id = ContentId::new("test-content-replay".to_string()).unwrap();
+        let alice_identity = Identity::user("alice".to_string()).unwrap();
+        let policy = AccessPolicy::new(content_id.clone(), alice_identity.clone());
+        repo.policies
+            .write()
+            .await
+            .insert("test-content-replay".to_string(), policy);
+
+        // Create a valid token
+        let auth_token = alice.create_auth_token(
+            &bob,
+            "monas://content/test-content-replay",
+            vec![crate::infrastructure::auth::auth_token::CapabilityAction::Read],
+            Some(3600),
+        );
+
+        let request_sig = bob.sign_request(&auth_token);
+        let bob_identity = Identity::user("bob".to_string()).unwrap();
+        let token = AuthToken::new(auth_token.to_jwt().unwrap());
+
+        // First request should succeed
+        let request = AuthorizationRequest {
+            identity: bob_identity.clone(),
+            resource: content_id.clone(),
+            capability: AuthCapability::ReadContent,
+            token: Some(token.clone()),
+            request_signature: Some(request_sig.clone()),
+        };
+        let result = adapter.authorize(&request).await.unwrap();
+        assert!(result.is_granted(), "First use should be granted");
+
+        // Second request with same token (same JTI) should be denied (replay)
+        let request2 = AuthorizationRequest {
+            identity: bob_identity,
+            resource: content_id,
+            capability: AuthCapability::ReadContent,
+            token: Some(token),
+            request_signature: Some(request_sig),
+        };
+        let result2 = adapter.authorize(&request2).await.unwrap();
+        assert!(
+            result2.is_denied(),
+            "Replay should be denied, but got: {:?}",
+            result2
         );
     }
 

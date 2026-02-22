@@ -18,9 +18,9 @@ use crsl_lib::graph::storage::{LeveldbNodeStorage, NodeStorage};
 use crsl_lib::repo::Repo;
 use crsl_lib::storage::SharedLeveldb;
 use multihash_codetable::{Code, MultihashDigest};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use std::sync::Mutex;
 
 /// Payload type for content storage.
 /// Contains raw binary content data and an optional access policy.
@@ -106,10 +106,7 @@ impl ContentRepository for CrslCrdtRepository {
         );
 
         let genesis_cid = {
-            let mut repo = self
-                .repo
-                .lock()
-                .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+            let mut repo = self.repo.lock();
             repo.commit_operation(op)
                 .map_err(|e| anyhow::anyhow!("Failed to commit create operation: {}", e))?
         };
@@ -134,10 +131,7 @@ impl ContentRepository for CrslCrdtRepository {
         let policy = if access_policy.is_some() {
             access_policy
         } else {
-            let repo = self
-                .repo
-                .lock()
-                .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+            let repo = self.repo.lock();
             repo.latest(&genesis).and_then(|latest_cid| {
                 repo.dag
                     .get_node(&latest_cid)
@@ -156,10 +150,7 @@ impl ContentRepository for CrslCrdtRepository {
         let op = Operation::new(genesis, OperationType::Update(payload), author.to_string());
 
         let version_cid = {
-            let mut repo = self
-                .repo
-                .lock()
-                .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+            let mut repo = self.repo.lock();
             repo.commit_operation(op)
                 .map_err(|e| anyhow::anyhow!("Failed to commit update operation: {}", e))?
         };
@@ -174,10 +165,7 @@ impl ContentRepository for CrslCrdtRepository {
     async fn get_latest(&self, genesis_cid: &str) -> Result<Option<Vec<u8>>> {
         let genesis = Self::parse_cid(genesis_cid)?;
 
-        let repo = self
-            .repo
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+        let repo = self.repo.lock();
 
         // Get the latest version CID
         match repo.latest(&genesis) {
@@ -199,10 +187,7 @@ impl ContentRepository for CrslCrdtRepository {
     ) -> Result<Option<(Vec<u8>, String)>> {
         let genesis = Self::parse_cid(genesis_cid)?;
 
-        let repo = self
-            .repo
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+        let repo = self.repo.lock();
 
         // Get the latest version CID
         match repo.latest(&genesis) {
@@ -223,10 +208,7 @@ impl ContentRepository for CrslCrdtRepository {
     async fn get_version(&self, version_cid: &str) -> Result<Option<Vec<u8>>> {
         let cid = Self::parse_cid(version_cid)?;
 
-        let repo = self
-            .repo
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+        let repo = self.repo.lock();
 
         match repo.dag.get_node(&cid) {
             Ok(Some(node)) => Ok(Some(node.payload().data.clone())),
@@ -238,10 +220,7 @@ impl ContentRepository for CrslCrdtRepository {
     async fn get_access_policy(&self, genesis_cid: &str) -> Result<Option<AccessPolicy>> {
         let genesis = Self::parse_cid(genesis_cid)?;
 
-        let repo = self
-            .repo
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+        let repo = self.repo.lock();
 
         match repo.latest(&genesis) {
             Some(latest_cid) => match repo.dag.get_node(&latest_cid) {
@@ -263,10 +242,7 @@ impl ContentRepository for CrslCrdtRepository {
 
         // Get current data from latest version
         let current_data = {
-            let repo = self
-                .repo
-                .lock()
-                .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+            let repo = self.repo.lock();
             repo.latest(&genesis)
                 .and_then(|latest_cid| {
                     repo.dag
@@ -286,10 +262,7 @@ impl ContentRepository for CrslCrdtRepository {
         let op = Operation::new(genesis, OperationType::Update(payload), author.to_string());
 
         let version_cid = {
-            let mut repo = self
-                .repo
-                .lock()
-                .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+            let mut repo = self.repo.lock();
             repo.commit_operation(op)
                 .map_err(|e| anyhow::anyhow!("Failed to commit access policy update: {}", e))?
         };
@@ -304,10 +277,7 @@ impl ContentRepository for CrslCrdtRepository {
     async fn get_history(&self, genesis_cid: &str) -> Result<Vec<String>> {
         let genesis = Self::parse_cid(genesis_cid)?;
 
-        let repo = self
-            .repo
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+        let repo = self.repo.lock();
 
         let path = repo
             .linear_history(&genesis)
@@ -323,10 +293,7 @@ impl ContentRepository for CrslCrdtRepository {
     ) -> Result<Vec<SerializedOperation>> {
         let genesis = Self::parse_cid(genesis_cid)?;
 
-        let repo = self
-            .repo
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+        let repo = self.repo.lock();
 
         let indexed_ops = repo
             .get_operations_with_index(&genesis)
@@ -440,10 +407,7 @@ impl ContentRepository for CrslCrdtRepository {
     async fn apply_operations(&self, operations: &[SerializedOperation]) -> Result<usize> {
         let mut applied = 0;
 
-        let mut repo = self
-            .repo
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+        let mut repo = self.repo.lock();
 
         for serialized_op in operations {
             // Deserialize the operation
@@ -473,19 +437,13 @@ impl ContentRepository for CrslCrdtRepository {
             Err(_) => return Ok(false),
         };
 
-        let repo = self
-            .repo
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+        let repo = self.repo.lock();
 
         Ok(repo.latest(&genesis).is_some())
     }
 
     async fn list_contents(&self) -> Result<Vec<String>> {
-        let repo = self
-            .repo
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+        let repo = self.repo.lock();
 
         // Get all nodes and collect unique genesis CIDs
         let node_map = repo

@@ -210,8 +210,9 @@ impl StateNode {
             )
             .context("Failed to open auth public key repository")?,
         );
-        let auth_service = MonasAccountAdapter::with_registry(auth_public_key_repo);
-        let authz_service = UcanAdapter::new(crdt_repo_dyn.clone());
+        let auth_service = MonasAccountAdapter::with_registry(auth_public_key_repo.clone());
+        let authz_service =
+            UcanAdapter::new(crdt_repo_dyn.clone()).with_nonce_store(auth_public_key_repo);
 
         // Create service with CRDT repository
         let service = Arc::new(

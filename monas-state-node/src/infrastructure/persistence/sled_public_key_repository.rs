@@ -56,7 +56,10 @@ impl SledPublicKeyRepository {
         Self::new(Arc::new(db))
     }
 
-    /// Check and record a nonce to prevent replay attacks
+    /// Check and record a nonce to prevent replay attacks.
+    ///
+    /// Uses sled's compare-and-swap to atomically check and insert,
+    /// preventing TOCTOU race conditions between concurrent requests.
     ///
     /// # Returns
     /// Ok(true) if the nonce is new and was recorded
@@ -64,23 +67,31 @@ impl SledPublicKeyRepository {
     pub async fn check_and_record_nonce(&self, nonce: &str) -> Result<bool> {
         let nonce_bytes = nonce.as_bytes();
 
-        // Check if nonce already exists
-        if self.nonce_tree.contains_key(nonce_bytes)? {
-            return Ok(false);
-        }
-
-        // Record the nonce with current timestamp
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
 
-        self.nonce_tree
-            .insert(nonce_bytes, &timestamp.to_le_bytes())?;
+        let timestamp_bytes = timestamp.to_le_bytes();
 
-        // Clean up old nonces (older than 1 hour)
-        self.cleanup_old_nonces(timestamp - 3600)?;
-
-        Ok(true)
+        // Atomic compare-and-swap: only insert if key does not exist (None -> Some)
+        match self.nonce_tree.compare_and_swap(
+            nonce_bytes,
+            None::<&[u8]>,
+            Some(&timestamp_bytes),
+        )? {
+            Ok(()) => {
+                // Successfully recorded — nonce was new
+                // Periodically clean up old nonces (older than 1 hour)
+                if timestamp % 60 == 0 {
+                    self.cleanup_old_nonces(timestamp.saturating_sub(3600))?;
+                }
+                Ok(true)
+            }
+            Err(_) => {
+                // Nonce already existed
+                Ok(false)
+            }
+        }
     }
 
     /// Clean up nonces older than the given timestamp
@@ -218,11 +229,11 @@ impl ExtendedPublicKeyRegistry for SledPublicKeyRepository {
     }
 
     async fn remove_public_key_by_key_id(&self, key_id: &str) -> Result<bool> {
-        // Remove from key_id_tree
-        let removed = self.key_id_tree.remove(key_id.as_bytes())?.is_some();
+        // Remove from key_id_tree, capturing the removed value for node tree cleanup
+        let removed_value = self.key_id_tree.remove(key_id.as_bytes())?;
 
         // If it's a node key, also remove from node trees
-        if let Some(public_key_ivec) = self.key_id_tree.get(key_id.as_bytes())? {
+        if let Some(public_key_ivec) = &removed_value {
             let public_key = public_key_ivec.to_vec();
             if let Ok(node_id) = NodeId::from_public_key(&public_key) {
                 self.node_key_tree.remove(node_id.as_str().as_bytes())?;
@@ -230,7 +241,7 @@ impl ExtendedPublicKeyRegistry for SledPublicKeyRepository {
             }
         }
 
-        Ok(removed)
+        Ok(removed_value.is_some())
     }
 }
 
@@ -363,6 +374,39 @@ mod tests {
             assert!(retrieved.is_some());
             assert_eq!(retrieved.unwrap(), public_key);
         }
+    }
+
+    #[tokio::test]
+    async fn test_remove_public_key_by_key_id_cleans_node_trees() {
+        let (repo, _temp_dir) = create_test_repository().await;
+        let public_key = generate_test_public_key();
+        let key_id = "node:test-remove".to_string();
+
+        // Register with node: prefix (creates entries in all three trees)
+        repo.register_public_key_for_key_id(key_id.clone(), public_key.clone())
+            .await
+            .unwrap();
+
+        let node_id = NodeId::from_public_key(&public_key).unwrap();
+
+        // Verify node trees have entries
+        assert!(repo.get_public_key(&node_id).await.unwrap().is_some());
+
+        // Remove by key_id — should also clean up node trees
+        assert!(repo.remove_public_key_by_key_id(&key_id).await.unwrap());
+
+        // key_id_tree should be empty
+        assert!(repo
+            .get_public_key_by_key_id(&key_id)
+            .await
+            .unwrap()
+            .is_none());
+
+        // node_key_tree should also be cleaned up
+        assert!(repo.get_public_key(&node_id).await.unwrap().is_none());
+
+        // Removing again should return false
+        assert!(!repo.remove_public_key_by_key_id(&key_id).await.unwrap());
     }
 
     #[tokio::test]

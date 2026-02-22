@@ -56,6 +56,9 @@ crsl-lib = { git = "https://github.com/Monas-project/crsl-lib", rev = "e13b86ce6
 # sled for persistence
 sled = "0.34"
 
+# parking_lot for non-poisoning Mutex
+parking_lot = "0.12"
+
 # fs2 for disk capacity queries (native only)
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 fs2 = "0.4"

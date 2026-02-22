@@ -48,14 +48,20 @@ pub fn create_router(state: AppState) -> Router {
         .unwrap();
 
     Router::new()
+        // --- Public endpoints (no auth required) ---
+        // These are intentionally unauthenticated for P2P peer discovery,
+        // node coordination, and operational monitoring.
+        // SECURITY NOTE: These endpoints expose only node/content IDs and
+        // capacity metadata — never content data itself.
         .route("/health", get(health_check))
         .route("/node/info", get(node_info))
         .route("/node/register", post(register_node))
         .route("/nodes", get(list_nodes))
+        .route("/contents", get(list_contents))
+        // --- Authenticated endpoints ---
         .route("/content", post(create_content))
         .route("/content/:id", put(update_content).delete(delete_content))
         .route("/content/:id/members", post(add_members))
-        .route("/contents", get(list_contents))
         // CRDT-related endpoints
         .route("/content/:id/data", get(get_content_data))
         .route("/content/:id/history", get(get_content_history))
@@ -257,7 +263,7 @@ fn extract_request_signature(headers: &HeaderMap) -> Option<Vec<u8>> {
 // Handlers
 // ============================================================================
 
-/// Health check endpoint.
+/// Health check endpoint (public, no auth required).
 async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
     Json(HealthResponse {
         status: "ok".to_string(),
@@ -265,7 +271,10 @@ async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
     })
 }
 
-/// Get node info.
+/// Get node info (public, no auth required).
+///
+/// Exposes node capacity and listen addresses for peer discovery.
+/// Does not expose content data.
 async fn node_info(State(state): State<AppState>) -> impl IntoResponse {
     let node_id = state.local_node_id().to_string();
     let listen_addrs = state.listen_addrs().await;
@@ -289,7 +298,10 @@ async fn node_info(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
-/// Register the local node.
+/// Register the local node (public, no auth required).
+///
+/// This endpoint is called by the node operator to initialize the local node.
+/// It is rate-limited by the global governor (100 req/s) to prevent abuse.
 async fn register_node(
     State(state): State<AppState>,
     Json(req): Json<RegisterNodeRequest>,
@@ -305,7 +317,9 @@ async fn register_node(
     }
 }
 
-/// List all nodes.
+/// List all nodes (public, no auth required).
+///
+/// Returns node IDs only — no content data. Used for peer coordination.
 async fn list_nodes(State(state): State<AppState>) -> impl IntoResponse {
     match state.list_nodes().await {
         Ok(nodes) => Json::<Vec<String>>(nodes).into_response(),
@@ -483,7 +497,10 @@ async fn add_members(
     }
 }
 
-/// List all content networks.
+/// List all content networks (public, no auth required).
+///
+/// Returns content IDs only — no content data. Used for sync coordination.
+/// Content data access requires authentication via GET /content/:id/data.
 async fn list_contents(State(state): State<AppState>) -> impl IntoResponse {
     match state.list_content_networks().await {
         Ok(contents) => Json::<Vec<String>>(contents).into_response(),
