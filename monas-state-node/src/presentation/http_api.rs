@@ -1,9 +1,7 @@
 //! HTTP API for the state node.
 
 use crate::application_service::state_node_service::StateNodeService;
-use crate::domain::auth_capability::AuthCapability;
 use crate::domain::errors::StateNodeError;
-use crate::domain::identity::Identity;
 use crate::infrastructure::crdt_repository::CrslCrdtRepository;
 use crate::infrastructure::gossipsub_publisher::GossipsubEventPublisher;
 use crate::infrastructure::network::Libp2pNetwork;
@@ -66,7 +64,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/content/:id/data", get(get_content_data))
         .route("/content/:id/history", get(get_content_history))
         .route("/content/:id/version/:version", get(get_content_version))
-        .route("/content/:id/access/grant", post(grant_access_handler))
+        .route(
+            "/content/:id/access/invalidate",
+            post(invalidate_tokens_handler),
+        )
         // Request body size limit: 16 MiB
         .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
         // Rate limit: 100 requests/sec, burst up to 200
@@ -190,17 +191,10 @@ impl IntoResponse for StateNodeError {
     }
 }
 
-#[derive(Debug, Deserialize)]
-pub struct GrantAccessRequest {
-    pub grantee_id: String,
-    pub capabilities: Vec<String>,
-}
-
 #[derive(Debug, Serialize)]
-pub struct GrantAccessResponse {
+pub struct InvalidateTokensResponse {
     pub content_id: String,
-    pub grantee_id: String,
-    pub granted_capabilities: Vec<String>,
+    pub new_min_valid_issued_at: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -510,8 +504,9 @@ async fn list_contents(State(state): State<AppState>) -> impl IntoResponse {
 
 /// Verify that the caller has read access to the given content.
 ///
-/// Extracts a Bearer token from the Authorization header, then checks the
-/// CRDT-embedded access policy for read permission.
+/// Extracts a Bearer token from the Authorization header, then checks:
+/// - If the caller is the content owner, access is granted immediately
+/// - Otherwise, the caller must provide a valid AuthToken (JWT) as the Bearer token
 async fn verify_read_access(
     state: &AppState,
     headers: &HeaderMap,
@@ -528,7 +523,7 @@ async fn verify_read_access(
     })?;
 
     // Authenticate the caller
-    let _identity = state.authenticate_for_read(&token).await.map_err(|e| {
+    let identity = state.authenticate_for_read(&token).await.map_err(|e| {
         (
             StatusCode::UNAUTHORIZED,
             Json(ErrorResponse {
@@ -541,18 +536,45 @@ async fn verify_read_access(
     // Check access policy for read permission
     let crdt_repo = state.crdt_repo();
     if let Ok(Some(policy)) = crdt_repo.get_access_policy(content_id).await {
-        if !policy.has_capability(
-            &_identity,
-            &crate::domain::auth_capability::AuthCapability::ReadContent,
-        ) {
-            return Err((
-                StatusCode::FORBIDDEN,
-                Json(ErrorResponse {
-                    error: "Insufficient permissions: read access required".to_string(),
-                }),
-            )
-                .into_response());
+        // Owner always has access
+        if policy.is_owner(&identity) {
+            return Ok(());
         }
+
+        // Non-owner: needs AuthToken-based authorization
+        // The Bearer token is used as-is for JWT-based auth
+        let request_signature = extract_request_signature(headers);
+        let authz_request = crate::port::authorization_service::AuthorizationRequest {
+            identity,
+            resource: crate::domain::value_objects::ContentId::new(content_id.to_string())
+                .map_err(|_| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error: "Invalid content ID".to_string(),
+                        }),
+                    )
+                        .into_response()
+                })?,
+            capability: crate::domain::auth_capability::AuthCapability::ReadContent,
+            token: Some(token),
+            request_signature,
+        };
+
+        if let Some(authz_service) = state.authz_service() {
+            match authz_service.authorize(&authz_request).await {
+                Ok(result) if result.is_granted() => return Ok(()),
+                _ => {}
+            }
+        }
+
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse {
+                error: "Insufficient permissions: read access required".to_string(),
+            }),
+        )
+            .into_response());
     }
     // If no policy exists, allow access (content may not have a policy yet)
 
@@ -679,26 +701,14 @@ async fn get_content_version(
     }
 }
 
-/// Parse a capability string into an AuthCapability enum variant.
-fn parse_capability(s: &str) -> Option<AuthCapability> {
-    match s {
-        "ReadContent" => Some(AuthCapability::ReadContent),
-        "WriteContent" => Some(AuthCapability::WriteContent),
-        "DeleteContent" => Some(AuthCapability::DeleteContent),
-        "ManageMembers" => Some(AuthCapability::ManageMembers),
-        "ShareContent" => Some(AuthCapability::ShareContent),
-        "RevokeAccess" => Some(AuthCapability::RevokeAccess),
-        "ReadMetadata" => Some(AuthCapability::ReadMetadata),
-        _ => None,
-    }
-}
-
-/// Grant access to a content for a specific identity.
-async fn grant_access_handler(
+/// Invalidate all AuthTokens for a content.
+///
+/// Only the content owner can call this endpoint.
+/// After invalidation, all previously issued AuthTokens become invalid.
+async fn invalidate_tokens_handler(
     State(state): State<AppState>,
     Path(content_id): Path<String>,
     headers: HeaderMap,
-    Json(req): Json<GrantAccessRequest>,
 ) -> impl IntoResponse {
     // Extract authentication token
     let token = match extract_auth_token(&headers) {
@@ -714,89 +724,15 @@ async fn grant_access_handler(
         }
     };
 
-    // Parse grantee identity from "type:id" format
-    let grantee_identity = if let Some((type_str, id)) = req.grantee_id.split_once(':') {
-        match type_str {
-            "user" => Identity::user(id.to_string()),
-            "node" => Identity::node(id.to_string()),
-            "service" => Identity::service(id.to_string()),
-            _ => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorResponse {
-                        error: format!("Invalid grantee_id format: unknown type '{}'", type_str),
-                    }),
-                )
-                    .into_response();
-            }
-        }
-    } else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "grantee_id must be in 'type:id' format (e.g., 'user:account2')".to_string(),
-            }),
-        )
-            .into_response();
-    };
-
-    let grantee_identity = match grantee_identity {
-        Ok(id) => id,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
-                    error: format!("Invalid grantee identity: {}", e),
-                }),
-            )
-                .into_response();
-        }
-    };
-
-    // Parse capabilities
-    let mut capabilities = Vec::new();
-    for cap_str in &req.capabilities {
-        match parse_capability(cap_str) {
-            Some(cap) => capabilities.push(cap),
-            None => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorResponse {
-                        error: format!("Unknown capability: '{}'", cap_str),
-                    }),
-                )
-                    .into_response();
-            }
-        }
-    }
-
-    if capabilities.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: "At least one capability is required".to_string(),
-            }),
-        )
-            .into_response();
-    }
-
-    let granted_capabilities: Vec<String> = req.capabilities.clone();
     let request_signature = extract_request_signature(&headers);
 
     match state
-        .grant_access(
-            &content_id,
-            grantee_identity,
-            capabilities,
-            &token,
-            request_signature.as_deref(),
-        )
+        .invalidate_tokens(&content_id, &token, request_signature.as_deref())
         .await
     {
-        Ok(()) => Json(GrantAccessResponse {
+        Ok(new_min_valid_issued_at) => Json(InvalidateTokensResponse {
             content_id,
-            grantee_id: req.grantee_id,
-            granted_capabilities,
+            new_min_valid_issued_at,
         })
         .into_response(),
         Err(e) => e.into_response(),

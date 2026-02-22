@@ -258,12 +258,10 @@ mod tests {
             Ok(true)
         }
 
-        async fn relay_grant_access(
+        async fn relay_invalidate_tokens(
             &self,
             _peer_id: &str,
             _content_id: &str,
-            _grantee_id: &str,
-            _capabilities: &[String],
             _auth_token: &str,
             _request_signature: &[u8],
         ) -> Result<bool> {

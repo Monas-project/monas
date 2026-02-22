@@ -141,11 +141,11 @@ mod tests {
 
             match policy {
                 Some(policy) => {
-                    if policy.has_capability(&request.identity, &request.capability) {
+                    if policy.is_owner(&request.identity) {
                         Ok(AuthorizationResult::Granted)
                     } else {
                         Ok(AuthorizationResult::Denied {
-                            reason: "Identity does not have required capability".to_string(),
+                            reason: "Non-owner access requires an AuthToken".to_string(),
                         })
                     }
                 }

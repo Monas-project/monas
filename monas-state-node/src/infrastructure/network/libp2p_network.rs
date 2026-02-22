@@ -58,10 +58,8 @@ pub enum RelayRequestKind {
         auth_token: String,
         request_signature: Vec<u8>,
     },
-    GrantAccess {
+    InvalidateTokens {
         content_id: String,
-        grantee_id: String,
-        capabilities: Vec<String>,
         auth_token: String,
         request_signature: Vec<u8>,
     },
@@ -191,11 +189,9 @@ enum SwarmCommand {
         request_signature: Vec<u8>,
         reply: oneshot::Sender<Result<bool>>,
     },
-    RelayGrantAccess {
+    RelayInvalidateTokens {
         peer_id: PeerId,
         content_id: String,
-        grantee_id: String,
-        capabilities: Vec<String>,
         auth_token: String,
         request_signature: Vec<u8>,
         reply: oneshot::Sender<Result<bool>>,
@@ -227,7 +223,7 @@ struct PendingRequests {
     public_key_queries: HashMap<OutboundRequestId, oneshot::Sender<Result<Vec<NodePublicKey>>>>,
     relay_update_queries: HashMap<OutboundRequestId, oneshot::Sender<Result<bool>>>,
     relay_delete_queries: HashMap<OutboundRequestId, oneshot::Sender<Result<bool>>>,
-    relay_grant_access_queries: HashMap<OutboundRequestId, oneshot::Sender<Result<bool>>>,
+    relay_invalidate_tokens_queries: HashMap<OutboundRequestId, oneshot::Sender<Result<bool>>>,
     /// Timestamps for all pending request IDs, used for TTL-based cleanup.
     timestamps: HashMap<u64, tokio::time::Instant>,
 }
@@ -249,7 +245,7 @@ impl PendingRequests {
         self.public_key_queries.retain(|_, s| !s.is_closed());
         self.relay_update_queries.retain(|_, s| !s.is_closed());
         self.relay_delete_queries.retain(|_, s| !s.is_closed());
-        self.relay_grant_access_queries
+        self.relay_invalidate_tokens_queries
             .retain(|_, s| !s.is_closed());
 
         // Clean up expired timestamps
@@ -260,7 +256,7 @@ impl PendingRequests {
 
 /// Channels for dispatching relay requests and sending responses back to the swarm.
 ///
-/// Relay requests (UpdateContent, DeleteContent, GrantAccess) are processed in
+/// Relay requests (UpdateContent, DeleteContent, InvalidateTokens) are processed in
 /// spawned tasks to avoid blocking the swarm loop. `relay_tx` dispatches the
 /// request to the relay handler, and `command_tx` sends the response back to the
 /// swarm via `SwarmCommand::SendRelayResponse`.
@@ -681,26 +677,24 @@ impl Libp2pNetwork {
                 );
                 pending.relay_delete_queries.insert(request_id, reply);
             }
-            SwarmCommand::RelayGrantAccess {
+            SwarmCommand::RelayInvalidateTokens {
                 peer_id,
                 content_id,
-                grantee_id,
-                capabilities,
                 auth_token,
                 request_signature,
                 reply,
             } => {
                 let request_id = swarm.behaviour_mut().request_response.send_request(
                     &peer_id,
-                    ContentRequest::GrantAccess {
+                    ContentRequest::InvalidateTokens {
                         content_id,
-                        grantee_id,
-                        capabilities,
                         auth_token,
                         request_signature,
                     },
                 );
-                pending.relay_grant_access_queries.insert(request_id, reply);
+                pending
+                    .relay_invalidate_tokens_queries
+                    .insert(request_id, reply);
             }
             SwarmCommand::SendRelayResponse { channel, response } => {
                 if let Err(e) = swarm
@@ -948,7 +942,7 @@ impl Libp2pNetwork {
                 if let Some(reply) = pending.relay_delete_queries.remove(&request_id) {
                     let _ = reply.send(Err(anyhow::anyhow!("{}", err_msg)));
                 }
-                if let Some(reply) = pending.relay_grant_access_queries.remove(&request_id) {
+                if let Some(reply) = pending.relay_invalidate_tokens_queries.remove(&request_id) {
                     let _ = reply.send(Err(anyhow::anyhow!("{}", err_msg)));
                 }
             }
@@ -967,7 +961,7 @@ impl Libp2pNetwork {
     ) {
         debug!("Received request from {}: {:?}", peer, request);
 
-        // For relay requests (UpdateContent, DeleteContent, GrantAccess), we spawn a
+        // For relay requests (UpdateContent, DeleteContent, InvalidateTokens), we spawn a
         // background task to avoid blocking the swarm loop. The relay handler may need
         // to send SwarmCommands (e.g. publish_event, query_capacity) which would deadlock
         // if the swarm loop is blocked waiting for the relay response.
@@ -1064,25 +1058,21 @@ impl Libp2pNetwork {
                 });
                 return;
             }
-            ContentRequest::GrantAccess {
+            ContentRequest::InvalidateTokens {
                 content_id,
-                grantee_id,
-                capabilities,
                 auth_token,
                 request_signature,
             } => {
                 info!(
-                    "Received relayed GrantAccess for {} from {}",
+                    "Received relayed InvalidateTokens for {} from {}",
                     content_id, peer
                 );
                 let channels = relay_channels.clone();
                 tokio::spawn(async move {
                     let (reply_tx, reply_rx) = oneshot::channel();
                     let relay_req = RelayRequest {
-                        kind: RelayRequestKind::GrantAccess {
+                        kind: RelayRequestKind::InvalidateTokens {
                             content_id: content_id.clone(),
-                            grantee_id,
-                            capabilities,
                             auth_token,
                             request_signature,
                         },
@@ -1090,12 +1080,12 @@ impl Libp2pNetwork {
                     };
                     let response = if channels.relay_tx.send(relay_req).await.is_ok() {
                         match reply_rx.await {
-                            Ok(Ok(())) => ContentResponse::GrantAccessResult {
+                            Ok(Ok(())) => ContentResponse::InvalidateTokensResult {
                                 content_id,
                                 success: true,
                             },
                             Ok(Err(e)) => ContentResponse::Error {
-                                message: format!("Relay grant_access failed: {}", e),
+                                message: format!("Relay invalidate_tokens failed: {}", e),
                             },
                             Err(_) => ContentResponse::Error {
                                 message: "Relay handler dropped".to_string(),
@@ -1221,7 +1211,7 @@ impl Libp2pNetwork {
             // Relay variants already handled above and returned early
             ContentRequest::UpdateContent { .. }
             | ContentRequest::DeleteContent { .. }
-            | ContentRequest::GrantAccess { .. } => unreachable!(),
+            | ContentRequest::InvalidateTokens { .. } => unreachable!(),
         };
 
         if let Err(e) = swarm
@@ -1351,15 +1341,15 @@ impl Libp2pNetwork {
             return;
         }
 
-        // Handle relay grant_access response
-        if let Some(reply) = pending.relay_grant_access_queries.remove(&request_id) {
+        // Handle relay invalidate_tokens response
+        if let Some(reply) = pending.relay_invalidate_tokens_queries.remove(&request_id) {
             match response {
-                ContentResponse::GrantAccessResult { success, .. } => {
+                ContentResponse::InvalidateTokensResult { success, .. } => {
                     let _ = reply.send(Ok(success));
                 }
                 ContentResponse::Error { message } => {
                     let _ = reply.send(Err(anyhow::anyhow!(
-                        "Relay grant_access error: {}",
+                        "Relay invalidate_tokens error: {}",
                         message
                     )));
                 }
@@ -1845,12 +1835,10 @@ impl PeerNetwork for Libp2pNetwork {
             .map_err(|_| anyhow::anyhow!("Failed to receive response"))?
     }
 
-    async fn relay_grant_access(
+    async fn relay_invalidate_tokens(
         &self,
         peer_id: &str,
         content_id: &str,
-        grantee_id: &str,
-        capabilities: &[String],
         auth_token: &str,
         request_signature: &[u8],
     ) -> Result<bool> {
@@ -1859,11 +1847,9 @@ impl PeerNetwork for Libp2pNetwork {
 
         let (tx, rx) = oneshot::channel();
         self.command_tx
-            .send(SwarmCommand::RelayGrantAccess {
+            .send(SwarmCommand::RelayInvalidateTokens {
                 peer_id,
                 content_id: content_id.to_string(),
-                grantee_id: grantee_id.to_string(),
-                capabilities: capabilities.to_vec(),
                 auth_token: auth_token.to_string(),
                 request_signature: request_signature.to_vec(),
                 reply: tx,
@@ -1873,7 +1859,7 @@ impl PeerNetwork for Libp2pNetwork {
 
         tokio::time::timeout(PEER_NETWORK_TIMEOUT, rx)
             .await
-            .map_err(|_| anyhow::anyhow!("relay_grant_access timed out"))?
+            .map_err(|_| anyhow::anyhow!("relay_invalidate_tokens timed out"))?
             .map_err(|_| anyhow::anyhow!("Failed to receive response"))?
     }
 }

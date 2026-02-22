@@ -50,11 +50,9 @@ pub enum ContentRequest {
         auth_token: String,
         request_signature: Vec<u8>,
     },
-    /// Relay a grant_access request to a member node.
-    GrantAccess {
+    /// Relay an invalidate_tokens request to a member node.
+    InvalidateTokens {
         content_id: String,
-        grantee_id: String,
-        capabilities: Vec<String>,
         auth_token: String,
         request_signature: Vec<u8>,
     },
@@ -91,8 +89,8 @@ pub enum ContentResponse {
     UpdateResult { content_id: String, success: bool },
     /// Response to relayed delete request.
     DeleteResult { content_id: String, success: bool },
-    /// Response to relayed grant_access request.
-    GrantAccessResult { content_id: String, success: bool },
+    /// Response to relayed invalidate_tokens request.
+    InvalidateTokensResult { content_id: String, success: bool },
     /// Content not found.
     NotFound { content_id: String },
     /// Error response.

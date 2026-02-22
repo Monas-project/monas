@@ -204,6 +204,11 @@ where
         &self.crdt_repo
     }
 
+    /// Get the authorization service (if configured).
+    pub fn authz_service(&self) -> Option<&Arc<dyn AuthorizationService>> {
+        self.authz_service.as_ref()
+    }
+
     /// Authenticate a caller for read operations.
     ///
     /// Returns the authenticated identity on success.
@@ -552,7 +557,7 @@ where
         } else {
             // Relay path: we are not a member, relay to a member node.
             // Authorization is delegated to the member node which has the up-to-date
-            // access policy (including any grants made via grant_access).
+            // access policy (including any grants made via invalidate_tokens).
             let members = network.member_nodes_as_strings();
             if members.is_empty() {
                 return Err(StateNodeError::NoAvailableMembers);
@@ -586,7 +591,7 @@ where
     /// before updating content.
     ///
     /// Non-member nodes delegate authorization to the member node via relay,
-    /// since access policy updates (e.g., grant_access) are only stored on member nodes.
+    /// since access policy updates (e.g., invalidate_tokens) are only stored on member nodes.
     pub async fn update_content(
         &self,
         content_id: &str,
@@ -683,7 +688,7 @@ where
         } else {
             // Relay path: we are not a member, relay to a member node.
             // Authorization is delegated to the member node which has the up-to-date
-            // access policy (including any grants made via grant_access).
+            // access policy (including any grants made via invalidate_tokens).
             let members = network.member_nodes_as_strings();
             if members.is_empty() {
                 return Err(StateNodeError::NoAvailableMembers);
@@ -716,32 +721,34 @@ where
         }
     }
 
-    /// Grant access capabilities to an identity for a content.
+    /// Invalidate all AuthTokens for a content by updating min_valid_issued_at.
     ///
-    /// This method allows the owner of content to share access with other identities.
-    /// Only the owner can grant access.
+    /// This method allows the owner of content to invalidate all previously issued
+    /// AuthTokens. After invalidation, only tokens issued after the new timestamp
+    /// will be accepted.
     ///
     /// # Arguments
     ///
-    /// * `content_id` - The content to grant access to
-    /// * `grantee_identity` - The identity to grant access to
-    /// * `capabilities` - The capabilities to grant
+    /// * `content_id` - The content to invalidate tokens for
     /// * `token` - Authentication token of the caller (must be owner)
+    /// * `request_signature` - Optional request signature
+    ///
+    /// # Returns
+    ///
+    /// The new min_valid_issued_at timestamp on success.
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - Authentication fails
     /// - Caller is not the owner of the content
-    /// - Access policy repository is not configured
-    pub async fn grant_access(
+    /// - Content not found
+    pub async fn invalidate_tokens(
         &self,
         content_id: &str,
-        grantee_identity: Identity,
-        capabilities: Vec<AuthCapability>,
         token: &AuthToken,
         request_signature: Option<&[u8]>,
-    ) -> Result<(), StateNodeError> {
+    ) -> Result<u64, StateNodeError> {
         // 1. Ensure auth services are configured
         let auth_service = self.auth_service.as_ref().ok_or_else(|| {
             StateNodeError::InvalidConfiguration("Authentication not configured".to_string())
@@ -777,14 +784,12 @@ where
             // 5. Verify caller is owner
             if !policy.is_owner(&caller_identity) {
                 return Err(StateNodeError::AuthorizationFailed(
-                    "Only the owner can grant access".to_string(),
+                    "Only the owner can invalidate tokens".to_string(),
                 ));
             }
 
-            // 6. Grant capabilities
-            policy
-                .grant(grantee_identity, capabilities)
-                .map_err(|e| StateNodeError::Internal(e.to_string()))?;
+            // 6. Invalidate tokens
+            let new_min = policy.invalidate_tokens();
 
             // 7. Save updated policy via CRDT
             self.crdt_repo
@@ -792,8 +797,23 @@ where
                 .await
                 .map_err(|e| StateNodeError::CrdtError(CrdtError::StorageError(e.to_string())))?;
 
-            // 8. Push CRDT operations (including updated AccessPolicy) to other member nodes
-            // This ensures all members have the grant before subsequent requests arrive
+            // 8. Sync to SledAccessControlRepository if available
+            if let Some(access_control_repo) = &self.access_control_repo {
+                let ac_repo = access_control_repo.read().await;
+                let mut ac = ac_repo
+                    .get_access_control(content_id)
+                    .await
+                    .unwrap_or(None)
+                    .unwrap_or_else(|| ContentAccessControl::new(content_id.to_string()));
+
+                if let Err(e) = ac.invalidate_before(new_min) {
+                    tracing::warn!("Failed to sync invalidation to access control repo: {}", e);
+                } else if let Err(e) = ac_repo.save_access_control(&ac).await {
+                    tracing::warn!("Failed to save access control to Sled: {}", e);
+                }
+            }
+
+            // 9. Push CRDT operations to other member nodes
             {
                 let operations = self
                     .crdt_repo
@@ -815,7 +835,7 @@ where
                             .await
                         {
                             tracing::warn!(
-                                "Failed to push grant operations to member {}: {} (will rely on sync)",
+                                "Failed to push invalidation operations to member {}: {} (will rely on sync)",
                                 member_id, e
                             );
                         }
@@ -823,7 +843,7 @@ where
                 }
             }
 
-            Ok(())
+            Ok(new_min)
         } else {
             // Relay path: we are not a member, relay to a member node
             let members = network.member_nodes_as_strings();
@@ -832,25 +852,12 @@ where
             }
 
             let target_peer = &members[0];
-            let grantee_id = format!(
-                "{}:{}",
-                match grantee_identity.identity_type() {
-                    crate::domain::identity::IdentityType::User => "user",
-                    crate::domain::identity::IdentityType::Node => "node",
-                    crate::domain::identity::IdentityType::Service => "service",
-                },
-                grantee_identity.id()
-            );
-            let cap_strings: Vec<String> =
-                capabilities.iter().map(|c| format!("{:?}", c)).collect();
 
             let success = self
                 .peer_network
-                .relay_grant_access(
+                .relay_invalidate_tokens(
                     target_peer,
                     content_id,
-                    &grantee_id,
-                    &cap_strings,
                     token.as_str(),
                     request_signature.unwrap_or(&[]),
                 )
@@ -859,11 +866,13 @@ where
 
             if !success {
                 return Err(StateNodeError::Internal(
-                    "Relay grant_access to member node failed".to_string(),
+                    "Relay invalidate_tokens to member node failed".to_string(),
                 ));
             }
 
-            Ok(())
+            // For relay path, we don't know the exact new_min_valid_issued_at
+            // Return current timestamp as approximate value
+            Ok(crate::domain::events::current_timestamp())
         }
     }
 

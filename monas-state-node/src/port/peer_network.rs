@@ -118,16 +118,14 @@ pub trait PeerNetwork: Send + Sync {
         request_signature: &[u8],
     ) -> Result<bool>;
 
-    /// Relay a grant_access request to a member node.
+    /// Relay an invalidate_tokens request to a member node.
     ///
-    /// Used when the creator node (non-member) receives a grant_access request
+    /// Used when the creator node (non-member) receives an invalidate_tokens request
     /// and needs to forward it to a member node for processing.
-    async fn relay_grant_access(
+    async fn relay_invalidate_tokens(
         &self,
         peer_id: &str,
         content_id: &str,
-        grantee_id: &str,
-        capabilities: &[String],
         auth_token: &str,
         request_signature: &[u8],
     ) -> Result<bool>;

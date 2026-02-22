@@ -36,7 +36,7 @@ pub struct MockPeerNetwork {
     pub local_peer_id: String,
     pub relay_update_result: Arc<Mutex<Option<bool>>>,
     pub relay_delete_result: Arc<Mutex<Option<bool>>>,
-    pub relay_grant_access_result: Arc<Mutex<Option<bool>>>,
+    pub relay_invalidate_tokens_result: Arc<Mutex<Option<bool>>>,
 }
 
 impl MockPeerNetwork {
@@ -51,7 +51,7 @@ impl MockPeerNetwork {
             local_peer_id: "mock-peer-id".to_string(),
             relay_update_result: Arc::new(Mutex::new(Some(true))),
             relay_delete_result: Arc::new(Mutex::new(Some(true))),
-            relay_grant_access_result: Arc::new(Mutex::new(Some(true))),
+            relay_invalidate_tokens_result: Arc::new(Mutex::new(Some(true))),
         }
     }
 
@@ -207,16 +207,18 @@ impl PeerNetwork for MockPeerNetwork {
         Ok(self.relay_delete_result.lock().await.unwrap_or(true))
     }
 
-    async fn relay_grant_access(
+    async fn relay_invalidate_tokens(
         &self,
         _peer_id: &str,
         _content_id: &str,
-        _grantee_id: &str,
-        _capabilities: &[String],
         _auth_token: &str,
         _request_signature: &[u8],
     ) -> Result<bool> {
-        Ok(self.relay_grant_access_result.lock().await.unwrap_or(true))
+        Ok(self
+            .relay_invalidate_tokens_result
+            .lock()
+            .await
+            .unwrap_or(true))
     }
 }
 

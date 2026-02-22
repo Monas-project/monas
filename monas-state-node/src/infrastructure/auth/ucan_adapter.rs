@@ -2,6 +2,13 @@
 //!
 //! This adapter implements the Anti-Corruption Layer pattern.
 //! It translates between State Node's capability model and UCAN's capability model.
+//!
+//! Authorization flow:
+//! 1. Owner check: if the identity is the owner, access is granted immediately
+//! 2. AuthToken check: non-owners must provide a valid AuthToken (JWT)
+//!    - Token signature is verified against the owner's public key
+//!    - Token's iat must be >= policy's min_valid_issued_at
+//!    - Token must grant the required capability
 
 use crate::domain::auth_capability::AuthCapability;
 use crate::domain::identity::{Identity, IdentityType};
@@ -213,18 +220,29 @@ impl UcanAdapter {
         }
     }
 
-    /// Verify AuthToken with dual signature verification and replay protection
+    /// Verify AuthToken with dual signature verification, replay protection,
+    /// and min_valid_issued_at check.
     async fn verify_auth_token(
         &self,
         token: &InfraAuthToken,
         request: &AuthorizationRequest,
+        min_valid_issued_at: u64,
     ) -> Result<()> {
         // 1. Check expiration
         if token.is_expired() {
             anyhow::bail!("AuthToken has expired");
         }
 
-        // 2. Verify audience matches requester
+        // 2. Check min_valid_issued_at (token invalidation)
+        if token.payload.iat < min_valid_issued_at {
+            anyhow::bail!(
+                "AuthToken invalidated: iat {} < min_valid_issued_at {}",
+                token.payload.iat,
+                min_valid_issued_at
+            );
+        }
+
+        // 3. Verify audience matches requester
         let requester_key_id = Self::identity_to_key_id(&request.identity);
         if token.payload.aud != requester_key_id {
             anyhow::bail!(
@@ -234,7 +252,7 @@ impl UcanAdapter {
             );
         }
 
-        // 2.5. Check JTI uniqueness (replay attack prevention)
+        // 3.5. Check JTI uniqueness (replay attack prevention)
         if let Some(nonce_store) = &self.nonce_store {
             if !nonce_store
                 .check_and_record_nonce(&token.payload.jti)
@@ -244,7 +262,7 @@ impl UcanAdapter {
             }
         }
 
-        // 3. Get owner's public key and verify AuthToken signature
+        // 4. Get owner's public key and verify AuthToken signature
         let owner_public_key = self
             .get_public_key(&token.payload.iss)
             .await?
@@ -258,7 +276,7 @@ impl UcanAdapter {
         SignatureVerifier::verify_auth_token_signature(token, &owner_public_key)
             .context("AuthToken signature verification failed")?;
 
-        // 4. Verify request signature if provided
+        // 5. Verify request signature if provided
         if let Some(request_signature) = &request.request_signature {
             // Get requester's public key
             let requester_public_key =
@@ -310,12 +328,14 @@ impl UcanAdapter {
         &self,
         token: &AuthToken,
         request: &AuthorizationRequest,
+        min_valid_issued_at: u64,
     ) -> Result<bool> {
         // 1. Parse AuthToken
         let auth_token = self.parse_auth_token(token.as_str())?;
 
-        // 2. Verify AuthToken and request signatures
-        self.verify_auth_token(&auth_token, request).await?;
+        // 2. Verify AuthToken and request signatures (including min_valid_issued_at)
+        self.verify_auth_token(&auth_token, request, min_valid_issued_at)
+            .await?;
 
         // 3. Check if AuthToken grants the required capability
         let has_capability = self.check_auth_token_capability(
@@ -350,34 +370,26 @@ impl AuthorizationService for UcanAdapter {
             return Ok(AuthorizationResult::Granted);
         }
 
-        // 3. Check direct policy grants (local access policy)
-        if policy.has_capability(&request.identity, &request.capability) {
-            return Ok(AuthorizationResult::Granted);
-        }
+        // 3. Non-owners must provide a token
+        let Some(token) = &request.token else {
+            return Ok(AuthorizationResult::Denied {
+                reason: "Non-owner access requires an AuthToken".to_string(),
+            });
+        };
 
-        // 4. Check token if provided (delegated access)
-        if let Some(token) = &request.token {
-            // Only AuthToken is supported. UCAN fallback is disabled until
-            // proper UCAN verification (signature, expiration, delegation chain) is implemented.
-            match self.check_auth_token_authorization(token, request).await {
-                Ok(true) => return Ok(AuthorizationResult::Granted),
-                Ok(false) => {
-                    return Ok(AuthorizationResult::Denied {
-                        reason: "AuthToken does not grant required capability".to_string(),
-                    });
-                }
-                Err(e) => {
-                    return Ok(AuthorizationResult::Denied {
-                        reason: format!("AuthToken verification failed: {}", e),
-                    });
-                }
-            }
+        // 4. Check AuthToken (delegated access) with min_valid_issued_at
+        match self
+            .check_auth_token_authorization(token, request, policy.min_valid_issued_at())
+            .await
+        {
+            Ok(true) => Ok(AuthorizationResult::Granted),
+            Ok(false) => Ok(AuthorizationResult::Denied {
+                reason: "AuthToken does not grant required capability".to_string(),
+            }),
+            Err(e) => Ok(AuthorizationResult::Denied {
+                reason: format!("AuthToken verification failed: {}", e),
+            }),
         }
-
-        // 5. No authorization found
-        Ok(AuthorizationResult::Denied {
-            reason: "Identity does not have required capability".to_string(),
-        })
     }
 
     async fn authorize_batch(
@@ -523,7 +535,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_authorize_non_owner_no_grant() {
+    async fn test_authorize_non_owner_no_token() {
         let repo = Arc::new(MockContentRepo::new());
         let adapter = UcanAdapter::new(repo.clone());
 
@@ -531,7 +543,7 @@ mod tests {
         let owner = Identity::user("alice".to_string()).unwrap();
         let other = Identity::user("bob".to_string()).unwrap();
 
-        // Create policy with owner (bob has no grants)
+        // Create policy with owner (bob has no token)
         let policy = AccessPolicy::new(content_id.clone(), owner);
         repo.policies
             .write()
@@ -549,38 +561,10 @@ mod tests {
         let result = adapter.authorize(&request).await.unwrap();
 
         assert!(result.is_denied());
-    }
-
-    #[tokio::test]
-    async fn test_authorize_with_grant() {
-        let repo = Arc::new(MockContentRepo::new());
-        let adapter = UcanAdapter::new(repo.clone());
-
-        let content_id = ContentId::new("content-1".to_string()).unwrap();
-        let owner = Identity::user("alice".to_string()).unwrap();
-        let bob = Identity::user("bob".to_string()).unwrap();
-
-        // Create policy and grant ReadContent to bob
-        let mut policy = AccessPolicy::new(content_id.clone(), owner);
-        policy
-            .grant(bob.clone(), vec![AuthCapability::ReadContent])
-            .unwrap();
-        repo.policies
-            .write()
-            .await
-            .insert("content-1".to_string(), policy);
-
-        let request = AuthorizationRequest {
-            identity: bob,
-            resource: content_id,
-            capability: AuthCapability::ReadContent,
-            token: None,
-            request_signature: None,
-        };
-
-        let result = adapter.authorize(&request).await.unwrap();
-
-        assert!(result.is_granted());
+        assert_eq!(
+            result.denial_reason(),
+            Some("Non-owner access requires an AuthToken")
+        );
     }
 
     #[tokio::test]
@@ -899,6 +883,72 @@ mod tests {
         assert!(
             result.is_denied(),
             "AuthToken authorization should be denied for expired token"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_auth_token_authorization_denied_invalidated() {
+        use crate::infrastructure::auth::test_helpers::TestKeyPair;
+        use crate::port::auth_token::AuthToken;
+
+        // Setup
+        let alice = TestKeyPair::generate("user", "alice");
+        let bob = TestKeyPair::generate("user", "bob");
+        let repo = Arc::new(MockContentRepo::new());
+        let adapter = UcanAdapter::new(repo.clone());
+
+        adapter
+            .register_public_key(alice.key_id().to_string(), alice.public_key().to_vec())
+            .await;
+        adapter
+            .register_public_key(bob.key_id().to_string(), bob.public_key().to_vec())
+            .await;
+
+        let content_id = ContentId::new("test-content-inv".to_string()).unwrap();
+        let alice_identity = Identity::user("alice".to_string()).unwrap();
+
+        // Create policy with min_valid_issued_at set to future
+        let mut policy = AccessPolicy::new(content_id.clone(), alice_identity.clone());
+        policy.invalidate_tokens(); // Sets min_valid_issued_at to now
+
+        // Wait a moment, then create a token with iat < min_valid_issued_at
+        // Since invalidate_tokens sets to current time, we need a token issued before that
+        // So we first create the token, then invalidate
+        let auth_token = alice.create_auth_token(
+            &bob,
+            "monas://content/test-content-inv",
+            vec![crate::infrastructure::auth::auth_token::CapabilityAction::Read],
+            Some(3600),
+        );
+
+        // Wait to ensure invalidation timestamp is after token's iat
+        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+        // Now invalidate tokens (min_valid_issued_at will be > token's iat)
+        let mut policy = AccessPolicy::new(content_id.clone(), alice_identity.clone());
+        policy.invalidate_tokens();
+        repo.policies
+            .write()
+            .await
+            .insert("test-content-inv".to_string(), policy);
+
+        let request_sig = bob.sign_request(&auth_token);
+        let bob_identity = Identity::user("bob".to_string()).unwrap();
+        let token = AuthToken::new(auth_token.to_jwt().unwrap());
+        let request = AuthorizationRequest {
+            identity: bob_identity,
+            resource: content_id.clone(),
+            capability: AuthCapability::ReadContent,
+            token: Some(token),
+            request_signature: Some(request_sig),
+        };
+
+        // Verify authorization is denied due to token invalidation
+        let result = adapter.authorize(&request).await.unwrap();
+        assert!(
+            result.is_denied(),
+            "AuthToken authorization should be denied for invalidated token, but got: {:?}",
+            result
         );
     }
 }

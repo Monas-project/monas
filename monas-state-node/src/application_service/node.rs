@@ -353,63 +353,16 @@ impl StateNode {
                                 .await
                                 .map(|_| ())
                         }
-                        RelayRequestKind::GrantAccess {
+                        RelayRequestKind::InvalidateTokens {
                             content_id,
-                            grantee_id,
-                            capabilities,
                             auth_token,
                             request_signature,
                         } => {
                             let token = AuthToken::new(auth_token);
-                            // Parse grantee identity
-                            let grantee = if let Some((type_str, id)) = grantee_id.split_once(':') {
-                                match type_str {
-                                    "user" => {
-                                        crate::domain::identity::Identity::user(id.to_string()).ok()
-                                    }
-                                    "node" => {
-                                        crate::domain::identity::Identity::node(id.to_string()).ok()
-                                    }
-                                    "service" => {
-                                        crate::domain::identity::Identity::service(id.to_string())
-                                            .ok()
-                                    }
-                                    _ => None,
-                                }
-                            } else {
-                                None
-                            };
-                            match grantee {
-                                Some(grantee_identity) => {
-                                    // Parse capabilities
-                                    let caps: Vec<crate::domain::auth_capability::AuthCapability> = capabilities
-                                        .iter()
-                                        .filter_map(|c| match c.as_str() {
-                                            "ReadContent" => Some(crate::domain::auth_capability::AuthCapability::ReadContent),
-                                            "WriteContent" => Some(crate::domain::auth_capability::AuthCapability::WriteContent),
-                                            "DeleteContent" => Some(crate::domain::auth_capability::AuthCapability::DeleteContent),
-                                            "ManageMembers" => Some(crate::domain::auth_capability::AuthCapability::ManageMembers),
-                                            "ShareContent" => Some(crate::domain::auth_capability::AuthCapability::ShareContent),
-                                            "RevokeAccess" => Some(crate::domain::auth_capability::AuthCapability::RevokeAccess),
-                                            "ReadMetadata" => Some(crate::domain::auth_capability::AuthCapability::ReadMetadata),
-                                            _ => None,
-                                        })
-                                        .collect();
-                                    service_for_relay
-                                        .grant_access(
-                                            &content_id,
-                                            grantee_identity,
-                                            caps,
-                                            &token,
-                                            Some(&request_signature),
-                                        )
-                                        .await
-                                        .map(|_| ())
-                                }
-                                None => Err(crate::domain::errors::StateNodeError::Internal(
-                                    format!("Invalid grantee identity: {}", grantee_id),
-                                )),
-                            }
+                            service_for_relay
+                                .invalidate_tokens(&content_id, &token, Some(&request_signature))
+                                .await
+                                .map(|_| ())
                         }
                     };
                     let _ = req
