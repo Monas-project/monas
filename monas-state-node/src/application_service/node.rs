@@ -203,8 +203,14 @@ impl StateNode {
             node_id.clone(),
         ));
 
-        // Create auth services
-        let auth_service = MonasAccountAdapter::new();
+        // Create auth services with public key registry for identity verification
+        let auth_public_key_repo = Arc::new(
+            crate::infrastructure::persistence::SledPublicKeyRepository::open(
+                config.data_dir.join("auth_public_keys"),
+            )
+            .context("Failed to open auth public key repository")?,
+        );
+        let auth_service = MonasAccountAdapter::with_registry(auth_public_key_repo);
         let authz_service = UcanAdapter::new(crdt_repo_dyn.clone());
 
         // Create service with CRDT repository

@@ -13,7 +13,7 @@ use crate::infrastructure::persistence::{
 use crate::port::auth_token::AuthToken;
 use crate::port::content_repository::ContentRepository;
 use axum::{
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post, put},
@@ -37,6 +37,16 @@ pub type AppState = Arc<
 
 /// Create the API router.
 pub fn create_router(state: AppState) -> Router {
+    use std::sync::Arc;
+    use tower_governor::governor::GovernorConfigBuilder;
+    use tower_governor::GovernorLayer;
+
+    let governor_config = GovernorConfigBuilder::default()
+        .per_second(100)
+        .burst_size(200)
+        .finish()
+        .unwrap();
+
     Router::new()
         .route("/health", get(health_check))
         .route("/node/info", get(node_info))
@@ -51,6 +61,12 @@ pub fn create_router(state: AppState) -> Router {
         .route("/content/:id/history", get(get_content_history))
         .route("/content/:id/version/:version", get(get_content_version))
         .route("/content/:id/access/grant", post(grant_access_handler))
+        // Request body size limit: 16 MiB
+        .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
+        // Rate limit: 100 requests/sec, burst up to 200
+        .layer(GovernorLayer {
+            config: Arc::new(governor_config),
+        })
         .with_state(state)
 }
 

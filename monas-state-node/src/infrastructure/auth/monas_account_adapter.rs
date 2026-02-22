@@ -148,14 +148,11 @@ impl Default for MonasAccountAdapter {
 impl AuthenticationService for MonasAccountAdapter {
     /// Authenticate a key ID-based token.
     ///
-    /// # Implementation
+    /// # Security
     ///
-    /// This implementation:
-    /// 1. Validates key ID format
-    /// 2. Returns authenticated identity based on the token
-    ///
-    /// Note: Signature verification should be handled at a different layer
-    /// (e.g., HTTP middleware) since AuthContext doesn't contain signature data.
+    /// Without a public key registry, authentication is rejected because there is
+    /// no way to verify the caller's identity. A registry must be configured via
+    /// `MonasAccountAdapter::with_registry()` for authentication to succeed.
     ///
     /// # Arguments
     /// * `token` - The authentication token (format: "type:id")
@@ -169,8 +166,6 @@ impl AuthenticationService for MonasAccountAdapter {
         let key_id = token.as_str();
         let (identity_type, id) = self.parse_key_id(key_id)?;
 
-        // Note: AuthContext only has content_id and operation, not signature data
-        // Signature verification should be done at the HTTP handler level
         if let Some(ctx) = context {
             tracing::debug!(
                 "Authentication for {} (operation: {}, content_id: {})",
@@ -182,12 +177,13 @@ impl AuthenticationService for MonasAccountAdapter {
             tracing::debug!("Authentication for {}", key_id);
         }
 
-        // Log warning in non-test mode
-        #[cfg(not(test))]
-        tracing::warn!(
-            "Key ID authentication for {} - signature verification should be done at HTTP layer",
-            key_id
-        );
+        // Reject authentication when no public key registry is configured.
+        // Without a registry, we cannot verify identity ownership.
+        if self.public_key_registry.is_none() {
+            return Err(anyhow::anyhow!(
+                "Authentication rejected: no public key registry configured for identity verification"
+            ));
+        }
 
         // Create and return identity
         Identity::new(id, identity_type).context("Failed to create Identity from key ID")
@@ -241,8 +237,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_authenticate_valid_user_key_id() {
+    async fn test_authenticate_rejected_without_registry() {
         let adapter = MonasAccountAdapter::new();
+        let token = AuthToken::new("user:alice".to_string());
+
+        let result = adapter.authenticate(&token, None).await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("no public key registry configured"));
+    }
+
+    #[tokio::test]
+    async fn test_authenticate_valid_user_key_id_with_registry() {
+        let (adapter, _, _, _temp_dir) = create_test_adapter_with_registry().await;
         let token = AuthToken::new("user:alice".to_string());
 
         let identity = adapter.authenticate(&token, None).await.unwrap();
@@ -252,10 +261,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_authenticate_valid_node_key_id() {
-        let adapter = MonasAccountAdapter::new();
+    async fn test_authenticate_valid_node_key_id_with_registry() {
+        let (adapter, _, _, _temp_dir) = create_test_adapter_with_registry().await;
         let token = AuthToken::new("node:node123".to_string());
 
+        // node:node123 is not registered, but format is valid and registry exists
         let identity = adapter.authenticate(&token, None).await.unwrap();
 
         assert_eq!(identity.id(), "node123");
@@ -263,8 +273,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_authenticate_valid_service_key_id() {
-        let adapter = MonasAccountAdapter::new();
+    async fn test_authenticate_valid_service_key_id_with_registry() {
+        let (adapter, _, _, _temp_dir) = create_test_adapter_with_registry().await;
         let token = AuthToken::new("service:indexer".to_string());
 
         let identity = adapter.authenticate(&token, None).await.unwrap();
@@ -396,8 +406,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_issuer() {
+    async fn test_get_issuer_rejected_without_registry() {
         let adapter = MonasAccountAdapter::new();
+        let token = AuthToken::new("user:alice".to_string());
+
+        let result = adapter.get_issuer(&token).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_get_issuer_with_registry() {
+        let (adapter, _, _, _temp_dir) = create_test_adapter_with_registry().await;
         let token = AuthToken::new("user:alice".to_string());
 
         let issuer = adapter.get_issuer(&token).await.unwrap();
@@ -408,7 +427,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_unknown_identity_type() {
-        let adapter = MonasAccountAdapter::new();
+        let (adapter, _, _, _temp_dir) = create_test_adapter_with_registry().await;
         let token = AuthToken::new("unknown:test".to_string());
 
         let result = adapter.authenticate(&token, None).await;

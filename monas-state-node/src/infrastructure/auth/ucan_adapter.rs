@@ -86,7 +86,11 @@ impl UcanAdapter {
         }
     }
 
+    // ---- UCAN methods below are disabled until proper verification is implemented ----
+    // They are retained for future Phase implementation of UCAN delegation chain support.
+
     /// Map State Node capability to UCAN capability string
+    #[allow(dead_code)]
     fn map_capability_to_ucan(cap: &AuthCapability) -> &str {
         match cap {
             AuthCapability::ReadContent => "content/read",
@@ -100,6 +104,7 @@ impl UcanAdapter {
     }
 
     /// Parse UCAN token from JWT string.
+    #[allow(dead_code)]
     fn parse_ucan(&self, token: &str) -> Result<UcanToken> {
         if token.is_empty() {
             return Err(anyhow::anyhow!("Empty UCAN token"));
@@ -127,19 +132,19 @@ impl UcanAdapter {
     }
 
     /// Verify UCAN token signature and proof chain.
-    fn verify_ucan(&self, ucan: &UcanToken) -> Result<()> {
-        if ucan.raw.is_empty() {
-            return Err(anyhow::anyhow!("Invalid UCAN: empty token"));
-        }
-
-        tracing::warn!(
-            "UCAN verification is not fully implemented - allowing all UCANs (INSECURE)"
-        );
-
-        Ok(())
+    ///
+    /// SECURITY: UCAN verification is not yet implemented. All tokens are rejected
+    /// until proper signature verification, expiration checks, and delegation chain
+    /// validation are implemented.
+    #[allow(dead_code)]
+    fn verify_ucan(&self, _ucan: &UcanToken) -> Result<()> {
+        Err(anyhow::anyhow!(
+            "UCAN verification is not implemented - all UCAN tokens are rejected"
+        ))
     }
 
     /// Check if UCAN grants a specific capability for a resource.
+    #[allow(dead_code)]
     fn check_ucan_capability(
         &self,
         ucan: &UcanToken,
@@ -162,6 +167,7 @@ impl UcanAdapter {
     }
 
     /// Check UCAN-based authorization
+    #[allow(dead_code)]
     async fn check_ucan_authorization(
         &self,
         token: &AuthToken,
@@ -331,7 +337,8 @@ impl AuthorizationService for UcanAdapter {
 
         // 4. Check token if provided (delegated access)
         if let Some(token) = &request.token {
-            // Try AuthToken first (recommended for new implementations)
+            // Only AuthToken is supported. UCAN fallback is disabled until
+            // proper UCAN verification (signature, expiration, delegation chain) is implemented.
             match self.check_auth_token_authorization(token, request).await {
                 Ok(true) => return Ok(AuthorizationResult::Granted),
                 Ok(false) => {
@@ -340,25 +347,9 @@ impl AuthorizationService for UcanAdapter {
                     });
                 }
                 Err(e) => {
-                    // If AuthToken parsing/verification fails, try UCAN as fallback
-                    tracing::debug!("AuthToken verification failed, trying UCAN: {}", e);
-
-                    match self.check_ucan_authorization(token, request).await {
-                        Ok(true) => return Ok(AuthorizationResult::Granted),
-                        Ok(false) => {
-                            return Ok(AuthorizationResult::Denied {
-                                reason: "Token does not grant required capability".to_string(),
-                            });
-                        }
-                        Err(ucan_err) => {
-                            return Ok(AuthorizationResult::Denied {
-                                reason: format!(
-                                    "Token verification failed (AuthToken: {}, UCAN: {})",
-                                    e, ucan_err
-                                ),
-                            });
-                        }
-                    }
+                    return Ok(AuthorizationResult::Denied {
+                        reason: format!("AuthToken verification failed: {}", e),
+                    });
                 }
             }
         }
@@ -385,6 +376,7 @@ impl AuthorizationService for UcanAdapter {
 }
 
 /// Internal UCAN token representation (hidden from domain)
+#[allow(dead_code)]
 struct UcanToken {
     raw: String,
 }

@@ -833,12 +833,31 @@ impl Libp2pNetwork {
                 request_id, error, ..
             } => {
                 error!("Outbound request failed: {:?}", error);
-                // Clean up pending requests
+                let err_msg = format!("Request failed: {:?}", error);
+                // Clean up all pending request types to prevent resource leaks
                 if let Some(reply) = pending.capacity_queries.remove(&request_id) {
-                    let _ = reply.send(Err(anyhow::anyhow!("Request failed: {:?}", error)));
+                    let _ = reply.send(Err(anyhow::anyhow!("{}", err_msg)));
                 }
                 if let Some(reply) = pending.content_fetches.remove(&request_id) {
-                    let _ = reply.send(Err(anyhow::anyhow!("Request failed: {:?}", error)));
+                    let _ = reply.send(Err(anyhow::anyhow!("{}", err_msg)));
+                }
+                if let Some(reply) = pending.operation_fetches.remove(&request_id) {
+                    let _ = reply.send(Err(anyhow::anyhow!("{}", err_msg)));
+                }
+                if let Some(reply) = pending.operation_pushes.remove(&request_id) {
+                    let _ = reply.send(Err(anyhow::anyhow!("{}", err_msg)));
+                }
+                if let Some(reply) = pending.public_key_queries.remove(&request_id) {
+                    let _ = reply.send(Err(anyhow::anyhow!("{}", err_msg)));
+                }
+                if let Some(reply) = pending.relay_update_queries.remove(&request_id) {
+                    let _ = reply.send(Err(anyhow::anyhow!("{}", err_msg)));
+                }
+                if let Some(reply) = pending.relay_delete_queries.remove(&request_id) {
+                    let _ = reply.send(Err(anyhow::anyhow!("{}", err_msg)));
+                }
+                if let Some(reply) = pending.relay_grant_access_queries.remove(&request_id) {
+                    let _ = reply.send(Err(anyhow::anyhow!("{}", err_msg)));
                 }
             }
             _ => {}
@@ -1071,6 +1090,26 @@ impl Libp2pNetwork {
                 genesis_cid,
                 operations,
             } => {
+                // Reject oversized payloads (max 16 MiB total)
+                const MAX_PUSH_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+                let total_size: usize = operations.iter().map(|op| op.len()).sum();
+                if total_size > MAX_PUSH_PAYLOAD_BYTES {
+                    let response = ContentResponse::Error {
+                        message: format!(
+                            "Push payload too large: {} bytes (max {})",
+                            total_size, MAX_PUSH_PAYLOAD_BYTES
+                        ),
+                    };
+                    if let Err(e) = swarm
+                        .behaviour_mut()
+                        .request_response
+                        .send_response(channel, response)
+                    {
+                        error!("Failed to send response: {:?}", e);
+                    }
+                    return;
+                }
+
                 // Deserialize operations from wire format
                 let ops: Vec<SerializedOperation> = operations
                     .iter()
