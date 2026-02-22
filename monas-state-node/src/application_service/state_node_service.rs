@@ -1391,13 +1391,20 @@ where
 
                 // Delete the local ContentNetwork if it exists
                 // This handles the case where an offline node receives the deletion event
-                if let Ok(Some(_)) = self
+                // NOTE: We acquire read and write locks separately to avoid holding the
+                // read guard across the write acquisition, which would deadlock since
+                // tokio::sync::RwLock is non-reentrant.
+                let exists = self
                     .content_repo
                     .read()
                     .await
                     .get_content_network(content_id)
                     .await
-                {
+                    .ok()
+                    .flatten()
+                    .is_some();
+
+                if exists {
                     self.content_repo
                         .write()
                         .await

@@ -248,21 +248,27 @@ where
 
         for content_id in content_ids {
             // Check if we're a member
-            if let Ok(Some(network)) = self
+            // NOTE: Acquire read lock transiently to avoid holding it across sync_from_peers
+            // (which makes network calls with 30s timeouts). Holding the lock would block
+            // write acquisitions from the event handler, causing effective deadlock.
+            let is_member = self
                 .content_network_repo
                 .read()
                 .await
                 .get_content_network(&content_id)
                 .await
-            {
-                if network.has_member_str(&self.local_node_id) {
-                    match self.sync_from_peers(&content_id).await {
-                        Ok(result) => {
-                            results.push((content_id, result));
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to sync content {}: {}", content_id, e);
-                        }
+                .ok()
+                .flatten()
+                .map(|net| net.has_member_str(&self.local_node_id))
+                .unwrap_or(false);
+
+            if is_member {
+                match self.sync_from_peers(&content_id).await {
+                    Ok(result) => {
+                        results.push((content_id, result));
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to sync content {}: {}", content_id, e);
                     }
                 }
             }
