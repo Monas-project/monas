@@ -85,6 +85,7 @@ pub struct NodeInfoResponse {
     pub node_id: String,
     pub total_capacity: Option<u64>,
     pub available_capacity: Option<u64>,
+    pub listen_addrs: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -267,18 +268,21 @@ async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
 /// Get node info.
 async fn node_info(State(state): State<AppState>) -> impl IntoResponse {
     let node_id = state.local_node_id().to_string();
+    let listen_addrs = state.listen_addrs().await;
 
     match state.get_node(&node_id).await {
         Ok(Some(node)) => Json(NodeInfoResponse {
             node_id: node.node_id,
             total_capacity: Some(node.total_capacity),
             available_capacity: Some(node.available_capacity),
+            listen_addrs,
         })
         .into_response(),
         Ok(None) => Json(NodeInfoResponse {
             node_id,
             total_capacity: None,
             available_capacity: None,
+            listen_addrs,
         })
         .into_response(),
         Err(e) => e.into_response(),

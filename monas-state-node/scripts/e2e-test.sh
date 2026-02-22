@@ -297,10 +297,11 @@ sleep 5
 log_step "各ノードでcontentデータを取得し、更新が反映されていることを確認"
 SYNC_OK=true
 for port in 8080 8081 8082; do
-    DATA_RESPONSE=$(curl -s "http://127.0.0.1:$port/content/$CONTENT_ID/data" 2>/dev/null)
-    DATA_STATUS=$?
+    DATA_RESPONSE=$(curl -s "http://127.0.0.1:$port/content/$CONTENT_ID/data" \
+        -H "Authorization: Bearer $ACCOUNT1_KEY_ID" \
+        -H "X-Request-Signature: $ACCOUNT1_SIGNATURE" 2>/dev/null)
 
-    if [ $DATA_STATUS -eq 0 ] && echo "$DATA_RESPONSE" | jq -e '.data' > /dev/null 2>&1; then
+    if echo "$DATA_RESPONSE" | jq -e '.data' > /dev/null 2>&1; then
         FETCHED_DATA=$(echo "$DATA_RESPONSE" | jq -r '.data' 2>/dev/null)
         DECODED=$(echo "$FETCHED_DATA" | base64 -d 2>/dev/null || echo "(decode failed)")
         log_info "  ノード (ポート $port): data=$DECODED"
@@ -313,7 +314,9 @@ done
 log_test "少なくとも1つのノードで更新データが取得できること"
 VERIFIED=false
 for port in 8080 8081 8082; do
-    DATA_RESPONSE=$(curl -s "http://127.0.0.1:$port/content/$CONTENT_ID/data" 2>/dev/null)
+    DATA_RESPONSE=$(curl -s "http://127.0.0.1:$port/content/$CONTENT_ID/data" \
+        -H "Authorization: Bearer $ACCOUNT1_KEY_ID" \
+        -H "X-Request-Signature: $ACCOUNT1_SIGNATURE" 2>/dev/null)
     if echo "$DATA_RESPONSE" | jq -e '.data' > /dev/null 2>&1; then
         FETCHED_DATA=$(echo "$DATA_RESPONSE" | jq -r '.data' 2>/dev/null)
         if [ -n "$FETCHED_DATA" ] && [ "$FETCHED_DATA" != "null" ]; then
@@ -384,7 +387,9 @@ if [ "$LAST_STATUS" = "200" ]; then
 
     VERIFIED_UPDATE=false
     for port in 8080 8081 8082; do
-        DATA_RESPONSE=$(curl -s "http://127.0.0.1:$port/content/$CONTENT_ID/data" 2>/dev/null)
+        DATA_RESPONSE=$(curl -s "http://127.0.0.1:$port/content/$CONTENT_ID/data" \
+            -H "Authorization: Bearer $ACCOUNT1_KEY_ID" \
+            -H "X-Request-Signature: $ACCOUNT1_SIGNATURE" 2>/dev/null)
         if echo "$DATA_RESPONSE" | jq -e '.data' > /dev/null 2>&1; then
             FETCHED_DATA=$(echo "$DATA_RESPONSE" | jq -r '.data' 2>/dev/null)
             DECODED=$(echo "$FETCHED_DATA" | base64 -d 2>/dev/null || echo "(decode failed)")

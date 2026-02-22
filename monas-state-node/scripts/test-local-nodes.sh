@@ -63,7 +63,7 @@ test_request() {
     fi
 
     status_code=$(echo "$response" | tail -n1)
-    body=$(echo "$response" | head -n-1)
+    body=$(echo "$response" | sed '$d')
 
     if [ "$status_code" = "$expected_status" ]; then
         log_success "$description (HTTP $status_code)"

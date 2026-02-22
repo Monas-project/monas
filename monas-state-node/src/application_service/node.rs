@@ -298,7 +298,7 @@ impl StateNode {
     /// Get the addresses this node is listening on.
     pub async fn listen_addrs(&self) -> Vec<String> {
         self.network
-            .listen_addrs()
+            .listen_addrs_raw()
             .await
             .into_iter()
             .map(|a| a.to_string())
@@ -554,9 +554,12 @@ impl StateNode {
             .await
             .context("Failed to bind HTTP listener")?;
 
-        axum::serve(listener, router)
-            .await
-            .context("HTTP server error")?;
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .context("HTTP server error")?;
 
         Ok(())
     }

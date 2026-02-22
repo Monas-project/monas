@@ -32,6 +32,10 @@ struct Args {
     #[arg(short, long)]
     bootstrap: Vec<String>,
 
+    /// P2P listen port (0 for random).
+    #[arg(long, default_value = "0")]
+    p2p_port: u16,
+
     /// Log level (trace, debug, info, warn, error).
     #[arg(long, default_value = "info")]
     log_level: String,
@@ -55,6 +59,11 @@ async fn main() -> Result<()> {
     // Build configuration
     let mut network_config =
         monas_state_node::infrastructure::network::Libp2pNetworkConfig::default();
+
+    // Override listen address with specified P2P port
+    network_config.listen_addrs = vec![format!("/ip4/0.0.0.0/tcp/{}", args.p2p_port)
+        .parse()
+        .unwrap()];
 
     // Parse and add bootstrap addresses
     for addr_str in &args.bootstrap {
@@ -97,6 +106,13 @@ async fn main() -> Result<()> {
         .context("Failed to create state node")?;
 
     tracing::info!("Node ID: {}", node.node_id());
+
+    // Wait briefly for network to start listening, then log addresses
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let addrs = node.listen_addrs().await;
+    for addr in &addrs {
+        tracing::info!("P2P listen address: {}", addr);
+    }
 
     // Run the node (this blocks until shutdown)
     node.run().await?;

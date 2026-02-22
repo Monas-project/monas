@@ -152,6 +152,10 @@ impl PeerNetwork for MockPeerNetwork {
         self.local_peer_id.clone()
     }
 
+    async fn listen_addrs(&self) -> Vec<String> {
+        vec![]
+    }
+
     async fn fetch_operations(
         &self,
         _peer_id: &str,

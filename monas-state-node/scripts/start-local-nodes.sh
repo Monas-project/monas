@@ -102,10 +102,11 @@ for i in {1..30}; do
     sleep 1
 done
 
-# ノード1のPeer IDを取得
-log_info "ノード1のPeer IDを取得しています..."
+# ノード1のPeer IDとlistenアドレスを取得
+log_info "ノード1のPeer IDとlistenアドレスを取得しています..."
 NODE1_INFO=$(curl -s http://127.0.0.1:8080/node/info)
-NODE1_PEER_ID=$(echo "$NODE1_INFO" | grep -o '"node_id":"[^"]*"' | cut -d'"' -f4)
+NODE1_PEER_ID=$(echo "$NODE1_INFO" | jq -r '.node_id')
+NODE1_ADDR=$(echo "$NODE1_INFO" | jq -r '.listen_addrs[] | select(startswith("/ip4/127.0.0.1/tcp/"))' | head -1)
 
 if [ -z "$NODE1_PEER_ID" ]; then
     log_error "ノード1のPeer IDが取得できませんでした"
@@ -113,14 +114,31 @@ if [ -z "$NODE1_PEER_ID" ]; then
     exit 1
 fi
 
+if [ -z "$NODE1_ADDR" ]; then
+    # 127.0.0.1がない場合は0.0.0.0のアドレスを使う
+    NODE1_ADDR=$(echo "$NODE1_INFO" | jq -r '.listen_addrs[] | select(startswith("/ip4/0.0.0.0/tcp/"))' | head -1)
+    if [ -n "$NODE1_ADDR" ]; then
+        # 0.0.0.0を127.0.0.1に置換
+        NODE1_ADDR=$(echo "$NODE1_ADDR" | sed 's|/ip4/0.0.0.0/|/ip4/127.0.0.1/|')
+    fi
+fi
+
+if [ -z "$NODE1_ADDR" ]; then
+    log_error "ノード1のlistenアドレスが取得できませんでした"
+    cleanup
+    exit 1
+fi
+
+BOOTSTRAP_ADDR="${NODE1_ADDR}/p2p/${NODE1_PEER_ID}"
 log_info "ノード1のPeer ID: $NODE1_PEER_ID"
+log_info "ブートストラップアドレス: $BOOTSTRAP_ADDR"
 
 # ノード2の起動（ノード1に接続）
 log_info "ノード2を起動しています..."
 "$STATE_NODE_BIN" \
     --data-dir ./data/node2 \
     -l 127.0.0.1:8081 \
-    -b "/ip4/127.0.0.1/tcp/9000/p2p/$NODE1_PEER_ID" \
+    -b "$BOOTSTRAP_ADDR" \
     --log-level info \
     > "$LOG_DIR/node2.log" 2>&1 &
 NODE2_PID=$!
@@ -146,7 +164,7 @@ log_info "ノード3を起動しています..."
 "$STATE_NODE_BIN" \
     --data-dir ./data/node3 \
     -l 127.0.0.1:8082 \
-    -b "/ip4/127.0.0.1/tcp/9000/p2p/$NODE1_PEER_ID" \
+    -b "$BOOTSTRAP_ADDR" \
     --log-level info \
     > "$LOG_DIR/node3.log" 2>&1 &
 NODE3_PID=$!

@@ -226,6 +226,11 @@ where
         &self.local_node_id
     }
 
+    /// Get the addresses this node is listening on.
+    pub async fn listen_addrs(&self) -> Vec<String> {
+        self.peer_network.listen_addrs().await
+    }
+
     /// Classify a relay error message into the appropriate StateNodeError.
     ///
     /// When a member node returns an error during relay, the error message is

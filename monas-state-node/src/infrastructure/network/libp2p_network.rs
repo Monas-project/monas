@@ -483,8 +483,8 @@ impl Libp2pNetwork {
         self.relay_request_rx.lock().await.take()
     }
 
-    /// Get the addresses this node is listening on.
-    pub async fn listen_addrs(&self) -> Vec<Multiaddr> {
+    /// Get the addresses this node is listening on (raw Multiaddr).
+    pub async fn listen_addrs_raw(&self) -> Vec<Multiaddr> {
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
             .command_tx
@@ -1692,6 +1692,14 @@ impl PeerNetwork for Libp2pNetwork {
 
     fn local_peer_id(&self) -> String {
         self.local_peer_id.to_string()
+    }
+
+    async fn listen_addrs(&self) -> Vec<String> {
+        self.listen_addrs_raw()
+            .await
+            .into_iter()
+            .map(|a| a.to_string())
+            .collect()
     }
 
     async fn fetch_operations(

@@ -203,6 +203,10 @@ mod tests {
             "mock-peer-id".to_string()
         }
 
+        async fn listen_addrs(&self) -> Vec<String> {
+            vec![]
+        }
+
         async fn fetch_operations(
             &self,
             _peer_id: &str,

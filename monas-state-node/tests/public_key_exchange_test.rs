@@ -131,7 +131,7 @@ mod tests {
 
         // Get listen addresses
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        let addrs1 = network1.listen_addrs().await;
+        let addrs1 = network1.listen_addrs_raw().await;
         assert!(!addrs1.is_empty(), "Network1 should have listen addresses");
 
         // Connect network2 to network1

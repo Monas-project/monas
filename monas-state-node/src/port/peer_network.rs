@@ -50,6 +50,9 @@ pub trait PeerNetwork: Send + Sync {
     /// Get the local peer ID as a string.
     fn local_peer_id(&self) -> String;
 
+    /// Get the addresses this node is listening on.
+    async fn listen_addrs(&self) -> Vec<String>;
+
     // ========== CRDT Synchronization Methods ==========
 
     /// Fetch CRDT operations from a peer for a specific content.
