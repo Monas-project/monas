@@ -190,6 +190,9 @@ impl AuthenticationService for MonasAccountAdapter {
     }
 
     async fn is_valid(&self, token: &AuthToken) -> Result<bool> {
+        if self.public_key_registry.is_none() {
+            return Ok(false);
+        }
         match self.parse_key_id(token.as_str()) {
             Ok(_) => Ok(true),
             Err(_) => Ok(false),
@@ -393,14 +396,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_is_valid() {
+    async fn test_is_valid_without_registry() {
         let adapter = MonasAccountAdapter::new();
 
-        // Valid key ID
+        // Without registry, is_valid should always return false
+        let valid_token = AuthToken::new("user:alice".to_string());
+        assert!(!adapter.is_valid(&valid_token).await.unwrap());
+
+        let invalid_token = AuthToken::new("invalid".to_string());
+        assert!(!adapter.is_valid(&invalid_token).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_is_valid_with_registry() {
+        let (adapter, _signing_key, _key_id, _temp_dir) = create_test_adapter_with_registry().await;
+
+        // With registry, valid key ID should return true
         let valid_token = AuthToken::new("user:alice".to_string());
         assert!(adapter.is_valid(&valid_token).await.unwrap());
 
-        // Invalid key ID
+        // Invalid key ID should still return false
         let invalid_token = AuthToken::new("invalid".to_string());
         assert!(!adapter.is_valid(&invalid_token).await.unwrap());
     }

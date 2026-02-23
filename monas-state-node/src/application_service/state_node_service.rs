@@ -798,18 +798,24 @@ where
                 .map_err(|e| StateNodeError::CrdtError(CrdtError::StorageError(e.to_string())))?;
 
             // 8. Sync to SledAccessControlRepository if available
+            //    Use transient lock pattern: acquire → read → release → modify → re-acquire → write
             if let Some(access_control_repo) = &self.access_control_repo {
-                let ac_repo = access_control_repo.read().await;
-                let mut ac = ac_repo
-                    .get_access_control(content_id)
-                    .await
-                    .unwrap_or(None)
-                    .unwrap_or_else(|| ContentAccessControl::new(content_id.to_string()));
+                let mut ac = {
+                    let ac_repo = access_control_repo.read().await;
+                    ac_repo
+                        .get_access_control(content_id)
+                        .await
+                        .unwrap_or(None)
+                        .unwrap_or_else(|| ContentAccessControl::new(content_id.to_string()))
+                }; // lock released here
 
                 if let Err(e) = ac.invalidate_before(new_min) {
                     tracing::warn!("Failed to sync invalidation to access control repo: {}", e);
-                } else if let Err(e) = ac_repo.save_access_control(&ac).await {
-                    tracing::warn!("Failed to save access control to Sled: {}", e);
+                } else {
+                    let ac_repo = access_control_repo.read().await;
+                    if let Err(e) = ac_repo.save_access_control(&ac).await {
+                        tracing::warn!("Failed to save access control to Sled: {}", e);
+                    }
                 }
             }
 
