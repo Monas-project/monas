@@ -229,7 +229,15 @@ where
             .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))?;
 
         // Verify request signature for non-JWT tokens
-        if let Some(sig) = request_signature {
+        // JWT tokens carry their own signature verified by the authorization layer.
+        // For type:id tokens (e.g., user:alice), request signature is mandatory
+        // to prove key ownership.
+        if !token.as_str().contains('.') {
+            let sig = request_signature.ok_or_else(|| {
+                StateNodeError::AuthenticationFailed(
+                    "Request signature is required for non-JWT tokens".to_string(),
+                )
+            })?;
             self.verify_caller_signature(
                 auth_service.as_ref(),
                 token,
