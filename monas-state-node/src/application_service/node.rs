@@ -212,7 +212,7 @@ impl StateNode {
         );
         let auth_service = MonasAccountAdapter::with_registry(auth_public_key_repo.clone());
         let authz_service =
-            UcanAdapter::new(crdt_repo_dyn.clone()).with_nonce_store(auth_public_key_repo);
+            UcanAdapter::new(crdt_repo_dyn.clone()).with_nonce_store(auth_public_key_repo.clone());
 
         // Create service with CRDT repository
         let service = Arc::new(
@@ -230,7 +230,8 @@ impl StateNode {
             )
             .with_access_control_repo(access_control_repo)
             .with_authentication_service(auth_service)
-            .with_authorization_service(authz_service),
+            .with_authorization_service(authz_service)
+            .with_extended_key_registry(auth_public_key_repo),
         );
 
         Ok(Self {
@@ -331,7 +332,6 @@ impl StateNode {
                             auth_token,
                             request_signature,
                             timestamp,
-                            nonce,
                         } => {
                             let token = AuthToken::new(auth_token);
                             service_for_relay
@@ -341,7 +341,6 @@ impl StateNode {
                                     Some(&token),
                                     Some(&request_signature),
                                     timestamp,
-                                    nonce.as_deref(),
                                 )
                                 .await
                                 .map(|_| ())
@@ -351,7 +350,6 @@ impl StateNode {
                             auth_token,
                             request_signature,
                             timestamp,
-                            nonce,
                         } => {
                             let token = AuthToken::new(auth_token);
                             service_for_relay
@@ -360,7 +358,6 @@ impl StateNode {
                                     Some(&token),
                                     Some(&request_signature),
                                     timestamp,
-                                    nonce.as_deref(),
                                 )
                                 .await
                                 .map(|_| ())
@@ -370,7 +367,6 @@ impl StateNode {
                             auth_token,
                             request_signature,
                             timestamp,
-                            nonce,
                         } => {
                             let token = AuthToken::new(auth_token);
                             service_for_relay
@@ -379,7 +375,6 @@ impl StateNode {
                                     &token,
                                     Some(&request_signature),
                                     timestamp,
-                                    nonce.as_deref(),
                                 )
                                 .await
                                 .map(|_| ())

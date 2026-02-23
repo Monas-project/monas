@@ -68,6 +68,8 @@ pub fn create_router(state: AppState) -> Router {
             "/content/:id/access/invalidate",
             post(invalidate_tokens_handler),
         )
+        // Key registration endpoint (for testing/development)
+        .route("/auth/register-key", post(register_public_key))
         // Request body size limit: 16 MiB
         .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
         // Rate limit: 100 requests/sec, burst up to 200
@@ -191,6 +193,18 @@ impl IntoResponse for StateNodeError {
     }
 }
 
+#[derive(Debug, Deserialize)]
+pub struct RegisterPublicKeyRequest {
+    pub key_id: String,
+    pub public_key_hex: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RegisterPublicKeyResponse {
+    pub key_id: String,
+    pub registered: bool,
+}
+
 #[derive(Debug, Serialize)]
 pub struct InvalidateTokensResponse {
     pub content_id: String,
@@ -263,13 +277,6 @@ fn extract_request_timestamp(headers: &HeaderMap) -> Option<u64> {
         .ok()?
         .parse()
         .ok()
-}
-
-/// Extract request nonce from X-Request-Nonce header.
-///
-/// Returns None if the header is missing.
-fn extract_request_nonce(headers: &HeaderMap) -> Option<String> {
-    Some(headers.get("x-request-nonce")?.to_str().ok()?.to_string())
 }
 
 // ============================================================================
@@ -365,7 +372,6 @@ async fn create_content(
     let token = extract_auth_token(&headers);
     let request_signature = extract_request_signature(&headers);
     let timestamp = extract_request_timestamp(&headers);
-    let nonce = extract_request_nonce(&headers);
 
     match state
         .create_content(
@@ -373,7 +379,6 @@ async fn create_content(
             token.as_ref(),
             request_signature.as_deref(),
             timestamp,
-            nonce.as_deref(),
         )
         .await
     {
@@ -424,7 +429,6 @@ async fn update_content(
     let token = extract_auth_token(&headers);
     let request_signature = extract_request_signature(&headers);
     let timestamp = extract_request_timestamp(&headers);
-    let nonce = extract_request_nonce(&headers);
 
     match state
         .update_content(
@@ -433,7 +437,6 @@ async fn update_content(
             token.as_ref(),
             request_signature.as_deref(),
             timestamp,
-            nonce.as_deref(),
         )
         .await
     {
@@ -460,7 +463,6 @@ async fn delete_content(
     let token = extract_auth_token(&headers);
     let request_signature = extract_request_signature(&headers);
     let timestamp = extract_request_timestamp(&headers);
-    let nonce = extract_request_nonce(&headers);
 
     match state
         .delete_content(
@@ -468,7 +470,6 @@ async fn delete_content(
             token.as_ref(),
             request_signature.as_deref(),
             timestamp,
-            nonce.as_deref(),
         )
         .await
     {
@@ -493,7 +494,6 @@ async fn add_members(
     let token = extract_auth_token(&headers);
     let request_signature = extract_request_signature(&headers);
     let timestamp = extract_request_timestamp(&headers);
-    let nonce = extract_request_nonce(&headers);
 
     match state
         .add_member_to_content(
@@ -502,7 +502,6 @@ async fn add_members(
             token.as_ref(),
             request_signature.as_deref(),
             timestamp,
-            nonce.as_deref(),
         )
         .await
     {
@@ -567,11 +566,10 @@ async fn verify_read_access(
 
     let request_sig = extract_request_signature(headers);
     let timestamp = extract_request_timestamp(headers);
-    let nonce = extract_request_nonce(headers);
 
     // Authenticate the caller
     let identity = state
-        .authenticate_for_read(&token, request_sig.as_deref(), timestamp, nonce.as_deref())
+        .authenticate_for_read(&token, request_sig.as_deref(), timestamp)
         .await
         .map_err(|e| {
             (
@@ -785,21 +783,48 @@ async fn invalidate_tokens_handler(
 
     let request_signature = extract_request_signature(&headers);
     let timestamp = extract_request_timestamp(&headers);
-    let nonce = extract_request_nonce(&headers);
 
     match state
-        .invalidate_tokens(
-            &content_id,
-            &token,
-            request_signature.as_deref(),
-            timestamp,
-            nonce.as_deref(),
-        )
+        .invalidate_tokens(&content_id, &token, request_signature.as_deref(), timestamp)
         .await
     {
         Ok(new_min_valid_issued_at) => Json(InvalidateTokensResponse {
             content_id,
             new_min_valid_issued_at,
+        })
+        .into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// Register a public key for a key_id.
+///
+/// This endpoint allows registering a public key for key_id-based authentication.
+/// Used for testing and development.
+async fn register_public_key(
+    State(state): State<AppState>,
+    Json(req): Json<RegisterPublicKeyRequest>,
+) -> impl IntoResponse {
+    let public_key = match hex::decode(&req.public_key_hex) {
+        Ok(pk) => pk,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!("Invalid public key hex: {}", e),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    match state
+        .register_public_key_for_key_id(req.key_id.clone(), public_key)
+        .await
+    {
+        Ok(()) => Json(RegisterPublicKeyResponse {
+            key_id: req.key_id,
+            registered: true,
         })
         .into_response(),
         Err(e) => e.into_response(),
