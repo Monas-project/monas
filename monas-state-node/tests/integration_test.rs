@@ -183,7 +183,13 @@ async fn test_create_content() {
     // This is expected behavior - content creation requires at least one other node to store the content.
     let data = b"Hello, World!";
     let result = service
-        .create_content(data, Some(&test_token()), Some(&test_request_signature()))
+        .create_content(
+            data,
+            Some(&test_token()),
+            Some(&test_request_signature()),
+            None,
+            None,
+        )
         .await;
 
     // Verify that it fails with the expected error in isolated environment
@@ -576,6 +582,8 @@ async fn test_access_control_update_and_verify() {
             &update,
             Some(&test_token()),
             Some(&test_request_signature()),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -626,6 +634,8 @@ async fn test_access_control_update_missing_signature() {
             &update,
             Some(&test_token()),
             Some(&test_request_signature()),
+            None,
+            None,
         )
         .await;
     assert!(result.is_err());
@@ -1028,7 +1038,7 @@ async fn test_create_content_requires_authentication() {
 
     // Without token - should fail
     let result = service
-        .create_content(data, None, Some(&test_request_signature()))
+        .create_content(data, None, Some(&test_request_signature()), None, None)
         .await;
     assert!(result.is_err());
     assert!(result
@@ -1038,7 +1048,7 @@ async fn test_create_content_requires_authentication() {
 
     // Without signature - should fail
     let result = service
-        .create_content(data, Some(&test_token()), None)
+        .create_content(data, Some(&test_token()), None, None, None)
         .await;
     assert!(result.is_err());
     assert!(result
@@ -1058,7 +1068,14 @@ async fn test_update_content_requires_authentication() {
 
     // Without token - should fail
     let result = service
-        .update_content(content_id, data, None, Some(&test_request_signature()))
+        .update_content(
+            content_id,
+            data,
+            None,
+            Some(&test_request_signature()),
+            None,
+            None,
+        )
         .await;
     assert!(result.is_err());
     assert!(result
@@ -1068,7 +1085,7 @@ async fn test_update_content_requires_authentication() {
 
     // Without signature - should fail
     let result = service
-        .update_content(content_id, data, Some(&test_token()), None)
+        .update_content(content_id, data, Some(&test_token()), None, None, None)
         .await;
     assert!(result.is_err());
     assert!(result
@@ -1087,7 +1104,13 @@ async fn test_delete_content_requires_authentication() {
 
     // Without token - should fail
     let result = service
-        .delete_content(content_id, None, Some(&test_request_signature()))
+        .delete_content(
+            content_id,
+            None,
+            Some(&test_request_signature()),
+            None,
+            None,
+        )
         .await;
     assert!(result.is_err());
     assert!(result
@@ -1097,7 +1120,7 @@ async fn test_delete_content_requires_authentication() {
 
     // Without signature - should fail
     let result = service
-        .delete_content(content_id, Some(&test_token()), None)
+        .delete_content(content_id, Some(&test_token()), None, None, None)
         .await;
     assert!(result.is_err());
     assert!(result
@@ -1116,7 +1139,14 @@ async fn test_add_member_to_content_requires_authentication() {
 
     // Without token - should fail
     let result = service
-        .add_member_to_content(content_id, 1, None, Some(&test_request_signature()))
+        .add_member_to_content(
+            content_id,
+            1,
+            None,
+            Some(&test_request_signature()),
+            None,
+            None,
+        )
         .await;
     assert!(result.is_err());
     assert!(result
@@ -1126,7 +1156,7 @@ async fn test_add_member_to_content_requires_authentication() {
 
     // Without signature - should fail
     let result = service
-        .add_member_to_content(content_id, 1, Some(&test_token()), None)
+        .add_member_to_content(content_id, 1, Some(&test_token()), None, None, None)
         .await;
     assert!(result.is_err());
     assert!(result
@@ -1149,13 +1179,13 @@ async fn test_update_access_control_requires_authentication() {
 
     // Without token - should fail
     let result = service
-        .update_access_control(&update, None, Some(&test_request_signature()))
+        .update_access_control(&update, None, Some(&test_request_signature()), None, None)
         .await;
     assert!(result.is_err());
 
     // Without signature - should fail
     let result = service
-        .update_access_control(&update, Some(&test_token()), None)
+        .update_access_control(&update, Some(&test_token()), None, None, None)
         .await;
     assert!(result.is_err());
 }
@@ -1234,7 +1264,13 @@ async fn test_authorization_denied_prevents_create_content() {
     // so it will fail at the peer selection step instead.
     // The authenticated user becomes the owner with full permissions.
     let result = service
-        .create_content(data, Some(&test_token()), Some(&test_request_signature()))
+        .create_content(
+            data,
+            Some(&test_token()),
+            Some(&test_request_signature()),
+            None,
+            None,
+        )
         .await;
 
     // Should fail because no peers are available (not authorization)
@@ -1303,6 +1339,8 @@ async fn test_access_control_update_signature_verification() {
             &update,
             Some(&test_token()),
             Some(&test_request_signature()),
+            None,
+            None,
         )
         .await;
 

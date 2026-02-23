@@ -13,7 +13,7 @@ use crate::domain::state_node::{self, NodeSnapshot};
 use crate::domain::value_objects::ContentId;
 use crate::infrastructure::crypto::verify_p256_signature;
 use crate::infrastructure::placement::compute_dht_key;
-use crate::port::auth_token::AuthToken;
+use crate::port::auth_token::{AuthToken, RequestMetadata};
 use crate::port::authentication_service::AuthenticationService;
 use crate::port::authorization_service::{AuthorizationRequest, AuthorizationService};
 use crate::port::content_repository::ContentRepository;
@@ -215,15 +215,84 @@ where
     pub async fn authenticate_for_read(
         &self,
         token: &AuthToken,
+        request_signature: Option<&[u8]>,
+        timestamp: Option<u64>,
+        nonce: Option<&str>,
     ) -> Result<Identity, StateNodeError> {
         let auth_service = self.auth_service.as_ref().ok_or_else(|| {
             StateNodeError::InvalidConfiguration("Authentication not configured".to_string())
         })?;
 
-        auth_service
+        let identity = auth_service
             .authenticate(token, None)
             .await
-            .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))
+            .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))?;
+
+        // Verify request signature for non-JWT tokens
+        if let Some(sig) = request_signature {
+            self.verify_caller_signature(
+                auth_service.as_ref(),
+                token,
+                sig,
+                "read",
+                "content",
+                timestamp,
+                nonce,
+            )
+            .await?;
+        }
+
+        Ok(identity)
+    }
+
+    /// Verify the caller's request signature.
+    ///
+    /// For `type:id` tokens (e.g., `user:alice`), constructs a signing message
+    /// using `RequestMetadata` and delegates to `AuthenticationService::verify_request_signature`.
+    ///
+    /// JWT tokens (containing `.`) are skipped because they carry their own
+    /// signature verified by the authorization layer.
+    #[allow(clippy::too_many_arguments)]
+    async fn verify_caller_signature(
+        &self,
+        auth_service: &dyn AuthenticationService,
+        token: &AuthToken,
+        signature: &[u8],
+        operation: &str,
+        resource: &str,
+        timestamp: Option<u64>,
+        nonce: Option<&str>,
+    ) -> Result<(), StateNodeError> {
+        // JWT tokens are self-signed; skip request signature verification
+        if token.as_str().contains('.') {
+            return Ok(());
+        }
+
+        let ts = timestamp.unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        });
+        let nonce_str = nonce.unwrap_or("").to_string();
+
+        let metadata = RequestMetadata {
+            nonce: nonce_str,
+            timestamp: ts,
+            operation: operation.to_string(),
+            resource: resource.to_string(),
+        };
+        let message = metadata.signing_message();
+
+        auth_service
+            .verify_request_signature(token, signature, &message, timestamp)
+            .await
+            .map_err(|e| {
+                StateNodeError::AuthenticationFailed(format!(
+                    "Signature verification failed: {}",
+                    e
+                ))
+            })
     }
 
     /// Get the local node ID.
@@ -291,11 +360,13 @@ where
         data: &[u8],
         token: Option<&AuthToken>,
         request_signature: Option<&[u8]>,
+        timestamp: Option<u64>,
+        nonce: Option<&str>,
     ) -> Result<Event, StateNodeError> {
         let token = token.ok_or_else(|| {
             StateNodeError::AuthenticationFailed("Authentication token is required".to_string())
         })?;
-        let _request_signature = request_signature.ok_or_else(|| {
+        let request_signature = request_signature.ok_or_else(|| {
             StateNodeError::AuthenticationFailed("Request signature is required".to_string())
         })?;
         let auth_service = self.auth_service.as_ref().ok_or_else(|| {
@@ -307,6 +378,18 @@ where
             .authenticate(token, None)
             .await
             .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))?;
+
+        // 1.5. Verify request signature
+        self.verify_caller_signature(
+            auth_service.as_ref(),
+            token,
+            request_signature,
+            "create",
+            "content",
+            timestamp,
+            nonce,
+        )
+        .await?;
 
         // 2. Skip authorization for content creation
         // New content doesn't have an access policy yet, so authorization would always fail.
@@ -474,6 +557,8 @@ where
         content_id: &str,
         token: Option<&AuthToken>,
         request_signature: Option<&[u8]>,
+        timestamp: Option<u64>,
+        nonce: Option<&str>,
     ) -> Result<Event, StateNodeError> {
         let token = token.ok_or_else(|| {
             StateNodeError::AuthenticationFailed("Authentication token is required".to_string())
@@ -508,6 +593,18 @@ where
                 .authenticate(token, None)
                 .await
                 .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))?;
+
+            // Verify request signature
+            self.verify_caller_signature(
+                auth_service.as_ref(),
+                token,
+                request_signature,
+                "delete",
+                content_id,
+                timestamp,
+                nonce,
+            )
+            .await?;
 
             let authz_request = AuthorizationRequest {
                 identity,
@@ -566,7 +663,14 @@ where
             let target_peer = &members[0];
             let success = self
                 .peer_network
-                .relay_delete_content(target_peer, content_id, token.as_str(), request_signature)
+                .relay_delete_content(
+                    target_peer,
+                    content_id,
+                    token.as_str(),
+                    request_signature,
+                    timestamp,
+                    nonce,
+                )
                 .await
                 .map_err(|e| Self::classify_relay_error(e.to_string()))?;
 
@@ -598,6 +702,8 @@ where
         data: &[u8],
         token: Option<&AuthToken>,
         request_signature: Option<&[u8]>,
+        timestamp: Option<u64>,
+        nonce: Option<&str>,
     ) -> Result<Event, StateNodeError> {
         let token = token.ok_or_else(|| {
             StateNodeError::AuthenticationFailed("Authentication token is required".to_string())
@@ -632,6 +738,18 @@ where
                 .authenticate(token, None)
                 .await
                 .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))?;
+
+            // Verify request signature
+            self.verify_caller_signature(
+                auth_service.as_ref(),
+                token,
+                request_signature,
+                "update",
+                content_id,
+                timestamp,
+                nonce,
+            )
+            .await?;
 
             let authz_request = AuthorizationRequest {
                 identity,
@@ -703,6 +821,8 @@ where
                     data,
                     token.as_str(),
                     request_signature,
+                    timestamp,
+                    nonce,
                 )
                 .await
                 .map_err(|e| Self::classify_relay_error(e.to_string()))?;
@@ -748,6 +868,8 @@ where
         content_id: &str,
         token: &AuthToken,
         request_signature: Option<&[u8]>,
+        timestamp: Option<u64>,
+        nonce: Option<&str>,
     ) -> Result<u64, StateNodeError> {
         // 1. Ensure auth services are configured
         let auth_service = self.auth_service.as_ref().ok_or_else(|| {
@@ -759,6 +881,20 @@ where
             .authenticate(token, None)
             .await
             .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))?;
+
+        // 2.5. Verify request signature
+        if let Some(sig) = request_signature {
+            self.verify_caller_signature(
+                auth_service.as_ref(),
+                token,
+                sig,
+                "invalidate",
+                content_id,
+                timestamp,
+                nonce,
+            )
+            .await?;
+        }
 
         // 3. Check if this node is a member
         let content_id_vo = ContentId::new(content_id.to_string())?;
@@ -866,6 +1002,8 @@ where
                     content_id,
                     token.as_str(),
                     request_signature.unwrap_or(&[]),
+                    timestamp,
+                    nonce,
                 )
                 .await
                 .map_err(|e| Self::classify_relay_error(e.to_string()))?;
@@ -894,6 +1032,8 @@ where
         count: usize,
         token: Option<&AuthToken>,
         request_signature: Option<&[u8]>,
+        timestamp: Option<u64>,
+        nonce: Option<&str>,
     ) -> Result<Event, StateNodeError> {
         let token = token.ok_or_else(|| {
             StateNodeError::AuthenticationFailed("Authentication token is required".to_string())
@@ -932,6 +1072,19 @@ where
             .authenticate(token, None)
             .await
             .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))?;
+
+        // Verify request signature
+        self.verify_caller_signature(
+            auth_service.as_ref(),
+            token,
+            request_signature,
+            "manage",
+            content_id,
+            timestamp,
+            nonce,
+        )
+        .await?;
+
         let authz_request = AuthorizationRequest {
             identity,
             resource: content_id_vo.clone(),
@@ -1560,6 +1713,8 @@ where
         update: &AccessControlUpdate,
         token: Option<&AuthToken>,
         request_signature: Option<&[u8]>,
+        timestamp: Option<u64>,
+        nonce: Option<&str>,
     ) -> Result<ContentAccessControl, AccessControlError> {
         let ac_repo = match &self.access_control_repo {
             Some(repo) => repo,
@@ -1594,6 +1749,19 @@ where
             .authenticate(token, None)
             .await
             .map_err(|_| AccessControlError::NotAuthorized)?;
+
+        // Verify request signature
+        self.verify_caller_signature(
+            auth_service.as_ref(),
+            token,
+            request_signature,
+            "revoke",
+            &update.content_id,
+            timestamp,
+            nonce,
+        )
+        .await
+        .map_err(|_| AccessControlError::InvalidSignature)?;
 
         let content_id_vo = ContentId::new(update.content_id.clone())
             .map_err(|_| AccessControlError::NotAuthorized)?;
@@ -1833,6 +2001,8 @@ mod tests {
                 b"test data",
                 Some(&test_token()),
                 Some(&test_request_signature()),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -1869,6 +2039,8 @@ mod tests {
                 b"test data",
                 Some(&test_token()),
                 Some(&test_request_signature()),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -1892,6 +2064,8 @@ mod tests {
                 b"test data",
                 Some(&test_token()),
                 Some(&test_request_signature()),
+                None,
+                None,
             )
             .await;
 
@@ -1937,6 +2111,8 @@ mod tests {
                 b"new data",
                 Some(&test_token()),
                 Some(&test_request_signature()),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -1983,6 +2159,8 @@ mod tests {
                 b"new data",
                 Some(&test_token()),
                 Some(&test_request_signature()),
+                None,
+                None,
             )
             .await;
 
@@ -2011,6 +2189,8 @@ mod tests {
                 b"data",
                 Some(&test_token()),
                 Some(&test_request_signature()),
+                None,
+                None,
             )
             .await;
 

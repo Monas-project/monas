@@ -193,6 +193,8 @@ impl PeerNetwork for MockPeerNetwork {
         _data: &[u8],
         _auth_token: &str,
         _request_signature: &[u8],
+        _timestamp: Option<u64>,
+        _nonce: Option<&str>,
     ) -> Result<bool> {
         Ok(self.relay_update_result.lock().await.unwrap_or(true))
     }
@@ -203,6 +205,8 @@ impl PeerNetwork for MockPeerNetwork {
         _content_id: &str,
         _auth_token: &str,
         _request_signature: &[u8],
+        _timestamp: Option<u64>,
+        _nonce: Option<&str>,
     ) -> Result<bool> {
         Ok(self.relay_delete_result.lock().await.unwrap_or(true))
     }
@@ -213,6 +217,8 @@ impl PeerNetwork for MockPeerNetwork {
         _content_id: &str,
         _auth_token: &str,
         _request_signature: &[u8],
+        _timestamp: Option<u64>,
+        _nonce: Option<&str>,
     ) -> Result<bool> {
         Ok(self
             .relay_invalidate_tokens_result

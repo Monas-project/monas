@@ -40,6 +40,31 @@ pub trait AuthenticationService: Send + Sync {
     /// Returns an error if the token cannot be parsed or validated.
     async fn is_valid(&self, token: &AuthToken) -> Result<bool>;
 
+    /// Verify a request signature against the identity's public key.
+    ///
+    /// This method verifies that the request was signed by the holder of the
+    /// private key corresponding to the token's identity. It prevents
+    /// impersonation by ensuring the caller actually possesses the key.
+    ///
+    /// Default implementation is a no-op that always succeeds.
+    /// `MonasAccountAdapter` overrides this to perform P-256 ECDSA verification.
+    ///
+    /// # Arguments
+    /// * `token` - The authentication token identifying the caller
+    /// * `signature` - The raw signature bytes
+    /// * `message` - The message that was signed (format: "{operation}:{resource}:{timestamp}:{nonce}")
+    /// * `timestamp` - Optional Unix timestamp for replay attack prevention
+    async fn verify_request_signature(
+        &self,
+        token: &AuthToken,
+        signature: &[u8],
+        message: &str,
+        timestamp: Option<u64>,
+    ) -> Result<()> {
+        let _ = (token, signature, message, timestamp);
+        Ok(())
+    }
+
     /// Get the issuer of a token (if applicable)
     ///
     /// This is optional and may not be supported by all implementations.

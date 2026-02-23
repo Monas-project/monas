@@ -330,6 +330,8 @@ impl StateNode {
                             data,
                             auth_token,
                             request_signature,
+                            timestamp,
+                            nonce,
                         } => {
                             let token = AuthToken::new(auth_token);
                             service_for_relay
@@ -338,6 +340,8 @@ impl StateNode {
                                     &data,
                                     Some(&token),
                                     Some(&request_signature),
+                                    timestamp,
+                                    nonce.as_deref(),
                                 )
                                 .await
                                 .map(|_| ())
@@ -346,10 +350,18 @@ impl StateNode {
                             content_id,
                             auth_token,
                             request_signature,
+                            timestamp,
+                            nonce,
                         } => {
                             let token = AuthToken::new(auth_token);
                             service_for_relay
-                                .delete_content(&content_id, Some(&token), Some(&request_signature))
+                                .delete_content(
+                                    &content_id,
+                                    Some(&token),
+                                    Some(&request_signature),
+                                    timestamp,
+                                    nonce.as_deref(),
+                                )
                                 .await
                                 .map(|_| ())
                         }
@@ -357,10 +369,18 @@ impl StateNode {
                             content_id,
                             auth_token,
                             request_signature,
+                            timestamp,
+                            nonce,
                         } => {
                             let token = AuthToken::new(auth_token);
                             service_for_relay
-                                .invalidate_tokens(&content_id, &token, Some(&request_signature))
+                                .invalidate_tokens(
+                                    &content_id,
+                                    &token,
+                                    Some(&request_signature),
+                                    timestamp,
+                                    nonce.as_deref(),
+                                )
                                 .await
                                 .map(|_| ())
                         }

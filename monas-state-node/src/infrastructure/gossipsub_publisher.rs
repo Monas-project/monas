@@ -244,6 +244,8 @@ mod tests {
             _data: &[u8],
             _auth_token: &str,
             _request_signature: &[u8],
+            _timestamp: Option<u64>,
+            _nonce: Option<&str>,
         ) -> Result<bool> {
             Ok(true)
         }
@@ -254,6 +256,8 @@ mod tests {
             _content_id: &str,
             _auth_token: &str,
             _request_signature: &[u8],
+            _timestamp: Option<u64>,
+            _nonce: Option<&str>,
         ) -> Result<bool> {
             Ok(true)
         }
@@ -264,6 +268,8 @@ mod tests {
             _content_id: &str,
             _auth_token: &str,
             _request_signature: &[u8],
+            _timestamp: Option<u64>,
+            _nonce: Option<&str>,
         ) -> Result<bool> {
             Ok(true)
         }

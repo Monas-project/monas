@@ -253,6 +253,25 @@ fn extract_request_signature(headers: &HeaderMap) -> Option<Vec<u8>> {
         .ok()
 }
 
+/// Extract request timestamp from X-Request-Timestamp header.
+///
+/// Returns None if the header is missing or cannot be parsed.
+fn extract_request_timestamp(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get("x-request-timestamp")?
+        .to_str()
+        .ok()?
+        .parse()
+        .ok()
+}
+
+/// Extract request nonce from X-Request-Nonce header.
+///
+/// Returns None if the header is missing.
+fn extract_request_nonce(headers: &HeaderMap) -> Option<String> {
+    Some(headers.get("x-request-nonce")?.to_str().ok()?.to_string())
+}
+
 // ============================================================================
 // Handlers
 // ============================================================================
@@ -345,9 +364,17 @@ async fn create_content(
     // Extract authentication token and request signature from headers
     let token = extract_auth_token(&headers);
     let request_signature = extract_request_signature(&headers);
+    let timestamp = extract_request_timestamp(&headers);
+    let nonce = extract_request_nonce(&headers);
 
     match state
-        .create_content(&data, token.as_ref(), request_signature.as_deref())
+        .create_content(
+            &data,
+            token.as_ref(),
+            request_signature.as_deref(),
+            timestamp,
+            nonce.as_deref(),
+        )
         .await
     {
         Ok(event) => {
@@ -396,6 +423,8 @@ async fn update_content(
     // Extract authentication token and request signature from headers
     let token = extract_auth_token(&headers);
     let request_signature = extract_request_signature(&headers);
+    let timestamp = extract_request_timestamp(&headers);
+    let nonce = extract_request_nonce(&headers);
 
     match state
         .update_content(
@@ -403,6 +432,8 @@ async fn update_content(
             &data,
             token.as_ref(),
             request_signature.as_deref(),
+            timestamp,
+            nonce.as_deref(),
         )
         .await
     {
@@ -428,9 +459,17 @@ async fn delete_content(
     // Extract authentication token and request signature from headers
     let token = extract_auth_token(&headers);
     let request_signature = extract_request_signature(&headers);
+    let timestamp = extract_request_timestamp(&headers);
+    let nonce = extract_request_nonce(&headers);
 
     match state
-        .delete_content(&content_id, token.as_ref(), request_signature.as_deref())
+        .delete_content(
+            &content_id,
+            token.as_ref(),
+            request_signature.as_deref(),
+            timestamp,
+            nonce.as_deref(),
+        )
         .await
     {
         Ok(_) => Json(DeleteContentResponse {
@@ -453,6 +492,8 @@ async fn add_members(
 
     let token = extract_auth_token(&headers);
     let request_signature = extract_request_signature(&headers);
+    let timestamp = extract_request_timestamp(&headers);
+    let nonce = extract_request_nonce(&headers);
 
     match state
         .add_member_to_content(
@@ -460,6 +501,8 @@ async fn add_members(
             req.count,
             token.as_ref(),
             request_signature.as_deref(),
+            timestamp,
+            nonce.as_deref(),
         )
         .await
     {
@@ -522,16 +565,23 @@ async fn verify_read_access(
             .into_response()
     })?;
 
+    let request_sig = extract_request_signature(headers);
+    let timestamp = extract_request_timestamp(headers);
+    let nonce = extract_request_nonce(headers);
+
     // Authenticate the caller
-    let identity = state.authenticate_for_read(&token).await.map_err(|e| {
-        (
-            StatusCode::UNAUTHORIZED,
-            Json(ErrorResponse {
-                error: format!("Authentication failed: {}", e),
-            }),
-        )
-            .into_response()
-    })?;
+    let identity = state
+        .authenticate_for_read(&token, request_sig.as_deref(), timestamp, nonce.as_deref())
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorResponse {
+                    error: format!("Authentication failed: {}", e),
+                }),
+            )
+                .into_response()
+        })?;
 
     // Check access policy for read permission
     let crdt_repo = state.crdt_repo();
@@ -734,9 +784,17 @@ async fn invalidate_tokens_handler(
     };
 
     let request_signature = extract_request_signature(&headers);
+    let timestamp = extract_request_timestamp(&headers);
+    let nonce = extract_request_nonce(&headers);
 
     match state
-        .invalidate_tokens(&content_id, &token, request_signature.as_deref())
+        .invalidate_tokens(
+            &content_id,
+            &token,
+            request_signature.as_deref(),
+            timestamp,
+            nonce.as_deref(),
+        )
         .await
     {
         Ok(new_min_valid_issued_at) => Json(InvalidateTokensResponse {

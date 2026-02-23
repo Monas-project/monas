@@ -13,6 +13,7 @@ use std::collections::HashMap;
 /// - Event publishing via Gossipsub
 /// - Content fetching from peers
 /// - CRDT operation synchronization
+#[allow(clippy::too_many_arguments)]
 #[async_trait]
 pub trait PeerNetwork: Send + Sync {
     /// Find the k closest peers to a given DHT key.
@@ -104,6 +105,8 @@ pub trait PeerNetwork: Send + Sync {
         data: &[u8],
         auth_token: &str,
         request_signature: &[u8],
+        timestamp: Option<u64>,
+        nonce: Option<&str>,
     ) -> Result<bool>;
 
     /// Relay a delete request to a member node.
@@ -116,6 +119,8 @@ pub trait PeerNetwork: Send + Sync {
         content_id: &str,
         auth_token: &str,
         request_signature: &[u8],
+        timestamp: Option<u64>,
+        nonce: Option<&str>,
     ) -> Result<bool>;
 
     /// Relay an invalidate_tokens request to a member node.
@@ -128,5 +133,7 @@ pub trait PeerNetwork: Send + Sync {
         content_id: &str,
         auth_token: &str,
         request_signature: &[u8],
+        timestamp: Option<u64>,
+        nonce: Option<&str>,
     ) -> Result<bool>;
 }

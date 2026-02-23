@@ -189,6 +189,27 @@ impl AuthenticationService for MonasAccountAdapter {
         Identity::new(id, identity_type).context("Failed to create Identity from key ID")
     }
 
+    async fn verify_request_signature(
+        &self,
+        token: &AuthToken,
+        signature: &[u8],
+        message: &str,
+        timestamp: Option<u64>,
+    ) -> Result<()> {
+        let key_id = token.as_str();
+        let context = SignatureContext::new(
+            "request".to_string(),
+            message.to_string(),
+            signature.to_vec(),
+        );
+        let context = if let Some(ts) = timestamp {
+            context.with_timestamp(ts)
+        } else {
+            context
+        };
+        self.verify_signature(key_id, &context).await
+    }
+
     async fn is_valid(&self, token: &AuthToken) -> Result<bool> {
         if self.public_key_registry.is_none() {
             return Ok(false);
@@ -448,5 +469,67 @@ mod tests {
         let result = adapter.authenticate(&token, None).await;
 
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_verify_request_signature_valid() {
+        let (adapter, signing_key, _, _temp_dir) = create_test_adapter_with_registry().await;
+        let token = AuthToken::new("user:alice".to_string());
+
+        let message = "update:content-1:1234567890:abc123";
+        use p256::ecdsa::signature::Signer;
+        let signature: p256::ecdsa::Signature = signing_key.sign(message.as_bytes());
+        let signature_bytes = signature.to_vec();
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let result = adapter
+            .verify_request_signature(&token, &signature_bytes, message, Some(timestamp))
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_verify_request_signature_invalid() {
+        let (adapter, _, _, _temp_dir) = create_test_adapter_with_registry().await;
+        let token = AuthToken::new("user:alice".to_string());
+
+        let message = "update:content-1:1234567890:abc123";
+        let invalid_signature = vec![0u8; 64];
+
+        let result = adapter
+            .verify_request_signature(&token, &invalid_signature, message, Some(0))
+            .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_verify_request_signature_expired_timestamp() {
+        let (adapter, signing_key, _, _temp_dir) = create_test_adapter_with_registry().await;
+        let token = AuthToken::new("user:alice".to_string());
+
+        let message = "update:content-1:1234567890:abc123";
+        use p256::ecdsa::signature::Signer;
+        let signature: p256::ecdsa::Signature = signing_key.sign(message.as_bytes());
+        let signature_bytes = signature.to_vec();
+
+        // 10 minutes ago
+        let old_timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 600;
+
+        let result = adapter
+            .verify_request_signature(&token, &signature_bytes, message, Some(old_timestamp))
+            .await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("timestamp too old"));
     }
 }
