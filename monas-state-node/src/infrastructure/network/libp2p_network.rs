@@ -53,21 +53,18 @@ pub enum RelayRequestKind {
         auth_token: String,
         request_signature: Vec<u8>,
         timestamp: Option<u64>,
-        nonce: Option<String>,
     },
     DeleteContent {
         content_id: String,
         auth_token: String,
         request_signature: Vec<u8>,
         timestamp: Option<u64>,
-        nonce: Option<String>,
     },
     InvalidateTokens {
         content_id: String,
         auth_token: String,
         request_signature: Vec<u8>,
         timestamp: Option<u64>,
-        nonce: Option<String>,
     },
 }
 
@@ -187,7 +184,6 @@ enum SwarmCommand {
         auth_token: String,
         request_signature: Vec<u8>,
         timestamp: Option<u64>,
-        nonce: Option<String>,
         reply: oneshot::Sender<Result<bool>>,
     },
     RelayDeleteContent {
@@ -196,7 +192,6 @@ enum SwarmCommand {
         auth_token: String,
         request_signature: Vec<u8>,
         timestamp: Option<u64>,
-        nonce: Option<String>,
         reply: oneshot::Sender<Result<bool>>,
     },
     RelayInvalidateTokens {
@@ -205,7 +200,6 @@ enum SwarmCommand {
         auth_token: String,
         request_signature: Vec<u8>,
         timestamp: Option<u64>,
-        nonce: Option<String>,
         reply: oneshot::Sender<Result<bool>>,
     },
     /// Send a response back through a ResponseChannel.
@@ -660,7 +654,6 @@ impl Libp2pNetwork {
                 auth_token,
                 request_signature,
                 timestamp,
-                nonce,
                 reply,
             } => {
                 let request_id = swarm.behaviour_mut().request_response.send_request(
@@ -671,7 +664,6 @@ impl Libp2pNetwork {
                         auth_token,
                         request_signature,
                         timestamp,
-                        nonce,
                     },
                 );
                 pending.relay_update_queries.insert(request_id, reply);
@@ -682,7 +674,6 @@ impl Libp2pNetwork {
                 auth_token,
                 request_signature,
                 timestamp,
-                nonce,
                 reply,
             } => {
                 let request_id = swarm.behaviour_mut().request_response.send_request(
@@ -692,7 +683,6 @@ impl Libp2pNetwork {
                         auth_token,
                         request_signature,
                         timestamp,
-                        nonce,
                     },
                 );
                 pending.relay_delete_queries.insert(request_id, reply);
@@ -703,7 +693,6 @@ impl Libp2pNetwork {
                 auth_token,
                 request_signature,
                 timestamp,
-                nonce,
                 reply,
             } => {
                 let request_id = swarm.behaviour_mut().request_response.send_request(
@@ -713,7 +702,6 @@ impl Libp2pNetwork {
                         auth_token,
                         request_signature,
                         timestamp,
-                        nonce,
                     },
                 );
                 pending
@@ -996,7 +984,6 @@ impl Libp2pNetwork {
                 auth_token,
                 request_signature,
                 timestamp,
-                nonce,
             } => {
                 info!(
                     "Received relayed UpdateContent for {} from {}",
@@ -1012,7 +999,6 @@ impl Libp2pNetwork {
                             auth_token,
                             request_signature,
                             timestamp,
-                            nonce,
                         },
                         reply: reply_tx,
                     };
@@ -1046,7 +1032,6 @@ impl Libp2pNetwork {
                 auth_token,
                 request_signature,
                 timestamp,
-                nonce,
             } => {
                 info!(
                     "Received relayed DeleteContent for {} from {}",
@@ -1061,7 +1046,6 @@ impl Libp2pNetwork {
                             auth_token,
                             request_signature,
                             timestamp,
-                            nonce,
                         },
                         reply: reply_tx,
                     };
@@ -1095,7 +1079,6 @@ impl Libp2pNetwork {
                 auth_token,
                 request_signature,
                 timestamp,
-                nonce,
             } => {
                 info!(
                     "Received relayed InvalidateTokens for {} from {}",
@@ -1110,7 +1093,6 @@ impl Libp2pNetwork {
                             auth_token,
                             request_signature,
                             timestamp,
-                            nonce,
                         },
                         reply: reply_tx,
                     };
@@ -1821,7 +1803,6 @@ impl PeerNetwork for Libp2pNetwork {
         auth_token: &str,
         request_signature: &[u8],
         timestamp: Option<u64>,
-        nonce: Option<&str>,
     ) -> Result<bool> {
         let peer_id = PeerId::from_str(peer_id)
             .map_err(|_| anyhow::anyhow!("Invalid peer ID: {}", peer_id))?;
@@ -1835,7 +1816,6 @@ impl PeerNetwork for Libp2pNetwork {
                 auth_token: auth_token.to_string(),
                 request_signature: request_signature.to_vec(),
                 timestamp,
-                nonce: nonce.map(|s| s.to_string()),
                 reply: tx,
             })
             .await
@@ -1854,7 +1834,6 @@ impl PeerNetwork for Libp2pNetwork {
         auth_token: &str,
         request_signature: &[u8],
         timestamp: Option<u64>,
-        nonce: Option<&str>,
     ) -> Result<bool> {
         let peer_id = PeerId::from_str(peer_id)
             .map_err(|_| anyhow::anyhow!("Invalid peer ID: {}", peer_id))?;
@@ -1867,7 +1846,6 @@ impl PeerNetwork for Libp2pNetwork {
                 auth_token: auth_token.to_string(),
                 request_signature: request_signature.to_vec(),
                 timestamp,
-                nonce: nonce.map(|s| s.to_string()),
                 reply: tx,
             })
             .await
@@ -1886,7 +1864,6 @@ impl PeerNetwork for Libp2pNetwork {
         auth_token: &str,
         request_signature: &[u8],
         timestamp: Option<u64>,
-        nonce: Option<&str>,
     ) -> Result<bool> {
         let peer_id = PeerId::from_str(peer_id)
             .map_err(|_| anyhow::anyhow!("Invalid peer ID: {}", peer_id))?;
@@ -1899,7 +1876,6 @@ impl PeerNetwork for Libp2pNetwork {
                 auth_token: auth_token.to_string(),
                 request_signature: request_signature.to_vec(),
                 timestamp,
-                nonce: nonce.map(|s| s.to_string()),
                 reply: tx,
             })
             .await

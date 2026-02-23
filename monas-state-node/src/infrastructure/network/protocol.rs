@@ -44,7 +44,6 @@ pub enum ContentRequest {
         auth_token: String,
         request_signature: Vec<u8>,
         timestamp: Option<u64>,
-        nonce: Option<String>,
     },
     /// Relay a delete request to a member node.
     DeleteContent {
@@ -52,7 +51,6 @@ pub enum ContentRequest {
         auth_token: String,
         request_signature: Vec<u8>,
         timestamp: Option<u64>,
-        nonce: Option<String>,
     },
     /// Relay an invalidate_tokens request to a member node.
     InvalidateTokens {
@@ -60,7 +58,6 @@ pub enum ContentRequest {
         auth_token: String,
         request_signature: Vec<u8>,
         timestamp: Option<u64>,
-        nonce: Option<String>,
     },
 }
 

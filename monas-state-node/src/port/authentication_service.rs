@@ -52,7 +52,7 @@ pub trait AuthenticationService: Send + Sync {
     /// # Arguments
     /// * `token` - The authentication token identifying the caller
     /// * `signature` - The raw signature bytes
-    /// * `message` - The message that was signed (format: "{operation}:{resource}:{timestamp}:{nonce}")
+    /// * `message` - The message that was signed (format: "{operation}:{resource}:{timestamp}")
     /// * `timestamp` - Optional Unix timestamp for replay attack prevention
     async fn verify_request_signature(
         &self,
@@ -62,6 +62,20 @@ pub trait AuthenticationService: Send + Sync {
         timestamp: Option<u64>,
     ) -> Result<()> {
         let _ = (token, signature, message, timestamp);
+        Ok(())
+    }
+
+    /// Verify the JWT signature of a token.
+    ///
+    /// For JWT tokens (containing `.`), this method verifies the P-256 ECDSA
+    /// signature and checks expiration. This is called from `verify_caller_signature()`
+    /// to ensure JWT tokens are always signature-verified, even on code paths
+    /// that skip the authorization layer (e.g., owner creating content).
+    ///
+    /// Default implementation is a no-op that always succeeds (for testing).
+    /// `MonasAccountAdapter` overrides this to perform actual verification.
+    async fn verify_jwt_signature(&self, token: &AuthToken) -> Result<()> {
+        let _ = token;
         Ok(())
     }
 

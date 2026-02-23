@@ -4,6 +4,7 @@
 //! It translates between State Node's domain concepts and external authentication tokens.
 
 use crate::domain::identity::{Identity, IdentityType};
+use crate::infrastructure::auth::auth_token::AuthToken as InfraAuthToken;
 use crate::infrastructure::auth::signature_verifier::SignatureVerifier;
 use crate::port::auth_token::{AuthContext, AuthToken};
 use crate::port::authentication_service::AuthenticationService;
@@ -187,6 +188,37 @@ impl AuthenticationService for MonasAccountAdapter {
 
         // Create and return identity
         Identity::new(id, identity_type).context("Failed to create Identity from key ID")
+    }
+
+    async fn verify_jwt_signature(&self, token: &AuthToken) -> Result<()> {
+        let jwt_str = token.as_str();
+
+        // Parse JWT
+        let parsed = InfraAuthToken::from_jwt(jwt_str).context("Failed to parse JWT token")?;
+
+        // Check expiration
+        if parsed.is_expired() {
+            anyhow::bail!("JWT token has expired");
+        }
+
+        // Get issuer's public key from registry
+        let registry = self
+            .public_key_registry
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Public key registry not configured"))?;
+
+        let issuer_key_id = &parsed.payload.iss;
+        let public_key = registry
+            .get_public_key_by_key_id(issuer_key_id)
+            .await
+            .context("Failed to get issuer public key")?
+            .ok_or_else(|| {
+                anyhow::anyhow!("Public key not found for JWT issuer: {}", issuer_key_id)
+            })?;
+
+        // Verify P-256 signature
+        SignatureVerifier::verify_auth_token_signature(&parsed, &public_key)
+            .context("JWT signature verification failed")
     }
 
     async fn verify_request_signature(

@@ -106,7 +106,6 @@ pub trait PeerNetwork: Send + Sync {
         auth_token: &str,
         request_signature: &[u8],
         timestamp: Option<u64>,
-        nonce: Option<&str>,
     ) -> Result<bool>;
 
     /// Relay a delete request to a member node.
@@ -120,7 +119,6 @@ pub trait PeerNetwork: Send + Sync {
         auth_token: &str,
         request_signature: &[u8],
         timestamp: Option<u64>,
-        nonce: Option<&str>,
     ) -> Result<bool>;
 
     /// Relay an invalidate_tokens request to a member node.
@@ -134,6 +132,5 @@ pub trait PeerNetwork: Send + Sync {
         auth_token: &str,
         request_signature: &[u8],
         timestamp: Option<u64>,
-        nonce: Option<&str>,
     ) -> Result<bool>;
 }

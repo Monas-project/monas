@@ -51,8 +51,6 @@ pub struct SignatureContext {
     pub signature: Vec<u8>,
     /// Unix timestamp (for replay attack prevention)
     pub timestamp: Option<u64>,
-    /// Nonce (for replay attack prevention)
-    pub nonce: Option<String>,
 }
 
 impl SignatureContext {
@@ -63,19 +61,12 @@ impl SignatureContext {
             message,
             signature,
             timestamp: None,
-            nonce: None,
         }
     }
 
     /// Set the timestamp
     pub fn with_timestamp(mut self, timestamp: u64) -> Self {
         self.timestamp = Some(timestamp);
-        self
-    }
-
-    /// Set the nonce
-    pub fn with_nonce(mut self, nonce: String) -> Self {
-        self.nonce = Some(nonce);
         self
     }
 }
