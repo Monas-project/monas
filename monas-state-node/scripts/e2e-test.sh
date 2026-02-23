@@ -54,9 +54,38 @@ cd "$STATE_NODE_DIR"
 TESTS_PASSED=0
 TESTS_FAILED=0
 
+# test-auth-generator バイナリのビルド
+log_info "test-auth-generatorをビルドしています..."
+cargo build --bin test-auth-generator 2>/dev/null || {
+    log_error "ビルドに失敗しました"
+    cargo build --bin test-auth-generator
+    exit 1
+}
+
+AUTH_GEN="cargo run --bin test-auth-generator --"
+
 # ============================================================================
 # ヘルパー関数
 # ============================================================================
+
+# 署名を生成する関数
+# 引数: private_key operation resource [body_base64]
+generate_signature() {
+    local private_key="$1"
+    local operation="$2"
+    local resource="$3"
+    local body_b64="$4"
+
+    local sign_args="sign-request --private-key $private_key --operation $operation --resource $resource"
+    if [ -n "$body_b64" ]; then
+        sign_args="$sign_args --body $body_b64"
+    fi
+
+    local output
+    output=$($AUTH_GEN $sign_args 2>/dev/null)
+    LAST_SIGNATURE=$(echo "$output" | grep "^SIGNATURE=" | sed 's/^SIGNATURE=//')
+    LAST_TIMESTAMP=$(echo "$output" | grep "^TIMESTAMP=" | sed 's/^TIMESTAMP=//')
+}
 
 # ノードの起動確認
 check_nodes_running() {
@@ -78,8 +107,20 @@ check_nodes_running() {
     fi
 }
 
+# 公開鍵をノードに登録する関数
+register_key_with_nodes() {
+    local key_id="$1"
+    local public_key_hex="$2"
+
+    for port in 8080 8081 8082; do
+        curl -s -X POST "http://127.0.0.1:$port/auth/register-key" \
+            -H "Content-Type: application/json" \
+            -d "{\"key_id\": \"$key_id\", \"public_key_hex\": \"$public_key_hex\"}" > /dev/null 2>&1
+    done
+}
+
 # 認証付きHTTPリクエストを実行してレスポンスをチェック
-# 引数: description method url data expected_status key_id signature
+# 引数: description method url data expected_status key_id private_key [body_for_sign]
 # data が空の場合は "" を渡す
 test_auth_request() {
     local description="$1"
@@ -87,22 +128,30 @@ test_auth_request() {
     local url="$3"
     local data="$4"
     local expected_status="${5:-200}"
-    local key_id="${6:-$ACCOUNT1_KEY_ID}"
-    local signature="${7:-$ACCOUNT1_SIGNATURE}"
+    local key_id="$6"
+    local private_key="$7"
+    local operation="$8"
+    local resource="$9"
+    local body_for_sign="${10}"
 
     log_test "$description"
+
+    # 署名を生成
+    generate_signature "$private_key" "$operation" "$resource" "$body_for_sign"
 
     local response
     if [ -z "$data" ]; then
         response=$(curl -s -X "$method" \
             -H "Authorization: Bearer $key_id" \
-            -H "X-Request-Signature: $signature" \
+            -H "X-Request-Signature: $LAST_SIGNATURE" \
+            -H "X-Request-Timestamp: $LAST_TIMESTAMP" \
             -w "\n%{http_code}" "$url" 2>/dev/null)
     else
         response=$(curl -s -X "$method" \
             -H "Content-Type: application/json" \
             -H "Authorization: Bearer $key_id" \
-            -H "X-Request-Signature: $signature" \
+            -H "X-Request-Signature: $LAST_SIGNATURE" \
+            -H "X-Request-Timestamp: $LAST_TIMESTAMP" \
             -d "$data" \
             -w "\n%{http_code}" "$url" 2>/dev/null)
     fi
@@ -159,30 +208,36 @@ echo ""
 echo -e "${BLUE}=== 認証データの準備 ===${NC}"
 echo ""
 
-# account1の認証データ生成
+# account1の鍵ペア生成
 log_info "account1の認証データを生成しています..."
-ACCOUNT1_AUTH_OUTPUT=$("$STATE_NODE_DIR/scripts/generate-test-auth.sh" test-auth 2>&1)
-ACCOUNT1_SIGNATURE=$(echo "$ACCOUNT1_AUTH_OUTPUT" | grep "export TEST_REQUEST_SIGNATURE=" | cut -d'"' -f2)
+ACCOUNT1_AUTH=$($AUTH_GEN test-auth 2>/dev/null)
+ACCOUNT1_PRIVATE_KEY=$(echo "$ACCOUNT1_AUTH" | grep "^PRIVATE_KEY=" | sed 's/^PRIVATE_KEY=//')
+ACCOUNT1_PUBLIC_KEY=$(echo "$ACCOUNT1_AUTH" | grep "^PUBLIC_KEY=" | sed 's/^PUBLIC_KEY=//')
 ACCOUNT1_KEY_ID="user:account1"
 
-if [ -z "$ACCOUNT1_SIGNATURE" ]; then
+if [ -z "$ACCOUNT1_PRIVATE_KEY" ] || [ -z "$ACCOUNT1_PUBLIC_KEY" ]; then
     log_error "account1の認証データ生成に失敗しました"
-    echo "$ACCOUNT1_AUTH_OUTPUT"
     exit 1
 fi
+
+# account1の公開鍵を全ノードに登録
+register_key_with_nodes "$ACCOUNT1_KEY_ID" "$ACCOUNT1_PUBLIC_KEY"
 log_success "account1: key_id=$ACCOUNT1_KEY_ID"
 
-# account2の認証データ生成
+# account2の鍵ペア生成
 log_info "account2の認証データを生成しています..."
-ACCOUNT2_AUTH_OUTPUT=$("$STATE_NODE_DIR/scripts/generate-test-auth.sh" test-auth 2>&1)
-ACCOUNT2_SIGNATURE=$(echo "$ACCOUNT2_AUTH_OUTPUT" | grep "export TEST_REQUEST_SIGNATURE=" | cut -d'"' -f2)
+ACCOUNT2_AUTH=$($AUTH_GEN test-auth 2>/dev/null)
+ACCOUNT2_PRIVATE_KEY=$(echo "$ACCOUNT2_AUTH" | grep "^PRIVATE_KEY=" | sed 's/^PRIVATE_KEY=//')
+ACCOUNT2_PUBLIC_KEY=$(echo "$ACCOUNT2_AUTH" | grep "^PUBLIC_KEY=" | sed 's/^PUBLIC_KEY=//')
 ACCOUNT2_KEY_ID="user:account2"
 
-if [ -z "$ACCOUNT2_SIGNATURE" ]; then
+if [ -z "$ACCOUNT2_PRIVATE_KEY" ] || [ -z "$ACCOUNT2_PUBLIC_KEY" ]; then
     log_error "account2の認証データ生成に失敗しました"
-    echo "$ACCOUNT2_AUTH_OUTPUT"
     exit 1
 fi
+
+# account2の公開鍵を全ノードに登録
+register_key_with_nodes "$ACCOUNT2_KEY_ID" "$ACCOUNT2_PUBLIC_KEY"
 log_success "account2: key_id=$ACCOUNT2_KEY_ID"
 
 # ============================================================================
@@ -194,6 +249,7 @@ echo -e "${BLUE}=== Step 1-2: Content作成 ===${NC}"
 echo ""
 
 CONTENT_DATA=$(echo -n "Hello, Monas E2E Test!" | base64)
+DECODED_BODY=$(echo -n "$CONTENT_DATA" | base64 -d 2>/dev/null | base64)
 log_step "account1 が node A (8080) に POST /content を送信"
 
 test_auth_request \
@@ -203,7 +259,10 @@ test_auth_request \
     "{\"data\": \"$CONTENT_DATA\"}" \
     201 \
     "$ACCOUNT1_KEY_ID" \
-    "$ACCOUNT1_SIGNATURE"
+    "$ACCOUNT1_PRIVATE_KEY" \
+    "create" \
+    "content" \
+    "$DECODED_BODY"
 
 CONTENT_ID=$(echo "$LAST_BODY" | jq -r '.content_id // empty' 2>/dev/null)
 
@@ -232,6 +291,7 @@ echo -e "${BLUE}=== エラーケース: 未認可ユーザーの更新試行 ===
 echo ""
 
 UPDATED_DATA_UNAUTHORIZED=$(echo -n "Unauthorized update attempt" | base64)
+DECODED_UNAUTH_BODY=$(echo -n "$UPDATED_DATA_UNAUTHORIZED" | base64 -d 2>/dev/null | base64)
 log_step "account2がgrant前にコンテンツを更新試行（403を期待）"
 
 test_auth_request \
@@ -241,7 +301,10 @@ test_auth_request \
     "{\"data\": \"$UPDATED_DATA_UNAUTHORIZED\"}" \
     403 \
     "$ACCOUNT2_KEY_ID" \
-    "$ACCOUNT2_SIGNATURE"
+    "$ACCOUNT2_PRIVATE_KEY" \
+    "update" \
+    "$CONTENT_ID" \
+    "$DECODED_UNAUTH_BODY"
 
 # ============================================================================
 # エラーケース: 無効なトークンでの更新試行
@@ -260,7 +323,10 @@ test_auth_request \
     "{\"data\": \"$UPDATED_DATA_UNAUTHORIZED\"}" \
     401 \
     "invalid:token:format" \
-    "$ACCOUNT1_SIGNATURE"
+    "$ACCOUNT1_PRIVATE_KEY" \
+    "update" \
+    "$CONTENT_ID" \
+    "$DECODED_UNAUTH_BODY"
 
 # ============================================================================
 # Step 3-5: Content更新（リレー）
@@ -271,6 +337,7 @@ echo -e "${BLUE}=== Step 3-5: Content更新（リレー） ===${NC}"
 echo ""
 
 UPDATED_DATA=$(echo -n "Updated content via relay!" | base64)
+DECODED_UPDATE_BODY=$(echo -n "$UPDATED_DATA" | base64 -d 2>/dev/null | base64)
 log_step "account1 が node A (8080) に PUT /content/:id を送信"
 log_info "node Aはmemberではない場合リレーが発生します"
 
@@ -281,7 +348,10 @@ test_auth_request \
     "{\"data\": \"$UPDATED_DATA\"}" \
     200 \
     "$ACCOUNT1_KEY_ID" \
-    "$ACCOUNT1_SIGNATURE"
+    "$ACCOUNT1_PRIVATE_KEY" \
+    "update" \
+    "$CONTENT_ID" \
+    "$DECODED_UPDATE_BODY"
 
 # ============================================================================
 # Step 6: 同期確認
@@ -295,11 +365,12 @@ log_step "gossipsubによる伝播を待機 (5秒)..."
 sleep 5
 
 log_step "各ノードでcontentデータを取得し、更新が反映されていることを確認"
-SYNC_OK=true
 for port in 8080 8081 8082; do
+    generate_signature "$ACCOUNT1_PRIVATE_KEY" "read" "content"
     DATA_RESPONSE=$(curl -s "http://127.0.0.1:$port/content/$CONTENT_ID/data" \
         -H "Authorization: Bearer $ACCOUNT1_KEY_ID" \
-        -H "X-Request-Signature: $ACCOUNT1_SIGNATURE" 2>/dev/null)
+        -H "X-Request-Signature: $LAST_SIGNATURE" \
+        -H "X-Request-Timestamp: $LAST_TIMESTAMP" 2>/dev/null)
 
     if echo "$DATA_RESPONSE" | jq -e '.data' > /dev/null 2>&1; then
         FETCHED_DATA=$(echo "$DATA_RESPONSE" | jq -r '.data' 2>/dev/null)
@@ -314,9 +385,11 @@ done
 log_test "少なくとも1つのノードで更新データが取得できること"
 VERIFIED=false
 for port in 8080 8081 8082; do
+    generate_signature "$ACCOUNT1_PRIVATE_KEY" "read" "content"
     DATA_RESPONSE=$(curl -s "http://127.0.0.1:$port/content/$CONTENT_ID/data" \
         -H "Authorization: Bearer $ACCOUNT1_KEY_ID" \
-        -H "X-Request-Signature: $ACCOUNT1_SIGNATURE" 2>/dev/null)
+        -H "X-Request-Signature: $LAST_SIGNATURE" \
+        -H "X-Request-Timestamp: $LAST_TIMESTAMP" 2>/dev/null)
     if echo "$DATA_RESPONSE" | jq -e '.data' > /dev/null 2>&1; then
         FETCHED_DATA=$(echo "$DATA_RESPONSE" | jq -r '.data' 2>/dev/null)
         if [ -n "$FETCHED_DATA" ] && [ "$FETCHED_DATA" != "null" ]; then
@@ -352,7 +425,10 @@ test_auth_request \
     "" \
     200 \
     "$ACCOUNT1_KEY_ID" \
-    "$ACCOUNT1_SIGNATURE"
+    "$ACCOUNT1_PRIVATE_KEY" \
+    "invalidate" \
+    "$CONTENT_ID" \
+    ""
 
 if [ "$LAST_STATUS" = "200" ]; then
     log_info "invalidate_tokensレスポンス:"

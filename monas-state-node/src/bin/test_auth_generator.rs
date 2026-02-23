@@ -5,7 +5,7 @@ use base64::{
 use p256::ecdsa::{signature::Signer, SigningKey};
 use p256::elliptic_curve::rand_core::OsRng;
 use serde_json::json;
-use sha3::{Digest, Keccak256};
+use sha2::{Digest as Sha2Digest, Sha256};
 use std::env;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -14,187 +14,240 @@ fn main() {
     let args: Vec<String> = env::args().collect();
 
     if args.len() < 2 {
-        eprintln!("Usage: {} <command> [args...]", args[0]);
-        eprintln!("Commands:");
-        eprintln!("  generate-token [content_id]  - Generate an auth token");
-        eprintln!("  generate-signature <data>    - Generate a request signature");
-        eprintln!("  generate-keys                - Generate a new keypair");
-        eprintln!("  test-auth                    - Generate complete test auth data");
-        eprintln!("  generate-share-token         - Generate a share token for another user");
-        eprintln!("    --owner-key <hex>          Owner's private key (hex)");
-        eprintln!("    --recipient-key <hex>      Recipient's public key (hex)");
-        eprintln!("    --content-id <id>          Content ID");
-        eprintln!(
-            "    --capabilities <caps>      Comma-separated capabilities (read,write,delete,share)"
-        );
-        eprintln!("    --expiry <seconds>         Token expiry in seconds (default: 3600)");
+        print_usage(&args[0]);
         std::process::exit(1);
     }
 
     let command = &args[1];
 
     match command.as_str() {
-        "generate-token" => {
-            let content_id = args.get(2).cloned();
-            generate_auth_token(content_id);
-        }
-        "generate-signature" => {
-            if args.len() < 3 {
-                eprintln!("Error: Please provide data to sign");
-                std::process::exit(1);
-            }
-            let data = &args[2];
-            generate_request_signature(data);
-        }
         "generate-keys" => {
             generate_keypair();
+        }
+        "sign-request" => {
+            sign_request(&args[2..]);
         }
         "test-auth" => {
             generate_test_auth_data();
         }
+        "generate-token" => {
+            let content_id = args.get(2).cloned();
+            generate_auth_token(content_id);
+        }
         "generate-share-token" => {
             generate_share_token(&args[2..]);
         }
+        "help" | "--help" | "-h" => {
+            print_usage(&args[0]);
+        }
         _ => {
             eprintln!("Unknown command: {}", command);
+            print_usage(&args[0]);
             std::process::exit(1);
         }
     }
 }
 
+fn print_usage(program: &str) {
+    eprintln!("Usage: {} <command> [args...]", program);
+    eprintln!("Commands:");
+    eprintln!("  generate-keys                        - Generate a new P-256 keypair");
+    eprintln!(
+        "  test-auth                            - Generate keypair + key_id (machine-readable)"
+    );
+    eprintln!("  sign-request                         - Sign a request message");
+    eprintln!("    --private-key <hex>                  Private key (hex)");
+    eprintln!("    --operation <op>                     Operation (create/update/delete/read/...)");
+    eprintln!("    --resource <res>                     Resource (content_id or 'content')");
+    eprintln!("    --timestamp <ts>                     Unix timestamp");
+    eprintln!("    [--body <base64>]                    Request body (base64, for create/update)");
+    eprintln!("  generate-token [content_id]           - Generate an auth token (JWT)");
+    eprintln!("  generate-share-token                  - Generate a share token for another user");
+}
+
+/// Generate a P-256 keypair and output in machine-readable format.
 fn generate_keypair() {
-    // Generate a new P-256 keypair
     let signing_key = SigningKey::random(&mut OsRng);
     let verifying_key = signing_key.verifying_key();
 
-    // Get the public key in SEC1 uncompressed format (65 bytes, starting with 0x04)
     let public_key_bytes = verifying_key.to_encoded_point(false).as_bytes().to_vec();
-    let public_key_hex = hex::encode(&public_key_bytes);
-
-    // Get the private key as bytes
     let private_key_bytes = signing_key.to_bytes();
-    let private_key_hex = hex::encode(private_key_bytes);
 
-    println!("=== Generated P-256 Keypair ===");
-    println!("Private Key (hex): {}", private_key_hex);
-    println!("Public Key (hex):  {}", public_key_hex);
-    println!(
-        "Public Key (base64): {}",
-        STANDARD.encode(&public_key_bytes)
-    );
+    println!("PRIVATE_KEY={}", hex::encode(private_key_bytes));
+    println!("PUBLIC_KEY={}", hex::encode(&public_key_bytes));
+}
+
+/// Generate test auth data: keypair + key_id, in machine-readable format.
+fn generate_test_auth_data() {
+    let signing_key = SigningKey::random(&mut OsRng);
+    let verifying_key = signing_key.verifying_key();
+
+    let public_key_bytes = verifying_key.to_encoded_point(false).as_bytes().to_vec();
+    let private_key_bytes = signing_key.to_bytes();
+
+    // Machine-readable output for script consumption
+    println!("PRIVATE_KEY={}", hex::encode(private_key_bytes));
+    println!("PUBLIC_KEY={}", hex::encode(&public_key_bytes));
+}
+
+/// Sign a request with the correct message format.
+///
+/// For requests WITH body (create/update):
+///   message = hex(sha256(body_bytes + timestamp_be_bytes))
+///
+/// For requests WITHOUT body (delete/read/invalidate/manage/revoke):
+///   message = "{operation}:{resource}:{timestamp}"
+fn sign_request(args: &[String]) {
+    let mut private_key_hex = String::new();
+    let mut operation = String::new();
+    let mut resource = String::new();
+    let mut timestamp_str = String::new();
+    let mut body_b64 = String::new();
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--private-key" => {
+                i += 1;
+                if i < args.len() {
+                    private_key_hex = args[i].clone();
+                }
+            }
+            "--operation" => {
+                i += 1;
+                if i < args.len() {
+                    operation = args[i].clone();
+                }
+            }
+            "--resource" => {
+                i += 1;
+                if i < args.len() {
+                    resource = args[i].clone();
+                }
+            }
+            "--timestamp" => {
+                i += 1;
+                if i < args.len() {
+                    timestamp_str = args[i].clone();
+                }
+            }
+            "--body" => {
+                i += 1;
+                if i < args.len() {
+                    body_b64 = args[i].clone();
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    if private_key_hex.is_empty() || operation.is_empty() || resource.is_empty() {
+        eprintln!("Error: --private-key, --operation, --resource are required");
+        std::process::exit(1);
+    }
+
+    let timestamp: u64 = if timestamp_str.is_empty() {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    } else {
+        timestamp_str.parse().unwrap_or_else(|e| {
+            eprintln!("Error: Invalid timestamp: {}", e);
+            std::process::exit(1);
+        })
+    };
+
+    // Parse private key
+    let private_key_bytes = hex::decode(&private_key_hex).unwrap_or_else(|e| {
+        eprintln!("Error: Invalid private key hex: {}", e);
+        std::process::exit(1);
+    });
+    let signing_key = SigningKey::from_bytes((&private_key_bytes[..]).into()).unwrap_or_else(|e| {
+        eprintln!("Error: Invalid private key: {}", e);
+        std::process::exit(1);
+    });
+
+    // Construct the signing message
+    let message = if !body_b64.is_empty() {
+        // Body-based signing: hex(sha256(body_bytes + timestamp_be_bytes))
+        let body_bytes = STANDARD.decode(&body_b64).unwrap_or_else(|e| {
+            eprintln!("Error: Invalid body base64: {}", e);
+            std::process::exit(1);
+        });
+        let mut hasher = Sha256::new();
+        hasher.update(&body_bytes);
+        hasher.update(timestamp.to_be_bytes());
+        hex::encode(hasher.finalize())
+    } else {
+        // Metadata-based signing: {operation}:{resource}:{timestamp}
+        format!("{}:{}:{}", operation, resource, timestamp)
+    };
+
+    // Sign the message
+    let signature: p256::ecdsa::Signature = signing_key.sign(message.as_bytes());
+    let signature_base64 = STANDARD.encode(signature.to_bytes());
+
+    // Machine-readable output
+    println!("SIGNATURE={}", signature_base64);
+    println!("TIMESTAMP={}", timestamp);
+    println!("MESSAGE={}", message);
 }
 
 fn generate_auth_token(content_id: Option<String>) {
-    // Create test signing key
     let signing_key = SigningKey::random(&mut OsRng);
     let verifying_key = signing_key.verifying_key();
 
-    // Get the public key in SEC1 uncompressed format
     let public_key_bytes = verifying_key.to_encoded_point(false).as_bytes().to_vec();
 
-    // Create key_id from public key hash
-    let mut hasher = Keccak256::new();
-    hasher.update(&public_key_bytes);
-    let key_id = hasher.finalize().to_vec();
-
-    // Create capabilities
     let mut capabilities = vec![];
     if let Some(cid) = content_id {
         capabilities.push(json!({
             "with": format!("monas://content/{}", cid),
-            "can": "write"  // write implies read
+            "can": "write"
         }));
     } else {
         capabilities.push(json!({
             "with": "monas://content/*",
-            "can": "write"  // write implies read
+            "can": "write"
         }));
     }
 
-    // Create JWT header
     let header = json!({
         "alg": "ES256",
         "typ": "JWT",
         "ver": "1.0"
     });
 
-    // Create JWT payload
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs();
 
     let payload = json!({
-        "iss": hex::encode(&key_id),
-        "aud": hex::encode(&key_id),  // Self-issued for testing
-        "exp": now + 3600,  // 1 hour from now
+        "iss": format!("user:{}", &hex::encode(&public_key_bytes)[..16]),
+        "aud": format!("user:{}", &hex::encode(&public_key_bytes)[..16]),
+        "exp": now + 3600,
         "iat": now,
         "jti": Uuid::new_v4().to_string(),
         "att": capabilities
     });
 
-    // Encode header and payload
     let header_b64 = URL_SAFE_NO_PAD.encode(header.to_string());
     let payload_b64 = URL_SAFE_NO_PAD.encode(payload.to_string());
-
-    // Create signing input
     let signing_input = format!("{}.{}", header_b64, payload_b64);
 
-    // Sign the input
     let signature: p256::ecdsa::Signature = signing_key.sign(signing_input.as_bytes());
     let signature_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
 
-    // Assemble JWT
     let token_str = format!("{}.{}.{}", header_b64, payload_b64, signature_b64);
 
-    println!("=== Generated Auth Token ===");
-    println!("Token: {}", token_str);
-    println!();
-    println!("Public Key (hex): {}", hex::encode(&public_key_bytes));
-    println!(
-        "Public Key (base64): {}",
-        STANDARD.encode(&public_key_bytes)
-    );
-    println!("Key ID (hex): {}", hex::encode(&key_id));
-    println!();
-    println!("Usage:");
-    println!("  curl -H \"Authorization: Bearer {}\" ...", token_str);
-}
-
-fn generate_request_signature(data: &str) {
-    // Create test signing key
-    let signing_key = SigningKey::random(&mut OsRng);
-    let verifying_key = signing_key.verifying_key();
-    let public_key_bytes = verifying_key.to_encoded_point(false).as_bytes().to_vec();
-
-    // Hash the data with Keccak256
-    let mut hasher = Keccak256::new();
-    hasher.update(data.as_bytes());
-    let hash = hasher.finalize();
-
-    // Sign the hash
-    let signature: p256::ecdsa::Signature = signing_key.sign(&hash);
-    let signature_bytes = signature.to_bytes();
-    let signature_base64 = STANDARD.encode(signature_bytes);
-
-    println!("=== Generated Request Signature ===");
-    println!("Data: {}", data);
-    println!("Signature: {}", signature_base64);
-    println!("Public Key (hex): {}", hex::encode(&public_key_bytes));
-    println!(
-        "Public Key (base64): {}",
-        STANDARD.encode(&public_key_bytes)
-    );
-    println!();
-    println!("Usage:");
-    println!(
-        "  curl -H \"X-Request-Signature: {}\" ...",
-        signature_base64
-    );
+    println!("TOKEN={}", token_str);
+    println!("PUBLIC_KEY={}", hex::encode(&public_key_bytes));
 }
 
 fn generate_share_token(args: &[String]) {
-    // Parse arguments
     let mut owner_key_hex = String::new();
     let mut recipient_key_hex = String::new();
     let mut content_id = String::new();
@@ -244,7 +297,6 @@ fn generate_share_token(args: &[String]) {
         std::process::exit(1);
     }
 
-    // Parse owner's private key
     let owner_key_bytes = hex::decode(&owner_key_hex).unwrap_or_else(|e| {
         eprintln!("Error: Invalid owner key hex: {}", e);
         std::process::exit(1);
@@ -260,25 +312,15 @@ fn generate_share_token(args: &[String]) {
         .as_bytes()
         .to_vec();
 
-    // Compute owner's key_id (monas:user:<keccak256_hash_prefix>)
-    let mut hasher = Keccak256::new();
-    hasher.update(&owner_public_key_bytes);
-    let owner_key_id_bytes = hasher.finalize().to_vec();
-    let owner_key_id = format!("monas:user:{}", hex::encode(&owner_key_id_bytes));
+    let owner_key_id = format!("user:{}", &hex::encode(&owner_public_key_bytes)[..16]);
 
-    // Parse recipient's public key
     let recipient_public_key_bytes = hex::decode(&recipient_key_hex).unwrap_or_else(|e| {
         eprintln!("Error: Invalid recipient key hex: {}", e);
         std::process::exit(1);
     });
 
-    // Compute recipient's key_id
-    let mut hasher = Keccak256::new();
-    hasher.update(&recipient_public_key_bytes);
-    let recipient_key_id_bytes = hasher.finalize().to_vec();
-    let recipient_key_id = format!("monas:user:{}", hex::encode(&recipient_key_id_bytes));
+    let recipient_key_id = format!("user:{}", &hex::encode(&recipient_public_key_bytes)[..16]);
 
-    // Parse capabilities
     let caps: Vec<serde_json::Value> = capabilities_str
         .split(',')
         .map(|c| {
@@ -290,7 +332,6 @@ fn generate_share_token(args: &[String]) {
         })
         .collect();
 
-    // Create JWT
     let header = json!({
         "alg": "ES256",
         "typ": "JWT",
@@ -318,115 +359,16 @@ fn generate_share_token(args: &[String]) {
 
     let signing_input = format!("{}.{}", header_b64, payload_b64);
 
-    // Sign with owner's key
     let signature: p256::ecdsa::Signature = owner_signing_key.sign(signing_input.as_bytes());
     let signature_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
 
     let token_str = format!("{}.{}.{}", header_b64, payload_b64, signature_b64);
 
-    // Generate recipient's request signature
-    // The recipient would need their own private key to sign, but for the test tool
-    // we just output the token. The recipient signs "{iss}:{aud}:{jti}" with their private key.
-    let request_message = format!("{}:{}:{}", owner_key_id, recipient_key_id, jti);
-
-    // Machine-readable output for script consumption
     println!("SHARE_TOKEN={}", token_str);
     println!("OWNER_PUBLIC_KEY={}", hex::encode(&owner_public_key_bytes));
     println!("RECIPIENT_PUBLIC_KEY={}", recipient_key_hex);
     println!("OWNER_KEY_ID={}", owner_key_id);
     println!("RECIPIENT_KEY_ID={}", recipient_key_id);
-    println!("REQUEST_MESSAGE={}", request_message);
     println!("CONTENT_ID={}", content_id);
     println!("JTI={}", jti);
-}
-
-fn generate_test_auth_data() {
-    // Create test signing key
-    let signing_key = SigningKey::random(&mut OsRng);
-    let verifying_key = signing_key.verifying_key();
-    let public_key_bytes = verifying_key.to_encoded_point(false).as_bytes().to_vec();
-
-    // Create key_id from public key hash
-    let mut hasher = Keccak256::new();
-    hasher.update(&public_key_bytes);
-    let key_id = hasher.finalize().to_vec();
-
-    // Generate auth token
-    let capabilities = vec![json!({
-        "with": "monas://content/*",
-        "can": "write"  // write implies read
-    })];
-
-    // Create JWT header and payload
-    let header = json!({
-        "alg": "ES256",
-        "typ": "JWT",
-        "ver": "1.0"
-    });
-
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-
-    let payload = json!({
-        "iss": hex::encode(&key_id),
-        "aud": hex::encode(&key_id),  // Self-issued for testing
-        "exp": now + 3600,  // 1 hour from now
-        "iat": now,
-        "jti": Uuid::new_v4().to_string(),
-        "att": capabilities
-    });
-
-    // Encode header and payload
-    let header_b64 = URL_SAFE_NO_PAD.encode(header.to_string());
-    let payload_b64 = URL_SAFE_NO_PAD.encode(payload.to_string());
-
-    // Create signing input
-    let signing_input = format!("{}.{}", header_b64, payload_b64);
-
-    // Sign the input
-    let signature: p256::ecdsa::Signature = signing_key.sign(signing_input.as_bytes());
-    let signature_b64 = URL_SAFE_NO_PAD.encode(signature.to_bytes());
-
-    // Assemble JWT
-    let token_str = format!("{}.{}.{}", header_b64, payload_b64, signature_b64);
-
-    // Generate a sample request body and its signature
-    let request_body = json!({
-        "data": "SGVsbG8sIFdvcmxkIQ=="  // "Hello, World!" in base64
-    });
-    let request_body_str = request_body.to_string();
-
-    // Hash and sign the request body
-    let mut hasher = Keccak256::new();
-    hasher.update(request_body_str.as_bytes());
-    let hash = hasher.finalize();
-
-    let req_signature: p256::ecdsa::Signature = signing_key.sign(&hash);
-    let req_signature_bytes = req_signature.to_bytes();
-    let req_signature_base64 = STANDARD.encode(req_signature_bytes);
-
-    println!("=== Complete Test Authentication Data ===");
-    println!();
-    println!("# Environment variables to set:");
-    println!("export TEST_AUTH_TOKEN=\"{}\"", token_str);
-    println!("export TEST_REQUEST_SIGNATURE=\"{}\"", req_signature_base64);
-    println!(
-        "export TEST_PUBLIC_KEY=\"{}\"",
-        hex::encode(&public_key_bytes)
-    );
-    println!();
-    println!("# Example curl command:");
-    println!("curl -X POST http://127.0.0.1:8080/content \\");
-    println!("  -H \"Content-Type: application/json\" \\");
-    println!("  -H \"Authorization: Bearer $TEST_AUTH_TOKEN\" \\");
-    println!("  -H \"X-Request-Signature: $TEST_REQUEST_SIGNATURE\" \\");
-    println!("  -d '{}'", request_body_str);
-    println!();
-    println!("# Token details:");
-    println!("  Issuer: {}", hex::encode(&key_id));
-    println!("  Audience: {}", hex::encode(&key_id));
-    println!("  Capabilities: read, write on all content");
-    println!("  Valid for: 1 hour from now");
 }

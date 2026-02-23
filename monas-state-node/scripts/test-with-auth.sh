@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Monas State Node - 認証付き機能テストスクリプト
-# 認証トークンと署名を生成し、実際のコンテンツ操作をテストします
+# P-256鍵ペアを生成し、各ノードに登録後、認証付きリクエストをテストします
 
 set -e
 
@@ -11,7 +11,6 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
-MAGENTA='\033[0;35m'
 NC='\033[0m' # No Color
 
 # ログ関数
@@ -47,6 +46,39 @@ cd "$STATE_NODE_DIR"
 TESTS_PASSED=0
 TESTS_FAILED=0
 
+# test-auth-generator バイナリのビルド
+log_info "test-auth-generatorをビルドしています..."
+cargo build --bin test-auth-generator 2>/dev/null || {
+    log_error "ビルドに失敗しました"
+    cargo build --bin test-auth-generator
+    exit 1
+}
+
+AUTH_GEN="cargo run --bin test-auth-generator --"
+
+# ============================================================================
+# ヘルパー関数
+# ============================================================================
+
+# 署名を生成する関数
+# 引数: private_key operation resource [body_base64]
+generate_signature() {
+    local private_key="$1"
+    local operation="$2"
+    local resource="$3"
+    local body_b64="$4"
+
+    local sign_args="sign-request --private-key $private_key --operation $operation --resource $resource"
+    if [ -n "$body_b64" ]; then
+        sign_args="$sign_args --body $body_b64"
+    fi
+
+    local output
+    output=$($AUTH_GEN $sign_args 2>/dev/null)
+    LAST_SIGNATURE=$(echo "$output" | grep "^SIGNATURE=" | sed 's/^SIGNATURE=//')
+    LAST_TIMESTAMP=$(echo "$output" | grep "^TIMESTAMP=" | sed 's/^TIMESTAMP=//')
+}
+
 # ノードの起動確認
 check_nodes_running() {
     log_info "ノードの起動状態を確認しています..."
@@ -63,7 +95,6 @@ check_nodes_running() {
 
     if [ "$all_running" = false ]; then
         log_warn "一部のノードが起動していません。最低1つのノードで動作確認を行います"
-        # 少なくとも1つのノードが起動していればテストを続行
         if ! curl -s "http://127.0.0.1:8080/health" > /dev/null 2>&1 && \
            ! curl -s "http://127.0.0.1:8081/health" > /dev/null 2>&1 && \
            ! curl -s "http://127.0.0.1:8082/health" > /dev/null 2>&1; then
@@ -73,76 +104,24 @@ check_nodes_running() {
     fi
 }
 
-# 認証データを生成する関数
-generate_auth_data() {
-    log_info "テスト用認証データを生成しています..."
+# 公開鍵をノードに登録する関数
+register_key_with_nodes() {
+    local key_id="$1"
+    local public_key_hex="$2"
 
-    # key_idは "type:id" 形式を使用
-    export TEST_KEY_ID="user:test-auth"
-
-    # generate-test-auth.shを使って認証データを生成
-    local auth_output=$("$STATE_NODE_DIR/scripts/generate-test-auth.sh" test-auth 2>&1)
-
-    # リクエスト署名をパース
-    export TEST_REQUEST_SIGNATURE=$(echo "$auth_output" | grep "export TEST_REQUEST_SIGNATURE=" | cut -d'"' -f2)
-
-    if [ -z "$TEST_REQUEST_SIGNATURE" ]; then
-        log_error "認証データの生成に失敗しました"
-        echo "$auth_output"
-        exit 1
-    fi
-
-    log_success "認証データを生成しました"
-    log_info "Key ID: $TEST_KEY_ID"
-    log_info "Signature: $TEST_REQUEST_SIGNATURE"
-}
-
-# HTTP リクエストを実行してレスポンスをチェック（認証付き）
-test_auth_request() {
-    local description="$1"
-    local method="$2"
-    local url="$3"
-    local data="$4"
-    local expected_status="${5:-200}"
-
-    log_test "$description"
-
-    local request_signature="$TEST_REQUEST_SIGNATURE"
-
-    local response
-    if [ -z "$data" ]; then
-        response=$(curl -s -X "$method" \
-            -H "Authorization: Bearer $TEST_KEY_ID" \
-            -H "X-Request-Signature: $request_signature" \
-            -w "\n%{http_code}" "$url" 2>/dev/null)
-    else
-        response=$(curl -s -X "$method" \
-            -H "Content-Type: application/json" \
-            -H "Authorization: Bearer $TEST_KEY_ID" \
-            -H "X-Request-Signature: $request_signature" \
-            -d "$data" \
-            -w "\n%{http_code}" "$url" 2>/dev/null)
-    fi
-
-    status_code=$(echo "$response" | tail -n1)
-    body=$(echo "$response" | sed '$d')
-
-    if [ "$status_code" = "$expected_status" ]; then
-        log_success "$description (HTTP $status_code)"
-        ((TESTS_PASSED++))
-        if [ -n "$body" ]; then
-            echo "$body" | jq -C '.' 2>/dev/null || echo "$body"
+    for port in 8080 8081 8082; do
+        if curl -s "http://127.0.0.1:$port/health" > /dev/null 2>&1; then
+            curl -s -X POST "http://127.0.0.1:$port/auth/register-key" \
+                -H "Content-Type: application/json" \
+                -d "{\"key_id\": \"$key_id\", \"public_key_hex\": \"$public_key_hex\"}" > /dev/null 2>&1
         fi
-        return 0
-    else
-        log_fail "$description (期待: HTTP $expected_status, 実際: HTTP $status_code)"
-        ((TESTS_FAILED++))
-        echo "$body"
-        return 1
-    fi
+    done
 }
 
+# ============================================================================
 # メイン処理
+# ============================================================================
+
 echo ""
 echo -e "${BLUE}========================================${NC}"
 echo -e "${BLUE}  Monas State Node 認証付き機能テスト  ${NC}"
@@ -165,22 +144,61 @@ fi
 BASE_URL="http://127.0.0.1:$TEST_PORT"
 log_info "テスト対象ノード: $BASE_URL"
 
-# 認証データの生成
+# ============================================================================
+# 認証データの生成と登録
+# ============================================================================
+
 echo ""
 echo -e "${BLUE}=== 認証データの生成 ===${NC}"
 echo ""
-generate_auth_data
+
+log_info "テスト用鍵ペアを生成しています..."
+AUTH_OUTPUT=$($AUTH_GEN test-auth 2>/dev/null)
+TEST_PRIVATE_KEY=$(echo "$AUTH_OUTPUT" | grep "^PRIVATE_KEY=" | sed 's/^PRIVATE_KEY=//')
+TEST_PUBLIC_KEY=$(echo "$AUTH_OUTPUT" | grep "^PUBLIC_KEY=" | sed 's/^PUBLIC_KEY=//')
+TEST_KEY_ID="user:test-auth"
+
+if [ -z "$TEST_PRIVATE_KEY" ] || [ -z "$TEST_PUBLIC_KEY" ]; then
+    log_error "鍵ペアの生成に失敗しました"
+    echo "$AUTH_OUTPUT"
+    exit 1
+fi
+
+log_success "鍵ペアを生成しました"
+log_info "Key ID: $TEST_KEY_ID"
+
+# 各ノードに公開鍵を登録
+log_info "公開鍵をノードに登録しています..."
+register_key_with_nodes "$TEST_KEY_ID" "$TEST_PUBLIC_KEY"
+log_success "公開鍵を登録しました"
+
+# ============================================================================
+# コンテンツ作成テスト（認証付き）
+# ============================================================================
 
 echo ""
 echo -e "${BLUE}=== コンテンツ作成テスト（認証付き） ===${NC}"
 echo ""
 
-# コンテンツの作成（レスポンスを保存）
+# base64デコードされたバイナリデータのbase64表現
+CONTENT_B64="SGVsbG8sIFdvcmxkIQ=="  # "Hello, World!"
+
+# Create用の署名を生成（bodyベース）
+# HTTP APIはJSON bodyをbase64デコードするので、署名はデコード後のバイトに対して行う
+# ただし verify_caller_signature() は create_content(&data, ...) で data はデコード済みバイト
+# => bodyとしてはデコード済みバイトを渡す
+DECODED_BODY=$(echo -n "$CONTENT_B64" | base64 -d 2>/dev/null | base64)
+generate_signature "$TEST_PRIVATE_KEY" "create" "content" "$DECODED_BODY"
+CREATE_SIGNATURE="$LAST_SIGNATURE"
+CREATE_TIMESTAMP="$LAST_TIMESTAMP"
+
+log_test "新しいコンテンツを作成"
 CONTENT_RESPONSE=$(curl -s -X POST "$BASE_URL/content" \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer $TEST_KEY_ID" \
-    -H "X-Request-Signature: $TEST_REQUEST_SIGNATURE" \
-    -d '{"data": "SGVsbG8sIFdvcmxkIQ=="}' \
+    -H "X-Request-Signature: $CREATE_SIGNATURE" \
+    -H "X-Request-Timestamp: $CREATE_TIMESTAMP" \
+    -d "{\"data\": \"$CONTENT_B64\"}" \
     -w "\n%{http_code}" 2>/dev/null)
 
 status_code=$(echo "$CONTENT_RESPONSE" | tail -n1)
@@ -190,8 +208,6 @@ if [ "$status_code" = "201" ]; then
     log_success "新しいコンテンツを作成 (HTTP 201)"
     ((TESTS_PASSED++))
     echo "$response_body" | jq -C '.' 2>/dev/null || echo "$response_body"
-
-    # 作成したコンテンツのIDを直接レスポンスから取得
     CONTENT_ID=$(echo "$response_body" | jq -r '.content_id // empty' 2>/dev/null)
 else
     log_fail "新しいコンテンツを作成 (期待: HTTP 201, 実際: HTTP $status_code)"
@@ -208,20 +224,38 @@ if [ -n "$CONTENT_ID" ]; then
     echo ""
 
     # コンテンツの更新
-    test_auth_request \
-        "コンテンツを更新" \
-        PUT \
-        "$BASE_URL/content/$CONTENT_ID" \
-        '{"data": "VXBkYXRlZCBjb250ZW50"}' \
-        200
+    UPDATED_B64="VXBkYXRlZCBjb250ZW50"  # "Updated content"
+    DECODED_UPDATED_BODY=$(echo -n "$UPDATED_B64" | base64 -d 2>/dev/null | base64)
+    generate_signature "$TEST_PRIVATE_KEY" "update" "$CONTENT_ID" "$DECODED_UPDATED_BODY"
+
+    log_test "コンテンツを更新"
+    UPDATE_RESPONSE=$(curl -s -X PUT "$BASE_URL/content/$CONTENT_ID" \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer $TEST_KEY_ID" \
+        -H "X-Request-Signature: $LAST_SIGNATURE" \
+        -H "X-Request-Timestamp: $LAST_TIMESTAMP" \
+        -d "{\"data\": \"$UPDATED_B64\"}" \
+        -w "\n%{http_code}" 2>/dev/null)
+    UPDATE_STATUS=$(echo "$UPDATE_RESPONSE" | tail -n1)
+    UPDATE_BODY=$(echo "$UPDATE_RESPONSE" | sed '$d')
+    if [ "$UPDATE_STATUS" = "200" ]; then
+        log_success "コンテンツを更新 (HTTP 200)"
+        ((TESTS_PASSED++))
+    else
+        log_fail "コンテンツを更新 (期待: HTTP 200, 実際: HTTP $UPDATE_STATUS)"
+        ((TESTS_FAILED++))
+        echo "$UPDATE_BODY"
+    fi
 
     # メンバー追加（count形式）
-    # 注: DHT peer discovery に依存するため、小規模クラスタでは 503 が返る場合がある
+    generate_signature "$TEST_PRIVATE_KEY" "manage" "$CONTENT_ID"
+
     log_test "コンテンツネットワークにメンバーを追加"
     MEMBER_RESPONSE=$(curl -s -X POST "$BASE_URL/content/$CONTENT_ID/members" \
         -H "Content-Type: application/json" \
         -H "Authorization: Bearer $TEST_KEY_ID" \
-        -H "X-Request-Signature: $TEST_REQUEST_SIGNATURE" \
+        -H "X-Request-Signature: $LAST_SIGNATURE" \
+        -H "X-Request-Timestamp: $LAST_TIMESTAMP" \
         -d '{"count": 1}' \
         -w "\n%{http_code}" 2>/dev/null)
     MEMBER_STATUS=$(echo "$MEMBER_RESPONSE" | tail -n1)
@@ -244,35 +278,73 @@ if [ -n "$CONTENT_ID" ]; then
     echo ""
 
     # CRDTデータの取得（認証ヘッダー付き）
-    test_auth_request \
-        "CRDTデータの取得" \
-        GET \
-        "$BASE_URL/content/$CONTENT_ID/data" \
-        "" \
-        200
+    generate_signature "$TEST_PRIVATE_KEY" "read" "content"
+
+    log_test "CRDTデータの取得"
+    DATA_RESPONSE=$(curl -s -X GET "$BASE_URL/content/$CONTENT_ID/data" \
+        -H "Authorization: Bearer $TEST_KEY_ID" \
+        -H "X-Request-Signature: $LAST_SIGNATURE" \
+        -H "X-Request-Timestamp: $LAST_TIMESTAMP" \
+        -w "\n%{http_code}" 2>/dev/null)
+    DATA_STATUS=$(echo "$DATA_RESPONSE" | tail -n1)
+    DATA_BODY=$(echo "$DATA_RESPONSE" | sed '$d')
+    if [ "$DATA_STATUS" = "200" ]; then
+        log_success "CRDTデータの取得 (HTTP 200)"
+        ((TESTS_PASSED++))
+    else
+        log_fail "CRDTデータの取得 (期待: HTTP 200, 実際: HTTP $DATA_STATUS)"
+        ((TESTS_FAILED++))
+        echo "$DATA_BODY"
+    fi
 
     # CRDT履歴の取得（認証ヘッダー付き）
-    test_auth_request \
-        "CRDT履歴の取得" \
-        GET \
-        "$BASE_URL/content/$CONTENT_ID/history" \
-        "" \
-        200
+    generate_signature "$TEST_PRIVATE_KEY" "read" "content"
+
+    log_test "CRDT履歴の取得"
+    HIST_RESPONSE=$(curl -s -X GET "$BASE_URL/content/$CONTENT_ID/history" \
+        -H "Authorization: Bearer $TEST_KEY_ID" \
+        -H "X-Request-Signature: $LAST_SIGNATURE" \
+        -H "X-Request-Timestamp: $LAST_TIMESTAMP" \
+        -w "\n%{http_code}" 2>/dev/null)
+    HIST_STATUS=$(echo "$HIST_RESPONSE" | tail -n1)
+    HIST_BODY=$(echo "$HIST_RESPONSE" | sed '$d')
+    if [ "$HIST_STATUS" = "200" ]; then
+        log_success "CRDT履歴の取得 (HTTP 200)"
+        ((TESTS_PASSED++))
+    else
+        log_fail "CRDT履歴の取得 (期待: HTTP 200, 実際: HTTP $HIST_STATUS)"
+        ((TESTS_FAILED++))
+        echo "$HIST_BODY"
+    fi
 
     echo ""
     echo -e "${BLUE}=== コンテンツ削除テスト ===${NC}"
     echo ""
 
-    # コンテンツの削除（HTTP 200を期待）
-    test_auth_request \
-        "コンテンツを削除" \
-        DELETE \
-        "$BASE_URL/content/$CONTENT_ID" \
-        "" \
-        200
-else
-    log_warn "コンテンツIDが取得できなかったため、一部のテストをスキップします"
+    # コンテンツの削除
+    generate_signature "$TEST_PRIVATE_KEY" "delete" "$CONTENT_ID"
+
+    log_test "コンテンツを削除"
+    DEL_RESPONSE=$(curl -s -X DELETE "$BASE_URL/content/$CONTENT_ID" \
+        -H "Authorization: Bearer $TEST_KEY_ID" \
+        -H "X-Request-Signature: $LAST_SIGNATURE" \
+        -H "X-Request-Timestamp: $LAST_TIMESTAMP" \
+        -w "\n%{http_code}" 2>/dev/null)
+    DEL_STATUS=$(echo "$DEL_RESPONSE" | tail -n1)
+    DEL_BODY=$(echo "$DEL_RESPONSE" | sed '$d')
+    if [ "$DEL_STATUS" = "200" ]; then
+        log_success "コンテンツを削除 (HTTP 200)"
+        ((TESTS_PASSED++))
+    else
+        log_fail "コンテンツを削除 (期待: HTTP 200, 実際: HTTP $DEL_STATUS)"
+        ((TESTS_FAILED++))
+        echo "$DEL_BODY"
+    fi
 fi
+
+# ============================================================================
+# 複数ノード間の同期テスト
+# ============================================================================
 
 echo ""
 echo -e "${BLUE}=== 複数ノード間の同期テスト ===${NC}"
@@ -285,12 +357,16 @@ if curl -s "http://127.0.0.1:8080/health" > /dev/null 2>&1 && \
 
     log_test "ノード1でコンテンツを作成"
 
-    # ノード1でコンテンツ作成
+    SYNC_B64="U3luYyBUZXN0IERhdGE="  # "Sync Test Data"
+    DECODED_SYNC_BODY=$(echo -n "$SYNC_B64" | base64 -d 2>/dev/null | base64)
+    generate_signature "$TEST_PRIVATE_KEY" "create" "content" "$DECODED_SYNC_BODY"
+
     response=$(curl -s -X POST "http://127.0.0.1:8080/content" \
         -H "Content-Type: application/json" \
         -H "Authorization: Bearer $TEST_KEY_ID" \
-        -H "X-Request-Signature: $TEST_REQUEST_SIGNATURE" \
-        -d '{"data": "U3luYyBUZXN0IERhdGE="}' 2>/dev/null)
+        -H "X-Request-Signature: $LAST_SIGNATURE" \
+        -H "X-Request-Timestamp: $LAST_TIMESTAMP" \
+        -d "{\"data\": \"$SYNC_B64\"}" 2>/dev/null)
 
     if [ $? -eq 0 ]; then
         log_success "コンテンツ作成成功"
@@ -307,8 +383,13 @@ if curl -s "http://127.0.0.1:8080/health" > /dev/null 2>&1 && \
         done
     fi
 else
-    log_warn "すべてのノードが起動していないため、同期テストをスキップします"
+    log_error "すべてのノードが起動していないため、同期テストを実行できません"
+    ((TESTS_FAILED++))
 fi
+
+# ============================================================================
+# 認証エラーのテスト
+# ============================================================================
 
 echo ""
 echo -e "${BLUE}=== 認証エラーのテスト ===${NC}"
@@ -316,11 +397,13 @@ echo ""
 
 # 無効なトークンでのリクエスト
 log_test "無効なトークンでのリクエスト（401を期待）"
+generate_signature "$TEST_PRIVATE_KEY" "create" "content"
 response=$(curl -s -X POST "$BASE_URL/content" \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer invalid_token_12345" \
-    -H "X-Request-Signature: $TEST_REQUEST_SIGNATURE" \
-    -d '{"data": "test"}' \
+    -H "X-Request-Signature: $LAST_SIGNATURE" \
+    -H "X-Request-Timestamp: $LAST_TIMESTAMP" \
+    -d '{"data": "dGVzdA=="}' \
     -w "\n%{http_code}" 2>/dev/null)
 
 status_code=$(echo "$response" | tail -n1)
@@ -337,7 +420,7 @@ log_test "署名なしのリクエスト（401を期待）"
 response=$(curl -s -X POST "$BASE_URL/content" \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer $TEST_KEY_ID" \
-    -d '{"data": "test"}' \
+    -d '{"data": "dGVzdA=="}' \
     -w "\n%{http_code}" 2>/dev/null)
 
 status_code=$(echo "$response" | tail -n1)
@@ -348,6 +431,10 @@ else
     log_fail "署名なしリクエストが拒否されませんでした (HTTP $status_code)"
     ((TESTS_FAILED++))
 fi
+
+# ============================================================================
+# テスト結果サマリー
+# ============================================================================
 
 echo ""
 echo -e "${BLUE}========================================${NC}"
