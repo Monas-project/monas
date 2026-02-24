@@ -70,6 +70,13 @@ impl CrslCrdtRepository {
         })
     }
 
+    /// Check if the repository is healthy (can list contents).
+    pub async fn health_check(&self) -> Result<()> {
+        // A simple read operation to verify DB is responsive
+        let _contents = self.list_contents().await?;
+        Ok(())
+    }
+
     /// Generate a placeholder CID from content data.
     /// This is used as a seed for Create operations.
     fn generate_placeholder_cid(data: &[u8]) -> Cid {

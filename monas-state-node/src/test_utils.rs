@@ -223,6 +223,10 @@ impl PeerNetwork for MockPeerNetwork {
             .await
             .unwrap_or(true))
     }
+
+    async fn connected_peer_count(&self) -> usize {
+        0
+    }
 }
 
 // ============================================================================

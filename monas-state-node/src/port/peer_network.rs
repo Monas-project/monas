@@ -133,4 +133,9 @@ pub trait PeerNetwork: Send + Sync {
         request_signature: &[u8],
         timestamp: Option<u64>,
     ) -> Result<bool>;
+
+    // ========== Monitoring Methods ==========
+
+    /// Get the number of currently connected peers.
+    async fn connected_peer_count(&self) -> usize;
 }

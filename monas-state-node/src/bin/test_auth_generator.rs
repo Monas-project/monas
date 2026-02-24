@@ -37,6 +37,9 @@ fn main() {
         "generate-share-token" => {
             generate_share_token(&args[2..]);
         }
+        "sign-key-id" => {
+            sign_key_id(&args[2..]);
+        }
         "help" | "--help" | "-h" => {
             print_usage(&args[0]);
         }
@@ -63,6 +66,9 @@ fn print_usage(program: &str) {
     eprintln!("    [--body <base64>]                    Request body (base64, for create/update)");
     eprintln!("  generate-token [content_id]           - Generate an auth token (JWT)");
     eprintln!("  generate-share-token                  - Generate a share token for another user");
+    eprintln!("  sign-key-id                          - Sign a key_id for proof-of-possession");
+    eprintln!("    --private-key <hex>                  Private key (hex)");
+    eprintln!("    --key-id <key_id>                    Key ID to sign");
 }
 
 /// Generate a P-256 keypair and output in machine-readable format.
@@ -371,4 +377,54 @@ fn generate_share_token(args: &[String]) {
     println!("RECIPIENT_KEY_ID={}", recipient_key_id);
     println!("CONTENT_ID={}", content_id);
     println!("JTI={}", jti);
+}
+
+/// Sign a key_id for proof-of-possession during key registration.
+///
+/// Uses SHA-256 digest signing (matching verify_p256_signature in crypto.rs).
+fn sign_key_id(args: &[String]) {
+    let mut private_key_hex = String::new();
+    let mut key_id = String::new();
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--private-key" => {
+                i += 1;
+                if i < args.len() {
+                    private_key_hex = args[i].clone();
+                }
+            }
+            "--key-id" => {
+                i += 1;
+                if i < args.len() {
+                    key_id = args[i].clone();
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    if private_key_hex.is_empty() || key_id.is_empty() {
+        eprintln!("Error: --private-key and --key-id are required");
+        std::process::exit(1);
+    }
+
+    let private_key_bytes = hex::decode(&private_key_hex).unwrap_or_else(|e| {
+        eprintln!("Error: Invalid private key hex: {}", e);
+        std::process::exit(1);
+    });
+    let signing_key = SigningKey::from_bytes((&private_key_bytes[..]).into()).unwrap_or_else(|e| {
+        eprintln!("Error: Invalid private key: {}", e);
+        std::process::exit(1);
+    });
+
+    // Sign with SHA-256 digest (matching verify_p256_signature in crypto.rs)
+    use p256::ecdsa::signature::DigestSigner;
+    let signature: p256::ecdsa::Signature =
+        signing_key.sign_digest(Sha256::new_with_prefix(key_id.as_bytes()));
+    let signature_hex = hex::encode(signature.to_bytes());
+
+    println!("SIGNATURE_HEX={}", signature_hex);
 }

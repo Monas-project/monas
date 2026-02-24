@@ -107,15 +107,22 @@ check_nodes_running() {
     fi
 }
 
-# 公開鍵をノードに登録する関数
+# 公開鍵をノードに登録する関数 (proof-of-possession署名付き)
 register_key_with_nodes() {
     local key_id="$1"
     local public_key_hex="$2"
+    local private_key="$3"
+
+    # key_idの署名を生成 (proof-of-possession)
+    local sig_output
+    sig_output=$($AUTH_GEN sign-key-id --private-key "$private_key" --key-id "$key_id" 2>/dev/null)
+    local signature_hex
+    signature_hex=$(echo "$sig_output" | grep "^SIGNATURE_HEX=" | sed 's/^SIGNATURE_HEX=//')
 
     for port in 8080 8081 8082; do
         curl -s -X POST "http://127.0.0.1:$port/auth/register-key" \
             -H "Content-Type: application/json" \
-            -d "{\"key_id\": \"$key_id\", \"public_key_hex\": \"$public_key_hex\"}" > /dev/null 2>&1
+            -d "{\"key_id\": \"$key_id\", \"public_key_hex\": \"$public_key_hex\", \"signature_hex\": \"$signature_hex\"}" > /dev/null 2>&1
     done
 }
 
@@ -221,7 +228,7 @@ if [ -z "$ACCOUNT1_PRIVATE_KEY" ] || [ -z "$ACCOUNT1_PUBLIC_KEY" ]; then
 fi
 
 # account1の公開鍵を全ノードに登録
-register_key_with_nodes "$ACCOUNT1_KEY_ID" "$ACCOUNT1_PUBLIC_KEY"
+register_key_with_nodes "$ACCOUNT1_KEY_ID" "$ACCOUNT1_PUBLIC_KEY" "$ACCOUNT1_PRIVATE_KEY"
 log_success "account1: key_id=$ACCOUNT1_KEY_ID"
 
 # account2の鍵ペア生成
@@ -237,7 +244,7 @@ if [ -z "$ACCOUNT2_PRIVATE_KEY" ] || [ -z "$ACCOUNT2_PUBLIC_KEY" ]; then
 fi
 
 # account2の公開鍵を全ノードに登録
-register_key_with_nodes "$ACCOUNT2_KEY_ID" "$ACCOUNT2_PUBLIC_KEY"
+register_key_with_nodes "$ACCOUNT2_KEY_ID" "$ACCOUNT2_PUBLIC_KEY" "$ACCOUNT2_PRIVATE_KEY"
 log_success "account2: key_id=$ACCOUNT2_KEY_ID"
 
 # ============================================================================

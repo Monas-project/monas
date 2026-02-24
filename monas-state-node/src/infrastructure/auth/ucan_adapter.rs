@@ -233,6 +233,19 @@ impl UcanAdapter {
             anyhow::bail!("AuthToken has expired");
         }
 
+        // 1.5. Check max TTL (reject abnormally long-lived tokens)
+        const MAX_TOKEN_TTL_SECS: u64 = 24 * 60 * 60; // 24 hours
+        if let Some(exp) = token.payload.exp {
+            let lifetime = exp.saturating_sub(token.payload.iat);
+            if lifetime > MAX_TOKEN_TTL_SECS {
+                anyhow::bail!(
+                    "AuthToken TTL too long: {} secs (max {})",
+                    lifetime,
+                    MAX_TOKEN_TTL_SECS
+                );
+            }
+        }
+
         // 2. Check min_valid_issued_at (token invalidation)
         if token.payload.iat < min_valid_issued_at {
             anyhow::bail!(

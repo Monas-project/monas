@@ -241,6 +241,16 @@ where
         self.authz_service.as_ref()
     }
 
+    /// Get the extended key registry (if configured).
+    pub fn extended_key_registry(&self) -> Option<&Arc<dyn ExtendedPublicKeyRegistry>> {
+        self.extended_key_registry.as_ref()
+    }
+
+    /// Get the peer network.
+    pub fn peer_network(&self) -> &Arc<P> {
+        &self.peer_network
+    }
+
     /// Authenticate a caller for read operations.
     ///
     /// Returns the authenticated identity on success.
@@ -377,6 +387,56 @@ where
         } else {
             StateNodeError::NetworkError(NetworkError::ConnectionFailed(message))
         }
+    }
+
+    /// Relay an operation to member nodes with failover.
+    ///
+    /// Tries each member in order. Returns on the first success.
+    /// If all members fail, returns `NoAvailableMembers`.
+    /// Authorization errors (e.g. 403) are returned immediately without failover,
+    /// since they indicate a real permission problem rather than a connectivity issue.
+    async fn relay_with_failover<F, Fut>(
+        &self,
+        members: &[String],
+        operation_name: &str,
+        relay_fn: F,
+    ) -> Result<(), StateNodeError>
+    where
+        F: Fn(String) -> Fut,
+        Fut: std::future::Future<Output = Result<bool, anyhow::Error>>,
+    {
+        for (i, member) in members.iter().enumerate() {
+            match relay_fn(member.clone()).await {
+                Ok(true) => return Ok(()),
+                Ok(false) => {
+                    tracing::warn!(
+                        "Relay {} returned false on member {} ({}/{})",
+                        operation_name,
+                        member,
+                        i + 1,
+                        members.len()
+                    );
+                }
+                Err(e) => {
+                    let err_msg = e.to_string();
+                    // Don't failover on auth errors — they'll fail on every member
+                    if err_msg.contains("Authorization failed")
+                        || err_msg.contains("Authentication failed")
+                    {
+                        return Err(Self::classify_relay_error(err_msg));
+                    }
+                    tracing::warn!(
+                        "Relay {} failed on member {} ({}/{}): {}",
+                        operation_name,
+                        member,
+                        i + 1,
+                        members.len(),
+                        err_msg
+                    );
+                }
+            }
+        }
+        Err(StateNodeError::NoAvailableMembers)
     }
 
     /// Register a new node.
@@ -709,32 +769,27 @@ where
 
             Ok(event)
         } else {
-            // Relay path: we are not a member, relay to a member node.
-            // Authorization is delegated to the member node which has the up-to-date
-            // access policy (including any grants made via invalidate_tokens).
+            // Relay path: we are not a member, relay to a member node with failover.
             let members = network.member_nodes_as_strings();
             if members.is_empty() {
                 return Err(StateNodeError::NoAvailableMembers);
             }
 
-            let target_peer = &members[0];
-            let success = self
-                .peer_network
-                .relay_delete_content(
-                    target_peer,
-                    content_id,
-                    token.as_str(),
-                    request_signature,
-                    timestamp,
-                )
-                .await
-                .map_err(|e| Self::classify_relay_error(e.to_string()))?;
-
-            if !success {
-                return Err(StateNodeError::Internal(
-                    "Relay delete to member node failed".to_string(),
-                ));
-            }
+            let token_str = token.as_str().to_string();
+            let content_id_owned = content_id.to_string();
+            let request_sig = request_signature.to_vec();
+            self.relay_with_failover(&members, "delete", |member| {
+                let peer_network = self.peer_network.clone();
+                let cid = content_id_owned.clone();
+                let ts = token_str.clone();
+                let sig = request_sig.clone();
+                async move {
+                    peer_network
+                        .relay_delete_content(&member, &cid, &ts, &sig, timestamp)
+                        .await
+                }
+            })
+            .await?;
 
             Ok(Event::ContentDeleted {
                 content_id: content_id.to_string(),
@@ -859,33 +914,29 @@ where
 
             Ok(event)
         } else {
-            // Relay path: we are not a member, relay to a member node.
-            // Authorization is delegated to the member node which has the up-to-date
-            // access policy (including any grants made via invalidate_tokens).
+            // Relay path: we are not a member, relay to a member node with failover.
             let members = network.member_nodes_as_strings();
             if members.is_empty() {
                 return Err(StateNodeError::NoAvailableMembers);
             }
 
-            let target_peer = &members[0];
-            let success = self
-                .peer_network
-                .relay_update_content(
-                    target_peer,
-                    content_id,
-                    data,
-                    token.as_str(),
-                    request_signature,
-                    timestamp,
-                )
-                .await
-                .map_err(|e| Self::classify_relay_error(e.to_string()))?;
-
-            if !success {
-                return Err(StateNodeError::Internal(
-                    "Relay update to member node failed".to_string(),
-                ));
-            }
+            let token_str = token.as_str().to_string();
+            let content_id_owned = content_id.to_string();
+            let data_owned = data.to_vec();
+            let request_sig = request_signature.to_vec();
+            self.relay_with_failover(&members, "update", |member| {
+                let peer_network = self.peer_network.clone();
+                let cid = content_id_owned.clone();
+                let d = data_owned.clone();
+                let ts = token_str.clone();
+                let sig = request_sig.clone();
+                async move {
+                    peer_network
+                        .relay_update_content(&member, &cid, &d, &ts, &sig, timestamp)
+                        .await
+                }
+            })
+            .await?;
 
             Ok(Event::ContentUpdated {
                 content_id: content_id.to_string(),
@@ -1046,25 +1097,21 @@ where
                 return Err(StateNodeError::NoAvailableMembers);
             }
 
-            let target_peer = &members[0];
-
-            let success = self
-                .peer_network
-                .relay_invalidate_tokens(
-                    target_peer,
-                    content_id,
-                    token.as_str(),
-                    request_signature.unwrap_or(&[]),
-                    timestamp,
-                )
-                .await
-                .map_err(|e| Self::classify_relay_error(e.to_string()))?;
-
-            if !success {
-                return Err(StateNodeError::Internal(
-                    "Relay invalidate_tokens to member node failed".to_string(),
-                ));
-            }
+            let token_str = token.as_str().to_string();
+            let content_id_owned = content_id.to_string();
+            let request_sig = request_signature.unwrap_or(&[]).to_vec();
+            self.relay_with_failover(&members, "invalidate_tokens", |member| {
+                let peer_network = self.peer_network.clone();
+                let cid = content_id_owned.clone();
+                let ts = token_str.clone();
+                let sig = request_sig.clone();
+                async move {
+                    peer_network
+                        .relay_invalidate_tokens(&member, &cid, &ts, &sig, timestamp)
+                        .await
+                }
+            })
+            .await?;
 
             // For relay path, we don't know the exact new_min_valid_issued_at
             // Return current timestamp as approximate value

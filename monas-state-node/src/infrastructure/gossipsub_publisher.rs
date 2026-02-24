@@ -270,6 +270,10 @@ mod tests {
         ) -> Result<bool> {
             Ok(true)
         }
+
+        async fn connected_peer_count(&self) -> usize {
+            0
+        }
     }
 
     #[tokio::test]

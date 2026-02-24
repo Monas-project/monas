@@ -279,8 +279,7 @@ pub struct Libp2pNetwork {
     /// Connected peers and their addresses.
     ///
     /// Updated by the swarm event loop when connections are established/closed.
-    /// Reserved for future use in network monitoring and peer management APIs.
-    #[allow(dead_code)]
+    /// Used for monitoring (health check) and peer management.
     connected_peers: Arc<RwLock<HashMap<PeerId, Vec<Multiaddr>>>>,
     /// Broadcast channel for received Gossipsub events.
     event_rx: broadcast::Sender<ReceivedEvent>,
@@ -1885,6 +1884,10 @@ impl PeerNetwork for Libp2pNetwork {
             .await
             .map_err(|_| anyhow::anyhow!("relay_invalidate_tokens timed out"))?
             .map_err(|_| anyhow::anyhow!("Failed to receive response"))?
+    }
+
+    async fn connected_peer_count(&self) -> usize {
+        self.connected_peers.read().await.len()
     }
 }
 

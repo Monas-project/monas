@@ -10,6 +10,7 @@ use crate::infrastructure::persistence::{
 };
 use crate::port::auth_token::AuthToken;
 use crate::port::content_repository::ContentRepository;
+use crate::port::peer_network::PeerNetwork;
 use axum::{
     extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, StatusCode},
@@ -37,11 +38,21 @@ pub type AppState = Arc<
 pub fn create_router(state: AppState) -> Router {
     use std::sync::Arc;
     use tower_governor::governor::GovernorConfigBuilder;
+    use tower_governor::key_extractor::SmartIpKeyExtractor;
     use tower_governor::GovernorLayer;
 
+    // Global rate limit: 100 requests/sec, burst up to 200
     let governor_config = GovernorConfigBuilder::default()
         .per_second(100)
         .burst_size(200)
+        .finish()
+        .unwrap();
+
+    // Per-IP rate limit: 20 requests/sec, burst up to 40
+    let per_ip_config = GovernorConfigBuilder::default()
+        .per_second(20)
+        .burst_size(40)
+        .key_extractor(SmartIpKeyExtractor)
         .finish()
         .unwrap();
 
@@ -52,6 +63,8 @@ pub fn create_router(state: AppState) -> Router {
         // SECURITY NOTE: These endpoints expose only node/content IDs and
         // capacity metadata — never content data itself.
         .route("/health", get(health_check))
+        .route("/health/live", get(liveness_check))
+        .route("/health/ready", get(readiness_check))
         .route("/node/info", get(node_info))
         .route("/node/register", post(register_node))
         .route("/nodes", get(list_nodes))
@@ -68,11 +81,15 @@ pub fn create_router(state: AppState) -> Router {
             "/content/:id/access/invalidate",
             post(invalidate_tokens_handler),
         )
-        // Key registration endpoint (for testing/development)
+        // Key registration endpoint
         .route("/auth/register-key", post(register_public_key))
         // Request body size limit: 16 MiB
         .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
-        // Rate limit: 100 requests/sec, burst up to 200
+        // Per-IP rate limit (inner layer, applied first)
+        .layer(GovernorLayer {
+            config: Arc::new(per_ip_config),
+        })
+        // Global rate limit (outer layer)
         .layer(GovernorLayer {
             config: Arc::new(governor_config),
         })
@@ -197,6 +214,8 @@ impl IntoResponse for StateNodeError {
 pub struct RegisterPublicKeyRequest {
     pub key_id: String,
     pub public_key_hex: String,
+    /// Proof-of-possession: sign(key_id) by the private key corresponding to public_key_hex
+    pub signature_hex: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -289,6 +308,42 @@ async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
         status: "ok".to_string(),
         node_id: state.local_node_id().to_string(),
     })
+}
+
+/// Liveness probe (public, no auth required).
+///
+/// Returns 200 if the process is alive. Used by orchestrators (K8s) for liveness probes.
+async fn liveness_check() -> impl IntoResponse {
+    (StatusCode::OK, Json(serde_json::json!({"status": "alive"})))
+}
+
+/// Readiness probe (public, no auth required).
+///
+/// Returns 200 if the node is ready to serve traffic (DB responsive + network connected).
+/// Returns 503 if the node is not ready.
+async fn readiness_check(State(state): State<AppState>) -> impl IntoResponse {
+    let peer_count = state.peer_network().connected_peer_count().await;
+    let db_ok = state.crdt_repo().health_check().await.is_ok();
+
+    if db_ok {
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "ready",
+                "peers": peer_count,
+                "database": "ok"
+            })),
+        )
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "status": "not_ready",
+                "peers": peer_count,
+                "database": "error"
+            })),
+        )
+    }
 }
 
 /// Get node info (public, no auth required).
@@ -800,7 +855,8 @@ async fn invalidate_tokens_handler(
 /// Register a public key for a key_id.
 ///
 /// This endpoint allows registering a public key for key_id-based authentication.
-/// Used for testing and development.
+/// Requires proof-of-possession: the caller must sign the key_id with the corresponding
+/// private key to prove ownership.
 async fn register_public_key(
     State(state): State<AppState>,
     Json(req): Json<RegisterPublicKeyRequest>,
@@ -817,6 +873,47 @@ async fn register_public_key(
                 .into_response();
         }
     };
+
+    let signature = match hex::decode(&req.signature_hex) {
+        Ok(sig) => sig,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!("Invalid signature hex: {}", e),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    // Verify proof-of-possession: signature over key_id using the registering key
+    if let Err(e) = crate::infrastructure::crypto::verify_p256_signature(
+        req.key_id.as_bytes(),
+        &signature,
+        &public_key,
+    ) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("Proof-of-possession failed: {}", e),
+            }),
+        )
+            .into_response();
+    }
+
+    // Check if key_id is already registered (prevent overwrite)
+    if let Some(registry) = state.extended_key_registry() {
+        if let Ok(Some(_)) = registry.get_public_key_by_key_id(&req.key_id).await {
+            return (
+                StatusCode::CONFLICT,
+                Json(ErrorResponse {
+                    error: format!("key_id '{}' is already registered", req.key_id),
+                }),
+            )
+                .into_response();
+        }
+    }
 
     match state
         .register_public_key_for_key_id(req.key_id.clone(), public_key)

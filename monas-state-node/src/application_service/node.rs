@@ -44,6 +44,8 @@ use std::sync::Arc;
 use std::time::Duration;
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::sync::RwLock;
+#[cfg(not(target_arch = "wasm32"))]
+use tokio_util::sync::CancellationToken;
 
 /// Configuration for the state node.
 #[derive(Debug, Clone)]
@@ -308,8 +310,13 @@ impl StateNode {
     }
 
     /// Run the node (HTTP server and event handler).
+    ///
+    /// Supports graceful shutdown via SIGINT/SIGTERM. When a shutdown signal
+    /// is received, the HTTP server stops accepting new connections, in-flight
+    /// requests are allowed to complete, and background tasks are cancelled.
     pub async fn run(&self) -> Result<()> {
         let router = create_router(self.service.clone());
+        let token = CancellationToken::new();
 
         tracing::info!(
             "Starting state node {} on {}",
@@ -320,69 +327,79 @@ impl StateNode {
         // Spawn relay request handler
         if let Some(mut relay_rx) = self.network.take_relay_receiver().await {
             let service_for_relay = self.service.clone();
+            let token_relay = token.clone();
             tokio::spawn(async move {
                 use crate::infrastructure::network::libp2p_network::RelayRequestKind;
                 use crate::port::auth_token::AuthToken;
                 tracing::info!("Started relay request handler");
-                while let Some(req) = relay_rx.recv().await {
-                    let result = match req.kind {
-                        RelayRequestKind::UpdateContent {
-                            content_id,
-                            data,
-                            auth_token,
-                            request_signature,
-                            timestamp,
-                        } => {
-                            let token = AuthToken::new(auth_token);
-                            service_for_relay
-                                .update_content(
-                                    &content_id,
-                                    &data,
-                                    Some(&token),
-                                    Some(&request_signature),
-                                    timestamp,
-                                )
-                                .await
-                                .map(|_| ())
+                loop {
+                    tokio::select! {
+                        _ = token_relay.cancelled() => {
+                            tracing::info!("Relay request handler shutting down");
+                            break;
                         }
-                        RelayRequestKind::DeleteContent {
-                            content_id,
-                            auth_token,
-                            request_signature,
-                            timestamp,
-                        } => {
-                            let token = AuthToken::new(auth_token);
-                            service_for_relay
-                                .delete_content(
-                                    &content_id,
-                                    Some(&token),
-                                    Some(&request_signature),
+                        req = relay_rx.recv() => {
+                            let Some(req) = req else { break };
+                            let result = match req.kind {
+                                RelayRequestKind::UpdateContent {
+                                    content_id,
+                                    data,
+                                    auth_token,
+                                    request_signature,
                                     timestamp,
-                                )
-                                .await
-                                .map(|_| ())
-                        }
-                        RelayRequestKind::InvalidateTokens {
-                            content_id,
-                            auth_token,
-                            request_signature,
-                            timestamp,
-                        } => {
-                            let token = AuthToken::new(auth_token);
-                            service_for_relay
-                                .invalidate_tokens(
-                                    &content_id,
-                                    &token,
-                                    Some(&request_signature),
+                                } => {
+                                    let token = AuthToken::new(auth_token);
+                                    service_for_relay
+                                        .update_content(
+                                            &content_id,
+                                            &data,
+                                            Some(&token),
+                                            Some(&request_signature),
+                                            timestamp,
+                                        )
+                                        .await
+                                        .map(|_| ())
+                                }
+                                RelayRequestKind::DeleteContent {
+                                    content_id,
+                                    auth_token,
+                                    request_signature,
                                     timestamp,
-                                )
-                                .await
-                                .map(|_| ())
+                                } => {
+                                    let token = AuthToken::new(auth_token);
+                                    service_for_relay
+                                        .delete_content(
+                                            &content_id,
+                                            Some(&token),
+                                            Some(&request_signature),
+                                            timestamp,
+                                        )
+                                        .await
+                                        .map(|_| ())
+                                }
+                                RelayRequestKind::InvalidateTokens {
+                                    content_id,
+                                    auth_token,
+                                    request_signature,
+                                    timestamp,
+                                } => {
+                                    let token = AuthToken::new(auth_token);
+                                    service_for_relay
+                                        .invalidate_tokens(
+                                            &content_id,
+                                            &token,
+                                            Some(&request_signature),
+                                            timestamp,
+                                        )
+                                        .await
+                                        .map(|_| ())
+                                }
+                            };
+                            let _ = req
+                                .reply
+                                .send(result.map_err(|e| anyhow::anyhow!(e.to_string())));
                         }
-                    };
-                    let _ = req
-                        .reply
-                        .send(result.map_err(|e| anyhow::anyhow!(e.to_string())));
+                    }
                 }
                 tracing::info!("Relay request handler stopped");
             });
@@ -394,65 +411,74 @@ impl StateNode {
         let sync_service_for_events = self.sync_service.clone();
 
         // Spawn event handler task
+        let token_events = token.clone();
         tokio::spawn(async move {
             tracing::info!("Started network event handler");
             loop {
-                match event_rx.recv().await {
-                    Ok(received) => {
-                        tracing::debug!(
-                            "Received event from {}: {:?}",
-                            received.source,
-                            received.event.event_type()
-                        );
+                tokio::select! {
+                    _ = token_events.cancelled() => {
+                        tracing::info!("Network event handler shutting down");
+                        break;
+                    }
+                    result = event_rx.recv() => {
+                        match result {
+                            Ok(received) => {
+                                tracing::debug!(
+                                    "Received event from {}: {:?}",
+                                    received.source,
+                                    received.event.event_type()
+                                );
 
-                        // Forward to service for processing (with source PeerID for verification)
-                        match service
-                            .handle_sync_event(&received.event, Some(&received.source))
-                            .await
-                        {
-                            Ok(outcome) => {
-                                tracing::debug!("Processed sync event: {:?}", outcome);
+                                // Forward to service for processing (with source PeerID for verification)
+                                match service
+                                    .handle_sync_event(&received.event, Some(&received.source))
+                                    .await
+                                {
+                                    Ok(outcome) => {
+                                        tracing::debug!("Processed sync event: {:?}", outcome);
 
-                                // If sync is needed, perform it
-                                if let crate::application_service::state_node_service::ApplyOutcome::NeedsSync { content_id } = outcome {
-                                    tracing::info!("Content sync needed for {}, initiating sync", content_id);
-                                    match sync_service_for_events.sync_from_peers(&content_id).await {
-                                        Ok(result) => {
-                                            tracing::info!(
-                                                "Content sync completed for {}: {} operations applied from {} providers",
-                                                content_id,
-                                                result.operations_applied,
-                                                result.providers_contacted
-                                            );
-                                            if !result.errors.is_empty() {
-                                                tracing::warn!(
-                                                    "Sync had {} errors: {:?}",
-                                                    result.errors.len(),
-                                                    result.errors
-                                                );
+                                        // If sync is needed, perform it
+                                        if let crate::application_service::state_node_service::ApplyOutcome::NeedsSync { content_id } = outcome {
+                                            tracing::info!("Content sync needed for {}, initiating sync", content_id);
+                                            match sync_service_for_events.sync_from_peers(&content_id).await {
+                                                Ok(result) => {
+                                                    tracing::info!(
+                                                        "Content sync completed for {}: {} operations applied from {} providers",
+                                                        content_id,
+                                                        result.operations_applied,
+                                                        result.providers_contacted
+                                                    );
+                                                    if !result.errors.is_empty() {
+                                                        tracing::warn!(
+                                                            "Sync had {} errors: {:?}",
+                                                            result.errors.len(),
+                                                            result.errors
+                                                        );
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    tracing::error!(
+                                                        "Failed to sync content {}: {}",
+                                                        content_id,
+                                                        e
+                                                    );
+                                                }
                                             }
                                         }
-                                        Err(e) => {
-                                            tracing::error!(
-                                                "Failed to sync content {}: {}",
-                                                content_id,
-                                                e
-                                            );
-                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("Failed to process sync event: {}", e);
                                     }
                                 }
                             }
-                            Err(e) => {
-                                tracing::error!("Failed to process sync event: {}", e);
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                tracing::warn!("Event handler lagged, missed {} events", n);
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                tracing::info!("Event channel closed, stopping handler");
+                                break;
                             }
                         }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!("Event handler lagged, missed {} events", n);
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        tracing::info!("Event channel closed, stopping handler");
-                        break;
                     }
                 }
             }
@@ -461,6 +487,7 @@ impl StateNode {
         // Spawn periodic sync task
         let sync_service = self.sync_service.clone();
         let sync_interval = Duration::from_secs(self.config.sync_interval_secs);
+        let token_sync = token.clone();
         tokio::spawn(async move {
             tracing::info!(
                 "Started periodic sync task (interval: {}s)",
@@ -468,22 +495,29 @@ impl StateNode {
             );
             let mut interval = tokio::time::interval(sync_interval);
             loop {
-                interval.tick().await;
-                tracing::debug!("Running periodic content sync");
-                match sync_service.sync_all_content().await {
-                    Ok(results) => {
-                        let total_applied: usize =
-                            results.iter().map(|(_, r)| r.operations_applied).sum();
-                        if total_applied > 0 {
-                            tracing::info!(
-                                "Periodic sync completed: {} operations applied across {} contents",
-                                total_applied,
-                                results.len()
-                            );
-                        }
+                tokio::select! {
+                    _ = token_sync.cancelled() => {
+                        tracing::info!("Periodic sync task shutting down");
+                        break;
                     }
-                    Err(e) => {
-                        tracing::warn!("Periodic sync failed: {}", e);
+                    _ = interval.tick() => {
+                        tracing::debug!("Running periodic content sync");
+                        match sync_service.sync_all_content().await {
+                            Ok(results) => {
+                                let total_applied: usize =
+                                    results.iter().map(|(_, r)| r.operations_applied).sum();
+                                if total_applied > 0 {
+                                    tracing::info!(
+                                        "Periodic sync completed: {} operations applied across {} contents",
+                                        total_applied,
+                                        results.len()
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("Periodic sync failed: {}", e);
+                            }
+                        }
                     }
                 }
             }
@@ -492,6 +526,7 @@ impl StateNode {
         // Spawn outbox retry task
         let reliable_publisher = self.reliable_publisher.clone();
         let retry_interval = Duration::from_secs(self.config.outbox_retry_interval_secs);
+        let token_outbox = token.clone();
         tokio::spawn(async move {
             tracing::info!(
                 "Started outbox retry task (interval: {}s)",
@@ -499,21 +534,28 @@ impl StateNode {
             );
             let mut interval = tokio::time::interval(retry_interval);
             loop {
-                interval.tick().await;
-                tracing::debug!("Running outbox retry");
-                match reliable_publisher.retry_pending().await {
-                    Ok(result) => {
-                        if result.delivered > 0 || result.dropped > 0 {
-                            tracing::info!(
-                                "Outbox retry: {} delivered, {} failed, {} dropped",
-                                result.delivered,
-                                result.failed,
-                                result.dropped
-                            );
-                        }
+                tokio::select! {
+                    _ = token_outbox.cancelled() => {
+                        tracing::info!("Outbox retry task shutting down");
+                        break;
                     }
-                    Err(e) => {
-                        tracing::warn!("Outbox retry failed: {}", e);
+                    _ = interval.tick() => {
+                        tracing::debug!("Running outbox retry");
+                        match reliable_publisher.retry_pending().await {
+                            Ok(result) => {
+                                if result.delivered > 0 || result.dropped > 0 {
+                                    tracing::info!(
+                                        "Outbox retry: {} delivered, {} failed, {} dropped",
+                                        result.delivered,
+                                        result.failed,
+                                        result.dropped
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("Outbox retry failed: {}", e);
+                            }
+                        }
                     }
                 }
             }
@@ -523,13 +565,22 @@ impl StateNode {
             .await
             .context("Failed to bind HTTP listener")?;
 
+        let shutdown_token = token.clone();
+        let shutdown_signal = async move {
+            tokio::signal::ctrl_c().await.ok();
+            tracing::info!("Shutdown signal received, starting graceful shutdown...");
+            shutdown_token.cancel();
+        };
+
         axum::serve(
             listener,
             router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
+        .with_graceful_shutdown(shutdown_signal)
         .await
         .context("HTTP server error")?;
 
+        tracing::info!("HTTP server stopped. Shutdown complete.");
         Ok(())
     }
 }

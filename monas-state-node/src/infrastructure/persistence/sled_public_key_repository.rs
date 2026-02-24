@@ -56,6 +56,9 @@ impl SledPublicKeyRepository {
         Self::new(Arc::new(db))
     }
 
+    /// Maximum number of nonce entries before forced cleanup.
+    const MAX_NONCE_ENTRIES: usize = 1_000_000;
+
     /// Check and record a nonce to prevent replay attacks.
     ///
     /// Uses sled's compare-and-swap to atomically check and insert,
@@ -72,6 +75,19 @@ impl SledPublicKeyRepository {
             .as_secs();
 
         let timestamp_bytes = timestamp.to_le_bytes();
+
+        // Size limit: clean up aggressively if approaching capacity
+        if self.nonce_tree.len() >= Self::MAX_NONCE_ENTRIES {
+            tracing::warn!(
+                "Nonce store at capacity ({} entries), running cleanup",
+                self.nonce_tree.len()
+            );
+            self.cleanup_old_nonces(timestamp.saturating_sub(3600))?;
+            // If still over capacity after 1-hour cleanup, be more aggressive
+            if self.nonce_tree.len() >= Self::MAX_NONCE_ENTRIES {
+                self.cleanup_old_nonces(timestamp.saturating_sub(300))?;
+            }
+        }
 
         // Atomic compare-and-swap: only insert if key does not exist (None -> Some)
         match self.nonce_tree.compare_and_swap(
