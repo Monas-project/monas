@@ -5,7 +5,7 @@ use crate::port::extended_public_key_registry::ExtendedPublicKeyRegistry;
 use crate::port::public_key_registry::PublicKeyRegistry;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use sled::Db;
+use sled::{Db, Transactional};
 use std::sync::Arc;
 
 /// Sled-based public key repository
@@ -144,19 +144,19 @@ impl PublicKeyRegistry for SledPublicKeyRepository {
         // Generate NodeId from public key
         let node_id = NodeId::from_public_key(&public_key)?;
 
-        // Store in node_key_tree
-        self.node_key_tree
-            .insert(node_id.as_str().as_bytes(), public_key.clone())?;
-
-        // Generate default key_id (monas:node:<node_id>)
         let key_id = format!("monas:node:{}", node_id.as_str());
+        let node_id_bytes = node_id.as_str().as_bytes().to_vec();
+        let key_id_bytes = key_id.as_bytes().to_vec();
 
-        // Store in key_id_tree
-        self.key_id_tree.insert(key_id.as_bytes(), public_key)?;
-
-        // Store mapping
-        self.node_to_key_tree
-            .insert(node_id.as_str().as_bytes(), key_id.as_bytes())?;
+        (&self.node_key_tree, &self.key_id_tree, &self.node_to_key_tree)
+            .transaction(|(node_key_tx, key_id_tx, node_to_key_tx)|
+                -> sled::transaction::ConflictableTransactionResult<(), ()> {
+                node_key_tx.insert(node_id_bytes.as_slice(), public_key.as_slice())?;
+                key_id_tx.insert(key_id_bytes.as_slice(), public_key.as_slice())?;
+                node_to_key_tx.insert(node_id_bytes.as_slice(), key_id_bytes.as_slice())?;
+                Ok(())
+            })
+            .map_err(|e| anyhow::anyhow!("Failed to register public key: {:?}", e))?;
 
         Ok(node_id)
     }
@@ -210,17 +210,24 @@ impl ExtendedPublicKeyRegistry for SledPublicKeyRepository {
         key_id: String,
         public_key: Vec<u8>,
     ) -> Result<()> {
-        // Store in key_id_tree
-        self.key_id_tree
-            .insert(key_id.as_bytes(), public_key.clone())?;
+        let is_node_key = key_id.starts_with("monas:node:") || key_id.starts_with("node:");
 
-        // Also generate and store NodeId if it's a node key
-        if key_id.starts_with("monas:node:") || key_id.starts_with("node:") {
+        if is_node_key {
             let node_id = NodeId::from_public_key(&public_key)?;
-            self.node_key_tree
-                .insert(node_id.as_str().as_bytes(), public_key)?;
-            self.node_to_key_tree
-                .insert(node_id.as_str().as_bytes(), key_id.as_bytes())?;
+            let node_id_bytes = node_id.as_str().as_bytes().to_vec();
+            let key_id_bytes = key_id.as_bytes().to_vec();
+
+            (&self.key_id_tree, &self.node_key_tree, &self.node_to_key_tree)
+                .transaction(|(key_id_tx, node_key_tx, node_to_key_tx)|
+                    -> sled::transaction::ConflictableTransactionResult<(), ()> {
+                    key_id_tx.insert(key_id_bytes.as_slice(), public_key.as_slice())?;
+                    node_key_tx.insert(node_id_bytes.as_slice(), public_key.as_slice())?;
+                    node_to_key_tx.insert(node_id_bytes.as_slice(), key_id_bytes.as_slice())?;
+                    Ok(())
+                })
+                .map_err(|e| anyhow::anyhow!("Failed to register public key for key_id: {:?}", e))?;
+        } else {
+            self.key_id_tree.insert(key_id.as_bytes(), public_key)?;
         }
 
         Ok(())

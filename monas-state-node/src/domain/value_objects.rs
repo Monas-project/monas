@@ -16,11 +16,18 @@ impl ContentId {
     /// Create a new ContentId.
     ///
     /// Returns an error if the CID is empty.
+    const MAX_LENGTH: usize = 512;
+
     pub fn new(cid: String) -> Result<Self, ValueError> {
         if cid.is_empty() {
             return Err(ValueError::EmptyContentId);
         }
-        // Additional CID format validation could be added here
+        if cid.len() > Self::MAX_LENGTH {
+            return Err(ValueError::InvalidCidFormat(format!(
+                "CID exceeds maximum length of {} bytes",
+                Self::MAX_LENGTH
+            )));
+        }
         Ok(Self(cid))
     }
 

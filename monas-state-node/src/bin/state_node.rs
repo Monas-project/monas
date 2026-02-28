@@ -59,8 +59,8 @@ async fn main() -> Result<()> {
     // Build configuration
     let mut network_config = monas_state_node::infrastructure::network::Libp2pNetworkConfig {
         listen_addrs: vec![format!("/ip4/0.0.0.0/tcp/{}", args.p2p_port)
-            .parse()
-            .unwrap()],
+            .parse::<Multiaddr>()
+            .context("Failed to parse P2P listen address")?],
         ..Default::default()
     };
 

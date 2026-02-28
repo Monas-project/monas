@@ -11,7 +11,7 @@
 //! It does NOT need to create or sign tokens (that's the client's responsibility).
 
 use serde::{Deserialize, Serialize};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// AuthToken header containing algorithm and type information.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,7 +75,7 @@ impl AuthTokenPayload {
             Some(exp) => {
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
-                    .expect("Time went backwards")
+                    .unwrap_or(Duration::ZERO)
                     .as_secs();
                 now > exp
             }
