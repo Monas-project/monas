@@ -97,6 +97,26 @@ impl CapabilityAction {
             Self::Reencrypt => AuthCapability::ManageMembers, // 暫定マッピング
         }
     }
+
+    /// Check if this action satisfies the required action.
+    ///
+    /// Capability hierarchy:
+    /// - Delete → Write, Read
+    /// - Write → Read
+    /// - Share → Read
+    /// - Revoke → Share, Read
+    pub fn satisfies(&self, required: &CapabilityAction) -> bool {
+        match (self, required) {
+            (CapabilityAction::Write, CapabilityAction::Read) => true,
+            (CapabilityAction::Delete, CapabilityAction::Write) => true,
+            (CapabilityAction::Delete, CapabilityAction::Read) => true,
+            (CapabilityAction::Share, CapabilityAction::Read) => true,
+            (CapabilityAction::Revoke, CapabilityAction::Share) => true,
+            (CapabilityAction::Revoke, CapabilityAction::Read) => true,
+            (a, b) if a == b => true,
+            _ => false,
+        }
+    }
 }
 
 /// AuthToken 本体
@@ -208,7 +228,7 @@ impl AuthToken {
         self.payload
             .att
             .iter()
-            .any(|cap| cap.with == resource && &cap.can == capability)
+            .any(|cap| cap.with == resource && cap.can.satisfies(capability))
     }
 }
 
