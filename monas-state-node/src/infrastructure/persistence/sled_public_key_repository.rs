@@ -1,7 +1,6 @@
 //! Sled-based public key repository for persistent storage.
 
 use crate::domain::value_objects::NodeId;
-use crate::port::extended_public_key_registry::ExtendedPublicKeyRegistry;
 use crate::port::public_key_registry::PublicKeyRegistry;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -203,71 +202,6 @@ impl PublicKeyRegistry for SledPublicKeyRepository {
     }
 }
 
-#[async_trait]
-impl ExtendedPublicKeyRegistry for SledPublicKeyRepository {
-    async fn register_public_key_for_key_id(
-        &self,
-        key_id: String,
-        public_key: Vec<u8>,
-    ) -> Result<()> {
-        let is_node_key = key_id.starts_with("monas:node:") || key_id.starts_with("node:");
-
-        if is_node_key {
-            let node_id = NodeId::from_public_key(&public_key)?;
-            let node_id_bytes = node_id.as_str().as_bytes().to_vec();
-            let key_id_bytes = key_id.as_bytes().to_vec();
-
-            (&self.key_id_tree, &self.node_key_tree, &self.node_to_key_tree)
-                .transaction(|(key_id_tx, node_key_tx, node_to_key_tx)|
-                    -> sled::transaction::ConflictableTransactionResult<(), ()> {
-                    key_id_tx.insert(key_id_bytes.as_slice(), public_key.as_slice())?;
-                    node_key_tx.insert(node_id_bytes.as_slice(), public_key.as_slice())?;
-                    node_to_key_tx.insert(node_id_bytes.as_slice(), key_id_bytes.as_slice())?;
-                    Ok(())
-                })
-                .map_err(|e| anyhow::anyhow!("Failed to register public key for key_id: {:?}", e))?;
-        } else {
-            self.key_id_tree.insert(key_id.as_bytes(), public_key)?;
-        }
-
-        Ok(())
-    }
-
-    async fn get_public_key_by_key_id(&self, key_id: &str) -> Result<Option<Vec<u8>>> {
-        // First try direct lookup
-        if let Some(key) = self.key_id_tree.get(key_id.as_bytes())? {
-            return Ok(Some(key.to_vec()));
-        }
-
-        // If not found and it's a simple format (e.g., "user:alice"),
-        // try with "monas:" prefix
-        if !key_id.starts_with("monas:") && key_id.contains(':') {
-            let monas_key_id = format!("monas:{}", key_id);
-            if let Some(key) = self.key_id_tree.get(monas_key_id.as_bytes())? {
-                return Ok(Some(key.to_vec()));
-            }
-        }
-
-        Ok(None)
-    }
-
-    async fn remove_public_key_by_key_id(&self, key_id: &str) -> Result<bool> {
-        // Remove from key_id_tree, capturing the removed value for node tree cleanup
-        let removed_value = self.key_id_tree.remove(key_id.as_bytes())?;
-
-        // If it's a node key, also remove from node trees
-        if let Some(public_key_ivec) = &removed_value {
-            let public_key = public_key_ivec.to_vec();
-            if let Ok(node_id) = NodeId::from_public_key(&public_key) {
-                self.node_key_tree.remove(node_id.as_str().as_bytes())?;
-                self.node_to_key_tree.remove(node_id.as_str().as_bytes())?;
-            }
-        }
-
-        Ok(removed_value.is_some())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,28 +234,6 @@ mod tests {
 
         // Retrieve by NodeId
         let retrieved = repo.get_public_key(&node_id).await.unwrap();
-        assert!(retrieved.is_some());
-        assert_eq!(retrieved.unwrap(), public_key);
-    }
-
-    #[tokio::test]
-    async fn test_register_and_get_by_key_id() {
-        let (repo, _temp_dir) = create_test_repository().await;
-        let public_key = generate_test_public_key();
-        let key_id = "monas:user:alice".to_string();
-
-        // Register with key_id
-        repo.register_public_key_for_key_id(key_id.clone(), public_key.clone())
-            .await
-            .unwrap();
-
-        // Retrieve by key_id
-        let retrieved = repo.get_public_key_by_key_id(&key_id).await.unwrap();
-        assert!(retrieved.is_some());
-        assert_eq!(retrieved.unwrap(), public_key);
-
-        // Should also work without "monas:" prefix
-        let retrieved = repo.get_public_key_by_key_id("user:alice").await.unwrap();
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap(), public_key);
     }
@@ -397,61 +309,5 @@ mod tests {
             assert!(retrieved.is_some());
             assert_eq!(retrieved.unwrap(), public_key);
         }
-    }
-
-    #[tokio::test]
-    async fn test_remove_public_key_by_key_id_cleans_node_trees() {
-        let (repo, _temp_dir) = create_test_repository().await;
-        let public_key = generate_test_public_key();
-        let key_id = "node:test-remove".to_string();
-
-        // Register with node: prefix (creates entries in all three trees)
-        repo.register_public_key_for_key_id(key_id.clone(), public_key.clone())
-            .await
-            .unwrap();
-
-        let node_id = NodeId::from_public_key(&public_key).unwrap();
-
-        // Verify node trees have entries
-        assert!(repo.get_public_key(&node_id).await.unwrap().is_some());
-
-        // Remove by key_id — should also clean up node trees
-        assert!(repo.remove_public_key_by_key_id(&key_id).await.unwrap());
-
-        // key_id_tree should be empty
-        assert!(repo
-            .get_public_key_by_key_id(&key_id)
-            .await
-            .unwrap()
-            .is_none());
-
-        // node_key_tree should also be cleaned up
-        assert!(repo.get_public_key(&node_id).await.unwrap().is_none());
-
-        // Removing again should return false
-        assert!(!repo.remove_public_key_by_key_id(&key_id).await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn test_key_id_with_node_prefix() {
-        let (repo, _temp_dir) = create_test_repository().await;
-        let public_key = generate_test_public_key();
-        let key_id = "node:test-node-123".to_string();
-
-        // Register with node: prefix
-        repo.register_public_key_for_key_id(key_id.clone(), public_key.clone())
-            .await
-            .unwrap();
-
-        // Should be retrievable by key_id
-        let retrieved = repo.get_public_key_by_key_id(&key_id).await.unwrap();
-        assert!(retrieved.is_some());
-        assert_eq!(retrieved.unwrap(), public_key);
-
-        // Should also create NodeId entry
-        let node_id = NodeId::from_public_key(&public_key).unwrap();
-        let retrieved = repo.get_public_key(&node_id).await.unwrap();
-        assert!(retrieved.is_some());
-        assert_eq!(retrieved.unwrap(), public_key);
     }
 }

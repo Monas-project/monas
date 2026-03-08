@@ -104,27 +104,6 @@ check_nodes_running() {
     fi
 }
 
-# 公開鍵をノードに登録する関数 (proof-of-possession署名付き)
-register_key_with_nodes() {
-    local key_id="$1"
-    local public_key_hex="$2"
-    local private_key="$3"
-
-    # key_idの署名を生成 (proof-of-possession)
-    local sig_output
-    sig_output=$($AUTH_GEN sign-key-id --private-key "$private_key" --key-id "$key_id" 2>/dev/null)
-    local signature_hex
-    signature_hex=$(echo "$sig_output" | grep "^SIGNATURE_HEX=" | sed 's/^SIGNATURE_HEX=//')
-
-    for port in 8080 8081 8082; do
-        if curl -s "http://127.0.0.1:$port/health" > /dev/null 2>&1; then
-            curl -s -X POST "http://127.0.0.1:$port/auth/register-key" \
-                -H "Content-Type: application/json" \
-                -d "{\"key_id\": \"$key_id\", \"public_key_hex\": \"$public_key_hex\", \"signature_hex\": \"$signature_hex\"}" > /dev/null 2>&1
-        fi
-    done
-}
-
 # ============================================================================
 # メイン処理
 # ============================================================================
@@ -163,9 +142,9 @@ log_info "テスト用鍵ペアを生成しています..."
 AUTH_OUTPUT=$($AUTH_GEN test-auth 2>/dev/null)
 TEST_PRIVATE_KEY=$(echo "$AUTH_OUTPUT" | grep "^PRIVATE_KEY=" | sed 's/^PRIVATE_KEY=//')
 TEST_PUBLIC_KEY=$(echo "$AUTH_OUTPUT" | grep "^PUBLIC_KEY=" | sed 's/^PUBLIC_KEY=//')
-TEST_KEY_ID="user:test-auth"
+TEST_KEY_ID=$(echo "$AUTH_OUTPUT" | grep "^KEY_ID=" | sed 's/^KEY_ID=//')
 
-if [ -z "$TEST_PRIVATE_KEY" ] || [ -z "$TEST_PUBLIC_KEY" ]; then
+if [ -z "$TEST_PRIVATE_KEY" ] || [ -z "$TEST_PUBLIC_KEY" ] || [ -z "$TEST_KEY_ID" ]; then
     log_error "鍵ペアの生成に失敗しました"
     echo "$AUTH_OUTPUT"
     exit 1
@@ -174,10 +153,8 @@ fi
 log_success "鍵ペアを生成しました"
 log_info "Key ID: $TEST_KEY_ID"
 
-# 各ノードに公開鍵を登録
-log_info "公開鍵をノードに登録しています..."
-register_key_with_nodes "$TEST_KEY_ID" "$TEST_PUBLIC_KEY" "$TEST_PRIVATE_KEY"
-log_success "公開鍵を登録しました"
+# 自己完結型key_idなのでノードへの公開鍵登録は不要
+log_success "自己完結型key_id: 公開鍵登録不要"
 
 # ============================================================================
 # コンテンツ作成テスト（認証付き）

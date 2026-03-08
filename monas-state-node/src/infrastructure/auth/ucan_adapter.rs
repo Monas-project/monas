@@ -22,9 +22,7 @@ use crate::port::authorization_service::{
 use crate::port::content_repository::ContentRepository;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
 /// Adapter for UCAN-based authorization
 ///
@@ -42,9 +40,6 @@ use tokio::sync::RwLock;
 /// ```
 pub struct UcanAdapter {
     content_repo: Arc<dyn ContentRepository>,
-    /// Public key registry for key ID resolution (Phase 1 mock implementation)
-    /// Maps key ID -> Public Key (65 bytes, uncompressed P256 format)
-    public_keys: Arc<RwLock<HashMap<String, Vec<u8>>>>,
     /// Nonce store for replay attack prevention (JTI uniqueness check)
     nonce_store: Option<Arc<SledPublicKeyRepository>>,
 }
@@ -54,7 +49,6 @@ impl UcanAdapter {
     pub fn new(content_repo: Arc<dyn ContentRepository>) -> Self {
         Self {
             content_repo,
-            public_keys: Arc::new(RwLock::new(HashMap::new())),
             nonce_store: None,
         }
     }
@@ -65,22 +59,15 @@ impl UcanAdapter {
         self
     }
 
-    /// Register a public key for a key ID (for testing and Phase 1 mock implementation)
-    ///
-    /// # Arguments
-    /// * `key_id` - The key ID to register (format: "monas:type:id")
-    /// * `public_key` - The public key in uncompressed P256 format (65 bytes)
-    pub async fn register_public_key(&self, key_id: String, public_key: Vec<u8>) {
-        self.public_keys.write().await.insert(key_id, public_key);
-    }
-
     /// Convert Identity to key ID format
     ///
     /// # Arguments
     /// * `identity` - The Identity to convert
     ///
     /// # Returns
-    /// Key ID string in format "monas:type:id" (e.g., "monas:user:alice")
+    /// Key ID string in format "monas:type:id"
+    /// For self-contained key IDs, id is the hex-encoded public key,
+    /// e.g., "monas:user:04abcd..."
     fn identity_to_key_id(identity: &Identity) -> String {
         let identity_type = match identity.identity_type() {
             IdentityType::User => "user",
@@ -88,6 +75,30 @@ impl UcanAdapter {
             IdentityType::Service => "service",
         };
         format!("monas:{}:{}", identity_type, identity.id())
+    }
+
+    /// Extract public key bytes from a self-contained key ID.
+    ///
+    /// Key ID format: "monas:type:{public_key_hex}" or "type:{public_key_hex}"
+    /// The public key hex is 130 characters (65 bytes uncompressed P256, starting with 04).
+    ///
+    /// Returns None if the key ID does not contain a valid embedded public key.
+    fn extract_public_key_from_key_id(key_id: &str) -> Option<Vec<u8>> {
+        // Extract the last segment (the id part)
+        let id_part = if key_id.starts_with("monas:") {
+            // "monas:user:04abcd..." -> split into ["monas", "user", "04abcd..."]
+            key_id.splitn(3, ':').nth(2)?
+        } else {
+            // "user:04abcd..." -> split into ["user", "04abcd..."]
+            key_id.splitn(2, ':').nth(1)?
+        };
+
+        // Uncompressed P256 public key = 65 bytes = 130 hex chars, starts with "04"
+        if id_part.len() == 130 && id_part.starts_with("04") {
+            hex::decode(id_part).ok()
+        } else {
+            None
+        }
     }
 
     /// Map State Node capability to AuthToken capability action
@@ -208,16 +219,17 @@ impl UcanAdapter {
         InfraAuthToken::from_jwt(token_str).context("Failed to parse AuthToken")
     }
 
-    /// Get public key for a key ID
-    async fn get_public_key(&self, key_id: &str) -> Result<Option<Vec<u8>>> {
-        // Phase 1: Use in-memory public key registry
-        let public_keys = self.public_keys.read().await;
-        if let Some(key) = public_keys.get(key_id) {
-            Ok(Some(key.clone()))
-        } else {
-            tracing::warn!("Public key not found for key ID: {}", key_id);
-            Ok(None)
-        }
+    /// Get public key for a key ID by extracting it from the self-contained key ID.
+    ///
+    /// The key ID embeds the full public key hex (e.g., "monas:user:04abcd..."),
+    /// so no external registry lookup is needed.
+    fn get_public_key_from_key_id(key_id: &str) -> Result<Vec<u8>> {
+        Self::extract_public_key_from_key_id(key_id).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Cannot extract public key from key ID '{}': expected format 'type:{{130-hex-char-public-key}}'",
+                key_id
+            )
+        })
     }
 
     /// Verify AuthToken with dual signature verification, replay protection,
@@ -275,50 +287,32 @@ impl UcanAdapter {
             }
         }
 
-        // 4. Get owner's public key and verify AuthToken signature
-        let owner_public_key = self
-            .get_public_key(&token.payload.iss)
-            .await?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Owner public key not found for key ID: {}",
-                    token.payload.iss
-                )
-            })?;
+        // 4. Extract owner's public key from key ID and verify AuthToken signature
+        let owner_public_key = Self::get_public_key_from_key_id(&token.payload.iss)?;
 
         SignatureVerifier::verify_auth_token_signature(token, &owner_public_key)
             .context("AuthToken signature verification failed")?;
 
-        // 5. Verify request signature if provided
-        if let Some(request_signature) = &request.request_signature {
-            // Get requester's public key
-            let requester_public_key =
-                self.get_public_key(&token.payload.aud)
-                    .await?
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "Requester public key not found for key ID: {}",
-                            token.payload.aud
-                        )
-                    })?;
+        // 5. Verify request signature (mandatory)
+        let request_signature = request.request_signature.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("Request signature is required for AuthToken-based authorization")
+        })?;
 
-            // Construct request message: "{iss}:{aud}:{jti}"
-            let request_message = format!(
-                "{}:{}:{}",
-                token.payload.iss, token.payload.aud, token.payload.jti
-            );
+        // Extract requester's public key from key ID
+        let requester_public_key = Self::get_public_key_from_key_id(&token.payload.aud)?;
 
-            SignatureVerifier::verify_request_signature(
-                request_message.as_bytes(),
-                request_signature,
-                &requester_public_key,
-            )
-            .context("Request signature verification failed")?;
-        } else {
-            tracing::warn!(
-                "No request signature provided - skipping request signature verification"
-            );
-        }
+        // Construct request message: "{iss}:{aud}:{jti}"
+        let request_message = format!(
+            "{}:{}:{}",
+            token.payload.iss, token.payload.aud, token.payload.jti
+        );
+
+        SignatureVerifier::verify_request_signature(
+            request_message.as_bytes(),
+            request_signature,
+            &requester_public_key,
+        )
+        .context("Request signature verification failed")?;
 
         Ok(())
     }
@@ -434,6 +428,7 @@ mod tests {
     use crate::domain::value_objects::ContentId;
     use crate::port::content_repository::{CommitResult, SerializedOperation};
     use std::collections::HashMap;
+    use tokio::sync::RwLock;
 
     // Mock content repository for testing
     struct MockContentRepo {
@@ -519,13 +514,24 @@ mod tests {
         }
     }
 
+    /// Helper to create an owner Identity from a TestKeyPair's public key
+    fn identity_from_key(
+        key_pair: &crate::infrastructure::auth::test_helpers::TestKeyPair,
+    ) -> Identity {
+        let pubkey_hex = hex::encode(key_pair.public_key());
+        Identity::user(pubkey_hex).unwrap()
+    }
+
     #[tokio::test]
     async fn test_authorize_owner() {
+        use crate::infrastructure::auth::test_helpers::TestKeyPair;
+
         let repo = Arc::new(MockContentRepo::new());
         let adapter = UcanAdapter::new(repo.clone());
 
+        let alice = TestKeyPair::generate("user", "alice");
         let content_id = ContentId::new("content-1".to_string()).unwrap();
-        let owner = Identity::user("alice".to_string()).unwrap();
+        let owner = identity_from_key(&alice);
 
         // Create policy with owner
         let policy = AccessPolicy::new(content_id.clone(), owner.clone());
@@ -549,12 +555,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_authorize_non_owner_no_token() {
+        use crate::infrastructure::auth::test_helpers::TestKeyPair;
+
         let repo = Arc::new(MockContentRepo::new());
         let adapter = UcanAdapter::new(repo.clone());
 
+        let alice = TestKeyPair::generate("user", "alice");
+        let bob = TestKeyPair::generate("user", "bob");
         let content_id = ContentId::new("content-1".to_string()).unwrap();
-        let owner = Identity::user("alice".to_string()).unwrap();
-        let other = Identity::user("bob".to_string()).unwrap();
+        let owner = identity_from_key(&alice);
+        let other = identity_from_key(&bob);
 
         // Create policy with owner (bob has no token)
         let policy = AccessPolicy::new(content_id.clone(), owner);
@@ -582,14 +592,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_authorize_no_policy() {
+        use crate::infrastructure::auth::test_helpers::TestKeyPair;
+
         let repo = Arc::new(MockContentRepo::new());
         let adapter = UcanAdapter::new(repo);
 
+        let alice = TestKeyPair::generate("user", "alice");
         let content_id = ContentId::new("content-1".to_string()).unwrap();
-        let alice = Identity::user("alice".to_string()).unwrap();
+        let alice_identity = identity_from_key(&alice);
 
         let request = AuthorizationRequest {
-            identity: alice,
+            identity: alice_identity,
             resource: content_id,
             capability: AuthCapability::ReadContent,
             token: None,
@@ -607,11 +620,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_authorize_batch() {
+        use crate::infrastructure::auth::test_helpers::TestKeyPair;
+
         let repo = Arc::new(MockContentRepo::new());
         let adapter = UcanAdapter::new(repo.clone());
 
+        let alice = TestKeyPair::generate("user", "alice");
         let content_id = ContentId::new("content-1".to_string()).unwrap();
-        let owner = Identity::user("alice".to_string()).unwrap();
+        let owner = identity_from_key(&alice);
 
         let policy = AccessPolicy::new(content_id.clone(), owner.clone());
         repo.policies
@@ -671,17 +687,11 @@ mod tests {
         let repo = Arc::new(MockContentRepo::new());
         let adapter = UcanAdapter::new(repo.clone());
 
-        // 3. Register public keys
-        adapter
-            .register_public_key(alice.key_id().to_string(), alice.public_key().to_vec())
-            .await;
-        adapter
-            .register_public_key(bob.key_id().to_string(), bob.public_key().to_vec())
-            .await;
+        // 3. No public key registration needed — key IDs are self-contained
 
         // 4. Create content and access policy (alice is owner)
         let content_id = ContentId::new("test-content-123".to_string()).unwrap();
-        let alice_identity = Identity::user("alice".to_string()).unwrap();
+        let alice_identity = identity_from_key(&alice);
         let policy = AccessPolicy::new(content_id.clone(), alice_identity.clone());
         repo.policies
             .write()
@@ -700,7 +710,7 @@ mod tests {
         let request_sig = bob.sign_request(&auth_token);
 
         // 7. Create authorization request from Bob using AuthToken
-        let bob_identity = Identity::user("bob".to_string()).unwrap();
+        let bob_identity = identity_from_key(&bob);
         let token = AuthToken::new(auth_token.to_jwt().unwrap());
         let request = AuthorizationRequest {
             identity: bob_identity,
@@ -730,15 +740,8 @@ mod tests {
         let repo = Arc::new(MockContentRepo::new());
         let adapter = UcanAdapter::new(repo.clone());
 
-        adapter
-            .register_public_key(alice.key_id().to_string(), alice.public_key().to_vec())
-            .await;
-        adapter
-            .register_public_key(bob.key_id().to_string(), bob.public_key().to_vec())
-            .await;
-
         let content_id = ContentId::new("test-content-456".to_string()).unwrap();
-        let alice_identity = Identity::user("alice".to_string()).unwrap();
+        let alice_identity = identity_from_key(&alice);
         let policy = AccessPolicy::new(content_id.clone(), alice_identity.clone());
         repo.policies
             .write()
@@ -756,7 +759,7 @@ mod tests {
         let request_sig = bob.sign_request(&auth_token);
 
         // Bob tries to use Write capability (not granted)
-        let bob_identity = Identity::user("bob".to_string()).unwrap();
+        let bob_identity = identity_from_key(&bob);
         let token = AuthToken::new(auth_token.to_jwt().unwrap());
         let request = AuthorizationRequest {
             identity: bob_identity,
@@ -788,15 +791,8 @@ mod tests {
         let nonce_store = Arc::new(SledPublicKeyRepository::open(temp_dir.path()).unwrap());
         let adapter = UcanAdapter::new(repo.clone()).with_nonce_store(nonce_store);
 
-        adapter
-            .register_public_key(alice.key_id().to_string(), alice.public_key().to_vec())
-            .await;
-        adapter
-            .register_public_key(bob.key_id().to_string(), bob.public_key().to_vec())
-            .await;
-
         let content_id = ContentId::new("test-content-replay".to_string()).unwrap();
-        let alice_identity = Identity::user("alice".to_string()).unwrap();
+        let alice_identity = identity_from_key(&alice);
         let policy = AccessPolicy::new(content_id.clone(), alice_identity.clone());
         repo.policies
             .write()
@@ -812,7 +808,7 @@ mod tests {
         );
 
         let request_sig = bob.sign_request(&auth_token);
-        let bob_identity = Identity::user("bob".to_string()).unwrap();
+        let bob_identity = identity_from_key(&bob);
         let token = AuthToken::new(auth_token.to_jwt().unwrap());
 
         // First request should succeed
@@ -853,15 +849,8 @@ mod tests {
         let repo = Arc::new(MockContentRepo::new());
         let adapter = UcanAdapter::new(repo.clone());
 
-        adapter
-            .register_public_key(alice.key_id().to_string(), alice.public_key().to_vec())
-            .await;
-        adapter
-            .register_public_key(bob.key_id().to_string(), bob.public_key().to_vec())
-            .await;
-
         let content_id = ContentId::new("test-content-789".to_string()).unwrap();
-        let alice_identity = Identity::user("alice".to_string()).unwrap();
+        let alice_identity = identity_from_key(&alice);
         let policy = AccessPolicy::new(content_id.clone(), alice_identity.clone());
         repo.policies
             .write()
@@ -881,7 +870,7 @@ mod tests {
 
         let request_sig = bob.sign_request(&auth_token);
 
-        let bob_identity = Identity::user("bob".to_string()).unwrap();
+        let bob_identity = identity_from_key(&bob);
         let token = AuthToken::new(auth_token.to_jwt().unwrap());
         let request = AuthorizationRequest {
             identity: bob_identity,
@@ -910,23 +899,10 @@ mod tests {
         let repo = Arc::new(MockContentRepo::new());
         let adapter = UcanAdapter::new(repo.clone());
 
-        adapter
-            .register_public_key(alice.key_id().to_string(), alice.public_key().to_vec())
-            .await;
-        adapter
-            .register_public_key(bob.key_id().to_string(), bob.public_key().to_vec())
-            .await;
-
         let content_id = ContentId::new("test-content-inv".to_string()).unwrap();
-        let alice_identity = Identity::user("alice".to_string()).unwrap();
+        let alice_identity = identity_from_key(&alice);
 
-        // Create policy with min_valid_issued_at set to future
-        let mut policy = AccessPolicy::new(content_id.clone(), alice_identity.clone());
-        policy.invalidate_tokens(); // Sets min_valid_issued_at to now
-
-        // Wait a moment, then create a token with iat < min_valid_issued_at
-        // Since invalidate_tokens sets to current time, we need a token issued before that
-        // So we first create the token, then invalidate
+        // First create the token, then invalidate
         let auth_token = alice.create_auth_token(
             &bob,
             "monas://content/test-content-inv",
@@ -946,7 +922,7 @@ mod tests {
             .insert("test-content-inv".to_string(), policy);
 
         let request_sig = bob.sign_request(&auth_token);
-        let bob_identity = Identity::user("bob".to_string()).unwrap();
+        let bob_identity = identity_from_key(&bob);
         let token = AuthToken::new(auth_token.to_jwt().unwrap());
         let request = AuthorizationRequest {
             identity: bob_identity,

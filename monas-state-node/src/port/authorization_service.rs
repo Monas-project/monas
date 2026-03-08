@@ -25,9 +25,10 @@ pub struct AuthorizationRequest {
     /// Optional authorization token (e.g., delegated UCAN)
     pub token: Option<AuthToken>,
 
-    /// Optional request signature for verifying the request sender
-    /// This is used to verify that the requester possesses the private key
-    /// corresponding to the audience (aud) in the AuthToken
+    /// Request signature for verifying the request sender.
+    /// Required for non-owner AuthToken-based authorization.
+    /// Verifies that the requester possesses the private key
+    /// corresponding to the audience (aud) in the AuthToken.
     pub request_signature: Option<Vec<u8>>,
 }
 

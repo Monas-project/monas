@@ -81,8 +81,6 @@ pub fn create_router(state: AppState) -> Router {
             "/content/:id/access/invalidate",
             post(invalidate_tokens_handler),
         )
-        // Key registration endpoint
-        .route("/auth/register-key", post(register_public_key))
         // Request body size limit: 16 MiB
         .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
         // Per-IP rate limit (inner layer, applied first)
@@ -208,20 +206,6 @@ impl IntoResponse for StateNodeError {
         };
         (status, Json(error_response)).into_response()
     }
-}
-
-#[derive(Debug, Deserialize)]
-pub struct RegisterPublicKeyRequest {
-    pub key_id: String,
-    pub public_key_hex: String,
-    /// Proof-of-possession: sign(key_id) by the private key corresponding to public_key_hex
-    pub signature_hex: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct RegisterPublicKeyResponse {
-    pub key_id: String,
-    pub registered: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -846,82 +830,6 @@ async fn invalidate_tokens_handler(
         Ok(new_min_valid_issued_at) => Json(InvalidateTokensResponse {
             content_id,
             new_min_valid_issued_at,
-        })
-        .into_response(),
-        Err(e) => e.into_response(),
-    }
-}
-
-/// Register a public key for a key_id.
-///
-/// This endpoint allows registering a public key for key_id-based authentication.
-/// Requires proof-of-possession: the caller must sign the key_id with the corresponding
-/// private key to prove ownership.
-async fn register_public_key(
-    State(state): State<AppState>,
-    Json(req): Json<RegisterPublicKeyRequest>,
-) -> impl IntoResponse {
-    let public_key = match hex::decode(&req.public_key_hex) {
-        Ok(pk) => pk,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
-                    error: format!("Invalid public key hex: {}", e),
-                }),
-            )
-                .into_response();
-        }
-    };
-
-    let signature = match hex::decode(&req.signature_hex) {
-        Ok(sig) => sig,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
-                    error: format!("Invalid signature hex: {}", e),
-                }),
-            )
-                .into_response();
-        }
-    };
-
-    // Verify proof-of-possession: signature over key_id using the registering key
-    if let Err(e) = crate::infrastructure::crypto::verify_p256_signature(
-        req.key_id.as_bytes(),
-        &signature,
-        &public_key,
-    ) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: format!("Proof-of-possession failed: {}", e),
-            }),
-        )
-            .into_response();
-    }
-
-    // Check if key_id is already registered (prevent overwrite)
-    if let Some(registry) = state.extended_key_registry() {
-        if let Ok(Some(_)) = registry.get_public_key_by_key_id(&req.key_id).await {
-            return (
-                StatusCode::CONFLICT,
-                Json(ErrorResponse {
-                    error: format!("key_id '{}' is already registered", req.key_id),
-                }),
-            )
-                .into_response();
-        }
-    }
-
-    match state
-        .register_public_key_for_key_id(req.key_id.clone(), public_key)
-        .await
-    {
-        Ok(()) => Json(RegisterPublicKeyResponse {
-            key_id: req.key_id,
-            registered: true,
         })
         .into_response(),
         Err(e) => e.into_response(),

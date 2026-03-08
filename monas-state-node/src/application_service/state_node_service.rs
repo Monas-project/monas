@@ -18,7 +18,6 @@ use crate::port::authentication_service::AuthenticationService;
 use crate::port::authorization_service::{AuthorizationRequest, AuthorizationService};
 use crate::port::content_repository::ContentRepository;
 use crate::port::event_publisher::EventPublisher;
-use crate::port::extended_public_key_registry::ExtendedPublicKeyRegistry;
 use crate::port::peer_network::PeerNetwork;
 use crate::port::persistence::{
     PersistentAccessControlRepository, PersistentContentRepository, PersistentNodeRegistry,
@@ -83,8 +82,6 @@ where
     auth_service: Option<Arc<dyn AuthenticationService>>,
     /// Authorization service for capability-based authorization
     authz_service: Option<Arc<dyn AuthorizationService>>,
-    /// Extended public key registry for key registration
-    extended_key_registry: Option<Arc<dyn ExtendedPublicKeyRegistry>>,
     local_node_id: String,
     /// Minimum number of member nodes for redundancy.
     min_replication_factor: usize,
@@ -166,7 +163,6 @@ where
             access_control_repo: None,
             auth_service: None,
             authz_service: None,
-            extended_key_registry: None,
             local_node_id,
             min_replication_factor: config.min_replication_factor,
             capacity_threshold_bytes: config.capacity_threshold_bytes,
@@ -203,34 +199,6 @@ where
         self
     }
 
-    /// Set the extended public key registry (builder pattern).
-    ///
-    /// This method allows registering public keys for key_id-based authentication.
-    pub fn with_extended_key_registry(
-        mut self,
-        registry: Arc<dyn ExtendedPublicKeyRegistry>,
-    ) -> Self {
-        self.extended_key_registry = Some(registry);
-        self
-    }
-
-    /// Register a public key for a key_id in the extended public key registry.
-    pub async fn register_public_key_for_key_id(
-        &self,
-        key_id: String,
-        public_key: Vec<u8>,
-    ) -> Result<(), StateNodeError> {
-        let registry = self.extended_key_registry.as_ref().ok_or_else(|| {
-            StateNodeError::InvalidConfiguration(
-                "Extended public key registry not configured".to_string(),
-            )
-        })?;
-        registry
-            .register_public_key_for_key_id(key_id, public_key)
-            .await
-            .map_err(|e| StateNodeError::Internal(e.to_string()))
-    }
-
     /// Get the CRDT repository.
     pub fn crdt_repo(&self) -> &Arc<R> {
         &self.crdt_repo
@@ -239,11 +207,6 @@ where
     /// Get the authorization service (if configured).
     pub fn authz_service(&self) -> Option<&Arc<dyn AuthorizationService>> {
         self.authz_service.as_ref()
-    }
-
-    /// Get the extended key registry (if configured).
-    pub fn extended_key_registry(&self) -> Option<&Arc<dyn ExtendedPublicKeyRegistry>> {
-        self.extended_key_registry.as_ref()
     }
 
     /// Get the peer network.

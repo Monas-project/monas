@@ -287,8 +287,8 @@ mod tests {
     #[test]
     fn test_auth_token_jwt_roundtrip() {
         let payload = AuthTokenPayload {
-            iss: "monas:user:alice".to_string(),
-            aud: "monas:user:bob".to_string(),
+            iss: "monas:user:04aaaa".to_string(),
+            aud: "monas:user:04bbbb".to_string(),
             exp: Some(1706744400),
             iat: 1706740800,
             jti: "550e61f7-98e0-45c3-b28c-1f8d72a6e6c4".to_string(),
@@ -319,8 +319,8 @@ mod tests {
     #[test]
     fn test_auth_token_signing_message() {
         let payload = AuthTokenPayload {
-            iss: "monas:user:alice".to_string(),
-            aud: "monas:user:bob".to_string(),
+            iss: "monas:user:04aaaa".to_string(),
+            aud: "monas:user:04bbbb".to_string(),
             exp: None,
             iat: 1706740800,
             jti: "test-id".to_string(),
@@ -336,8 +336,8 @@ mod tests {
     #[test]
     fn test_auth_token_has_capability() {
         let payload = AuthTokenPayload {
-            iss: "monas:user:alice".to_string(),
-            aud: "monas:user:bob".to_string(),
+            iss: "monas:user:04aaaa".to_string(),
+            aud: "monas:user:04bbbb".to_string(),
             exp: None,
             iat: 1706740800,
             jti: "test-id".to_string(),

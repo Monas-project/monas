@@ -212,7 +212,7 @@ impl StateNode {
             )
             .context("Failed to open auth public key repository")?,
         );
-        let auth_service = MonasAccountAdapter::with_registry(auth_public_key_repo.clone());
+        let auth_service = MonasAccountAdapter::new();
         let authz_service =
             UcanAdapter::new(crdt_repo_dyn.clone()).with_nonce_store(auth_public_key_repo.clone());
 
@@ -232,8 +232,7 @@ impl StateNode {
             )
             .with_access_control_repo(access_control_repo)
             .with_authentication_service(auth_service)
-            .with_authorization_service(authz_service)
-            .with_extended_key_registry(auth_public_key_repo),
+            .with_authorization_service(authz_service),
         );
 
         Ok(Self {
