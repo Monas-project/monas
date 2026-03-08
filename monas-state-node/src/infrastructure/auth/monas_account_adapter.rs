@@ -92,8 +92,8 @@ impl MonasAccountAdapter {
     /// (65 bytes uncompressed P256, starting with "04").
     fn extract_public_key_from_key_id(key_id: &str) -> Result<Vec<u8>> {
         let id_part = key_id
-            .splitn(2, ':')
-            .nth(1)
+            .split_once(':')
+            .map(|x| x.1)
             .ok_or_else(|| anyhow::anyhow!("Invalid key ID format: missing ':'"))?;
 
         // Uncompressed P256 public key = 65 bytes = 130 hex chars, starts with "04"

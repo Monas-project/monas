@@ -90,7 +90,7 @@ impl UcanAdapter {
             key_id.splitn(3, ':').nth(2)?
         } else {
             // "user:04abcd..." -> split into ["user", "04abcd..."]
-            key_id.splitn(2, ':').nth(1)?
+            key_id.split_once(':')?.1
         };
 
         // Uncompressed P256 public key = 65 bytes = 130 hex chars, starts with "04"
