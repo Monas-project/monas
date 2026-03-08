@@ -61,6 +61,20 @@ impl AuthenticationService for TestAuthService {
         Ok(!token.is_empty())
     }
 
+    async fn verify_request_signature(
+        &self,
+        _token: &AuthToken,
+        _signature: &[u8],
+        _message: &str,
+        _timestamp: Option<u64>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn verify_jwt_signature(&self, _token: &AuthToken) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     async fn get_issuer(
         &self,
         token: &AuthToken,

@@ -986,19 +986,28 @@ where
             .await
             .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))?;
 
-        // 2.5. Verify request signature
-        if let Some(sig) = request_signature {
-            self.verify_caller_signature(
-                auth_service.as_ref(),
-                token,
-                sig,
-                "invalidate",
-                content_id,
-                timestamp,
-                None,
-            )
-            .await?;
-        }
+        // 2.5. Verify request signature (mandatory)
+        // JWT tokens: signature is inside the token itself, pass empty slice
+        // type:id tokens: require request signature
+        let sig = if token.as_str().contains('.') {
+            &[] as &[u8]
+        } else {
+            request_signature.ok_or_else(|| {
+                StateNodeError::AuthenticationFailed(
+                    "Request signature is required for non-JWT tokens".to_string(),
+                )
+            })?
+        };
+        self.verify_caller_signature(
+            auth_service.as_ref(),
+            token,
+            sig,
+            "invalidate",
+            content_id,
+            timestamp,
+            None,
+        )
+        .await?;
 
         // 3. Check if this node is a member
         let content_id_vo = ContentId::new(content_id.to_string())?;
@@ -1953,6 +1962,20 @@ mod tests {
 
         async fn is_valid(&self, token: &AuthToken) -> Result<bool> {
             Ok(!token.is_empty())
+        }
+
+        async fn verify_request_signature(
+            &self,
+            _token: &AuthToken,
+            _signature: &[u8],
+            _message: &str,
+            _timestamp: Option<u64>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn verify_jwt_signature(&self, _token: &AuthToken) -> Result<()> {
+            Ok(())
         }
 
         async fn get_issuer(&self, token: &AuthToken) -> Result<Option<Identity>> {

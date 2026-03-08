@@ -46,9 +46,6 @@ pub trait AuthenticationService: Send + Sync {
     /// private key corresponding to the token's identity. It prevents
     /// impersonation by ensuring the caller actually possesses the key.
     ///
-    /// Default implementation is a no-op that always succeeds.
-    /// `MonasAccountAdapter` overrides this to perform P-256 ECDSA verification.
-    ///
     /// # Arguments
     /// * `token` - The authentication token identifying the caller
     /// * `signature` - The raw signature bytes
@@ -60,10 +57,7 @@ pub trait AuthenticationService: Send + Sync {
         signature: &[u8],
         message: &str,
         timestamp: Option<u64>,
-    ) -> Result<()> {
-        let _ = (token, signature, message, timestamp);
-        Ok(())
-    }
+    ) -> Result<()>;
 
     /// Verify the JWT signature of a token.
     ///
@@ -71,13 +65,7 @@ pub trait AuthenticationService: Send + Sync {
     /// signature and checks expiration. This is called from `verify_caller_signature()`
     /// to ensure JWT tokens are always signature-verified, even on code paths
     /// that skip the authorization layer (e.g., owner creating content).
-    ///
-    /// Default implementation is a no-op that always succeeds (for testing).
-    /// `MonasAccountAdapter` overrides this to perform actual verification.
-    async fn verify_jwt_signature(&self, token: &AuthToken) -> Result<()> {
-        let _ = token;
-        Ok(())
-    }
+    async fn verify_jwt_signature(&self, token: &AuthToken) -> Result<()>;
 
     /// Get the issuer of a token (if applicable)
     ///
@@ -116,6 +104,20 @@ mod tests {
 
         async fn is_valid(&self, token: &AuthToken) -> Result<bool> {
             Ok(!token.is_empty())
+        }
+
+        async fn verify_request_signature(
+            &self,
+            _token: &AuthToken,
+            _signature: &[u8],
+            _message: &str,
+            _timestamp: Option<u64>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn verify_jwt_signature(&self, _token: &AuthToken) -> Result<()> {
+            Ok(())
         }
     }
 

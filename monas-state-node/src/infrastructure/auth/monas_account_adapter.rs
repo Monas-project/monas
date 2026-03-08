@@ -180,11 +180,23 @@ impl AuthenticationService for MonasAccountAdapter {
 
         // Reject authentication when no public key registry is configured.
         // Without a registry, we cannot verify identity ownership.
-        if self.public_key_registry.is_none() {
-            return Err(anyhow::anyhow!(
+        let registry = self.public_key_registry.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
                 "Authentication rejected: no public key registry configured for identity verification"
-            ));
-        }
+            )
+        })?;
+
+        // Verify the key_id is actually registered in the registry
+        let _public_key = registry
+            .get_public_key_by_key_id(key_id)
+            .await
+            .context("Failed to look up public key")?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Authentication rejected: public key not registered for key ID '{}'",
+                    key_id
+                )
+            })?;
 
         // Create and return identity
         Identity::new(id, identity_type).context("Failed to create Identity from key ID")
@@ -317,26 +329,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_authenticate_valid_node_key_id_with_registry() {
+    async fn test_authenticate_unregistered_node_key_id_rejected() {
         let (adapter, _, _, _temp_dir) = create_test_adapter_with_registry().await;
         let token = AuthToken::new("node:node123".to_string());
 
-        // node:node123 is not registered, but format is valid and registry exists
-        let identity = adapter.authenticate(&token, None).await.unwrap();
-
-        assert_eq!(identity.id(), "node123");
-        assert!(identity.is_node());
+        // node:node123 is not registered — authentication must be rejected
+        let result = adapter.authenticate(&token, None).await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("public key not registered"));
     }
 
     #[tokio::test]
-    async fn test_authenticate_valid_service_key_id_with_registry() {
+    async fn test_authenticate_unregistered_service_key_id_rejected() {
         let (adapter, _, _, _temp_dir) = create_test_adapter_with_registry().await;
         let token = AuthToken::new("service:indexer".to_string());
 
-        let identity = adapter.authenticate(&token, None).await.unwrap();
-
-        assert_eq!(identity.id(), "indexer");
-        assert!(identity.is_service());
+        // service:indexer is not registered — authentication must be rejected
+        let result = adapter.authenticate(&token, None).await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("public key not registered"));
     }
 
     #[tokio::test]
