@@ -44,6 +44,8 @@ pub struct ServiceConfig {
     pub min_replication_factor: usize,
     /// Capacity threshold in bytes below which a node is considered low on storage.
     pub capacity_threshold_bytes: u64,
+    /// Maximum number of members to add in a single add_member_to_content call.
+    pub max_add_member_count: usize,
 }
 
 impl Default for ServiceConfig {
@@ -51,6 +53,7 @@ impl Default for ServiceConfig {
         Self {
             min_replication_factor: 3,
             capacity_threshold_bytes: 1_073_741_824, // 1GB
+            max_add_member_count: 10,
         }
     }
 }
@@ -87,6 +90,8 @@ where
     min_replication_factor: usize,
     /// Capacity threshold in bytes below which a node is considered low on storage.
     capacity_threshold_bytes: u64,
+    /// Maximum number of members to add in a single add_member_to_content call.
+    max_add_member_count: usize,
 }
 
 /// No-op access control repository for backward compatibility.
@@ -166,6 +171,7 @@ where
             local_node_id,
             min_replication_factor: config.min_replication_factor,
             capacity_threshold_bytes: config.capacity_threshold_bytes,
+            max_add_member_count: config.max_add_member_count,
         }
     }
 
@@ -1203,6 +1209,7 @@ where
         }
 
         // 3. Find closest peers (same pattern as create_content)
+        let count = count.min(self.max_add_member_count);
         let key = compute_dht_key(content_id);
         let k = count + network.member_count(); // Request more to filter
         let closest = self

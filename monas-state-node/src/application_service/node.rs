@@ -228,6 +228,7 @@ impl StateNode {
                 ServiceConfig {
                     min_replication_factor: config.min_replication_factor,
                     capacity_threshold_bytes: config.capacity_threshold_bytes,
+                    ..ServiceConfig::default()
                 },
             )
             .with_access_control_repo(access_control_repo)
