@@ -1537,6 +1537,11 @@ where
                 member_nodes,
                 ..
             } => {
+                // Only store network metadata if we're a member
+                if !member_nodes.contains(&self.local_node_id) {
+                    return Ok(ApplyOutcome::Ignored);
+                }
+
                 // When handling sync events, we create network with NodeIds directly
                 let content_id_vo = ContentId::new(content_id.clone())?;
 
@@ -1556,14 +1561,9 @@ where
                     .await
                     .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
 
-                // If we're now a member, we need to sync the content
-                if member_nodes.contains(&self.local_node_id) {
-                    Ok(ApplyOutcome::NeedsSync {
-                        content_id: content_id.clone(),
-                    })
-                } else {
-                    Ok(ApplyOutcome::Applied)
-                }
+                Ok(ApplyOutcome::NeedsSync {
+                    content_id: content_id.clone(),
+                })
             }
 
             Event::ContentNetworkManagerRemoved {
@@ -1572,8 +1572,27 @@ where
                 removed_node_id,
                 ..
             } => {
+                // If we were removed, delete the local network metadata
+                if removed_node_id == &self.local_node_id {
+                    tracing::info!(
+                        "This node was removed from content network {}: removing local metadata",
+                        content_id
+                    );
+                    self.content_repo
+                        .write()
+                        .await
+                        .delete_content_network(content_id)
+                        .await
+                        .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
+                    return Ok(ApplyOutcome::Applied);
+                }
+
+                // Skip if we're not a member
+                if !member_nodes.contains(&self.local_node_id) {
+                    return Ok(ApplyOutcome::Ignored);
+                }
+
                 // Update local network with new member list
-                // When handling sync events, we create network with NodeIds directly
                 let content_id_vo = ContentId::new(content_id.clone())?;
 
                 let first_node =
@@ -1591,15 +1610,6 @@ where
                     .save_content_network(network)
                     .await
                     .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
-
-                // If we were removed, log it
-                if removed_node_id == &self.local_node_id {
-                    tracing::info!(
-                        "This node was removed from content network {}: removed_node_id={}",
-                        content_id,
-                        removed_node_id
-                    );
-                }
 
                 Ok(ApplyOutcome::Applied)
             }
@@ -1609,6 +1619,11 @@ where
                 member_nodes,
                 ..
             } => {
+                // Only store network metadata if we're a member
+                if !member_nodes.contains(&self.local_node_id) {
+                    return Ok(ApplyOutcome::Ignored);
+                }
+
                 // When handling sync events, we create network with NodeIds directly
                 let content_id_vo = ContentId::new(content_id.clone())?;
 
@@ -1628,14 +1643,9 @@ where
                     .await
                     .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
 
-                // If we're a member of this new content, we need to sync it
-                if member_nodes.contains(&self.local_node_id) {
-                    Ok(ApplyOutcome::NeedsSync {
-                        content_id: content_id.clone(),
-                    })
-                } else {
-                    Ok(ApplyOutcome::Applied)
-                }
+                Ok(ApplyOutcome::NeedsSync {
+                    content_id: content_id.clone(),
+                })
             }
 
             Event::NodeCreated {
@@ -2386,16 +2396,15 @@ mod tests {
         };
 
         let outcome = service.handle_sync_event(&event, None).await.unwrap();
-        // node-1 is NOT a member, so just Applied
-        assert_eq!(outcome, ApplyOutcome::Applied);
+        // node-1 is NOT a member, so Ignored (non-member networks are not stored)
+        assert_eq!(outcome, ApplyOutcome::Ignored);
 
-        // Verify content network was stored
+        // Verify content network was NOT stored (non-member)
         let network = service
             .get_content_network_for_test("content-1")
             .await
-            .unwrap()
             .unwrap();
-        assert!(!network.has_member_str("node-1"));
+        assert!(network.is_none());
     }
 
     #[tokio::test]
@@ -2568,15 +2577,14 @@ mod tests {
         };
 
         let outcome = service.handle_sync_event(&event, None).await.unwrap();
-        // node-1 is NOT a member
-        assert_eq!(outcome, ApplyOutcome::Applied);
+        // node-1 is NOT a member, so Ignored (non-member networks are not stored)
+        assert_eq!(outcome, ApplyOutcome::Ignored);
 
         let network = service
             .get_content_network_for_test("content-1")
             .await
-            .unwrap()
             .unwrap();
-        assert_eq!(network.member_count(), 2);
+        assert!(network.is_none());
     }
 
     #[tokio::test]

@@ -211,18 +211,22 @@ async fn test_create_content() {
     assert!(err.to_string().contains("No available member nodes found"));
 
     // Instead, test content network creation via sync event (simulating receiving from another node)
+    // Include local node ID so this node stores the network metadata
+    let local_node_id = service.local_node_id().to_string();
     let event = Event::ContentCreated {
         content_id: "test-content-id".to_string(),
         creator_node_id: "external-node".to_string(),
         content_size: data.len() as u64,
-        member_nodes: vec!["node-a".to_string(), "node-b".to_string()],
+        member_nodes: vec![local_node_id, "node-b".to_string()],
         timestamp: 12345,
     };
 
     let outcome = service.handle_sync_event(&event, None).await.unwrap();
     assert_eq!(
         outcome,
-        monas_state_node::application_service::state_node_service::ApplyOutcome::Applied
+        monas_state_node::application_service::state_node_service::ApplyOutcome::NeedsSync {
+            content_id: "test-content-id".to_string()
+        }
     );
 
     // Verify the content network was persisted
@@ -252,18 +256,20 @@ async fn test_list_content_networks() {
     // In isolated test environment, we can't use create_content directly
     // because it requires other peers. Instead, use sync events to simulate
     // receiving content network information from other nodes.
+    // Include local node ID so this node stores the network metadata.
+    let local_node_id = service.local_node_id().to_string();
     let event1 = Event::ContentCreated {
         content_id: "content-1".to_string(),
         creator_node_id: "external-node".to_string(),
         content_size: 100,
-        member_nodes: vec!["node-a".to_string()],
+        member_nodes: vec![local_node_id.clone(), "node-a".to_string()],
         timestamp: 12345,
     };
     let event2 = Event::ContentCreated {
         content_id: "content-2".to_string(),
         creator_node_id: "external-node".to_string(),
         content_size: 200,
-        member_nodes: vec!["node-b".to_string()],
+        member_nodes: vec![local_node_id, "node-b".to_string()],
         timestamp: 12346,
     };
 
@@ -304,12 +310,13 @@ async fn test_handle_sync_event() {
 async fn test_handle_content_created_sync() {
     let (service, _crdt_repo, _temp_dir) = create_test_service().await;
 
-    // Create a ContentCreated event from another node
+    // Create a ContentCreated event from another node, including local node as member
+    let local_node_id = service.local_node_id().to_string();
     let event = Event::ContentCreated {
         content_id: "external-content-1".to_string(),
         creator_node_id: "external-node".to_string(),
         content_size: 1024,
-        member_nodes: vec!["node-a".to_string(), "node-b".to_string()],
+        member_nodes: vec![local_node_id, "node-b".to_string()],
         timestamp: 12345,
     };
 
@@ -317,7 +324,9 @@ async fn test_handle_content_created_sync() {
     let outcome = service.handle_sync_event(&event, None).await.unwrap();
     assert_eq!(
         outcome,
-        monas_state_node::application_service::state_node_service::ApplyOutcome::Applied
+        monas_state_node::application_service::state_node_service::ApplyOutcome::NeedsSync {
+            content_id: "external-content-1".to_string()
+        }
     );
 
     // Verify the content network was created
