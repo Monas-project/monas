@@ -12,7 +12,7 @@
 
 use crate::domain::auth_capability::AuthCapability;
 use crate::domain::identity::{Identity, IdentityType};
-use crate::infrastructure::auth::auth_token::{AuthToken as InfraAuthToken, CapabilityAction};
+use crate::infrastructure::auth::auth_token::AuthToken as InfraAuthToken;
 use crate::infrastructure::auth::signature_verifier::SignatureVerifier;
 use crate::infrastructure::persistence::SledPublicKeyRepository;
 use crate::port::auth_token::AuthToken;
@@ -98,19 +98,6 @@ impl UcanAdapter {
             hex::decode(id_part).ok()
         } else {
             None
-        }
-    }
-
-    /// Map State Node capability to AuthToken capability action
-    fn map_capability_to_auth_token(cap: &AuthCapability) -> CapabilityAction {
-        match cap {
-            AuthCapability::ReadContent => CapabilityAction::Read,
-            AuthCapability::WriteContent => CapabilityAction::Write,
-            AuthCapability::DeleteContent => CapabilityAction::Delete,
-            AuthCapability::ShareContent => CapabilityAction::Share,
-            AuthCapability::RevokeAccess => CapabilityAction::Revoke,
-            AuthCapability::ReadMetadata => CapabilityAction::Read, // ReadMetadata is subset of Read
-            AuthCapability::ManageMembers => CapabilityAction::Share, // ManageMembers requires Share
         }
     }
 
@@ -232,8 +219,19 @@ impl UcanAdapter {
         })
     }
 
-    /// Verify AuthToken with dual signature verification, replay protection,
-    /// and min_valid_issued_at check.
+    /// Verify AuthToken with domain-level checks delegated to domain verifier components,
+    /// plus adapter-specific checks (JTI uniqueness, request signature).
+    ///
+    /// Domain-level verification (signature, expiration, TTL, access control, audience,
+    /// capability) uses the same logic as domain::auth_token_verifier::AuthTokenVerifier.
+    /// Adapter-level checks (JTI nonce, request signature) remain here as they depend
+    /// on infrastructure concerns (nonce store, request context).
+    ///
+    /// Note: We cannot directly call AuthTokenVerifier::verify() because the infra and
+    /// domain AuthToken use different JWT serialization formats for iss/aud fields
+    /// (string key IDs vs byte-array KeyId). Instead, we use the domain's
+    /// ContentAccessControl for access control checks and delegate signature verification
+    /// to the shared crypto layer.
     async fn verify_auth_token(
         &self,
         token: &InfraAuthToken,
@@ -258,8 +256,14 @@ impl UcanAdapter {
             }
         }
 
-        // 2. Check min_valid_issued_at (token invalidation)
-        if token.payload.iat < min_valid_issued_at {
+        // 2. Check access control (min_valid_issued_at) using domain ContentAccessControl
+        let access_control = crate::domain::access_control::ContentAccessControl::with_values(
+            request.resource.as_str().to_string(),
+            min_valid_issued_at,
+            1,
+            0,
+        );
+        if !access_control.is_token_valid(token.payload.iat) {
             anyhow::bail!(
                 "AuthToken invalidated: iat {} < min_valid_issued_at {}",
                 token.payload.iat,
@@ -277,7 +281,7 @@ impl UcanAdapter {
             );
         }
 
-        // 3.5. Check JTI uniqueness (replay attack prevention)
+        // 4. Check JTI uniqueness (adapter layer - replay attack prevention)
         if let Some(nonce_store) = &self.nonce_store {
             if !nonce_store
                 .check_and_record_nonce(&token.payload.jti)
@@ -287,13 +291,13 @@ impl UcanAdapter {
             }
         }
 
-        // 4. Extract owner's public key from key ID and verify AuthToken signature
+        // 5. Extract owner's public key from key ID and verify AuthToken signature
         let owner_public_key = Self::get_public_key_from_key_id(&token.payload.iss)?;
 
         SignatureVerifier::verify_auth_token_signature(token, &owner_public_key)
             .context("AuthToken signature verification failed")?;
 
-        // 5. Verify request signature (mandatory)
+        // 6. Verify request signature (adapter layer - mandatory)
         let request_signature = request.request_signature.as_ref().ok_or_else(|| {
             anyhow::anyhow!("Request signature is required for AuthToken-based authorization")
         })?;
@@ -314,20 +318,18 @@ impl UcanAdapter {
         )
         .context("Request signature verification failed")?;
 
+        // 7. Check capability (domain-level check, using infra token's capability format)
+        let required_action = crate::infrastructure::auth::auth_token::CapabilityAction::from_auth_capability(&request.capability);
+        let resource_uri = format!("monas://content/{}", request.resource.as_str());
+        if !token.has_capability(&resource_uri, &required_action) {
+            anyhow::bail!(
+                "AuthToken does not grant required capability {:?} for {}",
+                request.capability,
+                resource_uri
+            );
+        }
+
         Ok(())
-    }
-
-    /// Check if AuthToken grants a specific capability for a resource
-    fn check_auth_token_capability(
-        &self,
-        token: &InfraAuthToken,
-        resource: &str,
-        capability: &AuthCapability,
-    ) -> bool {
-        let required_action = Self::map_capability_to_auth_token(capability);
-        let resource_uri = format!("monas://content/{}", resource);
-
-        token.has_capability(&resource_uri, &required_action)
     }
 
     /// Check AuthToken-based authorization
@@ -340,18 +342,12 @@ impl UcanAdapter {
         // 1. Parse AuthToken
         let auth_token = self.parse_auth_token(token.as_str())?;
 
-        // 2. Verify AuthToken and request signatures (including min_valid_issued_at)
+        // 2. Verify AuthToken (domain verifier checks signature, expiration, audience,
+        //    capability, and access control; adapter checks JTI and request signature)
         self.verify_auth_token(&auth_token, request, min_valid_issued_at)
             .await?;
 
-        // 3. Check if AuthToken grants the required capability
-        let has_capability = self.check_auth_token_capability(
-            &auth_token,
-            request.resource.as_str(),
-            &request.capability,
-        );
-
-        Ok(has_capability)
+        Ok(true)
     }
 }
 
