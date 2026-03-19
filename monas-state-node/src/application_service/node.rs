@@ -411,6 +411,7 @@ impl StateNode {
         // Subscribe to network events
         let mut event_rx = self.network.subscribe_events();
         let service = self.service.clone();
+        let service_for_redundancy = service.clone();
         let sync_service_for_events = self.sync_service.clone();
 
         // Spawn event handler task
@@ -519,6 +520,37 @@ impl StateNode {
                             }
                             Err(e) => {
                                 tracing::warn!("Periodic sync failed: {}", e);
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        // Spawn periodic redundancy check task (5 minute interval)
+        let token_redundancy = token.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(300));
+            tracing::info!("Started periodic redundancy check task (interval: 300s)");
+            loop {
+                tokio::select! {
+                    _ = token_redundancy.cancelled() => {
+                        tracing::info!("Periodic redundancy check task shutting down");
+                        break;
+                    }
+                    _ = interval.tick() => {
+                        tracing::debug!("Running periodic redundancy check");
+                        match service_for_redundancy.check_all_redundancy().await {
+                            Ok(checked) => {
+                                if !checked.is_empty() {
+                                    tracing::info!(
+                                        "Periodic redundancy check completed for {} content networks",
+                                        checked.len()
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("Periodic redundancy check failed: {}", e);
                             }
                         }
                     }

@@ -1416,6 +1416,43 @@ where
         Ok(())
     }
 
+    /// Check and maintain redundancy for all content networks this node is a member of.
+    ///
+    /// Iterates over all known content networks, checks membership, and runs
+    /// `check_and_maintain_redundancy` for each. Errors are logged but do not
+    /// stop processing of remaining networks.
+    pub async fn check_all_redundancy(&self) -> Result<Vec<String>, StateNodeError> {
+        let content_ids = self
+            .content_repo
+            .read()
+            .await
+            .list_content_networks()
+            .await
+            .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
+
+        let mut checked = Vec::new();
+        for content_id in content_ids {
+            let is_member = self
+                .content_repo
+                .read()
+                .await
+                .get_content_network(&content_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|net| net.has_member_str(&self.local_node_id))
+                .unwrap_or(false);
+
+            if is_member {
+                if let Err(e) = self.check_and_maintain_redundancy(&content_id).await {
+                    tracing::warn!("Redundancy check failed for {}: {}", content_id, e);
+                }
+                checked.push(content_id);
+            }
+        }
+        Ok(checked)
+    }
+
     /// Verify that the event's claimed node ID matches the source peer ID.
     /// Returns an error if there is a mismatch.
     fn verify_source_peer_id(
