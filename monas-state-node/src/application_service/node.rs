@@ -144,14 +144,17 @@ impl StateNode {
                 .context("Failed to open CRDT repository")?,
         );
 
-        // Initialize network with CRDT repository
+        // Initialize network with CRDT repository and content network repository for member verification
         let crdt_repo_dyn: Arc<dyn crate::port::content_repository::ContentRepository> =
             crdt_repo.clone();
+        let content_repo_dyn: Arc<tokio::sync::RwLock<dyn crate::port::persistence::PersistentContentRepository + Send + Sync>> =
+            content_repo.clone();
         let network = Arc::new(
-            Libp2pNetwork::new(
+            Libp2pNetwork::with_content_network_repo(
                 config.network_config.clone(),
                 crdt_repo_dyn.clone(),
                 config.data_dir.clone(),
+                Some(content_repo_dyn),
             )
             .await
             .context("Failed to create network")?,

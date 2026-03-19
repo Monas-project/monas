@@ -302,6 +302,9 @@ pub struct Libp2pNetwork {
     /// Channel receiver for relay requests from remote peers.
     /// Taken by node.rs run() to process relay requests via StateNodeService.
     relay_request_rx: tokio::sync::Mutex<Option<mpsc::Receiver<RelayRequest>>>,
+    /// Content network repository for member verification on incoming requests.
+    #[allow(dead_code)]
+    content_network_repo: Option<Arc<RwLock<dyn crate::port::persistence::PersistentContentRepository + Send + Sync>>>,
 }
 
 impl Libp2pNetwork {
@@ -344,6 +347,17 @@ impl Libp2pNetwork {
         config: Libp2pNetworkConfig,
         crdt_repo: Arc<dyn ContentRepository>,
         data_dir: PathBuf,
+    ) -> Result<Self> {
+        Self::with_content_network_repo(config, crdt_repo, data_dir, None).await
+    }
+
+    /// Create a new libp2p network with an optional content network repository
+    /// for member verification on incoming PushOperations/FetchOperations requests.
+    pub async fn with_content_network_repo(
+        config: Libp2pNetworkConfig,
+        crdt_repo: Arc<dyn ContentRepository>,
+        data_dir: PathBuf,
+        content_network_repo: Option<Arc<RwLock<dyn crate::port::persistence::PersistentContentRepository + Send + Sync>>>,
     ) -> Result<Self> {
         let keypair = Self::load_or_generate_peer_keypair(&data_dir)?;
         let local_peer_id = PeerId::from(keypair.public());
@@ -428,6 +442,7 @@ impl Libp2pNetwork {
             relay_tx,
             command_tx: command_tx.clone(),
         };
+        let content_network_repo_clone = content_network_repo.clone();
         tokio::spawn(Self::run_swarm_loop(
             swarm,
             command_rx,
@@ -437,6 +452,7 @@ impl Libp2pNetwork {
             data_dir_clone,
             p256_signing_key_clone,
             relay_channels,
+            content_network_repo_clone,
         ));
 
         Ok(Self {
@@ -448,6 +464,7 @@ impl Libp2pNetwork {
             data_dir,
             p256_public_key,
             relay_request_rx: tokio::sync::Mutex::new(Some(relay_rx)),
+            content_network_repo,
         })
     }
 
@@ -509,6 +526,7 @@ impl Libp2pNetwork {
         data_dir: PathBuf,
         p256_signing_key: Arc<crate::infrastructure::key_management::NodeKeyPair>,
         relay_channels: RelayChannels,
+        content_network_repo: Option<Arc<RwLock<dyn crate::port::persistence::PersistentContentRepository + Send + Sync>>>,
     ) {
         let mut pending = PendingRequests::default();
         let mut cleanup_interval = tokio::time::interval(Duration::from_secs(60));
@@ -522,7 +540,7 @@ impl Libp2pNetwork {
                 }
                 // Handle swarm events
                 event = swarm.select_next_some() => {
-                    Self::handle_swarm_event(&mut swarm, &mut pending, &connected_peers, &event_tx, &crdt_repo, &data_dir, &p256_signing_key, &relay_channels, event).await;
+                    Self::handle_swarm_event(&mut swarm, &mut pending, &connected_peers, &event_tx, &crdt_repo, &data_dir, &p256_signing_key, &relay_channels, &content_network_repo, event).await;
                 }
                 // Periodic cleanup of stale pending requests
                 _ = cleanup_interval.tick() => {
@@ -730,6 +748,7 @@ impl Libp2pNetwork {
         data_dir: &std::path::Path,
         p256_signing_key: &Arc<crate::infrastructure::key_management::NodeKeyPair>,
         relay_channels: &RelayChannels,
+        content_network_repo: &Option<Arc<RwLock<dyn crate::port::persistence::PersistentContentRepository + Send + Sync>>>,
         event: SwarmEvent<NodeBehaviourEvent>,
     ) {
         match event {
@@ -746,6 +765,7 @@ impl Libp2pNetwork {
                     crdt_repo,
                     data_dir,
                     relay_channels,
+                    content_network_repo,
                     rr_event,
                 )
                 .await;
@@ -901,6 +921,7 @@ impl Libp2pNetwork {
         crdt_repo: &Arc<dyn ContentRepository>,
         data_dir: &std::path::Path,
         relay_channels: &RelayChannels,
+        content_network_repo: &Option<Arc<RwLock<dyn crate::port::persistence::PersistentContentRepository + Send + Sync>>>,
         event: request_response::Event<ContentRequest, ContentResponse>,
     ) {
         match event {
@@ -916,6 +937,7 @@ impl Libp2pNetwork {
                         crdt_repo,
                         data_dir,
                         relay_channels,
+                        content_network_repo,
                     )
                     .await;
                 }
@@ -961,6 +983,7 @@ impl Libp2pNetwork {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn handle_incoming_request(
         swarm: &mut Swarm<NodeBehaviour>,
         peer: PeerId,
@@ -969,6 +992,7 @@ impl Libp2pNetwork {
         crdt_repo: &Arc<dyn ContentRepository>,
         data_dir: &std::path::Path,
         relay_channels: &RelayChannels,
+        content_network_repo: &Option<Arc<RwLock<dyn crate::port::persistence::PersistentContentRepository + Send + Sync>>>,
     ) {
         debug!("Received request from {}: {:?}", peer, request);
 
@@ -1165,30 +1189,90 @@ impl Libp2pNetwork {
                 genesis_cid,
                 since_version,
             } => {
-                match crdt_repo
-                    .get_operations(&genesis_cid, since_version.as_deref())
-                    .await
-                {
-                    Ok(ops) => {
-                        // Serialize operations for network transfer
-                        let operations: Vec<Vec<u8>> = ops
-                            .iter()
-                            .filter_map(|op| serde_json::to_vec(op).ok())
-                            .collect();
-                        ContentResponse::OperationsData {
-                            genesis_cid,
-                            operations,
+                // Verify peer is a member of the content network
+                if let Some(repo) = content_network_repo {
+                    let is_member = repo.read().await
+                        .get_content_network(&genesis_cid).await
+                        .ok().flatten()
+                        .map(|net| net.has_member_str(&peer.to_string()))
+                        .unwrap_or(false);
+                    if !is_member {
+                        ContentResponse::Error {
+                            message: format!(
+                                "Peer {} is not a member of content network {}",
+                                peer, genesis_cid
+                            ),
+                        }
+                    } else {
+                        match crdt_repo
+                            .get_operations(&genesis_cid, since_version.as_deref())
+                            .await
+                        {
+                            Ok(ops) => {
+                                let operations: Vec<Vec<u8>> = ops
+                                    .iter()
+                                    .filter_map(|op| serde_json::to_vec(op).ok())
+                                    .collect();
+                                ContentResponse::OperationsData {
+                                    genesis_cid,
+                                    operations,
+                                }
+                            }
+                            Err(e) => ContentResponse::Error {
+                                message: format!("Failed to fetch operations: {}", e),
+                            },
                         }
                     }
-                    Err(e) => ContentResponse::Error {
-                        message: format!("Failed to fetch operations: {}", e),
-                    },
+                } else {
+                    match crdt_repo
+                        .get_operations(&genesis_cid, since_version.as_deref())
+                        .await
+                    {
+                        Ok(ops) => {
+                            let operations: Vec<Vec<u8>> = ops
+                                .iter()
+                                .filter_map(|op| serde_json::to_vec(op).ok())
+                                .collect();
+                            ContentResponse::OperationsData {
+                                genesis_cid,
+                                operations,
+                            }
+                        }
+                        Err(e) => ContentResponse::Error {
+                            message: format!("Failed to fetch operations: {}", e),
+                        },
+                    }
                 }
             }
             ContentRequest::PushOperations {
                 genesis_cid,
                 operations,
             } => {
+                // Verify peer is a member of the content network
+                if let Some(repo) = content_network_repo {
+                    let is_member = repo.read().await
+                        .get_content_network(&genesis_cid).await
+                        .ok().flatten()
+                        .map(|net| net.has_member_str(&peer.to_string()))
+                        .unwrap_or(false);
+                    if !is_member {
+                        let response = ContentResponse::Error {
+                            message: format!(
+                                "Peer {} is not a member of content network {}",
+                                peer, genesis_cid
+                            ),
+                        };
+                        if let Err(e) = swarm
+                            .behaviour_mut()
+                            .request_response
+                            .send_response(channel, response)
+                        {
+                            error!("Failed to send response: {:?}", e);
+                        }
+                        return;
+                    }
+                }
+
                 // Reject oversized payloads (max 16 MiB total)
                 const MAX_PUSH_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
                 let total_size: usize = operations.iter().map(|op| op.len()).sum();
