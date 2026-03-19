@@ -147,8 +147,11 @@ impl StateNode {
         // Initialize network with CRDT repository and content network repository for member verification
         let crdt_repo_dyn: Arc<dyn crate::port::content_repository::ContentRepository> =
             crdt_repo.clone();
-        let content_repo_dyn: Arc<tokio::sync::RwLock<dyn crate::port::persistence::PersistentContentRepository + Send + Sync>> =
-            content_repo.clone();
+        let content_repo_dyn: Arc<
+            tokio::sync::RwLock<
+                dyn crate::port::persistence::PersistentContentRepository + Send + Sync,
+            >,
+        > = content_repo.clone();
         let network = Arc::new(
             Libp2pNetwork::with_content_network_repo(
                 config.network_config.clone(),

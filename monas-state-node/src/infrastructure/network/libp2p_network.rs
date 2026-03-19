@@ -304,7 +304,9 @@ pub struct Libp2pNetwork {
     relay_request_rx: tokio::sync::Mutex<Option<mpsc::Receiver<RelayRequest>>>,
     /// Content network repository for member verification on incoming requests.
     #[allow(dead_code)]
-    content_network_repo: Option<Arc<RwLock<dyn crate::port::persistence::PersistentContentRepository + Send + Sync>>>,
+    content_network_repo: Option<
+        Arc<RwLock<dyn crate::port::persistence::PersistentContentRepository + Send + Sync>>,
+    >,
 }
 
 impl Libp2pNetwork {
@@ -357,7 +359,9 @@ impl Libp2pNetwork {
         config: Libp2pNetworkConfig,
         crdt_repo: Arc<dyn ContentRepository>,
         data_dir: PathBuf,
-        content_network_repo: Option<Arc<RwLock<dyn crate::port::persistence::PersistentContentRepository + Send + Sync>>>,
+        content_network_repo: Option<
+            Arc<RwLock<dyn crate::port::persistence::PersistentContentRepository + Send + Sync>>,
+        >,
     ) -> Result<Self> {
         let keypair = Self::load_or_generate_peer_keypair(&data_dir)?;
         let local_peer_id = PeerId::from(keypair.public());
@@ -526,7 +530,9 @@ impl Libp2pNetwork {
         data_dir: PathBuf,
         p256_signing_key: Arc<crate::infrastructure::key_management::NodeKeyPair>,
         relay_channels: RelayChannels,
-        content_network_repo: Option<Arc<RwLock<dyn crate::port::persistence::PersistentContentRepository + Send + Sync>>>,
+        content_network_repo: Option<
+            Arc<RwLock<dyn crate::port::persistence::PersistentContentRepository + Send + Sync>>,
+        >,
     ) {
         let mut pending = PendingRequests::default();
         let mut cleanup_interval = tokio::time::interval(Duration::from_secs(60));
@@ -748,7 +754,9 @@ impl Libp2pNetwork {
         data_dir: &std::path::Path,
         p256_signing_key: &Arc<crate::infrastructure::key_management::NodeKeyPair>,
         relay_channels: &RelayChannels,
-        content_network_repo: &Option<Arc<RwLock<dyn crate::port::persistence::PersistentContentRepository + Send + Sync>>>,
+        content_network_repo: &Option<
+            Arc<RwLock<dyn crate::port::persistence::PersistentContentRepository + Send + Sync>>,
+        >,
         event: SwarmEvent<NodeBehaviourEvent>,
     ) {
         match event {
@@ -921,7 +929,9 @@ impl Libp2pNetwork {
         crdt_repo: &Arc<dyn ContentRepository>,
         data_dir: &std::path::Path,
         relay_channels: &RelayChannels,
-        content_network_repo: &Option<Arc<RwLock<dyn crate::port::persistence::PersistentContentRepository + Send + Sync>>>,
+        content_network_repo: &Option<
+            Arc<RwLock<dyn crate::port::persistence::PersistentContentRepository + Send + Sync>>,
+        >,
         event: request_response::Event<ContentRequest, ContentResponse>,
     ) {
         match event {
@@ -992,7 +1002,9 @@ impl Libp2pNetwork {
         crdt_repo: &Arc<dyn ContentRepository>,
         data_dir: &std::path::Path,
         relay_channels: &RelayChannels,
-        content_network_repo: &Option<Arc<RwLock<dyn crate::port::persistence::PersistentContentRepository + Send + Sync>>>,
+        content_network_repo: &Option<
+            Arc<RwLock<dyn crate::port::persistence::PersistentContentRepository + Send + Sync>>,
+        >,
     ) {
         debug!("Received request from {}: {:?}", peer, request);
 
@@ -1191,9 +1203,13 @@ impl Libp2pNetwork {
             } => {
                 // Verify peer is a member of the content network
                 if let Some(repo) = content_network_repo {
-                    let is_member = repo.read().await
-                        .get_content_network(&genesis_cid).await
-                        .ok().flatten()
+                    let is_member = repo
+                        .read()
+                        .await
+                        .get_content_network(&genesis_cid)
+                        .await
+                        .ok()
+                        .flatten()
                         .map(|net| net.has_member_str(&peer.to_string()))
                         .unwrap_or(false);
                     if !is_member {
@@ -1250,9 +1266,13 @@ impl Libp2pNetwork {
             } => {
                 // Verify peer is a member of the content network
                 if let Some(repo) = content_network_repo {
-                    let is_member = repo.read().await
-                        .get_content_network(&genesis_cid).await
-                        .ok().flatten()
+                    let is_member = repo
+                        .read()
+                        .await
+                        .get_content_network(&genesis_cid)
+                        .await
+                        .ok()
+                        .flatten()
                         .map(|net| net.has_member_str(&peer.to_string()))
                         .unwrap_or(false);
                     if !is_member {

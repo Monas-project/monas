@@ -319,7 +319,10 @@ impl UcanAdapter {
         .context("Request signature verification failed")?;
 
         // 7. Check capability (domain-level check, using infra token's capability format)
-        let required_action = crate::infrastructure::auth::auth_token::CapabilityAction::from_auth_capability(&request.capability);
+        let required_action =
+            crate::infrastructure::auth::auth_token::CapabilityAction::from_auth_capability(
+                &request.capability,
+            );
         let resource_uri = format!("monas://content/{}", request.resource.as_str());
         if !token.has_capability(&resource_uri, &required_action) {
             anyhow::bail!(
