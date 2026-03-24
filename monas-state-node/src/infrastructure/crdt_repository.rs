@@ -3,6 +3,7 @@
 //! This module provides an implementation of ContentRepository
 //! using crsl-lib for CRDT-based content versioning.
 
+use crate::domain::access_policy::AccessPolicy;
 use crate::port::content_repository::{CommitResult, ContentRepository, SerializedOperation};
 
 use anyhow::{Context, Result};
@@ -17,15 +18,17 @@ use crsl_lib::graph::storage::{LeveldbNodeStorage, NodeStorage};
 use crsl_lib::repo::Repo;
 use crsl_lib::storage::SharedLeveldb;
 use multihash_codetable::{Code, MultihashDigest};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use std::sync::Mutex;
 
 /// Payload type for content storage.
-/// Using Vec<u8> for raw binary content.
+/// Contains raw binary content data and an optional access policy.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct ContentPayload(pub Vec<u8>);
+pub struct ContentPayload {
+    pub data: Vec<u8>,
+    pub access_policy: Option<AccessPolicy>,
+}
 
 /// Type aliases for crsl-lib types.
 type OpStore = LeveldbStorage<Cid, ContentPayload>;
@@ -67,6 +70,13 @@ impl CrslCrdtRepository {
         })
     }
 
+    /// Check if the repository is healthy (can list contents).
+    pub async fn health_check(&self) -> Result<()> {
+        // A simple read operation to verify DB is responsive
+        let _contents = self.list_contents().await?;
+        Ok(())
+    }
+
     /// Generate a placeholder CID from content data.
     /// This is used as a seed for Create operations.
     fn generate_placeholder_cid(data: &[u8]) -> Cid {
@@ -84,9 +94,17 @@ impl CrslCrdtRepository {
 
 #[async_trait]
 impl ContentRepository for CrslCrdtRepository {
-    async fn create_content(&self, data: &[u8], author: &str) -> Result<CommitResult> {
+    async fn create_content(
+        &self,
+        data: &[u8],
+        author: &str,
+        access_policy: Option<AccessPolicy>,
+    ) -> Result<CommitResult> {
         let placeholder = Self::generate_placeholder_cid(data);
-        let payload = ContentPayload(data.to_vec());
+        let payload = ContentPayload {
+            data: data.to_vec(),
+            access_policy,
+        };
 
         let op = Operation::new(
             placeholder,
@@ -95,10 +113,7 @@ impl ContentRepository for CrslCrdtRepository {
         );
 
         let genesis_cid = {
-            let mut repo = self
-                .repo
-                .lock()
-                .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+            let mut repo = self.repo.lock();
             repo.commit_operation(op)
                 .map_err(|e| anyhow::anyhow!("Failed to commit create operation: {}", e))?
         };
@@ -115,18 +130,34 @@ impl ContentRepository for CrslCrdtRepository {
         genesis_cid: &str,
         data: &[u8],
         author: &str,
+        access_policy: Option<AccessPolicy>,
     ) -> Result<CommitResult> {
         let genesis = Self::parse_cid(genesis_cid)?;
-        let payload = ContentPayload(data.to_vec());
+
+        // If no access_policy provided, preserve the existing one from the latest version
+        let policy = if access_policy.is_some() {
+            access_policy
+        } else {
+            let repo = self.repo.lock();
+            repo.latest(&genesis).and_then(|latest_cid| {
+                repo.dag
+                    .get_node(&latest_cid)
+                    .ok()
+                    .flatten()
+                    .and_then(|node| node.payload().access_policy.clone())
+            })
+        };
+
+        let payload = ContentPayload {
+            data: data.to_vec(),
+            access_policy: policy,
+        };
 
         // Create update operation - parents will be auto-filled by crsl-lib
         let op = Operation::new(genesis, OperationType::Update(payload), author.to_string());
 
         let version_cid = {
-            let mut repo = self
-                .repo
-                .lock()
-                .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+            let mut repo = self.repo.lock();
             repo.commit_operation(op)
                 .map_err(|e| anyhow::anyhow!("Failed to commit update operation: {}", e))?
         };
@@ -141,17 +172,14 @@ impl ContentRepository for CrslCrdtRepository {
     async fn get_latest(&self, genesis_cid: &str) -> Result<Option<Vec<u8>>> {
         let genesis = Self::parse_cid(genesis_cid)?;
 
-        let repo = self
-            .repo
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+        let repo = self.repo.lock();
 
         // Get the latest version CID
         match repo.latest(&genesis) {
             Some(latest_cid) => {
-                // Get the node to retrieve payload
+                // Get the node to retrieve payload (data part only)
                 match repo.dag.get_node(&latest_cid) {
-                    Ok(Some(node)) => Ok(Some(node.payload().0.clone())),
+                    Ok(Some(node)) => Ok(Some(node.payload().data.clone())),
                     Ok(None) => Ok(None),
                     Err(e) => Err(anyhow::anyhow!("Failed to get node: {}", e)),
                 }
@@ -166,17 +194,16 @@ impl ContentRepository for CrslCrdtRepository {
     ) -> Result<Option<(Vec<u8>, String)>> {
         let genesis = Self::parse_cid(genesis_cid)?;
 
-        let repo = self
-            .repo
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+        let repo = self.repo.lock();
 
         // Get the latest version CID
         match repo.latest(&genesis) {
             Some(latest_cid) => {
-                // Get the node to retrieve payload
+                // Get the node to retrieve payload (data part only)
                 match repo.dag.get_node(&latest_cid) {
-                    Ok(Some(node)) => Ok(Some((node.payload().0.clone(), latest_cid.to_string()))),
+                    Ok(Some(node)) => {
+                        Ok(Some((node.payload().data.clone(), latest_cid.to_string())))
+                    }
                     Ok(None) => Ok(None),
                     Err(e) => Err(anyhow::anyhow!("Failed to get node: {}", e)),
                 }
@@ -188,25 +215,76 @@ impl ContentRepository for CrslCrdtRepository {
     async fn get_version(&self, version_cid: &str) -> Result<Option<Vec<u8>>> {
         let cid = Self::parse_cid(version_cid)?;
 
-        let repo = self
-            .repo
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+        let repo = self.repo.lock();
 
         match repo.dag.get_node(&cid) {
-            Ok(Some(node)) => Ok(Some(node.payload().0.clone())),
+            Ok(Some(node)) => Ok(Some(node.payload().data.clone())),
             Ok(None) => Ok(None),
             Err(e) => Err(anyhow::anyhow!("Failed to get node: {}", e)),
         }
     }
 
+    async fn get_access_policy(&self, genesis_cid: &str) -> Result<Option<AccessPolicy>> {
+        let genesis = Self::parse_cid(genesis_cid)?;
+
+        let repo = self.repo.lock();
+
+        match repo.latest(&genesis) {
+            Some(latest_cid) => match repo.dag.get_node(&latest_cid) {
+                Ok(Some(node)) => Ok(node.payload().access_policy.clone()),
+                Ok(None) => Ok(None),
+                Err(e) => Err(anyhow::anyhow!("Failed to get node: {}", e)),
+            },
+            None => Ok(None),
+        }
+    }
+
+    async fn update_access_policy(
+        &self,
+        genesis_cid: &str,
+        policy: AccessPolicy,
+        author: &str,
+    ) -> Result<CommitResult> {
+        let genesis = Self::parse_cid(genesis_cid)?;
+
+        // Get current data from latest version
+        let current_data = {
+            let repo = self.repo.lock();
+            repo.latest(&genesis)
+                .and_then(|latest_cid| {
+                    repo.dag
+                        .get_node(&latest_cid)
+                        .ok()
+                        .flatten()
+                        .map(|node| node.payload().data.clone())
+                })
+                .unwrap_or_default()
+        };
+
+        let payload = ContentPayload {
+            data: current_data,
+            access_policy: Some(policy),
+        };
+
+        let op = Operation::new(genesis, OperationType::Update(payload), author.to_string());
+
+        let version_cid = {
+            let mut repo = self.repo.lock();
+            repo.commit_operation(op)
+                .map_err(|e| anyhow::anyhow!("Failed to commit access policy update: {}", e))?
+        };
+
+        Ok(CommitResult {
+            genesis_cid: genesis_cid.to_string(),
+            version_cid: version_cid.to_string(),
+            is_new: false,
+        })
+    }
+
     async fn get_history(&self, genesis_cid: &str) -> Result<Vec<String>> {
         let genesis = Self::parse_cid(genesis_cid)?;
 
-        let repo = self
-            .repo
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+        let repo = self.repo.lock();
 
         let path = repo
             .linear_history(&genesis)
@@ -222,10 +300,7 @@ impl ContentRepository for CrslCrdtRepository {
     ) -> Result<Vec<SerializedOperation>> {
         let genesis = Self::parse_cid(genesis_cid)?;
 
-        let repo = self
-            .repo
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+        let repo = self.repo.lock();
 
         let indexed_ops = repo
             .get_operations_with_index(&genesis)
@@ -339,10 +414,7 @@ impl ContentRepository for CrslCrdtRepository {
     async fn apply_operations(&self, operations: &[SerializedOperation]) -> Result<usize> {
         let mut applied = 0;
 
-        let mut repo = self
-            .repo
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+        let mut repo = self.repo.lock();
 
         for serialized_op in operations {
             // Deserialize the operation
@@ -372,19 +444,13 @@ impl ContentRepository for CrslCrdtRepository {
             Err(_) => return Ok(false),
         };
 
-        let repo = self
-            .repo
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+        let repo = self.repo.lock();
 
         Ok(repo.latest(&genesis).is_some())
     }
 
     async fn list_contents(&self) -> Result<Vec<String>> {
-        let repo = self
-            .repo
-            .lock()
-            .map_err(|e| anyhow::anyhow!("Lock poisoned: {}", e))?;
+        let repo = self.repo.lock();
 
         // Get all nodes and collect unique genesis CIDs
         let node_map = repo
@@ -416,7 +482,10 @@ mod tests {
         let repo = CrslCrdtRepository::open(tmp.path()).unwrap();
 
         let data = b"Hello, CRDT!";
-        let result = repo.create_content(data, "test-author").await.unwrap();
+        let result = repo
+            .create_content(data, "test-author", None)
+            .await
+            .unwrap();
 
         assert!(result.is_new);
         assert!(!result.genesis_cid.is_empty());
@@ -431,11 +500,14 @@ mod tests {
         let repo = CrslCrdtRepository::open(tmp.path()).unwrap();
 
         let initial_data = b"Initial content";
-        let result = repo.create_content(initial_data, "author1").await.unwrap();
+        let result = repo
+            .create_content(initial_data, "author1", None)
+            .await
+            .unwrap();
 
         let updated_data = b"Updated content";
         let update_result = repo
-            .update_content(&result.genesis_cid, updated_data, "author1")
+            .update_content(&result.genesis_cid, updated_data, "author1", None)
             .await
             .unwrap();
 
@@ -452,7 +524,7 @@ mod tests {
         let repo = CrslCrdtRepository::open(tmp.path()).unwrap();
 
         let data = b"Test content";
-        let result = repo.create_content(data, "author").await.unwrap();
+        let result = repo.create_content(data, "author", None).await.unwrap();
 
         assert!(repo.exists(&result.genesis_cid).await.unwrap());
 
@@ -469,13 +541,13 @@ mod tests {
         let repo = CrslCrdtRepository::open(tmp.path()).unwrap();
 
         let data1 = b"Version 1";
-        let result = repo.create_content(data1, "author").await.unwrap();
+        let result = repo.create_content(data1, "author", None).await.unwrap();
 
         // Small delay to ensure different timestamps
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
         let data2 = b"Version 2";
-        repo.update_content(&result.genesis_cid, data2, "author")
+        repo.update_content(&result.genesis_cid, data2, "author", None)
             .await
             .unwrap();
 
@@ -489,7 +561,7 @@ mod tests {
         let repo = CrslCrdtRepository::open(tmp.path()).unwrap();
 
         let data = b"Test content";
-        let result = repo.create_content(data, "author").await.unwrap();
+        let result = repo.create_content(data, "author", None).await.unwrap();
 
         let retrieved = repo.get_version(&result.version_cid).await.unwrap();
         assert_eq!(retrieved, Some(data.to_vec()));
@@ -501,10 +573,10 @@ mod tests {
         let repo = CrslCrdtRepository::open(tmp.path()).unwrap();
 
         let data1 = b"Content 1";
-        let result1 = repo.create_content(data1, "author").await.unwrap();
+        let result1 = repo.create_content(data1, "author", None).await.unwrap();
 
         let data2 = b"Content 2";
-        let result2 = repo.create_content(data2, "author").await.unwrap();
+        let result2 = repo.create_content(data2, "author", None).await.unwrap();
 
         let contents = repo.list_contents().await.unwrap();
         assert!(contents.contains(&result1.genesis_cid));
@@ -517,7 +589,7 @@ mod tests {
         let repo = CrslCrdtRepository::open(tmp.path()).unwrap();
 
         let data = b"Test content";
-        let result = repo.create_content(data, "author").await.unwrap();
+        let result = repo.create_content(data, "author", None).await.unwrap();
 
         let operations = repo
             .get_operations(&result.genesis_cid, None)

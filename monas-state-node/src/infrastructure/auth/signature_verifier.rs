@@ -82,8 +82,8 @@ mod tests {
 
         // Create a test AuthToken
         let payload = super::super::auth_token::AuthTokenPayload {
-            iss: "user:alice".to_string(),
-            aud: "user:bob".to_string(),
+            iss: "user:04aaaa".to_string(),
+            aud: "user:04bbbb".to_string(),
             exp: None,
             iat: 1706740800,
             jti: "test-id".to_string(),
@@ -112,8 +112,8 @@ mod tests {
 
         // Create a test AuthToken with invalid signature
         let payload = super::super::auth_token::AuthTokenPayload {
-            iss: "user:alice".to_string(),
-            aud: "user:bob".to_string(),
+            iss: "user:04aaaa".to_string(),
+            aud: "user:04bbbb".to_string(),
             exp: None,
             iat: 1706740800,
             jti: "test-id".to_string(),

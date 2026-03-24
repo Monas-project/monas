@@ -61,6 +61,20 @@ impl AuthenticationService for TestAuthService {
         Ok(!token.is_empty())
     }
 
+    async fn verify_request_signature(
+        &self,
+        _token: &AuthToken,
+        _signature: &[u8],
+        _message: &str,
+        _timestamp: Option<u64>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn verify_jwt_signature(&self, _token: &AuthToken) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     async fn get_issuer(
         &self,
         token: &AuthToken,
@@ -96,14 +110,13 @@ fn sign_access_control_update(update: &AccessControlUpdate) -> (Vec<u8>, Vec<u8>
     use p256::ecdsa::signature::DigestSigner;
     use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
     use p256::elliptic_curve::rand_core::OsRng;
-    use sha3::{Digest, Keccak256};
+    use sha2::{Digest, Sha256};
 
     let signing_key = SigningKey::random(&mut OsRng);
     let verifying_key = VerifyingKey::from(&signing_key);
     let public_key_bytes = verifying_key.to_encoded_point(false).as_bytes().to_vec();
     let message = update.signing_message();
-    let (signature, _): (Signature, _) =
-        signing_key.sign_digest(Keccak256::new_with_prefix(&message));
+    let (signature, _): (Signature, _) = signing_key.sign_digest(Sha256::new_with_prefix(&message));
     (signature.to_vec(), public_key_bytes)
 }
 
@@ -184,7 +197,12 @@ async fn test_create_content() {
     // This is expected behavior - content creation requires at least one other node to store the content.
     let data = b"Hello, World!";
     let result = service
-        .create_content(data, Some(&test_token()), Some(&test_request_signature()))
+        .create_content(
+            data,
+            Some(&test_token()),
+            Some(&test_request_signature()),
+            None,
+        )
         .await;
 
     // Verify that it fails with the expected error in isolated environment
@@ -193,18 +211,22 @@ async fn test_create_content() {
     assert!(err.to_string().contains("No available member nodes found"));
 
     // Instead, test content network creation via sync event (simulating receiving from another node)
+    // Include local node ID so this node stores the network metadata
+    let local_node_id = service.local_node_id().to_string();
     let event = Event::ContentCreated {
         content_id: "test-content-id".to_string(),
         creator_node_id: "external-node".to_string(),
         content_size: data.len() as u64,
-        member_nodes: vec!["node-a".to_string(), "node-b".to_string()],
+        member_nodes: vec![local_node_id, "node-b".to_string()],
         timestamp: 12345,
     };
 
-    let outcome = service.handle_sync_event(&event).await.unwrap();
+    let outcome = service.handle_sync_event(&event, None).await.unwrap();
     assert_eq!(
         outcome,
-        monas_state_node::application_service::state_node_service::ApplyOutcome::Applied
+        monas_state_node::application_service::state_node_service::ApplyOutcome::NeedsSync {
+            content_id: "test-content-id".to_string()
+        }
     );
 
     // Verify the content network was persisted
@@ -234,23 +256,25 @@ async fn test_list_content_networks() {
     // In isolated test environment, we can't use create_content directly
     // because it requires other peers. Instead, use sync events to simulate
     // receiving content network information from other nodes.
+    // Include local node ID so this node stores the network metadata.
+    let local_node_id = service.local_node_id().to_string();
     let event1 = Event::ContentCreated {
         content_id: "content-1".to_string(),
         creator_node_id: "external-node".to_string(),
         content_size: 100,
-        member_nodes: vec!["node-a".to_string()],
+        member_nodes: vec![local_node_id.clone(), "node-a".to_string()],
         timestamp: 12345,
     };
     let event2 = Event::ContentCreated {
         content_id: "content-2".to_string(),
         creator_node_id: "external-node".to_string(),
         content_size: 200,
-        member_nodes: vec!["node-b".to_string()],
+        member_nodes: vec![local_node_id, "node-b".to_string()],
         timestamp: 12346,
     };
 
-    service.handle_sync_event(&event1).await.unwrap();
-    service.handle_sync_event(&event2).await.unwrap();
+    service.handle_sync_event(&event1, None).await.unwrap();
+    service.handle_sync_event(&event2, None).await.unwrap();
 
     // List content networks
     let networks = service.list_content_networks().await.unwrap();
@@ -270,7 +294,7 @@ async fn test_handle_sync_event() {
     };
 
     // Handle the sync event
-    let outcome = service.handle_sync_event(&event).await.unwrap();
+    let outcome = service.handle_sync_event(&event, None).await.unwrap();
     assert_eq!(
         outcome,
         monas_state_node::application_service::state_node_service::ApplyOutcome::Applied
@@ -286,20 +310,23 @@ async fn test_handle_sync_event() {
 async fn test_handle_content_created_sync() {
     let (service, _crdt_repo, _temp_dir) = create_test_service().await;
 
-    // Create a ContentCreated event from another node
+    // Create a ContentCreated event from another node, including local node as member
+    let local_node_id = service.local_node_id().to_string();
     let event = Event::ContentCreated {
         content_id: "external-content-1".to_string(),
         creator_node_id: "external-node".to_string(),
         content_size: 1024,
-        member_nodes: vec!["node-a".to_string(), "node-b".to_string()],
+        member_nodes: vec![local_node_id, "node-b".to_string()],
         timestamp: 12345,
     };
 
     // Handle the sync event
-    let outcome = service.handle_sync_event(&event).await.unwrap();
+    let outcome = service.handle_sync_event(&event, None).await.unwrap();
     assert_eq!(
         outcome,
-        monas_state_node::application_service::state_node_service::ApplyOutcome::Applied
+        monas_state_node::application_service::state_node_service::ApplyOutcome::NeedsSync {
+            content_id: "external-content-1".to_string()
+        }
     );
 
     // Verify the content network was created
@@ -317,7 +344,10 @@ async fn test_crdt_create_and_get_content() {
 
     // Create content directly in CRDT repository
     let data = b"Test CRDT content";
-    let result = crdt_repo.create_content(data, "test-author").await.unwrap();
+    let result = crdt_repo
+        .create_content(data, "test-author", None)
+        .await
+        .unwrap();
 
     assert!(result.is_new);
     assert!(!result.genesis_cid.is_empty());
@@ -334,14 +364,14 @@ async fn test_crdt_update_content() {
     // Create initial content
     let initial_data = b"Initial content";
     let result = crdt_repo
-        .create_content(initial_data, "author1")
+        .create_content(initial_data, "author1", None)
         .await
         .unwrap();
 
     // Update the content
     let updated_data = b"Updated content";
     let update_result = crdt_repo
-        .update_content(&result.genesis_cid, updated_data, "author1")
+        .update_content(&result.genesis_cid, updated_data, "author1", None)
         .await
         .unwrap();
 
@@ -359,7 +389,10 @@ async fn test_crdt_version_history() {
 
     // Create content
     let data1 = b"Version 1";
-    let result = crdt_repo.create_content(data1, "author").await.unwrap();
+    let result = crdt_repo
+        .create_content(data1, "author", None)
+        .await
+        .unwrap();
 
     // Small delay to ensure different timestamps
     tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
@@ -367,7 +400,7 @@ async fn test_crdt_version_history() {
     // Update content
     let data2 = b"Version 2";
     crdt_repo
-        .update_content(&result.genesis_cid, data2, "author")
+        .update_content(&result.genesis_cid, data2, "author", None)
         .await
         .unwrap();
 
@@ -382,7 +415,10 @@ async fn test_crdt_get_operations() {
 
     // Create content
     let data = b"Test content";
-    let result = crdt_repo.create_content(data, "author").await.unwrap();
+    let result = crdt_repo
+        .create_content(data, "author", None)
+        .await
+        .unwrap();
 
     // Get operations
     let operations = crdt_repo
@@ -404,7 +440,7 @@ async fn test_crdt_apply_operations() {
 
     // Create content in repo1
     let data = b"Shared content";
-    let result = repo1.create_content(data, "node1").await.unwrap();
+    let result = repo1.create_content(data, "node1", None).await.unwrap();
 
     // Get operations from repo1
     let operations = repo1
@@ -427,14 +463,17 @@ async fn test_crdt_since_version_filtering() {
 
     // Create content with multiple versions
     let data1 = b"Version 1";
-    let result = crdt_repo.create_content(data1, "author").await.unwrap();
+    let result = crdt_repo
+        .create_content(data1, "author", None)
+        .await
+        .unwrap();
     let first_version = result.version_cid.clone();
 
     tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
     let data2 = b"Version 2";
     crdt_repo
-        .update_content(&result.genesis_cid, data2, "author")
+        .update_content(&result.genesis_cid, data2, "author", None)
         .await
         .unwrap();
 
@@ -442,7 +481,7 @@ async fn test_crdt_since_version_filtering() {
 
     let data3 = b"Version 3";
     crdt_repo
-        .update_content(&result.genesis_cid, data3, "author")
+        .update_content(&result.genesis_cid, data3, "author", None)
         .await
         .unwrap();
 
@@ -565,6 +604,7 @@ async fn test_access_control_update_and_verify() {
             &update,
             Some(&test_token()),
             Some(&test_request_signature()),
+            None,
         )
         .await
         .unwrap();
@@ -615,6 +655,7 @@ async fn test_access_control_update_missing_signature() {
             &update,
             Some(&test_token()),
             Some(&test_request_signature()),
+            None,
         )
         .await;
     assert!(result.is_err());
@@ -631,7 +672,7 @@ mod auth_token_tests {
     use p256::ecdsa::signature::DigestSigner;
     use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
     use p256::elliptic_curve::rand_core::OsRng;
-    use sha3::{Digest, Keccak256};
+    use sha2::{Digest, Sha256};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn generate_test_keypair() -> (SigningKey, Vec<u8>) {
@@ -681,7 +722,7 @@ mod auth_token_tests {
         let signing_input = format!("{}.{}", header_b64, payload_b64);
 
         let (signature, _): (Signature, _) =
-            signing_key.sign_digest(Keccak256::new_with_prefix(signing_input.as_bytes()));
+            signing_key.sign_digest(Sha256::new_with_prefix(signing_input.as_bytes()));
         let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_vec());
 
         format!("{}.{}", signing_input, sig_b64)
@@ -733,7 +774,7 @@ mod auth_token_tests {
         let signing_input = format!("{}.{}", header_b64, payload_b64);
 
         let (signature, _): (Signature, _) =
-            signing_key.sign_digest(Keccak256::new_with_prefix(signing_input.as_bytes()));
+            signing_key.sign_digest(Sha256::new_with_prefix(signing_input.as_bytes()));
         let sig_b64 = URL_SAFE_NO_PAD.encode(signature.to_vec());
 
         format!("{}.{}", signing_input, sig_b64)
@@ -765,7 +806,7 @@ mod auth_token_tests {
         let result = AuthTokenVerifier::verify(
             &jwt,
             &owner_pk,
-            Some(&KeyId::new(recipient_pk.clone())),
+            &KeyId::new(recipient_pk.clone()),
             content_id,
             CapabilityAction::Read,
             None,
@@ -806,7 +847,7 @@ mod auth_token_tests {
         let result = AuthTokenVerifier::verify(
             &jwt,
             &owner_pk,
-            None,
+            &KeyId::new(recipient_pk.clone()),
             content_id,
             CapabilityAction::Read,
             Some(&access_control),
@@ -838,7 +879,14 @@ mod auth_token_tests {
 
         // Verify all owner actions are granted
         for action in CapabilityAction::owner_actions() {
-            let result = AuthTokenVerifier::verify(&jwt, &owner_pk, None, content_id, action, None);
+            let result = AuthTokenVerifier::verify(
+                &jwt,
+                &owner_pk,
+                &KeyId::new(recipient_pk.clone()),
+                content_id,
+                action,
+                None,
+            );
             assert!(result.is_ok(), "Owner should have {:?} capability", action);
         }
     }
@@ -868,7 +916,7 @@ mod auth_token_tests {
         let read_result = AuthTokenVerifier::verify(
             &jwt,
             &owner_pk,
-            None,
+            &KeyId::new(recipient_pk.clone()),
             content_id,
             CapabilityAction::Read,
             None,
@@ -878,7 +926,7 @@ mod auth_token_tests {
         let write_result = AuthTokenVerifier::verify(
             &jwt,
             &owner_pk,
-            None,
+            &KeyId::new(recipient_pk.clone()),
             content_id,
             CapabilityAction::Write,
             None,
@@ -889,7 +937,7 @@ mod auth_token_tests {
         let delete_result = AuthTokenVerifier::verify(
             &jwt,
             &owner_pk,
-            None,
+            &KeyId::new(recipient_pk.clone()),
             content_id,
             CapabilityAction::Delete,
             None,
@@ -925,7 +973,7 @@ mod auth_token_tests {
         let read_result = AuthTokenVerifier::verify(
             &jwt,
             &owner_pk,
-            None,
+            &KeyId::new(recipient_pk.clone()),
             content_id,
             CapabilityAction::Read,
             None,
@@ -936,7 +984,7 @@ mod auth_token_tests {
         let write_result = AuthTokenVerifier::verify(
             &jwt,
             &owner_pk,
-            None,
+            &KeyId::new(recipient_pk.clone()),
             content_id,
             CapabilityAction::Write,
             None,
@@ -972,7 +1020,7 @@ mod auth_token_tests {
         let result = AuthTokenVerifier::verify(
             &jwt,
             &owner_pk,
-            None,
+            &KeyId::new(recipient_pk.clone()),
             content_id,
             CapabilityAction::Reencrypt,
             None,
@@ -983,7 +1031,7 @@ mod auth_token_tests {
         let read_result = AuthTokenVerifier::verify(
             &jwt,
             &owner_pk,
-            None,
+            &KeyId::new(recipient_pk.clone()),
             content_id,
             CapabilityAction::Read,
             None,
@@ -1010,7 +1058,7 @@ async fn test_create_content_requires_authentication() {
 
     // Without token - should fail
     let result = service
-        .create_content(data, None, Some(&test_request_signature()))
+        .create_content(data, None, Some(&test_request_signature()), None)
         .await;
     assert!(result.is_err());
     assert!(result
@@ -1020,7 +1068,7 @@ async fn test_create_content_requires_authentication() {
 
     // Without signature - should fail
     let result = service
-        .create_content(data, Some(&test_token()), None)
+        .create_content(data, Some(&test_token()), None, None)
         .await;
     assert!(result.is_err());
     assert!(result
@@ -1040,7 +1088,13 @@ async fn test_update_content_requires_authentication() {
 
     // Without token - should fail
     let result = service
-        .update_content(content_id, data, None, Some(&test_request_signature()))
+        .update_content(
+            content_id,
+            data,
+            None,
+            Some(&test_request_signature()),
+            None,
+        )
         .await;
     assert!(result.is_err());
     assert!(result
@@ -1050,7 +1104,7 @@ async fn test_update_content_requires_authentication() {
 
     // Without signature - should fail
     let result = service
-        .update_content(content_id, data, Some(&test_token()), None)
+        .update_content(content_id, data, Some(&test_token()), None, None)
         .await;
     assert!(result.is_err());
     assert!(result
@@ -1069,7 +1123,7 @@ async fn test_delete_content_requires_authentication() {
 
     // Without token - should fail
     let result = service
-        .delete_content(content_id, None, Some(&test_request_signature()))
+        .delete_content(content_id, None, Some(&test_request_signature()), None)
         .await;
     assert!(result.is_err());
     assert!(result
@@ -1079,7 +1133,7 @@ async fn test_delete_content_requires_authentication() {
 
     // Without signature - should fail
     let result = service
-        .delete_content(content_id, Some(&test_token()), None)
+        .delete_content(content_id, Some(&test_token()), None, None)
         .await;
     assert!(result.is_err());
     assert!(result
@@ -1098,7 +1152,7 @@ async fn test_add_member_to_content_requires_authentication() {
 
     // Without token - should fail
     let result = service
-        .add_member_to_content(content_id, 1, None, Some(&test_request_signature()))
+        .add_member_to_content(content_id, 1, None, Some(&test_request_signature()), None)
         .await;
     assert!(result.is_err());
     assert!(result
@@ -1108,7 +1162,7 @@ async fn test_add_member_to_content_requires_authentication() {
 
     // Without signature - should fail
     let result = service
-        .add_member_to_content(content_id, 1, Some(&test_token()), None)
+        .add_member_to_content(content_id, 1, Some(&test_token()), None, None)
         .await;
     assert!(result.is_err());
     assert!(result
@@ -1131,13 +1185,13 @@ async fn test_update_access_control_requires_authentication() {
 
     // Without token - should fail
     let result = service
-        .update_access_control(&update, None, Some(&test_request_signature()))
+        .update_access_control(&update, None, Some(&test_request_signature()), None)
         .await;
     assert!(result.is_err());
 
     // Without signature - should fail
     let result = service
-        .update_access_control(&update, Some(&test_token()), None)
+        .update_access_control(&update, Some(&test_token()), None, None)
         .await;
     assert!(result.is_err());
 }
@@ -1212,13 +1266,24 @@ async fn test_authorization_denied_prevents_create_content() {
 
     let data = b"Test data";
 
-    // With valid token and signature but authorization denied
+    // create_content skips authorization for new content (no policy yet),
+    // so it will fail at the peer selection step instead.
+    // The authenticated user becomes the owner with full permissions.
     let result = service
-        .create_content(data, Some(&test_token()), Some(&test_request_signature()))
+        .create_content(
+            data,
+            Some(&test_token()),
+            Some(&test_request_signature()),
+            None,
+        )
         .await;
 
+    // Should fail because no peers are available (not authorization)
     assert!(result.is_err());
-    assert!(result.unwrap_err().to_string().contains("Authorization"));
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("No available member nodes found"));
 }
 
 #[tokio::test]
@@ -1279,6 +1344,7 @@ async fn test_access_control_update_signature_verification() {
             &update,
             Some(&test_token()),
             Some(&test_request_signature()),
+            None,
         )
         .await;
 

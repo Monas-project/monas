@@ -13,19 +13,16 @@ use crate::domain::state_node::{self, NodeSnapshot};
 use crate::domain::value_objects::ContentId;
 use crate::infrastructure::crypto::verify_p256_signature;
 use crate::infrastructure::placement::compute_dht_key;
-use crate::port::auth_token::AuthToken;
+use crate::port::auth_token::{AuthToken, RequestMetadata};
 use crate::port::authentication_service::AuthenticationService;
 use crate::port::authorization_service::{AuthorizationRequest, AuthorizationService};
 use crate::port::content_repository::ContentRepository;
 use crate::port::event_publisher::EventPublisher;
 use crate::port::peer_network::PeerNetwork;
 use crate::port::persistence::{
-    PersistentAccessControlRepository, PersistentAccessPolicyRepository,
-    PersistentContentRepository, PersistentNodeRegistry,
+    PersistentAccessControlRepository, PersistentContentRepository, PersistentNodeRegistry,
 };
 use anyhow::Result;
-use cid::Cid;
-use multihash_codetable::{Code, MultihashDigest};
 use std::sync::Arc;
 
 /// Result of applying an event.
@@ -47,6 +44,8 @@ pub struct ServiceConfig {
     pub min_replication_factor: usize,
     /// Capacity threshold in bytes below which a node is considered low on storage.
     pub capacity_threshold_bytes: u64,
+    /// Maximum number of members to add in a single add_member_to_content call.
+    pub max_add_member_count: usize,
 }
 
 impl Default for ServiceConfig {
@@ -54,6 +53,7 @@ impl Default for ServiceConfig {
         Self {
             min_replication_factor: 3,
             capacity_threshold_bytes: 1_073_741_824, // 1GB
+            max_add_member_count: 10,
         }
     }
 }
@@ -85,13 +85,13 @@ where
     auth_service: Option<Arc<dyn AuthenticationService>>,
     /// Authorization service for capability-based authorization
     authz_service: Option<Arc<dyn AuthorizationService>>,
-    /// Access policy repository for managing content permissions
-    access_policy_repo: Option<Arc<tokio::sync::RwLock<dyn PersistentAccessPolicyRepository>>>,
     local_node_id: String,
     /// Minimum number of member nodes for redundancy.
     min_replication_factor: usize,
     /// Capacity threshold in bytes below which a node is considered low on storage.
     capacity_threshold_bytes: u64,
+    /// Maximum number of members to add in a single add_member_to_content call.
+    max_add_member_count: usize,
 }
 
 /// No-op access control repository for backward compatibility.
@@ -125,12 +125,6 @@ where
     R: ContentRepository,
     A: PersistentAccessControlRepository,
 {
-    fn compute_content_id(data: &[u8]) -> Result<String, StateNodeError> {
-        let mh = Code::Sha2_256.digest(data);
-        let cid = Cid::new_v1(0x55, mh);
-        Ok(cid.to_string())
-    }
-
     /// Create a new StateNodeService.
     ///
     /// The `peer_network` is passed as an `Arc` to allow sharing with other components
@@ -174,10 +168,10 @@ where
             access_control_repo: None,
             auth_service: None,
             authz_service: None,
-            access_policy_repo: None,
             local_node_id,
             min_replication_factor: config.min_replication_factor,
             capacity_threshold_bytes: config.capacity_threshold_bytes,
+            max_add_member_count: config.max_add_member_count,
         }
     }
 
@@ -211,27 +205,207 @@ where
         self
     }
 
-    /// Set the access policy repository (builder pattern).
-    ///
-    /// This method allows adding access policy management after construction.
-    /// Accepts an already-wrapped Arc<RwLock<>> to allow sharing the same instance
-    /// with other components (e.g., UcanAdapter).
-    pub fn with_access_policy_repo(
-        mut self,
-        access_policy_repo: Arc<tokio::sync::RwLock<dyn PersistentAccessPolicyRepository>>,
-    ) -> Self {
-        self.access_policy_repo = Some(access_policy_repo);
-        self
-    }
-
     /// Get the CRDT repository.
     pub fn crdt_repo(&self) -> &Arc<R> {
         &self.crdt_repo
     }
 
+    /// Get the authorization service (if configured).
+    pub fn authz_service(&self) -> Option<&Arc<dyn AuthorizationService>> {
+        self.authz_service.as_ref()
+    }
+
+    /// Get the peer network.
+    pub fn peer_network(&self) -> &Arc<P> {
+        &self.peer_network
+    }
+
+    /// Authenticate a caller for read operations.
+    ///
+    /// Returns the authenticated identity on success.
+    pub async fn authenticate_for_read(
+        &self,
+        token: &AuthToken,
+        request_signature: Option<&[u8]>,
+        timestamp: Option<u64>,
+    ) -> Result<Identity, StateNodeError> {
+        let auth_service = self.auth_service.as_ref().ok_or_else(|| {
+            StateNodeError::InvalidConfiguration("Authentication not configured".to_string())
+        })?;
+
+        let identity = auth_service
+            .authenticate(token, None)
+            .await
+            .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))?;
+
+        // Verify caller signature:
+        // - JWT tokens: verify JWT's own P-256 signature
+        // - type:id tokens: verify request signature (mandatory)
+        let sig = if token.as_str().contains('.') {
+            // JWT: signature is inside the token itself, pass empty slice
+            &[] as &[u8]
+        } else {
+            request_signature.ok_or_else(|| {
+                StateNodeError::AuthenticationFailed(
+                    "Request signature is required for non-JWT tokens".to_string(),
+                )
+            })?
+        };
+        self.verify_caller_signature(
+            auth_service.as_ref(),
+            token,
+            sig,
+            "read",
+            "content",
+            timestamp,
+            None,
+        )
+        .await?;
+
+        Ok(identity)
+    }
+
+    /// Verify the caller's request signature.
+    ///
+    /// For JWT tokens (containing `.`), verifies the JWT's own P-256 signature
+    /// via `AuthenticationService::verify_jwt_signature`. JWT tokens contain
+    /// operation/resource/timestamp in their payload, so no separate request
+    /// body signature is needed.
+    ///
+    /// For `type:id` tokens (e.g., `user:alice`), constructs a signing message
+    /// and delegates to `AuthenticationService::verify_request_signature`:
+    /// - If `request_body` is `Some(body)`: signs `hex(sha256(body + timestamp_be_bytes))`
+    /// - If `request_body` is `None`: signs `{operation}:{resource}:{timestamp}`
+    #[allow(clippy::too_many_arguments)]
+    async fn verify_caller_signature(
+        &self,
+        auth_service: &dyn AuthenticationService,
+        token: &AuthToken,
+        signature: &[u8],
+        operation: &str,
+        resource: &str,
+        timestamp: Option<u64>,
+        request_body: Option<&[u8]>,
+    ) -> Result<(), StateNodeError> {
+        // JWT tokens: verify the JWT's own signature
+        if token.as_str().contains('.') {
+            return auth_service.verify_jwt_signature(token).await.map_err(|e| {
+                StateNodeError::AuthenticationFailed(format!(
+                    "JWT signature verification failed: {}",
+                    e
+                ))
+            });
+        }
+
+        // non-JWT tokens: verify request signature
+        let ts = timestamp.unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        });
+
+        let message = if let Some(body) = request_body {
+            // Body-based signing: hex(sha256(body + timestamp_be_bytes))
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(body);
+            hasher.update(ts.to_be_bytes());
+            hex::encode(hasher.finalize())
+        } else {
+            // Metadata-based signing: {operation}:{resource}:{timestamp}
+            let metadata = RequestMetadata {
+                timestamp: ts,
+                operation: operation.to_string(),
+                resource: resource.to_string(),
+            };
+            metadata.signing_message()
+        };
+
+        auth_service
+            .verify_request_signature(token, signature, &message, timestamp)
+            .await
+            .map_err(|e| {
+                StateNodeError::AuthenticationFailed(format!(
+                    "Signature verification failed: {}",
+                    e
+                ))
+            })
+    }
+
     /// Get the local node ID.
     pub fn local_node_id(&self) -> &str {
         &self.local_node_id
+    }
+
+    /// Get the addresses this node is listening on.
+    pub async fn listen_addrs(&self) -> Vec<String> {
+        self.peer_network.listen_addrs().await
+    }
+
+    /// Classify a relay error message into the appropriate StateNodeError.
+    ///
+    /// When a member node returns an error during relay, the error message is
+    /// wrapped in P2P protocol layers. This method parses the message to
+    /// preserve the original error semantics (e.g., 403 vs 500).
+    fn classify_relay_error(message: String) -> StateNodeError {
+        if message.contains("Authorization failed") {
+            StateNodeError::AuthorizationFailed(message)
+        } else if message.contains("Authentication failed") {
+            StateNodeError::AuthenticationFailed(message)
+        } else {
+            StateNodeError::NetworkError(NetworkError::ConnectionFailed(message))
+        }
+    }
+
+    /// Relay an operation to member nodes with failover.
+    ///
+    /// Tries each member in order. Returns on the first success.
+    /// If all members fail, returns `NoAvailableMembers`.
+    /// Authorization errors (e.g. 403) are returned immediately without failover,
+    /// since they indicate a real permission problem rather than a connectivity issue.
+    async fn relay_with_failover<F, Fut>(
+        &self,
+        members: &[String],
+        operation_name: &str,
+        relay_fn: F,
+    ) -> Result<(), StateNodeError>
+    where
+        F: Fn(String) -> Fut,
+        Fut: std::future::Future<Output = Result<bool, anyhow::Error>>,
+    {
+        for (i, member) in members.iter().enumerate() {
+            match relay_fn(member.clone()).await {
+                Ok(true) => return Ok(()),
+                Ok(false) => {
+                    tracing::warn!(
+                        "Relay {} returned false on member {} ({}/{})",
+                        operation_name,
+                        member,
+                        i + 1,
+                        members.len()
+                    );
+                }
+                Err(e) => {
+                    let err_msg = e.to_string();
+                    // Don't failover on auth errors — they'll fail on every member
+                    if err_msg.contains("Authorization failed")
+                        || err_msg.contains("Authentication failed")
+                    {
+                        return Err(Self::classify_relay_error(err_msg));
+                    }
+                    tracing::warn!(
+                        "Relay {} failed on member {} ({}/{}): {}",
+                        operation_name,
+                        member,
+                        i + 1,
+                        members.len(),
+                        err_msg
+                    );
+                }
+            }
+        }
+        Err(StateNodeError::NoAvailableMembers)
     }
 
     /// Register a new node.
@@ -274,6 +448,7 @@ where
         data: &[u8],
         token: Option<&AuthToken>,
         request_signature: Option<&[u8]>,
+        timestamp: Option<u64>,
     ) -> Result<Event, StateNodeError> {
         let token = token.ok_or_else(|| {
             StateNodeError::AuthenticationFailed("Authentication token is required".to_string())
@@ -284,9 +459,6 @@ where
         let auth_service = self.auth_service.as_ref().ok_or_else(|| {
             StateNodeError::InvalidConfiguration("Authentication not configured".to_string())
         })?;
-        let authz_service = self.authz_service.as_ref().ok_or_else(|| {
-            StateNodeError::InvalidConfiguration("Authorization not configured".to_string())
-        })?;
 
         // 1. Authenticate caller
         let owner_identity = auth_service
@@ -294,33 +466,26 @@ where
             .await
             .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))?;
 
-        // 2. Authorize creation for derived content ID
-        let content_id = Self::compute_content_id(data)?;
-        let content_id_vo = ContentId::new(content_id.clone())?;
-        let authz_request = AuthorizationRequest {
-            identity: owner_identity.clone(),
-            resource: content_id_vo,
-            capability: AuthCapability::WriteContent,
-            token: Some(token.clone()),
-            request_signature: Some(request_signature.to_vec()),
-        };
-        let authz_result = authz_service
-            .authorize(&authz_request)
-            .await
-            .map_err(|e| StateNodeError::AuthorizationFailed(e.to_string()))?;
-        if authz_result.is_denied() {
-            return Err(StateNodeError::AuthorizationFailed(
-                authz_result
-                    .denial_reason()
-                    .unwrap_or("Access denied")
-                    .to_string(),
-            ));
-        }
+        // 1.5. Verify request signature
+        self.verify_caller_signature(
+            auth_service.as_ref(),
+            token,
+            request_signature,
+            "create",
+            "content",
+            timestamp,
+            Some(data),
+        )
+        .await?;
 
-        // 3. Save content to CRDT repository first
+        // 2. Skip authorization for content creation
+        // New content doesn't have an access policy yet, so authorization would always fail.
+        // The authenticated user becomes the owner with full permissions.
+
+        // 3. Save content to CRDT repository first (without access policy; policy is added after genesis_cid is known)
         let commit_result = self
             .crdt_repo
-            .create_content(data, &self.local_node_id)
+            .create_content(data, &self.local_node_id, None)
             .await
             .map_err(|e| StateNodeError::CrdtError(CrdtError::StorageError(e.to_string())))?;
         let content_id = commit_result.genesis_cid;
@@ -357,26 +522,7 @@ where
             return Err(StateNodeError::NoAvailableMembers);
         }
 
-        // 5. Query public keys for the selected nodes
-        let public_keys = self
-            .peer_network
-            .query_node_public_keys_batch(&selected)
-            .await
-            .map_err(|e| {
-                StateNodeError::NetworkError(NetworkError::ConnectionFailed(e.to_string()))
-            })?;
-
-        // 6. Create content network (validate public keys exist but don't store them)
-        // Verify all nodes have public keys
-        for node_id in &selected {
-            if !public_keys.contains_key(node_id) {
-                return Err(StateNodeError::Internal(format!(
-                    "No public key found for node {}",
-                    node_id
-                )));
-            }
-        }
-
+        // 5. Create content network with PeerId-based NodeIds
         let first_node = crate::domain::value_objects::NodeId::from_string(selected[0].clone())?;
         let mut network = ContentNetwork::new(
             crate::domain::value_objects::ContentId::new(content_id.clone())?,
@@ -389,23 +535,75 @@ where
             network.add_member(node_id_vo);
         }
 
-        self.content_repo
+        if let Err(e) = self
+            .content_repo
             .write()
             .await
             .save_content_network(network)
             .await
-            .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
+        {
+            // Rollback: CRDT content was created but network save failed.
+            // Log the orphaned CRDT entry for cleanup. The CRDT data is append-only
+            // so we can't delete it, but without a ContentNetwork it won't be served.
+            tracing::error!(
+                "Failed to save content network for {}, CRDT entry orphaned: {}",
+                content_id,
+                e
+            );
+            return Err(StateNodeError::StorageError(e.to_string()));
+        }
 
-        // 7. Create access policy for authenticated owner
-        if let Some(policy_repo) = &self.access_policy_repo {
+        // 7. Create access policy for authenticated owner and embed in CRDT
+        if let Err(e) = async {
             let content_id_vo = ContentId::new(content_id.clone())?;
             let policy = AccessPolicy::new(content_id_vo, owner_identity);
-            policy_repo
+            self.crdt_repo
+                .update_access_policy(&content_id, policy, &self.local_node_id)
+                .await
+                .map_err(|e| StateNodeError::CrdtError(CrdtError::StorageError(e.to_string())))
+        }
+        .await
+        {
+            // Rollback: remove the content network since access policy failed
+            if let Err(cleanup_err) = self
+                .content_repo
                 .write()
                 .await
-                .save_policy(&policy)
+                .delete_content_network(&content_id)
                 .await
-                .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
+            {
+                tracing::error!(
+                    "Failed to rollback content network for {}: {}",
+                    content_id,
+                    cleanup_err
+                );
+            }
+            return Err(e);
+        }
+
+        // 7.5. Push CRDT operations (including AccessPolicy) to member nodes
+        // This ensures members have the data before the Gossipsub event triggers relay requests
+        {
+            let operations = self
+                .crdt_repo
+                .get_operations(&content_id, None)
+                .await
+                .map_err(|e| StateNodeError::CrdtError(CrdtError::StorageError(e.to_string())))?;
+
+            if !operations.is_empty() {
+                for member_id in &selected {
+                    if let Err(e) = self
+                        .peer_network
+                        .push_operations(member_id, &content_id, &operations)
+                        .await
+                    {
+                        tracing::warn!(
+                            "Failed to push CRDT operations to member {}: {} (will rely on Gossipsub sync)",
+                            member_id, e
+                        );
+                    }
+                }
+            }
         }
 
         // 8. Create and publish event both locally and to the network
@@ -430,35 +628,29 @@ where
     /// Delete content.
     ///
     /// This method:
-    /// 1. Verifies the content network exists and local node is a member
-    /// 2. Checks authorization if authentication is configured
-    /// 3. Removes the ContentNetwork (access control)
-    /// 4. Publishes ContentDeleted event for offline node notification
+    /// 1. Verifies the content network exists
+    /// 2. If local node is a member: authenticates, authorizes, and deletes locally
+    /// 3. If not a member: relays to a member node (authorization delegated to member)
     ///
     /// Note: The CRDT history and CID are preserved for:
     /// - Offline nodes to receive deletion notification via event
     /// - Historical record keeping
     ///
     /// The caller must provide an authentication token and request signature.
-    /// The state node authenticates with monas-account and authorizes via UCAN
-    /// before deleting content.
+    /// Non-member nodes delegate authorization to the member node via relay,
+    /// since access policy updates are only stored on member nodes.
     pub async fn delete_content(
         &self,
         content_id: &str,
         token: Option<&AuthToken>,
         request_signature: Option<&[u8]>,
+        timestamp: Option<u64>,
     ) -> Result<Event, StateNodeError> {
         let token = token.ok_or_else(|| {
             StateNodeError::AuthenticationFailed("Authentication token is required".to_string())
         })?;
         let request_signature = request_signature.ok_or_else(|| {
             StateNodeError::AuthenticationFailed("Request signature is required".to_string())
-        })?;
-        let auth_service = self.auth_service.as_ref().ok_or_else(|| {
-            StateNodeError::InvalidConfiguration("Authentication not configured".to_string())
-        })?;
-        let authz_service = self.authz_service.as_ref().ok_or_else(|| {
-            StateNodeError::InvalidConfiguration("Authorization not configured".to_string())
         })?;
 
         // 1. Verify content network exists
@@ -472,75 +664,108 @@ where
             .map_err(|e| StateNodeError::StorageError(e.to_string()))?
             .ok_or_else(|| StateNodeError::ContentNotFound(content_id_vo.clone()))?;
 
-        // 2. Authenticate and authorize
-        let identity = auth_service
-            .authenticate(token, None)
-            .await
-            .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))?;
-
-        let authz_request = AuthorizationRequest {
-            identity,
-            resource: content_id_vo.clone(),
-            capability: AuthCapability::DeleteContent,
-            token: Some(token.clone()),
-            request_signature: Some(request_signature.to_vec()),
-        };
-
-        let authz_result = authz_service
-            .authorize(&authz_request)
-            .await
-            .map_err(|e| StateNodeError::AuthorizationFailed(e.to_string()))?;
-
-        if authz_result.is_denied() {
-            return Err(StateNodeError::AuthorizationFailed(
-                authz_result
-                    .denial_reason()
-                    .unwrap_or("Access denied")
-                    .to_string(),
-            ));
-        }
-
-        // 3. Verify local node is a member (only members can delete)
-        if !network.has_member_str(&self.local_node_id) {
-            return Err(StateNodeError::NotAMember {
-                node_id: self.local_node_id.clone(),
-                content_id: content_id_vo,
-            });
-        }
-
-        // 4. Delete the ContentNetwork
-        self.content_repo
-            .write()
-            .await
-            .delete_content_network(content_id)
-            .await
-            .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
-
-        // 5. Delete the AccessPolicy if it exists
-        if let Some(policy_repo) = &self.access_policy_repo {
-            policy_repo
-                .write()
-                .await
-                .delete_policy(content_id)
-                .await
-                .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
-        }
-
-        // 6. Create and publish ContentDeleted event
-        let event = Event::ContentDeleted {
-            content_id: content_id.to_string(),
-            deleted_by_node_id: self.local_node_id.clone(),
-            timestamp: current_timestamp(),
-        };
-
-        self.event_publisher
-            .publish_all(&event)
-            .await
-            .map_err(|e| {
-                StateNodeError::NetworkError(NetworkError::ProtocolError(e.to_string()))
+        // 2. Check if local node is a member
+        if network.has_member_str(&self.local_node_id) {
+            // Local delete path: we are a member node
+            // Authenticate and authorize locally (we have the up-to-date access policy)
+            let auth_service = self.auth_service.as_ref().ok_or_else(|| {
+                StateNodeError::InvalidConfiguration("Authentication not configured".to_string())
+            })?;
+            let authz_service = self.authz_service.as_ref().ok_or_else(|| {
+                StateNodeError::InvalidConfiguration("Authorization not configured".to_string())
             })?;
 
-        Ok(event)
+            let identity = auth_service
+                .authenticate(token, None)
+                .await
+                .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))?;
+
+            // Verify request signature
+            self.verify_caller_signature(
+                auth_service.as_ref(),
+                token,
+                request_signature,
+                "delete",
+                content_id,
+                timestamp,
+                None,
+            )
+            .await?;
+
+            let authz_request = AuthorizationRequest {
+                identity,
+                resource: content_id_vo.clone(),
+                capability: AuthCapability::DeleteContent,
+                token: Some(token.clone()),
+                request_signature: Some(request_signature.to_vec()),
+            };
+
+            let authz_result = authz_service
+                .authorize(&authz_request)
+                .await
+                .map_err(|e| StateNodeError::AuthorizationFailed(e.to_string()))?;
+
+            if authz_result.is_denied() {
+                return Err(StateNodeError::AuthorizationFailed(
+                    authz_result
+                        .denial_reason()
+                        .unwrap_or("Access denied")
+                        .to_string(),
+                ));
+            }
+
+            // 3. Delete the ContentNetwork
+            self.content_repo
+                .write()
+                .await
+                .delete_content_network(content_id)
+                .await
+                .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
+
+            // 4. Create and publish ContentDeleted event
+            let event = Event::ContentDeleted {
+                content_id: content_id.to_string(),
+                deleted_by_node_id: self.local_node_id.clone(),
+                timestamp: current_timestamp(),
+            };
+
+            self.event_publisher
+                .publish_all(&event)
+                .await
+                .map_err(|e| {
+                    StateNodeError::NetworkError(NetworkError::ProtocolError(e.to_string()))
+                })?;
+
+            Ok(event)
+        } else {
+            // Relay path: we are not a member, relay to a member node with failover.
+            let members = network.member_nodes_as_strings();
+            if members.is_empty() {
+                return Err(StateNodeError::NoAvailableMembers);
+            }
+
+            let token_str = token.as_str().to_string();
+            let content_id_owned = content_id.to_string();
+            let request_sig = request_signature.to_vec();
+            self.relay_with_failover(&members, "delete", |member| {
+                let peer_network = self.peer_network.clone();
+                let cid = content_id_owned.clone();
+                let ts = token_str.clone();
+                let sig = request_sig.clone();
+                async move {
+                    peer_network
+                        .relay_delete_content(&member, &cid, &ts, &sig, timestamp)
+                        .await
+                }
+            })
+            .await?;
+
+            Ok(Event::ContentDeleted {
+                content_id: content_id.to_string(),
+                deleted_by_node_id: self.local_node_id.clone(),
+                timestamp: current_timestamp(),
+            })
+        }
     }
 
     /// Update existing content.
@@ -548,24 +773,22 @@ where
     /// The caller must provide an authentication token and request signature.
     /// The state node authenticates with monas-account and authorizes via UCAN
     /// before updating content.
+    ///
+    /// Non-member nodes delegate authorization to the member node via relay,
+    /// since access policy updates (e.g., invalidate_tokens) are only stored on member nodes.
     pub async fn update_content(
         &self,
         content_id: &str,
         data: &[u8],
         token: Option<&AuthToken>,
         request_signature: Option<&[u8]>,
+        timestamp: Option<u64>,
     ) -> Result<Event, StateNodeError> {
         let token = token.ok_or_else(|| {
             StateNodeError::AuthenticationFailed("Authentication token is required".to_string())
         })?;
         let request_signature = request_signature.ok_or_else(|| {
             StateNodeError::AuthenticationFailed("Request signature is required".to_string())
-        })?;
-        let auth_service = self.auth_service.as_ref().ok_or_else(|| {
-            StateNodeError::InvalidConfiguration("Authentication not configured".to_string())
-        })?;
-        let authz_service = self.authz_service.as_ref().ok_or_else(|| {
-            StateNodeError::InvalidConfiguration("Authorization not configured".to_string())
         })?;
 
         // 1. Verify content network exists
@@ -579,108 +802,151 @@ where
             .map_err(|e| StateNodeError::StorageError(e.to_string()))?
             .ok_or_else(|| StateNodeError::ContentNotFound(content_id_vo.clone()))?;
 
-        // 2. Authenticate and authorize
-        let identity = auth_service
-            .authenticate(token, None)
-            .await
-            .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))?;
-
-        let authz_request = AuthorizationRequest {
-            identity,
-            resource: content_id_vo.clone(),
-            capability: AuthCapability::WriteContent,
-            token: Some(token.clone()),
-            request_signature: Some(request_signature.to_vec()),
-        };
-
-        let authz_result = authz_service
-            .authorize(&authz_request)
-            .await
-            .map_err(|e| StateNodeError::AuthorizationFailed(e.to_string()))?;
-
-        if authz_result.is_denied() {
-            return Err(StateNodeError::AuthorizationFailed(
-                authz_result
-                    .denial_reason()
-                    .unwrap_or("Access denied")
-                    .to_string(),
-            ));
-        }
-
-        // 3. Verify local node is a member
-        if !network.has_member_str(&self.local_node_id) {
-            return Err(StateNodeError::NotAMember {
-                node_id: self.local_node_id.clone(),
-                content_id: content_id_vo,
-            });
-        }
-
-        // 4. Update content in CRDT repository
-        self.crdt_repo
-            .update_content(content_id, data, &self.local_node_id)
-            .await
-            .map_err(|e| StateNodeError::CrdtError(CrdtError::StorageError(e.to_string())))?;
-
-        // 5. Create and publish update event both locally and to the network
-        let event = Event::ContentUpdated {
-            content_id: content_id.to_string(),
-            updated_node_id: self.local_node_id.clone(),
-            timestamp: current_timestamp(),
-        };
-
-        self.event_publisher
-            .publish_all(&event)
-            .await
-            .map_err(|e| {
-                StateNodeError::NetworkError(NetworkError::ProtocolError(e.to_string()))
+        // 2. Check if local node is a member
+        if network.has_member_str(&self.local_node_id) {
+            // Local update path: we are a member node
+            // Authenticate and authorize locally (we have the up-to-date access policy)
+            let auth_service = self.auth_service.as_ref().ok_or_else(|| {
+                StateNodeError::InvalidConfiguration("Authentication not configured".to_string())
+            })?;
+            let authz_service = self.authz_service.as_ref().ok_or_else(|| {
+                StateNodeError::InvalidConfiguration("Authorization not configured".to_string())
             })?;
 
-        // 6. Check and maintain redundancy (best effort - don't fail update if this fails)
-        if let Err(e) = self.check_and_maintain_redundancy(content_id).await {
-            tracing::warn!(
-                "Failed to check/maintain redundancy for content {}: {}",
-                content_id,
-                e
-            );
-        }
+            let identity = auth_service
+                .authenticate(token, None)
+                .await
+                .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))?;
 
-        Ok(event)
+            // Verify request signature
+            self.verify_caller_signature(
+                auth_service.as_ref(),
+                token,
+                request_signature,
+                "update",
+                content_id,
+                timestamp,
+                Some(data),
+            )
+            .await?;
+
+            let authz_request = AuthorizationRequest {
+                identity,
+                resource: content_id_vo.clone(),
+                capability: AuthCapability::WriteContent,
+                token: Some(token.clone()),
+                request_signature: Some(request_signature.to_vec()),
+            };
+
+            let authz_result = authz_service
+                .authorize(&authz_request)
+                .await
+                .map_err(|e| StateNodeError::AuthorizationFailed(e.to_string()))?;
+
+            if authz_result.is_denied() {
+                return Err(StateNodeError::AuthorizationFailed(
+                    authz_result
+                        .denial_reason()
+                        .unwrap_or("Access denied")
+                        .to_string(),
+                ));
+            }
+
+            // 3. Update content in CRDT repository (access_policy: None preserves existing policy)
+            self.crdt_repo
+                .update_content(content_id, data, &self.local_node_id, None)
+                .await
+                .map_err(|e| StateNodeError::CrdtError(CrdtError::StorageError(e.to_string())))?;
+
+            // 4. Create and publish update event both locally and to the network
+            let event = Event::ContentUpdated {
+                content_id: content_id.to_string(),
+                updated_node_id: self.local_node_id.clone(),
+                timestamp: current_timestamp(),
+            };
+
+            self.event_publisher
+                .publish_all(&event)
+                .await
+                .map_err(|e| {
+                    StateNodeError::NetworkError(NetworkError::ProtocolError(e.to_string()))
+                })?;
+
+            // 5. Check and maintain redundancy (best effort - don't fail update if this fails)
+            if let Err(e) = self.check_and_maintain_redundancy(content_id).await {
+                tracing::warn!(
+                    "Failed to check/maintain redundancy for content {}: {}",
+                    content_id,
+                    e
+                );
+            }
+
+            Ok(event)
+        } else {
+            // Relay path: we are not a member, relay to a member node with failover.
+            let members = network.member_nodes_as_strings();
+            if members.is_empty() {
+                return Err(StateNodeError::NoAvailableMembers);
+            }
+
+            let token_str = token.as_str().to_string();
+            let content_id_owned = content_id.to_string();
+            let data_owned = data.to_vec();
+            let request_sig = request_signature.to_vec();
+            self.relay_with_failover(&members, "update", |member| {
+                let peer_network = self.peer_network.clone();
+                let cid = content_id_owned.clone();
+                let d = data_owned.clone();
+                let ts = token_str.clone();
+                let sig = request_sig.clone();
+                async move {
+                    peer_network
+                        .relay_update_content(&member, &cid, &d, &ts, &sig, timestamp)
+                        .await
+                }
+            })
+            .await?;
+
+            Ok(Event::ContentUpdated {
+                content_id: content_id.to_string(),
+                updated_node_id: self.local_node_id.clone(),
+                timestamp: current_timestamp(),
+            })
+        }
     }
 
-    /// Grant access capabilities to an identity for a content.
+    /// Invalidate all AuthTokens for a content by updating min_valid_issued_at.
     ///
-    /// This method allows the owner of content to share access with other identities.
-    /// Only the owner can grant access.
+    /// This method allows the owner of content to invalidate all previously issued
+    /// AuthTokens. After invalidation, only tokens issued after the new timestamp
+    /// will be accepted.
     ///
     /// # Arguments
     ///
-    /// * `content_id` - The content to grant access to
-    /// * `grantee_identity` - The identity to grant access to
-    /// * `capabilities` - The capabilities to grant
+    /// * `content_id` - The content to invalidate tokens for
     /// * `token` - Authentication token of the caller (must be owner)
+    /// * `request_signature` - Optional request signature
+    ///
+    /// # Returns
+    ///
+    /// The new min_valid_issued_at timestamp on success.
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - Authentication fails
     /// - Caller is not the owner of the content
-    /// - Access policy repository is not configured
-    pub async fn grant_access(
+    /// - Content not found
+    pub async fn invalidate_tokens(
         &self,
         content_id: &str,
-        grantee_identity: Identity,
-        capabilities: Vec<AuthCapability>,
         token: &AuthToken,
-    ) -> Result<(), StateNodeError> {
+        request_signature: Option<&[u8]>,
+        timestamp: Option<u64>,
+    ) -> Result<u64, StateNodeError> {
         // 1. Ensure auth services are configured
         let auth_service = self.auth_service.as_ref().ok_or_else(|| {
             StateNodeError::InvalidConfiguration("Authentication not configured".to_string())
-        })?;
-
-        let policy_repo = self.access_policy_repo.as_ref().ok_or_else(|| {
-            StateNodeError::InvalidConfiguration(
-                "Access policy repository not configured".to_string(),
-            )
         })?;
 
         // 2. Authenticate caller
@@ -689,37 +955,146 @@ where
             .await
             .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))?;
 
-        // 3. Get access policy
+        // 2.5. Verify request signature (mandatory)
+        // JWT tokens: signature is inside the token itself, pass empty slice
+        // type:id tokens: require request signature
+        let sig = if token.as_str().contains('.') {
+            &[] as &[u8]
+        } else {
+            request_signature.ok_or_else(|| {
+                StateNodeError::AuthenticationFailed(
+                    "Request signature is required for non-JWT tokens".to_string(),
+                )
+            })?
+        };
+        self.verify_caller_signature(
+            auth_service.as_ref(),
+            token,
+            sig,
+            "invalidate",
+            content_id,
+            timestamp,
+            None,
+        )
+        .await?;
+
+        // 3. Check if this node is a member
         let content_id_vo = ContentId::new(content_id.to_string())?;
-        let mut policy = policy_repo
+        let network = self
+            .content_repo
             .read()
             .await
-            .get_policy(content_id)
+            .get_content_network(content_id)
             .await
             .map_err(|e| StateNodeError::StorageError(e.to_string()))?
             .ok_or_else(|| StateNodeError::ContentNotFound(content_id_vo.clone()))?;
 
-        // 4. Verify caller is owner
-        if !policy.is_owner(&caller_identity) {
-            return Err(StateNodeError::AuthorizationFailed(
-                "Only the owner can grant access".to_string(),
-            ));
+        if network.has_member_str(&self.local_node_id) {
+            // Local path: we are a member node
+            // 4. Get access policy from CRDT
+            let mut policy = self
+                .crdt_repo
+                .get_access_policy(content_id)
+                .await
+                .map_err(|e| StateNodeError::StorageError(e.to_string()))?
+                .ok_or_else(|| StateNodeError::ContentNotFound(content_id_vo.clone()))?;
+
+            // 5. Verify caller is owner
+            if !policy.is_owner(&caller_identity) {
+                return Err(StateNodeError::AuthorizationFailed(
+                    "Only the owner can invalidate tokens".to_string(),
+                ));
+            }
+
+            // 6. Invalidate tokens
+            let new_min = policy.invalidate_tokens();
+
+            // 7. Save updated policy via CRDT
+            self.crdt_repo
+                .update_access_policy(content_id, policy, &self.local_node_id)
+                .await
+                .map_err(|e| StateNodeError::CrdtError(CrdtError::StorageError(e.to_string())))?;
+
+            // 8. Sync to SledAccessControlRepository if available
+            //    Use transient lock pattern: acquire → read → release → modify → re-acquire → write
+            if let Some(access_control_repo) = &self.access_control_repo {
+                let mut ac = {
+                    let ac_repo = access_control_repo.read().await;
+                    ac_repo
+                        .get_access_control(content_id)
+                        .await
+                        .unwrap_or(None)
+                        .unwrap_or_else(|| ContentAccessControl::new(content_id.to_string()))
+                }; // lock released here
+
+                if let Err(e) = ac.invalidate_before(new_min) {
+                    tracing::warn!("Failed to sync invalidation to access control repo: {}", e);
+                } else {
+                    let ac_repo = access_control_repo.read().await;
+                    if let Err(e) = ac_repo.save_access_control(&ac).await {
+                        tracing::warn!("Failed to save access control to Sled: {}", e);
+                    }
+                }
+            }
+
+            // 9. Push CRDT operations to other member nodes
+            {
+                let operations = self
+                    .crdt_repo
+                    .get_operations(content_id, None)
+                    .await
+                    .map_err(|e| {
+                        StateNodeError::CrdtError(CrdtError::StorageError(e.to_string()))
+                    })?;
+
+                if !operations.is_empty() {
+                    let members = network.member_nodes_as_strings();
+                    for member_id in &members {
+                        if member_id == &self.local_node_id {
+                            continue;
+                        }
+                        if let Err(e) = self
+                            .peer_network
+                            .push_operations(member_id, content_id, &operations)
+                            .await
+                        {
+                            tracing::warn!(
+                                "Failed to push invalidation operations to member {}: {} (will rely on sync)",
+                                member_id, e
+                            );
+                        }
+                    }
+                }
+            }
+
+            Ok(new_min)
+        } else {
+            // Relay path: we are not a member, relay to a member node
+            let members = network.member_nodes_as_strings();
+            if members.is_empty() {
+                return Err(StateNodeError::NoAvailableMembers);
+            }
+
+            let token_str = token.as_str().to_string();
+            let content_id_owned = content_id.to_string();
+            let request_sig = request_signature.unwrap_or(&[]).to_vec();
+            self.relay_with_failover(&members, "invalidate_tokens", |member| {
+                let peer_network = self.peer_network.clone();
+                let cid = content_id_owned.clone();
+                let ts = token_str.clone();
+                let sig = request_sig.clone();
+                async move {
+                    peer_network
+                        .relay_invalidate_tokens(&member, &cid, &ts, &sig, timestamp)
+                        .await
+                }
+            })
+            .await?;
+
+            // For relay path, we don't know the exact new_min_valid_issued_at
+            // Return current timestamp as approximate value
+            Ok(crate::domain::events::current_timestamp())
         }
-
-        // 5. Grant capabilities
-        policy
-            .grant(grantee_identity, capabilities)
-            .map_err(|e| StateNodeError::Internal(e.to_string()))?;
-
-        // 6. Save updated policy
-        policy_repo
-            .write()
-            .await
-            .save_policy(&policy)
-            .await
-            .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
-
-        Ok(())
     }
 
     /// Add new member nodes to a content network.
@@ -734,6 +1109,7 @@ where
         count: usize,
         token: Option<&AuthToken>,
         request_signature: Option<&[u8]>,
+        timestamp: Option<u64>,
     ) -> Result<Event, StateNodeError> {
         let token = token.ok_or_else(|| {
             StateNodeError::AuthenticationFailed("Authentication token is required".to_string())
@@ -772,6 +1148,19 @@ where
             .authenticate(token, None)
             .await
             .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))?;
+
+        // Verify request signature
+        self.verify_caller_signature(
+            auth_service.as_ref(),
+            token,
+            request_signature,
+            "manage",
+            content_id,
+            timestamp,
+            None,
+        )
+        .await?;
+
         let authz_request = AuthorizationRequest {
             identity,
             resource: content_id_vo.clone(),
@@ -820,6 +1209,7 @@ where
         }
 
         // 3. Find closest peers (same pattern as create_content)
+        let count = count.min(self.max_add_member_count);
         let key = compute_dht_key(content_id);
         let k = count + network.member_count(); // Request more to filter
         let closest = self
@@ -850,31 +1240,14 @@ where
             return Err(StateNodeError::NoAvailableMembers);
         }
 
-        // 5. Query public keys for the selected nodes
-        let public_keys = self
-            .peer_network
-            .query_node_public_keys_batch(&selected)
-            .await
-            .map_err(|e| {
-                StateNodeError::NetworkError(NetworkError::ConnectionFailed(e.to_string()))
-            })?;
-
-        // 6. Add each node using domain function with their actual public key
+        // 5. Add each node using PeerId-based NodeId
         let mut updated_network = network;
         let mut last_event = None;
-        for node_id in &selected {
-            let public_key = public_keys
-                .get(node_id)
-                .ok_or_else(|| {
-                    StateNodeError::Internal(format!("No public key found for node {}", node_id))
-                })?
-                .clone();
-
-            // Use add_member_node_from_public_key to ensure cryptographic binding
-            let (net, events) = crate::domain::content_network::add_member_node_from_public_key(
-                updated_network,
-                public_key,
-            )?;
+        for node_id_str in &selected {
+            let node_id_vo =
+                crate::domain::value_objects::NodeId::from_string(node_id_str.clone())?;
+            let (net, events) =
+                crate::domain::content_network::add_member_node(updated_network, node_id_vo)?;
             updated_network = net;
             // Publish each event
             for event in events {
@@ -1043,17 +1416,86 @@ where
         Ok(())
     }
 
+    /// Check and maintain redundancy for all content networks this node is a member of.
+    ///
+    /// Iterates over all known content networks, checks membership, and runs
+    /// `check_and_maintain_redundancy` for each. Errors are logged but do not
+    /// stop processing of remaining networks.
+    pub async fn check_all_redundancy(&self) -> Result<Vec<String>, StateNodeError> {
+        let content_ids = self
+            .content_repo
+            .read()
+            .await
+            .list_content_networks()
+            .await
+            .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
+
+        let mut checked = Vec::new();
+        for content_id in content_ids {
+            let is_member = self
+                .content_repo
+                .read()
+                .await
+                .get_content_network(&content_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|net| net.has_member_str(&self.local_node_id))
+                .unwrap_or(false);
+
+            if is_member {
+                if let Err(e) = self.check_and_maintain_redundancy(&content_id).await {
+                    tracing::warn!("Redundancy check failed for {}: {}", content_id, e);
+                }
+                checked.push(content_id);
+            }
+        }
+        Ok(checked)
+    }
+
+    /// Verify that the event's claimed node ID matches the source peer ID.
+    /// Returns an error if there is a mismatch.
+    fn verify_source_peer_id(
+        source_peer_id: Option<&str>,
+        claimed_node_id: &str,
+    ) -> Result<(), StateNodeError> {
+        if let Some(source) = source_peer_id {
+            if source != claimed_node_id {
+                tracing::warn!(
+                    "Source PeerID mismatch: event claims node_id={}, but source={}",
+                    claimed_node_id,
+                    source
+                );
+                return Err(StateNodeError::Internal(format!(
+                    "Source PeerID mismatch: claimed={}, actual={}",
+                    claimed_node_id, source
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Handle a sync event from another node.
+    ///
+    /// The `source_peer_id` parameter is used to verify that events claiming
+    /// to be from a particular node actually came from that peer's PeerID.
     ///
     /// Returns `ApplyOutcome::NeedsSync` when the caller should perform content
     /// synchronization (e.g., call `ContentSyncService::sync_from_peers`).
-    pub async fn handle_sync_event(&self, event: &Event) -> Result<ApplyOutcome, StateNodeError> {
+    pub async fn handle_sync_event(
+        &self,
+        event: &Event,
+        source_peer_id: Option<&str>,
+    ) -> Result<ApplyOutcome, StateNodeError> {
         match event {
             Event::ContentUpdated {
                 content_id,
                 updated_node_id,
                 ..
             } => {
+                // Verify source PeerID matches claimed node ID
+                Self::verify_source_peer_id(source_peer_id, updated_node_id)?;
+
                 // Skip if we sent this update ourselves
                 if updated_node_id == &self.local_node_id {
                     return Ok(ApplyOutcome::Ignored);
@@ -1095,6 +1537,11 @@ where
                 member_nodes,
                 ..
             } => {
+                // Only store network metadata if we're a member
+                if !member_nodes.contains(&self.local_node_id) {
+                    return Ok(ApplyOutcome::Ignored);
+                }
+
                 // When handling sync events, we create network with NodeIds directly
                 let content_id_vo = ContentId::new(content_id.clone())?;
 
@@ -1114,14 +1561,9 @@ where
                     .await
                     .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
 
-                // If we're now a member, we need to sync the content
-                if member_nodes.contains(&self.local_node_id) {
-                    Ok(ApplyOutcome::NeedsSync {
-                        content_id: content_id.clone(),
-                    })
-                } else {
-                    Ok(ApplyOutcome::Applied)
-                }
+                Ok(ApplyOutcome::NeedsSync {
+                    content_id: content_id.clone(),
+                })
             }
 
             Event::ContentNetworkManagerRemoved {
@@ -1130,8 +1572,27 @@ where
                 removed_node_id,
                 ..
             } => {
+                // If we were removed, delete the local network metadata
+                if removed_node_id == &self.local_node_id {
+                    tracing::info!(
+                        "This node was removed from content network {}: removing local metadata",
+                        content_id
+                    );
+                    self.content_repo
+                        .write()
+                        .await
+                        .delete_content_network(content_id)
+                        .await
+                        .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
+                    return Ok(ApplyOutcome::Applied);
+                }
+
+                // Skip if we're not a member
+                if !member_nodes.contains(&self.local_node_id) {
+                    return Ok(ApplyOutcome::Ignored);
+                }
+
                 // Update local network with new member list
-                // When handling sync events, we create network with NodeIds directly
                 let content_id_vo = ContentId::new(content_id.clone())?;
 
                 let first_node =
@@ -1149,15 +1610,6 @@ where
                     .save_content_network(network)
                     .await
                     .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
-
-                // If we were removed, log it
-                if removed_node_id == &self.local_node_id {
-                    tracing::info!(
-                        "This node was removed from content network {}: removed_node_id={}",
-                        content_id,
-                        removed_node_id
-                    );
-                }
 
                 Ok(ApplyOutcome::Applied)
             }
@@ -1167,6 +1619,11 @@ where
                 member_nodes,
                 ..
             } => {
+                // Only store network metadata if we're a member
+                if !member_nodes.contains(&self.local_node_id) {
+                    return Ok(ApplyOutcome::Ignored);
+                }
+
                 // When handling sync events, we create network with NodeIds directly
                 let content_id_vo = ContentId::new(content_id.clone())?;
 
@@ -1186,14 +1643,9 @@ where
                     .await
                     .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
 
-                // If we're a member of this new content, we need to sync it
-                if member_nodes.contains(&self.local_node_id) {
-                    Ok(ApplyOutcome::NeedsSync {
-                        content_id: content_id.clone(),
-                    })
-                } else {
-                    Ok(ApplyOutcome::Applied)
-                }
+                Ok(ApplyOutcome::NeedsSync {
+                    content_id: content_id.clone(),
+                })
             }
 
             Event::NodeCreated {
@@ -1221,6 +1673,9 @@ where
                 deleted_by_node_id,
                 ..
             } => {
+                // Verify source PeerID matches claimed node ID
+                Self::verify_source_peer_id(source_peer_id, deleted_by_node_id)?;
+
                 // Skip if we initiated the deletion
                 if deleted_by_node_id == &self.local_node_id {
                     return Ok(ApplyOutcome::Ignored);
@@ -1228,13 +1683,20 @@ where
 
                 // Delete the local ContentNetwork if it exists
                 // This handles the case where an offline node receives the deletion event
-                if let Ok(Some(_)) = self
+                // NOTE: We acquire read and write locks separately to avoid holding the
+                // read guard across the write acquisition, which would deadlock since
+                // tokio::sync::RwLock is non-reentrant.
+                let exists = self
                     .content_repo
                     .read()
                     .await
                     .get_content_network(content_id)
                     .await
-                {
+                    .ok()
+                    .flatten()
+                    .is_some();
+
+                if exists {
                     self.content_repo
                         .write()
                         .await
@@ -1375,6 +1837,7 @@ where
         update: &AccessControlUpdate,
         token: Option<&AuthToken>,
         request_signature: Option<&[u8]>,
+        timestamp: Option<u64>,
     ) -> Result<ContentAccessControl, AccessControlError> {
         let ac_repo = match &self.access_control_repo {
             Some(repo) => repo,
@@ -1409,6 +1872,19 @@ where
             .authenticate(token, None)
             .await
             .map_err(|_| AccessControlError::NotAuthorized)?;
+
+        // Verify request signature
+        self.verify_caller_signature(
+            auth_service.as_ref(),
+            token,
+            request_signature,
+            "revoke",
+            &update.content_id,
+            timestamp,
+            None,
+        )
+        .await
+        .map_err(|_| AccessControlError::InvalidSignature)?;
 
         let content_id_vo = ContentId::new(update.content_id.clone())
             .map_err(|_| AccessControlError::NotAuthorized)?;
@@ -1503,6 +1979,20 @@ mod tests {
 
         async fn is_valid(&self, token: &AuthToken) -> Result<bool> {
             Ok(!token.is_empty())
+        }
+
+        async fn verify_request_signature(
+            &self,
+            _token: &AuthToken,
+            _signature: &[u8],
+            _message: &str,
+            _timestamp: Option<u64>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn verify_jwt_signature(&self, _token: &AuthToken) -> Result<()> {
+            Ok(())
         }
 
         async fn get_issuer(&self, token: &AuthToken) -> Result<Option<Identity>> {
@@ -1648,6 +2138,7 @@ mod tests {
                 b"test data",
                 Some(&test_token()),
                 Some(&test_request_signature()),
+                None,
             )
             .await
             .unwrap();
@@ -1684,6 +2175,7 @@ mod tests {
                 b"test data",
                 Some(&test_token()),
                 Some(&test_request_signature()),
+                None,
             )
             .await
             .unwrap();
@@ -1707,6 +2199,7 @@ mod tests {
                 b"test data",
                 Some(&test_token()),
                 Some(&test_request_signature()),
+                None,
             )
             .await;
 
@@ -1752,6 +2245,7 @@ mod tests {
                 b"new data",
                 Some(&test_token()),
                 Some(&test_request_signature()),
+                None,
             )
             .await
             .unwrap();
@@ -1770,7 +2264,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_update_content_fails_if_not_member() {
+    async fn test_update_content_relay_when_not_member() {
         let node_registry = MockNodeRegistry::new();
         let content_repo = Arc::new(RwLock::new(
             MockContentNetworkRepository::new()
@@ -1791,17 +2285,30 @@ mod tests {
         .with_authentication_service(TestAuthService)
         .with_authorization_service(AllowAllAuthorizationService);
 
+        // When not a member, the update should be relayed to a member node
         let result = service
             .update_content(
                 "content-1",
                 b"new data",
                 Some(&test_token()),
                 Some(&test_request_signature()),
+                None,
             )
             .await;
 
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("not a member"));
+        // Should succeed via relay
+        assert!(result.is_ok());
+        match result.unwrap() {
+            Event::ContentUpdated {
+                content_id,
+                updated_node_id,
+                ..
+            } => {
+                assert_eq!(content_id, "content-1");
+                assert_eq!(updated_node_id, "node-1");
+            }
+            _ => panic!("Expected ContentUpdated event"),
+        }
     }
 
     #[tokio::test]
@@ -1814,6 +2321,7 @@ mod tests {
                 b"data",
                 Some(&test_token()),
                 Some(&test_request_signature()),
+                None,
             )
             .await;
 
@@ -1835,7 +2343,7 @@ mod tests {
             timestamp: 12345,
         };
 
-        let outcome = service.handle_sync_event(&event).await.unwrap();
+        let outcome = service.handle_sync_event(&event, None).await.unwrap();
         assert_eq!(outcome, ApplyOutcome::Applied);
 
         // Verify node was stored
@@ -1856,7 +2364,7 @@ mod tests {
             timestamp: 12345,
         };
 
-        let outcome = service.handle_sync_event(&event).await.unwrap();
+        let outcome = service.handle_sync_event(&event, None).await.unwrap();
         // node-1 is a member, so it should need sync
         assert_eq!(
             outcome,
@@ -1887,17 +2395,16 @@ mod tests {
             timestamp: 12345,
         };
 
-        let outcome = service.handle_sync_event(&event).await.unwrap();
-        // node-1 is NOT a member, so just Applied
-        assert_eq!(outcome, ApplyOutcome::Applied);
+        let outcome = service.handle_sync_event(&event, None).await.unwrap();
+        // node-1 is NOT a member, so Ignored (non-member networks are not stored)
+        assert_eq!(outcome, ApplyOutcome::Ignored);
 
-        // Verify content network was stored
+        // Verify content network was NOT stored (non-member)
         let network = service
             .get_content_network_for_test("content-1")
             .await
-            .unwrap()
             .unwrap();
-        assert!(!network.has_member_str("node-1"));
+        assert!(network.is_none());
     }
 
     #[tokio::test]
@@ -1911,7 +2418,7 @@ mod tests {
             timestamp: 12345,
         };
 
-        let outcome = service.handle_sync_event(&event).await.unwrap();
+        let outcome = service.handle_sync_event(&event, None).await.unwrap();
         // Network doesn't exist locally = we're not a member, just ignore
         assert_eq!(outcome, ApplyOutcome::Ignored);
 
@@ -1951,7 +2458,7 @@ mod tests {
             timestamp: 12345,
         };
 
-        let outcome = service.handle_sync_event(&event).await.unwrap();
+        let outcome = service.handle_sync_event(&event, None).await.unwrap();
         // node-1 is a member, so it should need sync
         assert_eq!(
             outcome,
@@ -1989,7 +2496,7 @@ mod tests {
             timestamp: 12345,
         };
 
-        let outcome = service.handle_sync_event(&event).await.unwrap();
+        let outcome = service.handle_sync_event(&event, None).await.unwrap();
         // Should be ignored since we sent it
         assert_eq!(outcome, ApplyOutcome::Ignored);
     }
@@ -2021,7 +2528,7 @@ mod tests {
             timestamp: 12345,
         };
 
-        let outcome = service.handle_sync_event(&event).await.unwrap();
+        let outcome = service.handle_sync_event(&event, None).await.unwrap();
         // node-1 is NOT a member, so just Applied (no sync needed)
         assert_eq!(outcome, ApplyOutcome::Applied);
     }
@@ -2041,7 +2548,7 @@ mod tests {
             timestamp: 12345,
         };
 
-        let outcome = service.handle_sync_event(&event).await.unwrap();
+        let outcome = service.handle_sync_event(&event, None).await.unwrap();
         // node-1 is a member, so it should need sync
         assert_eq!(
             outcome,
@@ -2069,16 +2576,15 @@ mod tests {
             timestamp: 12345,
         };
 
-        let outcome = service.handle_sync_event(&event).await.unwrap();
-        // node-1 is NOT a member
-        assert_eq!(outcome, ApplyOutcome::Applied);
+        let outcome = service.handle_sync_event(&event, None).await.unwrap();
+        // node-1 is NOT a member, so Ignored (non-member networks are not stored)
+        assert_eq!(outcome, ApplyOutcome::Ignored);
 
         let network = service
             .get_content_network_for_test("content-1")
             .await
-            .unwrap()
             .unwrap();
-        assert_eq!(network.member_count(), 2);
+        assert!(network.is_none());
     }
 
     #[tokio::test]
@@ -2092,7 +2598,7 @@ mod tests {
             timestamp: 12345,
         };
 
-        let outcome = service.handle_sync_event(&event).await.unwrap();
+        let outcome = service.handle_sync_event(&event, None).await.unwrap();
         assert_eq!(outcome, ApplyOutcome::Ignored);
     }
 
@@ -2110,7 +2616,7 @@ mod tests {
             available_capacity: 2000,
             timestamp: 12345,
         };
-        service.handle_sync_event(&event).await.unwrap();
+        service.handle_sync_event(&event, None).await.unwrap();
 
         let nodes = service.list_nodes().await.unwrap();
         assert!(nodes.contains(&"node-1".to_string()));
@@ -2137,8 +2643,8 @@ mod tests {
             timestamp: 12346,
         };
 
-        service.handle_sync_event(&event1).await.unwrap();
-        service.handle_sync_event(&event2).await.unwrap();
+        service.handle_sync_event(&event1, None).await.unwrap();
+        service.handle_sync_event(&event2, None).await.unwrap();
 
         let networks = service.list_content_networks().await.unwrap();
         assert!(networks.contains(&"content-1".to_string()));

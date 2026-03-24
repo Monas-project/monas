@@ -13,6 +13,7 @@ use std::collections::HashMap;
 /// - Event publishing via Gossipsub
 /// - Content fetching from peers
 /// - CRDT operation synchronization
+#[allow(clippy::too_many_arguments)]
 #[async_trait]
 pub trait PeerNetwork: Send + Sync {
     /// Find the k closest peers to a given DHT key.
@@ -49,6 +50,9 @@ pub trait PeerNetwork: Send + Sync {
 
     /// Get the local peer ID as a string.
     fn local_peer_id(&self) -> String;
+
+    /// Get the addresses this node is listening on.
+    async fn listen_addrs(&self) -> Vec<String>;
 
     // ========== CRDT Synchronization Methods ==========
 
@@ -87,4 +91,51 @@ pub trait PeerNetwork: Send + Sync {
     ///
     /// Uses Kademlia's get_providers to find content providers.
     async fn find_content_providers(&self, genesis_cid: &str) -> Result<Vec<String>>;
+
+    // ========== Relay Methods ==========
+
+    /// Relay an update request to a member node.
+    ///
+    /// Used when the creator node (non-member) receives an update request
+    /// and needs to forward it to a member node for processing.
+    async fn relay_update_content(
+        &self,
+        peer_id: &str,
+        content_id: &str,
+        data: &[u8],
+        auth_token: &str,
+        request_signature: &[u8],
+        timestamp: Option<u64>,
+    ) -> Result<bool>;
+
+    /// Relay a delete request to a member node.
+    ///
+    /// Used when the creator node (non-member) receives a delete request
+    /// and needs to forward it to a member node for processing.
+    async fn relay_delete_content(
+        &self,
+        peer_id: &str,
+        content_id: &str,
+        auth_token: &str,
+        request_signature: &[u8],
+        timestamp: Option<u64>,
+    ) -> Result<bool>;
+
+    /// Relay an invalidate_tokens request to a member node.
+    ///
+    /// Used when the creator node (non-member) receives an invalidate_tokens request
+    /// and needs to forward it to a member node for processing.
+    async fn relay_invalidate_tokens(
+        &self,
+        peer_id: &str,
+        content_id: &str,
+        auth_token: &str,
+        request_signature: &[u8],
+        timestamp: Option<u64>,
+    ) -> Result<bool>;
+
+    // ========== Monitoring Methods ==========
+
+    /// Get the number of currently connected peers.
+    async fn connected_peer_count(&self) -> usize;
 }

@@ -19,7 +19,7 @@ use crate::infrastructure::network::{Libp2pNetwork, Libp2pNetworkConfig};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::infrastructure::outbox_persistence::SledOutboxPersistence;
 #[cfg(not(target_arch = "wasm32"))]
-use crate::infrastructure::persistence::{SledAccessControlRepository, SledAccessPolicyRepository};
+use crate::infrastructure::persistence::SledAccessControlRepository;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::infrastructure::persistence::{SledContentNetworkRepository, SledNodeRegistry};
 #[cfg(not(target_arch = "wasm32"))]
@@ -27,7 +27,7 @@ use crate::infrastructure::reliable_event_publisher::{
     ReliableEventPublisher, ReliablePublisherConfig,
 };
 #[cfg(not(target_arch = "wasm32"))]
-use crate::port::persistence::PersistentAccessPolicyRepository;
+use crate::port::peer_network::PeerNetwork;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::port::public_key_registry::PublicKeyRegistry;
 #[cfg(not(target_arch = "wasm32"))]
@@ -44,6 +44,8 @@ use std::sync::Arc;
 use std::time::Duration;
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::sync::RwLock;
+#[cfg(not(target_arch = "wasm32"))]
+use tokio_util::sync::CancellationToken;
 
 /// Configuration for the state node.
 #[derive(Debug, Clone)]
@@ -135,13 +137,6 @@ impl StateNode {
         let access_control_repo =
             SledAccessControlRepository::open(config.data_dir.join("access_control"))
                 .context("Failed to open access control repository")?;
-        let access_policy_db = sled::open(config.data_dir.join("access_policies"))
-            .context("Failed to open access policy database")?;
-        // Create a single shared access policy repository instance
-        // Both StateNodeService and UcanAdapter will use the same instance to avoid sync issues
-        let access_policy_repo: Arc<RwLock<dyn PersistentAccessPolicyRepository>> = Arc::new(
-            RwLock::new(SledAccessPolicyRepository::new(access_policy_db)),
-        );
 
         // Initialize CRDT repository
         let crdt_repo = Arc::new(
@@ -149,14 +144,20 @@ impl StateNode {
                 .context("Failed to open CRDT repository")?,
         );
 
-        // Initialize network with CRDT repository
+        // Initialize network with CRDT repository and content network repository for member verification
         let crdt_repo_dyn: Arc<dyn crate::port::content_repository::ContentRepository> =
             crdt_repo.clone();
+        let content_repo_dyn: Arc<
+            tokio::sync::RwLock<
+                dyn crate::port::persistence::PersistentContentRepository + Send + Sync,
+            >,
+        > = content_repo.clone();
         let network = Arc::new(
-            Libp2pNetwork::new(
+            Libp2pNetwork::with_content_network_repo(
                 config.network_config.clone(),
-                crdt_repo_dyn,
+                crdt_repo_dyn.clone(),
                 config.data_dir.clone(),
+                Some(content_repo_dyn),
             )
             .await
             .context("Failed to create network")?,
@@ -172,16 +173,13 @@ impl StateNode {
             .get_default_node_key()
             .context("Failed to load/generate node key")?;
 
-        // Generate NodeId from the P-256 public key
+        // Use libp2p PeerId as NodeId for consistency with DHT peer discovery
         let node_id = if let Some(ref provided_id) = config.node_id {
             // If a node ID is explicitly provided, use it (for backward compatibility)
             provided_id.clone()
         } else {
-            // Generate NodeId from P-256 public key hash
-            node_key_pair
-                .node_id()
-                .context("Failed to generate NodeId from public key")?
-                .into_inner()
+            // Use the libp2p PeerId so that NodeId matches what find_closest_peers returns
+            network.local_peer_id()
         };
 
         // Initialize public key registry and register our key
@@ -213,9 +211,16 @@ impl StateNode {
             node_id.clone(),
         ));
 
-        // Create auth services
+        // Create auth services with public key registry for identity verification
+        let auth_public_key_repo = Arc::new(
+            crate::infrastructure::persistence::SledPublicKeyRepository::open(
+                config.data_dir.join("auth_public_keys"),
+            )
+            .context("Failed to open auth public key repository")?,
+        );
         let auth_service = MonasAccountAdapter::new();
-        let authz_service = UcanAdapter::new_with_dyn_repo(access_policy_repo.clone());
+        let authz_service =
+            UcanAdapter::new(crdt_repo_dyn.clone()).with_nonce_store(auth_public_key_repo.clone());
 
         // Create service with CRDT repository
         let service = Arc::new(
@@ -229,10 +234,10 @@ impl StateNode {
                 ServiceConfig {
                     min_replication_factor: config.min_replication_factor,
                     capacity_threshold_bytes: config.capacity_threshold_bytes,
+                    ..ServiceConfig::default()
                 },
             )
             .with_access_control_repo(access_control_repo)
-            .with_access_policy_repo(access_policy_repo)
             .with_authentication_service(auth_service)
             .with_authorization_service(authz_service),
         );
@@ -303,7 +308,7 @@ impl StateNode {
     /// Get the addresses this node is listening on.
     pub async fn listen_addrs(&self) -> Vec<String> {
         self.network
-            .listen_addrs()
+            .listen_addrs_raw()
             .await
             .into_iter()
             .map(|a| a.to_string())
@@ -311,8 +316,13 @@ impl StateNode {
     }
 
     /// Run the node (HTTP server and event handler).
+    ///
+    /// Supports graceful shutdown via SIGINT/SIGTERM. When a shutdown signal
+    /// is received, the HTTP server stops accepting new connections, in-flight
+    /// requests are allowed to complete, and background tasks are cancelled.
     pub async fn run(&self) -> Result<()> {
         let router = create_router(self.service.clone());
+        let token = CancellationToken::new();
 
         tracing::info!(
             "Starting state node {} on {}",
@@ -320,68 +330,162 @@ impl StateNode {
             self.config.http_addr
         );
 
+        // Spawn relay request handler
+        if let Some(mut relay_rx) = self.network.take_relay_receiver().await {
+            let service_for_relay = self.service.clone();
+            let token_relay = token.clone();
+            tokio::spawn(async move {
+                use crate::infrastructure::network::libp2p_network::RelayRequestKind;
+                use crate::port::auth_token::AuthToken;
+                tracing::info!("Started relay request handler");
+                loop {
+                    tokio::select! {
+                        _ = token_relay.cancelled() => {
+                            tracing::info!("Relay request handler shutting down");
+                            break;
+                        }
+                        req = relay_rx.recv() => {
+                            let Some(req) = req else { break };
+                            let result = match req.kind {
+                                RelayRequestKind::UpdateContent {
+                                    content_id,
+                                    data,
+                                    auth_token,
+                                    request_signature,
+                                    timestamp,
+                                } => {
+                                    let token = AuthToken::new(auth_token);
+                                    service_for_relay
+                                        .update_content(
+                                            &content_id,
+                                            &data,
+                                            Some(&token),
+                                            Some(&request_signature),
+                                            timestamp,
+                                        )
+                                        .await
+                                        .map(|_| ())
+                                }
+                                RelayRequestKind::DeleteContent {
+                                    content_id,
+                                    auth_token,
+                                    request_signature,
+                                    timestamp,
+                                } => {
+                                    let token = AuthToken::new(auth_token);
+                                    service_for_relay
+                                        .delete_content(
+                                            &content_id,
+                                            Some(&token),
+                                            Some(&request_signature),
+                                            timestamp,
+                                        )
+                                        .await
+                                        .map(|_| ())
+                                }
+                                RelayRequestKind::InvalidateTokens {
+                                    content_id,
+                                    auth_token,
+                                    request_signature,
+                                    timestamp,
+                                } => {
+                                    let token = AuthToken::new(auth_token);
+                                    service_for_relay
+                                        .invalidate_tokens(
+                                            &content_id,
+                                            &token,
+                                            Some(&request_signature),
+                                            timestamp,
+                                        )
+                                        .await
+                                        .map(|_| ())
+                                }
+                            };
+                            let _ = req
+                                .reply
+                                .send(result.map_err(|e| anyhow::anyhow!(e.to_string())));
+                        }
+                    }
+                }
+                tracing::info!("Relay request handler stopped");
+            });
+        }
+
         // Subscribe to network events
         let mut event_rx = self.network.subscribe_events();
         let service = self.service.clone();
+        let service_for_redundancy = service.clone();
         let sync_service_for_events = self.sync_service.clone();
 
         // Spawn event handler task
+        let token_events = token.clone();
         tokio::spawn(async move {
             tracing::info!("Started network event handler");
             loop {
-                match event_rx.recv().await {
-                    Ok(received) => {
-                        tracing::debug!(
-                            "Received event from {}: {:?}",
-                            received.source,
-                            received.event.event_type()
-                        );
+                tokio::select! {
+                    _ = token_events.cancelled() => {
+                        tracing::info!("Network event handler shutting down");
+                        break;
+                    }
+                    result = event_rx.recv() => {
+                        match result {
+                            Ok(received) => {
+                                tracing::debug!(
+                                    "Received event from {}: {:?}",
+                                    received.source,
+                                    received.event.event_type()
+                                );
 
-                        // Forward to service for processing
-                        match service.handle_sync_event(&received.event).await {
-                            Ok(outcome) => {
-                                tracing::debug!("Processed sync event: {:?}", outcome);
+                                // Forward to service for processing (with source PeerID for verification)
+                                match service
+                                    .handle_sync_event(&received.event, Some(&received.source))
+                                    .await
+                                {
+                                    Ok(outcome) => {
+                                        tracing::debug!("Processed sync event: {:?}", outcome);
 
-                                // If sync is needed, perform it
-                                if let crate::application_service::state_node_service::ApplyOutcome::NeedsSync { content_id } = outcome {
-                                    tracing::info!("Content sync needed for {}, initiating sync", content_id);
-                                    match sync_service_for_events.sync_from_peers(&content_id).await {
-                                        Ok(result) => {
-                                            tracing::info!(
-                                                "Content sync completed for {}: {} operations applied from {} providers",
-                                                content_id,
-                                                result.operations_applied,
-                                                result.providers_contacted
-                                            );
-                                            if !result.errors.is_empty() {
-                                                tracing::warn!(
-                                                    "Sync had {} errors: {:?}",
-                                                    result.errors.len(),
-                                                    result.errors
-                                                );
+                                        // If sync is needed, perform it
+                                        if let crate::application_service::state_node_service::ApplyOutcome::NeedsSync { content_id } = outcome {
+                                            tracing::info!("Content sync needed for {}, initiating sync", content_id);
+                                            match sync_service_for_events.sync_from_peers(&content_id).await {
+                                                Ok(result) => {
+                                                    tracing::info!(
+                                                        "Content sync completed for {}: {} operations applied from {} providers",
+                                                        content_id,
+                                                        result.operations_applied,
+                                                        result.providers_contacted
+                                                    );
+                                                    if !result.errors.is_empty() {
+                                                        tracing::warn!(
+                                                            "Sync had {} errors: {:?}",
+                                                            result.errors.len(),
+                                                            result.errors
+                                                        );
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    tracing::error!(
+                                                        "Failed to sync content {}: {}",
+                                                        content_id,
+                                                        e
+                                                    );
+                                                }
                                             }
                                         }
-                                        Err(e) => {
-                                            tracing::error!(
-                                                "Failed to sync content {}: {}",
-                                                content_id,
-                                                e
-                                            );
-                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("Failed to process sync event: {}", e);
                                     }
                                 }
                             }
-                            Err(e) => {
-                                tracing::error!("Failed to process sync event: {}", e);
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                tracing::warn!("Event handler lagged, missed {} events", n);
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                tracing::info!("Event channel closed, stopping handler");
+                                break;
                             }
                         }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        tracing::warn!("Event handler lagged, missed {} events", n);
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        tracing::info!("Event channel closed, stopping handler");
-                        break;
                     }
                 }
             }
@@ -390,6 +494,7 @@ impl StateNode {
         // Spawn periodic sync task
         let sync_service = self.sync_service.clone();
         let sync_interval = Duration::from_secs(self.config.sync_interval_secs);
+        let token_sync = token.clone();
         tokio::spawn(async move {
             tracing::info!(
                 "Started periodic sync task (interval: {}s)",
@@ -397,22 +502,60 @@ impl StateNode {
             );
             let mut interval = tokio::time::interval(sync_interval);
             loop {
-                interval.tick().await;
-                tracing::debug!("Running periodic content sync");
-                match sync_service.sync_all_content().await {
-                    Ok(results) => {
-                        let total_applied: usize =
-                            results.iter().map(|(_, r)| r.operations_applied).sum();
-                        if total_applied > 0 {
-                            tracing::info!(
-                                "Periodic sync completed: {} operations applied across {} contents",
-                                total_applied,
-                                results.len()
-                            );
+                tokio::select! {
+                    _ = token_sync.cancelled() => {
+                        tracing::info!("Periodic sync task shutting down");
+                        break;
+                    }
+                    _ = interval.tick() => {
+                        tracing::debug!("Running periodic content sync");
+                        match sync_service.sync_all_content().await {
+                            Ok(results) => {
+                                let total_applied: usize =
+                                    results.iter().map(|(_, r)| r.operations_applied).sum();
+                                if total_applied > 0 {
+                                    tracing::info!(
+                                        "Periodic sync completed: {} operations applied across {} contents",
+                                        total_applied,
+                                        results.len()
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("Periodic sync failed: {}", e);
+                            }
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!("Periodic sync failed: {}", e);
+                }
+            }
+        });
+
+        // Spawn periodic redundancy check task (5 minute interval)
+        let token_redundancy = token.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(300));
+            tracing::info!("Started periodic redundancy check task (interval: 300s)");
+            loop {
+                tokio::select! {
+                    _ = token_redundancy.cancelled() => {
+                        tracing::info!("Periodic redundancy check task shutting down");
+                        break;
+                    }
+                    _ = interval.tick() => {
+                        tracing::debug!("Running periodic redundancy check");
+                        match service_for_redundancy.check_all_redundancy().await {
+                            Ok(checked) => {
+                                if !checked.is_empty() {
+                                    tracing::info!(
+                                        "Periodic redundancy check completed for {} content networks",
+                                        checked.len()
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("Periodic redundancy check failed: {}", e);
+                            }
+                        }
                     }
                 }
             }
@@ -421,6 +564,7 @@ impl StateNode {
         // Spawn outbox retry task
         let reliable_publisher = self.reliable_publisher.clone();
         let retry_interval = Duration::from_secs(self.config.outbox_retry_interval_secs);
+        let token_outbox = token.clone();
         tokio::spawn(async move {
             tracing::info!(
                 "Started outbox retry task (interval: {}s)",
@@ -428,21 +572,28 @@ impl StateNode {
             );
             let mut interval = tokio::time::interval(retry_interval);
             loop {
-                interval.tick().await;
-                tracing::debug!("Running outbox retry");
-                match reliable_publisher.retry_pending().await {
-                    Ok(result) => {
-                        if result.delivered > 0 || result.dropped > 0 {
-                            tracing::info!(
-                                "Outbox retry: {} delivered, {} failed, {} dropped",
-                                result.delivered,
-                                result.failed,
-                                result.dropped
-                            );
-                        }
+                tokio::select! {
+                    _ = token_outbox.cancelled() => {
+                        tracing::info!("Outbox retry task shutting down");
+                        break;
                     }
-                    Err(e) => {
-                        tracing::warn!("Outbox retry failed: {}", e);
+                    _ = interval.tick() => {
+                        tracing::debug!("Running outbox retry");
+                        match reliable_publisher.retry_pending().await {
+                            Ok(result) => {
+                                if result.delivered > 0 || result.dropped > 0 {
+                                    tracing::info!(
+                                        "Outbox retry: {} delivered, {} failed, {} dropped",
+                                        result.delivered,
+                                        result.failed,
+                                        result.dropped
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("Outbox retry failed: {}", e);
+                            }
+                        }
                     }
                 }
             }
@@ -452,10 +603,22 @@ impl StateNode {
             .await
             .context("Failed to bind HTTP listener")?;
 
-        axum::serve(listener, router)
-            .await
-            .context("HTTP server error")?;
+        let shutdown_token = token.clone();
+        let shutdown_signal = async move {
+            tokio::signal::ctrl_c().await.ok();
+            tracing::info!("Shutdown signal received, starting graceful shutdown...");
+            shutdown_token.cancel();
+        };
 
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown_signal)
+        .await
+        .context("HTTP server error")?;
+
+        tracing::info!("HTTP server stopped. Shutdown complete.");
         Ok(())
     }
 }
@@ -551,7 +714,7 @@ mod tests {
                 enable_mdns: false,
                 gossipsub_topics: vec!["test".to_string()],
             },
-            node_id: None, // Will be auto-generated from P-256 public key
+            node_id: None, // Will be auto-generated from libp2p PeerId
             sync_interval_secs: 30,
             outbox_retry_interval_secs: 10,
             ..StateNodeConfig::default()
@@ -559,19 +722,13 @@ mod tests {
 
         let node = StateNode::new(config).await.unwrap();
 
-        // Node ID should be generated from the P-256 public key hash
+        // Node ID should be generated from the libp2p PeerId
         let node_id = node.node_id();
         assert!(!node_id.is_empty());
 
-        // Verify the node ID matches what's expected from the public key
-        use crate::domain::value_objects::NodeId;
-        let expected_node_id = NodeId::from_public_key(&node.public_key())
-            .expect("Failed to generate NodeId from public key");
-        assert_eq!(node_id, expected_node_id.as_str());
-
-        // The node ID should be different from the libp2p peer ID
+        // The node ID should match the libp2p peer ID
         let peer_id = node.network().local_peer_id();
-        assert_ne!(node_id, peer_id);
+        assert_eq!(node_id, peer_id);
     }
 
     #[tokio::test]

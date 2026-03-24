@@ -203,6 +203,10 @@ mod tests {
             "mock-peer-id".to_string()
         }
 
+        async fn listen_addrs(&self) -> Vec<String> {
+            vec![]
+        }
+
         async fn fetch_operations(
             &self,
             _peer_id: &str,
@@ -231,6 +235,44 @@ mod tests {
 
         async fn find_content_providers(&self, _genesis_cid: &str) -> Result<Vec<String>> {
             Ok(vec![])
+        }
+
+        async fn relay_update_content(
+            &self,
+            _peer_id: &str,
+            _content_id: &str,
+            _data: &[u8],
+            _auth_token: &str,
+            _request_signature: &[u8],
+            _timestamp: Option<u64>,
+        ) -> Result<bool> {
+            Ok(true)
+        }
+
+        async fn relay_delete_content(
+            &self,
+            _peer_id: &str,
+            _content_id: &str,
+            _auth_token: &str,
+            _request_signature: &[u8],
+            _timestamp: Option<u64>,
+        ) -> Result<bool> {
+            Ok(true)
+        }
+
+        async fn relay_invalidate_tokens(
+            &self,
+            _peer_id: &str,
+            _content_id: &str,
+            _auth_token: &str,
+            _request_signature: &[u8],
+            _timestamp: Option<u64>,
+        ) -> Result<bool> {
+            Ok(true)
+        }
+
+        async fn connected_peer_count(&self) -> usize {
+            0
         }
     }
 

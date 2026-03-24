@@ -1,11 +1,10 @@
 //! Sled-based public key repository for persistent storage.
 
 use crate::domain::value_objects::NodeId;
-use crate::port::extended_public_key_registry::ExtendedPublicKeyRegistry;
 use crate::port::public_key_registry::PublicKeyRegistry;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use sled::Db;
+use sled::{Db, Transactional};
 use std::sync::Arc;
 
 /// Sled-based public key repository
@@ -56,7 +55,13 @@ impl SledPublicKeyRepository {
         Self::new(Arc::new(db))
     }
 
-    /// Check and record a nonce to prevent replay attacks
+    /// Maximum number of nonce entries before forced cleanup.
+    const MAX_NONCE_ENTRIES: usize = 1_000_000;
+
+    /// Check and record a nonce to prevent replay attacks.
+    ///
+    /// Uses sled's compare-and-swap to atomically check and insert,
+    /// preventing TOCTOU race conditions between concurrent requests.
     ///
     /// # Returns
     /// Ok(true) if the nonce is new and was recorded
@@ -64,23 +69,44 @@ impl SledPublicKeyRepository {
     pub async fn check_and_record_nonce(&self, nonce: &str) -> Result<bool> {
         let nonce_bytes = nonce.as_bytes();
 
-        // Check if nonce already exists
-        if self.nonce_tree.contains_key(nonce_bytes)? {
-            return Ok(false);
-        }
-
-        // Record the nonce with current timestamp
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_secs();
 
-        self.nonce_tree
-            .insert(nonce_bytes, &timestamp.to_le_bytes())?;
+        let timestamp_bytes = timestamp.to_le_bytes();
 
-        // Clean up old nonces (older than 1 hour)
-        self.cleanup_old_nonces(timestamp - 3600)?;
+        // Size limit: clean up aggressively if approaching capacity
+        if self.nonce_tree.len() >= Self::MAX_NONCE_ENTRIES {
+            tracing::warn!(
+                "Nonce store at capacity ({} entries), running cleanup",
+                self.nonce_tree.len()
+            );
+            self.cleanup_old_nonces(timestamp.saturating_sub(3600))?;
+            // If still over capacity after 1-hour cleanup, be more aggressive
+            if self.nonce_tree.len() >= Self::MAX_NONCE_ENTRIES {
+                self.cleanup_old_nonces(timestamp.saturating_sub(300))?;
+            }
+        }
 
-        Ok(true)
+        // Atomic compare-and-swap: only insert if key does not exist (None -> Some)
+        match self.nonce_tree.compare_and_swap(
+            nonce_bytes,
+            None::<&[u8]>,
+            Some(&timestamp_bytes),
+        )? {
+            Ok(()) => {
+                // Successfully recorded — nonce was new
+                // Periodically clean up old nonces (older than 1 hour)
+                if timestamp % 60 == 0 {
+                    self.cleanup_old_nonces(timestamp.saturating_sub(3600))?;
+                }
+                Ok(true)
+            }
+            Err(_) => {
+                // Nonce already existed
+                Ok(false)
+            }
+        }
     }
 
     /// Clean up nonces older than the given timestamp
@@ -117,19 +143,19 @@ impl PublicKeyRegistry for SledPublicKeyRepository {
         // Generate NodeId from public key
         let node_id = NodeId::from_public_key(&public_key)?;
 
-        // Store in node_key_tree
-        self.node_key_tree
-            .insert(node_id.as_str().as_bytes(), public_key.clone())?;
-
-        // Generate default key_id (monas:node:<node_id>)
         let key_id = format!("monas:node:{}", node_id.as_str());
+        let node_id_bytes = node_id.as_str().as_bytes().to_vec();
+        let key_id_bytes = key_id.as_bytes().to_vec();
 
-        // Store in key_id_tree
-        self.key_id_tree.insert(key_id.as_bytes(), public_key)?;
-
-        // Store mapping
-        self.node_to_key_tree
-            .insert(node_id.as_str().as_bytes(), key_id.as_bytes())?;
+        (&self.node_key_tree, &self.key_id_tree, &self.node_to_key_tree)
+            .transaction(|(node_key_tx, key_id_tx, node_to_key_tx)|
+                -> sled::transaction::ConflictableTransactionResult<(), ()> {
+                node_key_tx.insert(node_id_bytes.as_slice(), public_key.as_slice())?;
+                key_id_tx.insert(key_id_bytes.as_slice(), public_key.as_slice())?;
+                node_to_key_tx.insert(node_id_bytes.as_slice(), key_id_bytes.as_slice())?;
+                Ok(())
+            })
+            .map_err(|e| anyhow::anyhow!("Failed to register public key: {:?}", e))?;
 
         Ok(node_id)
     }
@@ -176,64 +202,6 @@ impl PublicKeyRegistry for SledPublicKeyRepository {
     }
 }
 
-#[async_trait]
-impl ExtendedPublicKeyRegistry for SledPublicKeyRepository {
-    async fn register_public_key_for_key_id(
-        &self,
-        key_id: String,
-        public_key: Vec<u8>,
-    ) -> Result<()> {
-        // Store in key_id_tree
-        self.key_id_tree
-            .insert(key_id.as_bytes(), public_key.clone())?;
-
-        // Also generate and store NodeId if it's a node key
-        if key_id.starts_with("monas:node:") || key_id.starts_with("node:") {
-            let node_id = NodeId::from_public_key(&public_key)?;
-            self.node_key_tree
-                .insert(node_id.as_str().as_bytes(), public_key)?;
-            self.node_to_key_tree
-                .insert(node_id.as_str().as_bytes(), key_id.as_bytes())?;
-        }
-
-        Ok(())
-    }
-
-    async fn get_public_key_by_key_id(&self, key_id: &str) -> Result<Option<Vec<u8>>> {
-        // First try direct lookup
-        if let Some(key) = self.key_id_tree.get(key_id.as_bytes())? {
-            return Ok(Some(key.to_vec()));
-        }
-
-        // If not found and it's a simple format (e.g., "user:alice"),
-        // try with "monas:" prefix
-        if !key_id.starts_with("monas:") && key_id.contains(':') {
-            let monas_key_id = format!("monas:{}", key_id);
-            if let Some(key) = self.key_id_tree.get(monas_key_id.as_bytes())? {
-                return Ok(Some(key.to_vec()));
-            }
-        }
-
-        Ok(None)
-    }
-
-    async fn remove_public_key_by_key_id(&self, key_id: &str) -> Result<bool> {
-        // Remove from key_id_tree
-        let removed = self.key_id_tree.remove(key_id.as_bytes())?.is_some();
-
-        // If it's a node key, also remove from node trees
-        if let Some(public_key_ivec) = self.key_id_tree.get(key_id.as_bytes())? {
-            let public_key = public_key_ivec.to_vec();
-            if let Ok(node_id) = NodeId::from_public_key(&public_key) {
-                self.node_key_tree.remove(node_id.as_str().as_bytes())?;
-                self.node_to_key_tree.remove(node_id.as_str().as_bytes())?;
-            }
-        }
-
-        Ok(removed)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,28 +234,6 @@ mod tests {
 
         // Retrieve by NodeId
         let retrieved = repo.get_public_key(&node_id).await.unwrap();
-        assert!(retrieved.is_some());
-        assert_eq!(retrieved.unwrap(), public_key);
-    }
-
-    #[tokio::test]
-    async fn test_register_and_get_by_key_id() {
-        let (repo, _temp_dir) = create_test_repository().await;
-        let public_key = generate_test_public_key();
-        let key_id = "monas:user:alice".to_string();
-
-        // Register with key_id
-        repo.register_public_key_for_key_id(key_id.clone(), public_key.clone())
-            .await
-            .unwrap();
-
-        // Retrieve by key_id
-        let retrieved = repo.get_public_key_by_key_id(&key_id).await.unwrap();
-        assert!(retrieved.is_some());
-        assert_eq!(retrieved.unwrap(), public_key);
-
-        // Should also work without "monas:" prefix
-        let retrieved = repo.get_public_key_by_key_id("user:alice").await.unwrap();
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap(), public_key);
     }
@@ -363,28 +309,5 @@ mod tests {
             assert!(retrieved.is_some());
             assert_eq!(retrieved.unwrap(), public_key);
         }
-    }
-
-    #[tokio::test]
-    async fn test_key_id_with_node_prefix() {
-        let (repo, _temp_dir) = create_test_repository().await;
-        let public_key = generate_test_public_key();
-        let key_id = "node:test-node-123".to_string();
-
-        // Register with node: prefix
-        repo.register_public_key_for_key_id(key_id.clone(), public_key.clone())
-            .await
-            .unwrap();
-
-        // Should be retrievable by key_id
-        let retrieved = repo.get_public_key_by_key_id(&key_id).await.unwrap();
-        assert!(retrieved.is_some());
-        assert_eq!(retrieved.unwrap(), public_key);
-
-        // Should also create NodeId entry
-        let node_id = NodeId::from_public_key(&public_key).unwrap();
-        let retrieved = repo.get_public_key(&node_id).await.unwrap();
-        assert!(retrieved.is_some());
-        assert_eq!(retrieved.unwrap(), public_key);
     }
 }

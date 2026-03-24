@@ -4,7 +4,7 @@
 //! It uses `min_valid_issued_at` to invalidate tokens issued before a certain timestamp.
 
 use serde::{Deserialize, Serialize};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Access control state for a single content.
 ///
@@ -31,7 +31,7 @@ impl ContentAccessControl {
     pub fn new(content_id: String) -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards")
+            .unwrap_or(Duration::ZERO)
             .as_secs();
 
         Self {
@@ -101,7 +101,7 @@ impl ContentAccessControl {
         self.version += 1;
         self.updated_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards")
+            .unwrap_or(Duration::ZERO)
             .as_secs();
 
         Ok(AccessControlEvent::TokensInvalidated {

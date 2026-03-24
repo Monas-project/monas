@@ -34,6 +34,40 @@ use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
 use tracing::{debug, error, info, warn};
 
+/// Default timeout for PeerNetwork operations (30 seconds).
+const PEER_NETWORK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A relay request received from a remote peer via P2P protocol.
+/// The swarm loop sends these through a channel to the application layer (node.rs),
+/// which processes them using StateNodeService.
+pub struct RelayRequest {
+    pub kind: RelayRequestKind,
+    pub reply: oneshot::Sender<Result<()>>,
+}
+
+/// The kind of relay request.
+pub enum RelayRequestKind {
+    UpdateContent {
+        content_id: String,
+        data: Vec<u8>,
+        auth_token: String,
+        request_signature: Vec<u8>,
+        timestamp: Option<u64>,
+    },
+    DeleteContent {
+        content_id: String,
+        auth_token: String,
+        request_signature: Vec<u8>,
+        timestamp: Option<u64>,
+    },
+    InvalidateTokens {
+        content_id: String,
+        auth_token: String,
+        request_signature: Vec<u8>,
+        timestamp: Option<u64>,
+    },
+}
+
 /// Gossipsub message received from the network.
 #[derive(Debug, Clone)]
 pub struct GossipsubMessage {
@@ -143,9 +177,46 @@ enum SwarmCommand {
         node_ids: Vec<String>,
         reply: oneshot::Sender<Result<Vec<NodePublicKey>>>,
     },
+    RelayUpdateContent {
+        peer_id: PeerId,
+        content_id: String,
+        data: Vec<u8>,
+        auth_token: String,
+        request_signature: Vec<u8>,
+        timestamp: Option<u64>,
+        reply: oneshot::Sender<Result<bool>>,
+    },
+    RelayDeleteContent {
+        peer_id: PeerId,
+        content_id: String,
+        auth_token: String,
+        request_signature: Vec<u8>,
+        timestamp: Option<u64>,
+        reply: oneshot::Sender<Result<bool>>,
+    },
+    RelayInvalidateTokens {
+        peer_id: PeerId,
+        content_id: String,
+        auth_token: String,
+        request_signature: Vec<u8>,
+        timestamp: Option<u64>,
+        reply: oneshot::Sender<Result<bool>>,
+    },
+    /// Send a response back through a ResponseChannel.
+    /// Used by spawned relay tasks to send responses without blocking the swarm loop.
+    SendRelayResponse {
+        channel: ResponseChannel<ContentResponse>,
+        response: ContentResponse,
+    },
 }
 
-/// Pending requests tracking.
+/// TTL for pending requests. Entries older than this are cleaned up to prevent memory leaks.
+const PENDING_REQUEST_TTL: Duration = Duration::from_secs(120);
+
+/// Pending requests tracking with TTL support.
+///
+/// Each request tracks its creation time. A periodic sweep removes entries
+/// whose oneshot::Sender is closed (receiver timed out) or exceeded the TTL.
 #[derive(Default)]
 struct PendingRequests {
     capacity_queries: HashMap<OutboundRequestId, oneshot::Sender<Result<(u64, u64)>>>,
@@ -156,6 +227,49 @@ struct PendingRequests {
         HashMap<OutboundRequestId, oneshot::Sender<Result<Vec<SerializedOperation>>>>,
     operation_pushes: HashMap<OutboundRequestId, oneshot::Sender<Result<usize>>>,
     public_key_queries: HashMap<OutboundRequestId, oneshot::Sender<Result<Vec<NodePublicKey>>>>,
+    relay_update_queries: HashMap<OutboundRequestId, oneshot::Sender<Result<bool>>>,
+    relay_delete_queries: HashMap<OutboundRequestId, oneshot::Sender<Result<bool>>>,
+    relay_invalidate_tokens_queries: HashMap<OutboundRequestId, oneshot::Sender<Result<bool>>>,
+    /// Timestamps for all pending request IDs, used for TTL-based cleanup.
+    timestamps: HashMap<u64, tokio::time::Instant>,
+}
+
+impl PendingRequests {
+    /// Remove pending entries whose oneshot::Sender is closed (receiver dropped)
+    /// or that have exceeded the TTL. This prevents unbounded memory growth.
+    fn cleanup_stale(&mut self) {
+        let now = tokio::time::Instant::now();
+        let ttl = PENDING_REQUEST_TTL;
+
+        // Clean up closed senders from each map
+        self.capacity_queries.retain(|_, s| !s.is_closed());
+        self.content_fetches.retain(|_, s| !s.is_closed());
+        self.kad_queries.retain(|_, s| !s.is_closed());
+        self.kad_provider_queries.retain(|_, s| !s.is_closed());
+        self.operation_fetches.retain(|_, s| !s.is_closed());
+        self.operation_pushes.retain(|_, s| !s.is_closed());
+        self.public_key_queries.retain(|_, s| !s.is_closed());
+        self.relay_update_queries.retain(|_, s| !s.is_closed());
+        self.relay_delete_queries.retain(|_, s| !s.is_closed());
+        self.relay_invalidate_tokens_queries
+            .retain(|_, s| !s.is_closed());
+
+        // Clean up expired timestamps
+        self.timestamps
+            .retain(|_, ts| now.duration_since(*ts) < ttl);
+    }
+}
+
+/// Channels for dispatching relay requests and sending responses back to the swarm.
+///
+/// Relay requests (UpdateContent, DeleteContent, InvalidateTokens) are processed in
+/// spawned tasks to avoid blocking the swarm loop. `relay_tx` dispatches the
+/// request to the relay handler, and `command_tx` sends the response back to the
+/// swarm via `SwarmCommand::SendRelayResponse`.
+#[derive(Clone)]
+struct RelayChannels {
+    relay_tx: mpsc::Sender<RelayRequest>,
+    command_tx: mpsc::Sender<SwarmCommand>,
 }
 
 /// libp2p-based network implementation.
@@ -165,8 +279,7 @@ pub struct Libp2pNetwork {
     /// Connected peers and their addresses.
     ///
     /// Updated by the swarm event loop when connections are established/closed.
-    /// Reserved for future use in network monitoring and peer management APIs.
-    #[allow(dead_code)]
+    /// Used for monitoring (health check) and peer management.
     connected_peers: Arc<RwLock<HashMap<PeerId, Vec<Multiaddr>>>>,
     /// Broadcast channel for received Gossipsub events.
     event_rx: broadcast::Sender<ReceivedEvent>,
@@ -186,16 +299,71 @@ pub struct Libp2pNetwork {
     /// Reserved for future use in public key exchange APIs.
     #[allow(dead_code)]
     p256_public_key: Vec<u8>,
+    /// Channel receiver for relay requests from remote peers.
+    /// Taken by node.rs run() to process relay requests via StateNodeService.
+    relay_request_rx: tokio::sync::Mutex<Option<mpsc::Receiver<RelayRequest>>>,
+    /// Content network repository for member verification on incoming requests.
+    #[allow(dead_code)]
+    content_network_repo: Option<
+        Arc<RwLock<dyn crate::port::persistence::PersistentContentRepository + Send + Sync>>,
+    >,
 }
 
 impl Libp2pNetwork {
+    /// Create a new libp2p network with the given configuration.
+    /// Load an Ed25519 keypair from disk, or generate a new one and save it.
+    fn load_or_generate_peer_keypair(
+        data_dir: &std::path::Path,
+    ) -> Result<libp2p::identity::Keypair> {
+        let key_path = data_dir.join("peer_key.ed25519");
+
+        if key_path.exists() {
+            let key_bytes =
+                std::fs::read(&key_path).context("Failed to read peer keypair from disk")?;
+            let keypair = libp2p::identity::Keypair::ed25519_from_bytes(key_bytes)
+                .map_err(|e| anyhow::anyhow!("Failed to decode peer keypair: {:?}", e))?;
+            info!("Loaded peer keypair from {}", key_path.display());
+            Ok(keypair)
+        } else {
+            let keypair = libp2p::identity::Keypair::generate_ed25519();
+            // Extract the raw Ed25519 secret key bytes for persistence
+            if let Ok(ed25519_kp) = keypair.clone().try_into_ed25519() {
+                let secret_bytes = ed25519_kp.secret().as_ref().to_vec();
+                if let Some(parent) = key_path.parent() {
+                    std::fs::create_dir_all(parent)
+                        .context("Failed to create data directory for peer key")?;
+                }
+                std::fs::write(&key_path, &secret_bytes)
+                    .context("Failed to write peer keypair to disk")?;
+                info!(
+                    "Generated and saved new peer keypair to {}",
+                    key_path.display()
+                );
+            }
+            Ok(keypair)
+        }
+    }
+
     /// Create a new libp2p network with the given configuration.
     pub async fn new(
         config: Libp2pNetworkConfig,
         crdt_repo: Arc<dyn ContentRepository>,
         data_dir: PathBuf,
     ) -> Result<Self> {
-        let keypair = libp2p::identity::Keypair::generate_ed25519();
+        Self::with_content_network_repo(config, crdt_repo, data_dir, None).await
+    }
+
+    /// Create a new libp2p network with an optional content network repository
+    /// for member verification on incoming PushOperations/FetchOperations requests.
+    pub async fn with_content_network_repo(
+        config: Libp2pNetworkConfig,
+        crdt_repo: Arc<dyn ContentRepository>,
+        data_dir: PathBuf,
+        content_network_repo: Option<
+            Arc<RwLock<dyn crate::port::persistence::PersistentContentRepository + Send + Sync>>,
+        >,
+    ) -> Result<Self> {
+        let keypair = Self::load_or_generate_peer_keypair(&data_dir)?;
         let local_peer_id = PeerId::from(keypair.public());
 
         // Load or generate P-256 key for node authentication
@@ -213,9 +381,11 @@ impl Libp2pNetwork {
         // Build behaviour
         let behaviour = NodeBehaviour::new(local_peer_id, &keypair, BehaviourConfig::default())?;
 
-        // Create swarm
+        // Create swarm with connection limits to prevent FD/memory exhaustion (M-3).
+        // idle_connection_timeout is set higher than the default sync_interval (30s)
+        // to avoid excessive reconnection overhead (L-12).
         let swarm_config = libp2p::swarm::Config::with_tokio_executor()
-            .with_idle_connection_timeout(Duration::from_secs(60));
+            .with_idle_connection_timeout(Duration::from_secs(120));
 
         let mut swarm = Swarm::new(transport, behaviour, local_peer_id, swarm_config);
 
@@ -268,7 +438,15 @@ impl Libp2pNetwork {
         let data_dir_clone = data_dir.clone();
         let p256_signing_key_clone = p256_signing_key.clone();
 
+        // Create relay request channel
+        let (relay_tx, relay_rx) = mpsc::channel::<RelayRequest>(64);
+
         // Spawn swarm event loop
+        let relay_channels = RelayChannels {
+            relay_tx,
+            command_tx: command_tx.clone(),
+        };
+        let content_network_repo_clone = content_network_repo.clone();
         tokio::spawn(Self::run_swarm_loop(
             swarm,
             command_rx,
@@ -277,6 +455,8 @@ impl Libp2pNetwork {
             crdt_repo_clone,
             data_dir_clone,
             p256_signing_key_clone,
+            relay_channels,
+            content_network_repo_clone,
         ));
 
         Ok(Self {
@@ -287,6 +467,8 @@ impl Libp2pNetwork {
             crdt_repo,
             data_dir,
             p256_public_key,
+            relay_request_rx: tokio::sync::Mutex::new(Some(relay_rx)),
+            content_network_repo,
         })
     }
 
@@ -309,13 +491,22 @@ impl Libp2pNetwork {
             })
             .await
             .map_err(|_| anyhow::anyhow!("Failed to send dial command"))?;
-        reply_rx
+        tokio::time::timeout(PEER_NETWORK_TIMEOUT, reply_rx)
             .await
+            .map_err(|_| anyhow::anyhow!("dial timed out"))?
             .map_err(|_| anyhow::anyhow!("Dial response channel closed"))?
     }
 
-    /// Get the addresses this node is listening on.
-    pub async fn listen_addrs(&self) -> Vec<Multiaddr> {
+    /// Take the relay request receiver.
+    ///
+    /// This can only be called once. Returns None on subsequent calls.
+    /// Used by node.rs run() to process incoming relay requests.
+    pub async fn take_relay_receiver(&self) -> Option<mpsc::Receiver<RelayRequest>> {
+        self.relay_request_rx.lock().await.take()
+    }
+
+    /// Get the addresses this node is listening on (raw Multiaddr).
+    pub async fn listen_addrs_raw(&self) -> Vec<Multiaddr> {
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
             .command_tx
@@ -329,6 +520,7 @@ impl Libp2pNetwork {
     }
 
     /// Run the swarm event loop.
+    #[allow(clippy::too_many_arguments)]
     async fn run_swarm_loop(
         mut swarm: Swarm<NodeBehaviour>,
         mut command_rx: mpsc::Receiver<SwarmCommand>,
@@ -337,8 +529,14 @@ impl Libp2pNetwork {
         crdt_repo: Arc<dyn ContentRepository>,
         data_dir: PathBuf,
         p256_signing_key: Arc<crate::infrastructure::key_management::NodeKeyPair>,
+        relay_channels: RelayChannels,
+        content_network_repo: Option<
+            Arc<RwLock<dyn crate::port::persistence::PersistentContentRepository + Send + Sync>>,
+        >,
     ) {
         let mut pending = PendingRequests::default();
+        let mut cleanup_interval = tokio::time::interval(Duration::from_secs(60));
+        cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
@@ -348,7 +546,11 @@ impl Libp2pNetwork {
                 }
                 // Handle swarm events
                 event = swarm.select_next_some() => {
-                    Self::handle_swarm_event(&mut swarm, &mut pending, &connected_peers, &event_tx, &crdt_repo, &data_dir, &p256_signing_key, event).await;
+                    Self::handle_swarm_event(&mut swarm, &mut pending, &connected_peers, &event_tx, &crdt_repo, &data_dir, &p256_signing_key, &relay_channels, &content_network_repo, event).await;
+                }
+                // Periodic cleanup of stale pending requests
+                _ = cleanup_interval.tick() => {
+                    pending.cleanup_stale();
                 }
             }
         }
@@ -468,6 +670,76 @@ impl Libp2pNetwork {
                     .send_request(&peer_id, request);
                 pending.public_key_queries.insert(request_id, reply);
             }
+            SwarmCommand::RelayUpdateContent {
+                peer_id,
+                content_id,
+                data,
+                auth_token,
+                request_signature,
+                timestamp,
+                reply,
+            } => {
+                let request_id = swarm.behaviour_mut().request_response.send_request(
+                    &peer_id,
+                    ContentRequest::UpdateContent {
+                        content_id,
+                        data,
+                        auth_token,
+                        request_signature,
+                        timestamp,
+                    },
+                );
+                pending.relay_update_queries.insert(request_id, reply);
+            }
+            SwarmCommand::RelayDeleteContent {
+                peer_id,
+                content_id,
+                auth_token,
+                request_signature,
+                timestamp,
+                reply,
+            } => {
+                let request_id = swarm.behaviour_mut().request_response.send_request(
+                    &peer_id,
+                    ContentRequest::DeleteContent {
+                        content_id,
+                        auth_token,
+                        request_signature,
+                        timestamp,
+                    },
+                );
+                pending.relay_delete_queries.insert(request_id, reply);
+            }
+            SwarmCommand::RelayInvalidateTokens {
+                peer_id,
+                content_id,
+                auth_token,
+                request_signature,
+                timestamp,
+                reply,
+            } => {
+                let request_id = swarm.behaviour_mut().request_response.send_request(
+                    &peer_id,
+                    ContentRequest::InvalidateTokens {
+                        content_id,
+                        auth_token,
+                        request_signature,
+                        timestamp,
+                    },
+                );
+                pending
+                    .relay_invalidate_tokens_queries
+                    .insert(request_id, reply);
+            }
+            SwarmCommand::SendRelayResponse { channel, response } => {
+                if let Err(e) = swarm
+                    .behaviour_mut()
+                    .request_response
+                    .send_response(channel, response)
+                {
+                    error!("Failed to send relay response: {:?}", e);
+                }
+            }
         }
     }
 
@@ -481,6 +753,10 @@ impl Libp2pNetwork {
         crdt_repo: &Arc<dyn ContentRepository>,
         data_dir: &std::path::Path,
         p256_signing_key: &Arc<crate::infrastructure::key_management::NodeKeyPair>,
+        relay_channels: &RelayChannels,
+        content_network_repo: &Option<
+            Arc<RwLock<dyn crate::port::persistence::PersistentContentRepository + Send + Sync>>,
+        >,
         event: SwarmEvent<NodeBehaviourEvent>,
     ) {
         match event {
@@ -491,8 +767,16 @@ impl Libp2pNetwork {
                 Self::handle_gossipsub_event(event_tx, *gossip_event).await;
             }
             SwarmEvent::Behaviour(NodeBehaviourEvent::RequestResponse(rr_event)) => {
-                Self::handle_request_response_event(swarm, pending, crdt_repo, data_dir, rr_event)
-                    .await;
+                Self::handle_request_response_event(
+                    swarm,
+                    pending,
+                    crdt_repo,
+                    data_dir,
+                    relay_channels,
+                    content_network_repo,
+                    rr_event,
+                )
+                .await;
             }
             SwarmEvent::Behaviour(NodeBehaviourEvent::PublicKeyProtocol(pk_event)) => {
                 Self::handle_public_key_protocol_event(swarm, pending, p256_signing_key, pk_event)
@@ -506,16 +790,28 @@ impl Libp2pNetwork {
                 Self::handle_mdns_event(swarm, connected_peers, mdns_event).await;
             }
             SwarmEvent::ConnectionEstablished {
-                peer_id, endpoint, ..
+                peer_id,
+                endpoint,
+                connection_id,
+                ..
             } => {
                 let addr = endpoint.get_remote_address().clone();
                 info!("Connection established with {} at {}", peer_id, addr);
-                connected_peers
-                    .write()
-                    .await
-                    .entry(peer_id)
-                    .or_insert_with(Vec::new)
-                    .push(addr);
+
+                // Enforce connection limit (M-3): close excess connections to prevent
+                // FD/memory exhaustion. Limit total unique peers to 256.
+                const MAX_CONNECTED_PEERS: usize = 256;
+                let mut peers = connected_peers.write().await;
+                let peer_count = peers.len();
+                if !peers.contains_key(&peer_id) && peer_count >= MAX_CONNECTED_PEERS {
+                    warn!(
+                        "Connection limit reached ({}/{}), closing connection to {}",
+                        peer_count, MAX_CONNECTED_PEERS, peer_id
+                    );
+                    let _ = swarm.close_connection(connection_id);
+                } else {
+                    peers.entry(peer_id).or_insert_with(Vec::new).push(addr);
+                }
             }
             SwarmEvent::ConnectionClosed { peer_id, .. } => {
                 info!("Connection closed with {}", peer_id);
@@ -632,6 +928,10 @@ impl Libp2pNetwork {
         pending: &mut PendingRequests,
         crdt_repo: &Arc<dyn ContentRepository>,
         data_dir: &std::path::Path,
+        relay_channels: &RelayChannels,
+        content_network_repo: &Option<
+            Arc<RwLock<dyn crate::port::persistence::PersistentContentRepository + Send + Sync>>,
+        >,
         event: request_response::Event<ContentRequest, ContentResponse>,
     ) {
         match event {
@@ -640,7 +940,14 @@ impl Libp2pNetwork {
                     request, channel, ..
                 } => {
                     Self::handle_incoming_request(
-                        swarm, peer, request, channel, crdt_repo, data_dir,
+                        swarm,
+                        peer,
+                        request,
+                        channel,
+                        crdt_repo,
+                        data_dir,
+                        relay_channels,
+                        content_network_repo,
                     )
                     .await;
                 }
@@ -655,18 +962,38 @@ impl Libp2pNetwork {
                 request_id, error, ..
             } => {
                 error!("Outbound request failed: {:?}", error);
-                // Clean up pending requests
+                let err_msg = format!("Request failed: {:?}", error);
+                // Clean up all pending request types to prevent resource leaks
                 if let Some(reply) = pending.capacity_queries.remove(&request_id) {
-                    let _ = reply.send(Err(anyhow::anyhow!("Request failed: {:?}", error)));
+                    let _ = reply.send(Err(anyhow::anyhow!("{}", err_msg)));
                 }
                 if let Some(reply) = pending.content_fetches.remove(&request_id) {
-                    let _ = reply.send(Err(anyhow::anyhow!("Request failed: {:?}", error)));
+                    let _ = reply.send(Err(anyhow::anyhow!("{}", err_msg)));
+                }
+                if let Some(reply) = pending.operation_fetches.remove(&request_id) {
+                    let _ = reply.send(Err(anyhow::anyhow!("{}", err_msg)));
+                }
+                if let Some(reply) = pending.operation_pushes.remove(&request_id) {
+                    let _ = reply.send(Err(anyhow::anyhow!("{}", err_msg)));
+                }
+                if let Some(reply) = pending.public_key_queries.remove(&request_id) {
+                    let _ = reply.send(Err(anyhow::anyhow!("{}", err_msg)));
+                }
+                if let Some(reply) = pending.relay_update_queries.remove(&request_id) {
+                    let _ = reply.send(Err(anyhow::anyhow!("{}", err_msg)));
+                }
+                if let Some(reply) = pending.relay_delete_queries.remove(&request_id) {
+                    let _ = reply.send(Err(anyhow::anyhow!("{}", err_msg)));
+                }
+                if let Some(reply) = pending.relay_invalidate_tokens_queries.remove(&request_id) {
+                    let _ = reply.send(Err(anyhow::anyhow!("{}", err_msg)));
                 }
             }
             _ => {}
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn handle_incoming_request(
         swarm: &mut Swarm<NodeBehaviour>,
         peer: PeerId,
@@ -674,9 +1001,165 @@ impl Libp2pNetwork {
         channel: ResponseChannel<ContentResponse>,
         crdt_repo: &Arc<dyn ContentRepository>,
         data_dir: &std::path::Path,
+        relay_channels: &RelayChannels,
+        content_network_repo: &Option<
+            Arc<RwLock<dyn crate::port::persistence::PersistentContentRepository + Send + Sync>>,
+        >,
     ) {
         debug!("Received request from {}: {:?}", peer, request);
 
+        // For relay requests (UpdateContent, DeleteContent, InvalidateTokens), we spawn a
+        // background task to avoid blocking the swarm loop. The relay handler may need
+        // to send SwarmCommands (e.g. publish_event, query_capacity) which would deadlock
+        // if the swarm loop is blocked waiting for the relay response.
+        match request {
+            ContentRequest::UpdateContent {
+                content_id,
+                data,
+                auth_token,
+                request_signature,
+                timestamp,
+            } => {
+                info!(
+                    "Received relayed UpdateContent for {} from {}",
+                    content_id, peer
+                );
+                let channels = relay_channels.clone();
+                tokio::spawn(async move {
+                    let (reply_tx, reply_rx) = oneshot::channel();
+                    let relay_req = RelayRequest {
+                        kind: RelayRequestKind::UpdateContent {
+                            content_id: content_id.clone(),
+                            data,
+                            auth_token,
+                            request_signature,
+                            timestamp,
+                        },
+                        reply: reply_tx,
+                    };
+                    let response = if channels.relay_tx.send(relay_req).await.is_ok() {
+                        match reply_rx.await {
+                            Ok(Ok(())) => ContentResponse::UpdateResult {
+                                content_id,
+                                success: true,
+                            },
+                            Ok(Err(e)) => ContentResponse::Error {
+                                message: format!("Relay update failed: {}", e),
+                            },
+                            Err(_) => ContentResponse::Error {
+                                message: "Relay handler dropped".to_string(),
+                            },
+                        }
+                    } else {
+                        ContentResponse::Error {
+                            message: "Relay channel closed".to_string(),
+                        }
+                    };
+                    let _ = channels
+                        .command_tx
+                        .send(SwarmCommand::SendRelayResponse { channel, response })
+                        .await;
+                });
+                return;
+            }
+            ContentRequest::DeleteContent {
+                content_id,
+                auth_token,
+                request_signature,
+                timestamp,
+            } => {
+                info!(
+                    "Received relayed DeleteContent for {} from {}",
+                    content_id, peer
+                );
+                let channels = relay_channels.clone();
+                tokio::spawn(async move {
+                    let (reply_tx, reply_rx) = oneshot::channel();
+                    let relay_req = RelayRequest {
+                        kind: RelayRequestKind::DeleteContent {
+                            content_id: content_id.clone(),
+                            auth_token,
+                            request_signature,
+                            timestamp,
+                        },
+                        reply: reply_tx,
+                    };
+                    let response = if channels.relay_tx.send(relay_req).await.is_ok() {
+                        match reply_rx.await {
+                            Ok(Ok(())) => ContentResponse::DeleteResult {
+                                content_id,
+                                success: true,
+                            },
+                            Ok(Err(e)) => ContentResponse::Error {
+                                message: format!("Relay delete failed: {}", e),
+                            },
+                            Err(_) => ContentResponse::Error {
+                                message: "Relay handler dropped".to_string(),
+                            },
+                        }
+                    } else {
+                        ContentResponse::Error {
+                            message: "Relay channel closed".to_string(),
+                        }
+                    };
+                    let _ = channels
+                        .command_tx
+                        .send(SwarmCommand::SendRelayResponse { channel, response })
+                        .await;
+                });
+                return;
+            }
+            ContentRequest::InvalidateTokens {
+                content_id,
+                auth_token,
+                request_signature,
+                timestamp,
+            } => {
+                info!(
+                    "Received relayed InvalidateTokens for {} from {}",
+                    content_id, peer
+                );
+                let channels = relay_channels.clone();
+                tokio::spawn(async move {
+                    let (reply_tx, reply_rx) = oneshot::channel();
+                    let relay_req = RelayRequest {
+                        kind: RelayRequestKind::InvalidateTokens {
+                            content_id: content_id.clone(),
+                            auth_token,
+                            request_signature,
+                            timestamp,
+                        },
+                        reply: reply_tx,
+                    };
+                    let response = if channels.relay_tx.send(relay_req).await.is_ok() {
+                        match reply_rx.await {
+                            Ok(Ok(())) => ContentResponse::InvalidateTokensResult {
+                                content_id,
+                                success: true,
+                            },
+                            Ok(Err(e)) => ContentResponse::Error {
+                                message: format!("Relay invalidate_tokens failed: {}", e),
+                            },
+                            Err(_) => ContentResponse::Error {
+                                message: "Relay handler dropped".to_string(),
+                            },
+                        }
+                    } else {
+                        ContentResponse::Error {
+                            message: "Relay channel closed".to_string(),
+                        }
+                    };
+                    let _ = channels
+                        .command_tx
+                        .send(SwarmCommand::SendRelayResponse { channel, response })
+                        .await;
+                });
+                return;
+            }
+            _ => {}
+        }
+
+        // Non-relay requests: handle synchronously in the swarm loop
         let response = match request {
             ContentRequest::CapacityQuery => match disk_capacity::get_disk_capacity(data_dir) {
                 Ok((total, available)) => ContentResponse::CapacityResponse {
@@ -718,30 +1201,118 @@ impl Libp2pNetwork {
                 genesis_cid,
                 since_version,
             } => {
-                match crdt_repo
-                    .get_operations(&genesis_cid, since_version.as_deref())
-                    .await
-                {
-                    Ok(ops) => {
-                        // Serialize operations for network transfer
-                        let operations: Vec<Vec<u8>> = ops
-                            .iter()
-                            .filter_map(|op| serde_json::to_vec(op).ok())
-                            .collect();
-                        ContentResponse::OperationsData {
-                            genesis_cid,
-                            operations,
+                // Verify peer is a member of the content network
+                if let Some(repo) = content_network_repo {
+                    let is_member = repo
+                        .read()
+                        .await
+                        .get_content_network(&genesis_cid)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|net| net.has_member_str(&peer.to_string()))
+                        .unwrap_or(false);
+                    if !is_member {
+                        ContentResponse::Error {
+                            message: format!(
+                                "Peer {} is not a member of content network {}",
+                                peer, genesis_cid
+                            ),
+                        }
+                    } else {
+                        match crdt_repo
+                            .get_operations(&genesis_cid, since_version.as_deref())
+                            .await
+                        {
+                            Ok(ops) => {
+                                let operations: Vec<Vec<u8>> = ops
+                                    .iter()
+                                    .filter_map(|op| serde_json::to_vec(op).ok())
+                                    .collect();
+                                ContentResponse::OperationsData {
+                                    genesis_cid,
+                                    operations,
+                                }
+                            }
+                            Err(e) => ContentResponse::Error {
+                                message: format!("Failed to fetch operations: {}", e),
+                            },
                         }
                     }
-                    Err(e) => ContentResponse::Error {
-                        message: format!("Failed to fetch operations: {}", e),
-                    },
+                } else {
+                    match crdt_repo
+                        .get_operations(&genesis_cid, since_version.as_deref())
+                        .await
+                    {
+                        Ok(ops) => {
+                            let operations: Vec<Vec<u8>> = ops
+                                .iter()
+                                .filter_map(|op| serde_json::to_vec(op).ok())
+                                .collect();
+                            ContentResponse::OperationsData {
+                                genesis_cid,
+                                operations,
+                            }
+                        }
+                        Err(e) => ContentResponse::Error {
+                            message: format!("Failed to fetch operations: {}", e),
+                        },
+                    }
                 }
             }
             ContentRequest::PushOperations {
                 genesis_cid,
                 operations,
             } => {
+                // Verify peer is a member of the content network
+                if let Some(repo) = content_network_repo {
+                    let is_member = repo
+                        .read()
+                        .await
+                        .get_content_network(&genesis_cid)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|net| net.has_member_str(&peer.to_string()))
+                        .unwrap_or(false);
+                    if !is_member {
+                        let response = ContentResponse::Error {
+                            message: format!(
+                                "Peer {} is not a member of content network {}",
+                                peer, genesis_cid
+                            ),
+                        };
+                        if let Err(e) = swarm
+                            .behaviour_mut()
+                            .request_response
+                            .send_response(channel, response)
+                        {
+                            error!("Failed to send response: {:?}", e);
+                        }
+                        return;
+                    }
+                }
+
+                // Reject oversized payloads (max 16 MiB total)
+                const MAX_PUSH_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+                let total_size: usize = operations.iter().map(|op| op.len()).sum();
+                if total_size > MAX_PUSH_PAYLOAD_BYTES {
+                    let response = ContentResponse::Error {
+                        message: format!(
+                            "Push payload too large: {} bytes (max {})",
+                            total_size, MAX_PUSH_PAYLOAD_BYTES
+                        ),
+                    };
+                    if let Err(e) = swarm
+                        .behaviour_mut()
+                        .request_response
+                        .send_response(channel, response)
+                    {
+                        error!("Failed to send response: {:?}", e);
+                    }
+                    return;
+                }
+
                 // Deserialize operations from wire format
                 let ops: Vec<SerializedOperation> = operations
                     .iter()
@@ -758,6 +1329,10 @@ impl Libp2pNetwork {
                     },
                 }
             }
+            // Relay variants already handled above and returned early
+            ContentRequest::UpdateContent { .. }
+            | ContentRequest::DeleteContent { .. }
+            | ContentRequest::InvalidateTokens { .. } => unreachable!(),
         };
 
         if let Err(e) = swarm
@@ -847,6 +1422,57 @@ impl Libp2pNetwork {
                 }
                 ContentResponse::Error { message } => {
                     let _ = reply.send(Err(anyhow::anyhow!("Push operations error: {}", message)));
+                }
+                _ => {
+                    let _ = reply.send(Err(anyhow::anyhow!("Unexpected response type")));
+                }
+            }
+            return;
+        }
+
+        // Handle relay update response
+        if let Some(reply) = pending.relay_update_queries.remove(&request_id) {
+            match response {
+                ContentResponse::UpdateResult { success, .. } => {
+                    let _ = reply.send(Ok(success));
+                }
+                ContentResponse::Error { message } => {
+                    let _ = reply.send(Err(anyhow::anyhow!("Relay update error: {}", message)));
+                }
+                _ => {
+                    let _ = reply.send(Err(anyhow::anyhow!("Unexpected response type")));
+                }
+            }
+            return;
+        }
+
+        // Handle relay delete response
+        if let Some(reply) = pending.relay_delete_queries.remove(&request_id) {
+            match response {
+                ContentResponse::DeleteResult { success, .. } => {
+                    let _ = reply.send(Ok(success));
+                }
+                ContentResponse::Error { message } => {
+                    let _ = reply.send(Err(anyhow::anyhow!("Relay delete error: {}", message)));
+                }
+                _ => {
+                    let _ = reply.send(Err(anyhow::anyhow!("Unexpected response type")));
+                }
+            }
+            return;
+        }
+
+        // Handle relay invalidate_tokens response
+        if let Some(reply) = pending.relay_invalidate_tokens_queries.remove(&request_id) {
+            match response {
+                ContentResponse::InvalidateTokensResult { success, .. } => {
+                    let _ = reply.send(Ok(success));
+                }
+                ContentResponse::Error { message } => {
+                    let _ = reply.send(Err(anyhow::anyhow!(
+                        "Relay invalidate_tokens error: {}",
+                        message
+                    )));
                 }
                 _ => {
                     let _ = reply.send(Err(anyhow::anyhow!("Unexpected response type")));
@@ -1030,8 +1656,9 @@ impl PeerNetwork for Libp2pNetwork {
             .await
             .map_err(|_| anyhow::anyhow!("Failed to send command"))?;
 
-        let peers = rx
+        let peers = tokio::time::timeout(PEER_NETWORK_TIMEOUT, rx)
             .await
+            .map_err(|_| anyhow::anyhow!("find_closest_peers timed out"))?
             .map_err(|_| anyhow::anyhow!("Failed to receive response"))??;
         Ok(peers.into_iter().map(|p| p.to_string()).collect())
     }
@@ -1055,7 +1682,8 @@ impl PeerNetwork for Libp2pNetwork {
                 continue;
             }
 
-            if let Ok(Ok((_, available))) = rx.await {
+            if let Ok(Ok(Ok((_, available)))) = tokio::time::timeout(PEER_NETWORK_TIMEOUT, rx).await
+            {
                 results.insert(peer_id_str.clone(), available);
             }
         }
@@ -1102,7 +1730,7 @@ impl PeerNetwork for Libp2pNetwork {
                     .await
                     .is_ok()
                 {
-                    if let Ok(Ok(keys)) = rx.await {
+                    if let Ok(Ok(Ok(keys))) = tokio::time::timeout(PEER_NETWORK_TIMEOUT, rx).await {
                         // The returned key might have a different node_id (e.g., the actual NodeId)
                         // than what we requested (e.g., a PeerId), but we should still store it
                         // indexed by what was requested
@@ -1134,7 +1762,9 @@ impl PeerNetwork for Libp2pNetwork {
             .await
             .map_err(|_| anyhow::anyhow!("Failed to send command"))?;
 
-        rx.await
+        tokio::time::timeout(PEER_NETWORK_TIMEOUT, rx)
+            .await
+            .map_err(|_| anyhow::anyhow!("publish_event timed out"))?
             .map_err(|_| anyhow::anyhow!("Failed to receive response"))?
     }
 
@@ -1152,7 +1782,9 @@ impl PeerNetwork for Libp2pNetwork {
             .await
             .map_err(|_| anyhow::anyhow!("Failed to send command"))?;
 
-        rx.await
+        tokio::time::timeout(PEER_NETWORK_TIMEOUT, rx)
+            .await
+            .map_err(|_| anyhow::anyhow!("fetch_content timed out"))?
             .map_err(|_| anyhow::anyhow!("Failed to receive response"))?
     }
 
@@ -1163,12 +1795,22 @@ impl PeerNetwork for Libp2pNetwork {
             .await
             .map_err(|_| anyhow::anyhow!("Failed to send command"))?;
 
-        rx.await
+        tokio::time::timeout(PEER_NETWORK_TIMEOUT, rx)
+            .await
+            .map_err(|_| anyhow::anyhow!("publish_provider timed out"))?
             .map_err(|_| anyhow::anyhow!("Failed to receive response"))?
     }
 
     fn local_peer_id(&self) -> String {
         self.local_peer_id.to_string()
+    }
+
+    async fn listen_addrs(&self) -> Vec<String> {
+        self.listen_addrs_raw()
+            .await
+            .into_iter()
+            .map(|a| a.to_string())
+            .collect()
     }
 
     async fn fetch_operations(
@@ -1191,7 +1833,9 @@ impl PeerNetwork for Libp2pNetwork {
             .await
             .map_err(|_| anyhow::anyhow!("Failed to send command"))?;
 
-        rx.await
+        tokio::time::timeout(PEER_NETWORK_TIMEOUT, rx)
+            .await
+            .map_err(|_| anyhow::anyhow!("fetch_operations timed out"))?
             .map_err(|_| anyhow::anyhow!("Failed to receive response"))?
     }
 
@@ -1215,7 +1859,9 @@ impl PeerNetwork for Libp2pNetwork {
             .await
             .map_err(|_| anyhow::anyhow!("Failed to send command"))?;
 
-        rx.await
+        tokio::time::timeout(PEER_NETWORK_TIMEOUT, rx)
+            .await
+            .map_err(|_| anyhow::anyhow!("push_operations timed out"))?
             .map_err(|_| anyhow::anyhow!("Failed to receive response"))?
     }
 
@@ -1245,10 +1891,107 @@ impl PeerNetwork for Libp2pNetwork {
             .await
             .map_err(|_| anyhow::anyhow!("Failed to send command"))?;
 
-        let peers = rx
+        let peers = tokio::time::timeout(PEER_NETWORK_TIMEOUT, rx)
             .await
+            .map_err(|_| anyhow::anyhow!("find_content_providers timed out"))?
             .map_err(|_| anyhow::anyhow!("Failed to receive response"))??;
         Ok(peers.into_iter().map(|p| p.to_string()).collect())
+    }
+
+    async fn relay_update_content(
+        &self,
+        peer_id: &str,
+        content_id: &str,
+        data: &[u8],
+        auth_token: &str,
+        request_signature: &[u8],
+        timestamp: Option<u64>,
+    ) -> Result<bool> {
+        let peer_id = PeerId::from_str(peer_id)
+            .map_err(|_| anyhow::anyhow!("Invalid peer ID: {}", peer_id))?;
+
+        let (tx, rx) = oneshot::channel();
+        self.command_tx
+            .send(SwarmCommand::RelayUpdateContent {
+                peer_id,
+                content_id: content_id.to_string(),
+                data: data.to_vec(),
+                auth_token: auth_token.to_string(),
+                request_signature: request_signature.to_vec(),
+                timestamp,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("Failed to send command"))?;
+
+        tokio::time::timeout(PEER_NETWORK_TIMEOUT, rx)
+            .await
+            .map_err(|_| anyhow::anyhow!("relay_update_content timed out"))?
+            .map_err(|_| anyhow::anyhow!("Failed to receive response"))?
+    }
+
+    async fn relay_delete_content(
+        &self,
+        peer_id: &str,
+        content_id: &str,
+        auth_token: &str,
+        request_signature: &[u8],
+        timestamp: Option<u64>,
+    ) -> Result<bool> {
+        let peer_id = PeerId::from_str(peer_id)
+            .map_err(|_| anyhow::anyhow!("Invalid peer ID: {}", peer_id))?;
+
+        let (tx, rx) = oneshot::channel();
+        self.command_tx
+            .send(SwarmCommand::RelayDeleteContent {
+                peer_id,
+                content_id: content_id.to_string(),
+                auth_token: auth_token.to_string(),
+                request_signature: request_signature.to_vec(),
+                timestamp,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("Failed to send command"))?;
+
+        tokio::time::timeout(PEER_NETWORK_TIMEOUT, rx)
+            .await
+            .map_err(|_| anyhow::anyhow!("relay_delete_content timed out"))?
+            .map_err(|_| anyhow::anyhow!("Failed to receive response"))?
+    }
+
+    async fn relay_invalidate_tokens(
+        &self,
+        peer_id: &str,
+        content_id: &str,
+        auth_token: &str,
+        request_signature: &[u8],
+        timestamp: Option<u64>,
+    ) -> Result<bool> {
+        let peer_id = PeerId::from_str(peer_id)
+            .map_err(|_| anyhow::anyhow!("Invalid peer ID: {}", peer_id))?;
+
+        let (tx, rx) = oneshot::channel();
+        self.command_tx
+            .send(SwarmCommand::RelayInvalidateTokens {
+                peer_id,
+                content_id: content_id.to_string(),
+                auth_token: auth_token.to_string(),
+                request_signature: request_signature.to_vec(),
+                timestamp,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("Failed to send command"))?;
+
+        tokio::time::timeout(PEER_NETWORK_TIMEOUT, rx)
+            .await
+            .map_err(|_| anyhow::anyhow!("relay_invalidate_tokens timed out"))?
+            .map_err(|_| anyhow::anyhow!("Failed to receive response"))?
+    }
+
+    async fn connected_peer_count(&self) -> usize {
+        self.connected_peers.read().await.len()
     }
 }
 

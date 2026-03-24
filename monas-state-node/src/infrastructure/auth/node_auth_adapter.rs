@@ -163,6 +163,24 @@ impl AuthenticationService for NodeAuthAdapter {
         Identity::new(node_id, IdentityType::Node).context("Failed to create node Identity")
     }
 
+    async fn verify_request_signature(
+        &self,
+        _token: &AuthToken,
+        _signature: &[u8],
+        _message: &str,
+        _timestamp: Option<u64>,
+    ) -> Result<()> {
+        Err(anyhow::anyhow!(
+            "NodeAuthAdapter does not support request signature verification; use authenticate() with AuthContext instead"
+        ))
+    }
+
+    async fn verify_jwt_signature(&self, _token: &AuthToken) -> Result<()> {
+        Err(anyhow::anyhow!(
+            "NodeAuthAdapter does not support JWT signature verification"
+        ))
+    }
+
     async fn is_valid(&self, token: &AuthToken) -> Result<bool> {
         // Check if token can be parsed and NodeId exists in registry
         match self.parse_node_token(token.as_str()) {

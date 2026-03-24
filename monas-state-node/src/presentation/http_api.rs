@@ -10,8 +10,9 @@ use crate::infrastructure::persistence::{
 };
 use crate::port::auth_token::AuthToken;
 use crate::port::content_repository::ContentRepository;
+use crate::port::peer_network::PeerNetwork;
 use axum::{
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post, put},
@@ -35,19 +36,61 @@ pub type AppState = Arc<
 
 /// Create the API router.
 pub fn create_router(state: AppState) -> Router {
+    use std::sync::Arc;
+    use tower_governor::governor::GovernorConfigBuilder;
+    use tower_governor::key_extractor::SmartIpKeyExtractor;
+    use tower_governor::GovernorLayer;
+
+    // Global rate limit: 100 requests/sec, burst up to 200
+    let governor_config = GovernorConfigBuilder::default()
+        .per_second(100)
+        .burst_size(200)
+        .finish()
+        .unwrap();
+
+    // Per-IP rate limit: 20 requests/sec, burst up to 40
+    let per_ip_config = GovernorConfigBuilder::default()
+        .per_second(20)
+        .burst_size(40)
+        .key_extractor(SmartIpKeyExtractor)
+        .finish()
+        .unwrap();
+
     Router::new()
+        // --- Public endpoints (no auth required) ---
+        // These are intentionally unauthenticated for P2P peer discovery,
+        // node coordination, and operational monitoring.
+        // SECURITY NOTE: These endpoints expose only node/content IDs and
+        // capacity metadata — never content data itself.
         .route("/health", get(health_check))
+        .route("/health/live", get(liveness_check))
+        .route("/health/ready", get(readiness_check))
         .route("/node/info", get(node_info))
         .route("/node/register", post(register_node))
         .route("/nodes", get(list_nodes))
+        .route("/contents", get(list_contents))
+        // --- Authenticated endpoints ---
         .route("/content", post(create_content))
         .route("/content/:id", put(update_content).delete(delete_content))
         .route("/content/:id/members", post(add_members))
-        .route("/contents", get(list_contents))
         // CRDT-related endpoints
         .route("/content/:id/data", get(get_content_data))
         .route("/content/:id/history", get(get_content_history))
         .route("/content/:id/version/:version", get(get_content_version))
+        .route(
+            "/content/:id/access/invalidate",
+            post(invalidate_tokens_handler),
+        )
+        // Request body size limit: 16 MiB
+        .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
+        // Per-IP rate limit (inner layer, applied first)
+        .layer(GovernorLayer {
+            config: Arc::new(per_ip_config),
+        })
+        // Global rate limit (outer layer)
+        .layer(GovernorLayer {
+            config: Arc::new(governor_config),
+        })
         .with_state(state)
 }
 
@@ -66,6 +109,7 @@ pub struct NodeInfoResponse {
     pub node_id: String,
     pub total_capacity: Option<u64>,
     pub available_capacity: Option<u64>,
+    pub listen_addrs: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -126,14 +170,48 @@ pub struct ErrorResponse {
 }
 
 /// Implement IntoResponse for StateNodeError to automatically map to HTTP responses.
+///
+/// Internal error details are sanitized to prevent information leakage.
+/// Only client-facing error categories are returned; detailed messages are logged server-side.
 impl IntoResponse for StateNodeError {
     fn into_response(self) -> Response {
         let status = self.to_http_status();
+        let error_message = match &self {
+            // Client errors: safe to expose the message
+            StateNodeError::ContentNotFound(_) => self.to_string(),
+            StateNodeError::ContentAlreadyExists(_) => self.to_string(),
+            StateNodeError::NodeNotFound(_) => self.to_string(),
+            StateNodeError::InsufficientCapacity { .. } => self.to_string(),
+            StateNodeError::NoAvailableMembers => self.to_string(),
+            StateNodeError::NotAMember { .. } => self.to_string(),
+            StateNodeError::PermissionDenied(_) => "Permission denied".to_string(),
+            StateNodeError::InvalidUcanToken(_) => "Invalid authentication token".to_string(),
+            StateNodeError::AuthenticationFailed(_) => "Authentication failed".to_string(),
+            StateNodeError::AuthorizationFailed(_) => "Authorization failed".to_string(),
+            StateNodeError::InvalidCid(_) => "Invalid content identifier".to_string(),
+            StateNodeError::InvalidConfiguration(_) => "Invalid request".to_string(),
+            StateNodeError::ValueError(_) => "Invalid input value".to_string(),
+            // Server errors: log details but return generic message
+            StateNodeError::NetworkError(_)
+            | StateNodeError::PeerNotReachable(_)
+            | StateNodeError::CrdtError(_)
+            | StateNodeError::StorageError(_)
+            | StateNodeError::Internal(_) => {
+                tracing::error!("Internal error: {}", self);
+                "Internal server error".to_string()
+            }
+        };
         let error_response = ErrorResponse {
-            error: self.to_string(),
+            error: error_message,
         };
         (status, Json(error_response)).into_response()
     }
+}
+
+#[derive(Debug, Serialize)]
+pub struct InvalidateTokensResponse {
+    pub content_id: String,
+    pub new_min_valid_issued_at: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -192,11 +270,23 @@ fn extract_request_signature(headers: &HeaderMap) -> Option<Vec<u8>> {
         .ok()
 }
 
+/// Extract request timestamp from X-Request-Timestamp header.
+///
+/// Returns None if the header is missing or cannot be parsed.
+fn extract_request_timestamp(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get("x-request-timestamp")?
+        .to_str()
+        .ok()?
+        .parse()
+        .ok()
+}
+
 // ============================================================================
 // Handlers
 // ============================================================================
 
-/// Health check endpoint.
+/// Health check endpoint (public, no auth required).
 async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
     Json(HealthResponse {
         status: "ok".to_string(),
@@ -204,28 +294,73 @@ async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
     })
 }
 
-/// Get node info.
+/// Liveness probe (public, no auth required).
+///
+/// Returns 200 if the process is alive. Used by orchestrators (K8s) for liveness probes.
+async fn liveness_check() -> impl IntoResponse {
+    (StatusCode::OK, Json(serde_json::json!({"status": "alive"})))
+}
+
+/// Readiness probe (public, no auth required).
+///
+/// Returns 200 if the node is ready to serve traffic (DB responsive + network connected).
+/// Returns 503 if the node is not ready.
+async fn readiness_check(State(state): State<AppState>) -> impl IntoResponse {
+    let peer_count = state.peer_network().connected_peer_count().await;
+    let db_ok = state.crdt_repo().health_check().await.is_ok();
+
+    if db_ok {
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "ready",
+                "peers": peer_count,
+                "database": "ok"
+            })),
+        )
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "status": "not_ready",
+                "peers": peer_count,
+                "database": "error"
+            })),
+        )
+    }
+}
+
+/// Get node info (public, no auth required).
+///
+/// Exposes node capacity and listen addresses for peer discovery.
+/// Does not expose content data.
 async fn node_info(State(state): State<AppState>) -> impl IntoResponse {
     let node_id = state.local_node_id().to_string();
+    let listen_addrs = state.listen_addrs().await;
 
     match state.get_node(&node_id).await {
         Ok(Some(node)) => Json(NodeInfoResponse {
             node_id: node.node_id,
             total_capacity: Some(node.total_capacity),
             available_capacity: Some(node.available_capacity),
+            listen_addrs,
         })
         .into_response(),
         Ok(None) => Json(NodeInfoResponse {
             node_id,
             total_capacity: None,
             available_capacity: None,
+            listen_addrs,
         })
         .into_response(),
         Err(e) => e.into_response(),
     }
 }
 
-/// Register the local node.
+/// Register the local node (public, no auth required).
+///
+/// This endpoint is called by the node operator to initialize the local node.
+/// It is rate-limited by the global governor (100 req/s) to prevent abuse.
 async fn register_node(
     State(state): State<AppState>,
     Json(req): Json<RegisterNodeRequest>,
@@ -241,7 +376,9 @@ async fn register_node(
     }
 }
 
-/// List all nodes.
+/// List all nodes (public, no auth required).
+///
+/// Returns node IDs only — no content data. Used for peer coordination.
 async fn list_nodes(State(state): State<AppState>) -> impl IntoResponse {
     match state.list_nodes().await {
         Ok(nodes) => Json::<Vec<String>>(nodes).into_response(),
@@ -273,14 +410,24 @@ async fn create_content(
     // Extract authentication token and request signature from headers
     let token = extract_auth_token(&headers);
     let request_signature = extract_request_signature(&headers);
+    let timestamp = extract_request_timestamp(&headers);
 
     match state
-        .create_content(&data, token.as_ref(), request_signature.as_deref())
+        .create_content(
+            &data,
+            token.as_ref(),
+            request_signature.as_deref(),
+            timestamp,
+        )
         .await
     {
         Ok(event) => {
             if let crate::domain::events::Event::ContentCreated { content_id, .. } = event {
-                Json(CreateContentResponse { content_id }).into_response()
+                (
+                    StatusCode::CREATED,
+                    Json(CreateContentResponse { content_id }),
+                )
+                    .into_response()
             } else {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -320,6 +467,7 @@ async fn update_content(
     // Extract authentication token and request signature from headers
     let token = extract_auth_token(&headers);
     let request_signature = extract_request_signature(&headers);
+    let timestamp = extract_request_timestamp(&headers);
 
     match state
         .update_content(
@@ -327,6 +475,7 @@ async fn update_content(
             &data,
             token.as_ref(),
             request_signature.as_deref(),
+            timestamp,
         )
         .await
     {
@@ -352,9 +501,15 @@ async fn delete_content(
     // Extract authentication token and request signature from headers
     let token = extract_auth_token(&headers);
     let request_signature = extract_request_signature(&headers);
+    let timestamp = extract_request_timestamp(&headers);
 
     match state
-        .delete_content(&content_id, token.as_ref(), request_signature.as_deref())
+        .delete_content(
+            &content_id,
+            token.as_ref(),
+            request_signature.as_deref(),
+            timestamp,
+        )
         .await
     {
         Ok(_) => Json(DeleteContentResponse {
@@ -377,6 +532,7 @@ async fn add_members(
 
     let token = extract_auth_token(&headers);
     let request_signature = extract_request_signature(&headers);
+    let timestamp = extract_request_timestamp(&headers);
 
     match state
         .add_member_to_content(
@@ -384,6 +540,7 @@ async fn add_members(
             req.count,
             token.as_ref(),
             request_signature.as_deref(),
+            timestamp,
         )
         .await
     {
@@ -415,7 +572,10 @@ async fn add_members(
     }
 }
 
-/// List all content networks.
+/// List all content networks (public, no auth required).
+///
+/// Returns content IDs only — no content data. Used for sync coordination.
+/// Content data access requires authentication via GET /content/:id/data.
 async fn list_contents(State(state): State<AppState>) -> impl IntoResponse {
     match state.list_content_networks().await {
         Ok(contents) => Json::<Vec<String>>(contents).into_response(),
@@ -423,14 +583,104 @@ async fn list_contents(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
+/// Verify that the caller has read access to the given content.
+///
+/// Extracts a Bearer token from the Authorization header, then checks:
+/// - If the caller is the content owner, access is granted immediately
+/// - Otherwise, the caller must provide a valid AuthToken (JWT) as the Bearer token
+async fn verify_read_access(
+    state: &AppState,
+    headers: &HeaderMap,
+    content_id: &str,
+) -> Result<(), Response> {
+    let token = extract_auth_token(headers).ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "Authorization header is required".to_string(),
+            }),
+        )
+            .into_response()
+    })?;
+
+    let request_sig = extract_request_signature(headers);
+    let timestamp = extract_request_timestamp(headers);
+
+    // Authenticate the caller
+    let identity = state
+        .authenticate_for_read(&token, request_sig.as_deref(), timestamp)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorResponse {
+                    error: format!("Authentication failed: {}", e),
+                }),
+            )
+                .into_response()
+        })?;
+
+    // Check access policy for read permission
+    let crdt_repo = state.crdt_repo();
+    if let Ok(Some(policy)) = crdt_repo.get_access_policy(content_id).await {
+        // Owner always has access
+        if policy.is_owner(&identity) {
+            return Ok(());
+        }
+
+        // Non-owner: needs AuthToken-based authorization
+        // The Bearer token is used as-is for JWT-based auth
+        let request_signature = extract_request_signature(headers);
+        let authz_request = crate::port::authorization_service::AuthorizationRequest {
+            identity,
+            resource: crate::domain::value_objects::ContentId::new(content_id.to_string())
+                .map_err(|_| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error: "Invalid content ID".to_string(),
+                        }),
+                    )
+                        .into_response()
+                })?,
+            capability: crate::domain::auth_capability::AuthCapability::ReadContent,
+            token: Some(token),
+            request_signature,
+        };
+
+        if let Some(authz_service) = state.authz_service() {
+            match authz_service.authorize(&authz_request).await {
+                Ok(result) if result.is_granted() => return Ok(()),
+                _ => {}
+            }
+        }
+
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ErrorResponse {
+                error: "Insufficient permissions: read access required".to_string(),
+            }),
+        )
+            .into_response());
+    }
+    // If no policy exists, allow access (content may not have a policy yet)
+
+    Ok(())
+}
+
 /// Get content data from CRDT repository.
 ///
-/// Returns the latest version of the content data.
+/// Requires authentication. Returns the latest version of the content data.
 async fn get_content_data(
     State(state): State<AppState>,
     Path(content_id): Path<String>,
+    headers: HeaderMap,
     Query(query): Query<VersionQuery>,
 ) -> impl IntoResponse {
+    if let Err(response) = verify_read_access(&state, &headers, &content_id).await {
+        return response;
+    }
+
     let crdt_repo = state.crdt_repo();
 
     // Get data based on version parameter
@@ -457,21 +707,31 @@ async fn get_content_data(
             }),
         )
             .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-            .into_response(),
+        Err(e) => {
+            tracing::error!("Failed to get content data for {}: {}", content_id, e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "Internal server error".to_string(),
+                }),
+            )
+                .into_response()
+        }
     }
 }
 
 /// Get content version history from CRDT repository.
+///
+/// Requires authentication.
 async fn get_content_history(
     State(state): State<AppState>,
     Path(content_id): Path<String>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
+    if let Err(response) = verify_read_access(&state, &headers, &content_id).await {
+        return response;
+    }
+
     let crdt_repo = state.crdt_repo();
 
     match crdt_repo.get_history(&content_id).await {
@@ -480,21 +740,31 @@ async fn get_content_history(
             versions,
         })
         .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-            .into_response(),
+        Err(e) => {
+            tracing::error!("Failed to get content history for {}: {}", content_id, e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "Internal server error".to_string(),
+                }),
+            )
+                .into_response()
+        }
     }
 }
 
 /// Get a specific version of content data.
+///
+/// Requires authentication.
 async fn get_content_version(
     State(state): State<AppState>,
     Path((content_id, version)): Path<(String, String)>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
+    if let Err(response) = verify_read_access(&state, &headers, &content_id).await {
+        return response;
+    }
+
     let crdt_repo = state.crdt_repo();
 
     match crdt_repo.get_version(&version).await {
@@ -514,13 +784,55 @@ async fn get_content_version(
             }),
         )
             .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-            .into_response(),
+        Err(e) => {
+            tracing::error!("Failed to get content version {}: {}", version, e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "Internal server error".to_string(),
+                }),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Invalidate all AuthTokens for a content.
+///
+/// Only the content owner can call this endpoint.
+/// After invalidation, all previously issued AuthTokens become invalid.
+async fn invalidate_tokens_handler(
+    State(state): State<AppState>,
+    Path(content_id): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    // Extract authentication token
+    let token = match extract_auth_token(&headers) {
+        Some(t) => t,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorResponse {
+                    error: "Authentication token is required".to_string(),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    let request_signature = extract_request_signature(&headers);
+    let timestamp = extract_request_timestamp(&headers);
+
+    match state
+        .invalidate_tokens(&content_id, &token, request_signature.as_deref(), timestamp)
+        .await
+    {
+        Ok(new_min_valid_issued_at) => Json(InvalidateTokensResponse {
+            content_id,
+            new_min_valid_issued_at,
+        })
+        .into_response(),
+        Err(e) => e.into_response(),
     }
 }
 

@@ -28,11 +28,11 @@ impl TestKeyPair {
     ///
     /// # Arguments
     /// * `identity_type` - The type of identity ("user", "node", "service")
-    /// * `name` - The name/identifier for this identity
+    /// * `_name` - Unused (kept for API compatibility). Key ID is derived from public key.
     ///
     /// # Returns
-    /// A new TestKeyPair with key ID format: "monas:type:name" (e.g., "monas:user:alice")
-    pub fn generate(identity_type: &str, name: &str) -> Self {
+    /// A new TestKeyPair with self-contained key ID format: "monas:type:{public_key_hex}"
+    pub fn generate(identity_type: &str, _name: &str) -> Self {
         let secret = SecretKey::random(&mut OsRng);
         let signing_key = SigningKey::from(secret);
         let verifying_key = signing_key.verifying_key();
@@ -40,7 +40,7 @@ impl TestKeyPair {
         // Get uncompressed public key (65 bytes: 0x04 + X + Y)
         let public_key_bytes = verifying_key.to_encoded_point(false).as_bytes().to_vec();
 
-        let key_id = format!("monas:{}:{}", identity_type, name);
+        let key_id = format!("monas:{}:{}", identity_type, hex::encode(&public_key_bytes));
 
         Self {
             secret_key: signing_key,
@@ -208,9 +208,12 @@ mod tests {
     #[test]
     fn test_generate_key_pair() {
         let alice = TestKeyPair::generate("user", "alice");
-        assert_eq!(alice.key_id(), "monas:user:alice");
+        assert!(alice.key_id().starts_with("monas:user:04"));
         assert_eq!(alice.public_key().len(), 65); // Uncompressed P256 key
         assert_eq!(alice.public_key()[0], 0x04); // Uncompressed format marker
+                                                 // key_id should contain the full hex-encoded public key
+        let expected_key_id = format!("monas:user:{}", hex::encode(alice.public_key()));
+        assert_eq!(alice.key_id(), expected_key_id);
     }
 
     #[test]
@@ -233,8 +236,8 @@ mod tests {
             Some(3600),
         );
 
-        assert_eq!(token.payload.iss, "monas:user:alice");
-        assert_eq!(token.payload.aud, "monas:user:bob");
+        assert_eq!(token.payload.iss, alice.key_id());
+        assert_eq!(token.payload.aud, bob.key_id());
         assert_eq!(token.payload.att.len(), 1);
         assert_eq!(token.payload.att[0].with, "monas://content/test123");
         assert_eq!(token.payload.att[0].can, CapabilityAction::Read);

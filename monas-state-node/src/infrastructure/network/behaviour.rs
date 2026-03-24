@@ -142,21 +142,28 @@ impl NodeBehaviour {
         .map_err(|e| anyhow::anyhow!("Failed to create gossipsub behaviour: {}", e))?;
 
         // RequestResponse configuration using CBOR codec
+        // Apply request timeout and limit concurrent streams to mitigate DoS
+        let rr_config = request_response::Config::default()
+            .with_request_timeout(Duration::from_secs(30))
+            .with_max_concurrent_streams(32);
         let request_response = request_response::cbor::Behaviour::new(
             [(
                 StreamProtocol::new(CONTENT_PROTOCOL_NAME),
                 ProtocolSupport::Full,
             )],
-            request_response::Config::default(),
+            rr_config,
         );
 
         // Public key protocol configuration using CBOR codec
+        let pk_config = request_response::Config::default()
+            .with_request_timeout(Duration::from_secs(15))
+            .with_max_concurrent_streams(16);
         let public_key_protocol = request_response::cbor::Behaviour::new(
             [(
                 StreamProtocol::new(PUBLIC_KEY_PROTOCOL_NAME),
                 ProtocolSupport::Full,
             )],
-            request_response::Config::default(),
+            pk_config,
         );
 
         // Identify configuration
@@ -207,21 +214,28 @@ impl NodeBehaviour {
         .map_err(|e| anyhow::anyhow!("Failed to create gossipsub behaviour: {}", e))?;
 
         // RequestResponse configuration using CBOR codec
+        // Apply request timeout and limit concurrent streams to mitigate DoS
+        let rr_config = request_response::Config::default()
+            .with_request_timeout(Duration::from_secs(30))
+            .with_max_concurrent_streams(32);
         let request_response = request_response::cbor::Behaviour::new(
             [(
                 StreamProtocol::new(CONTENT_PROTOCOL_NAME),
                 ProtocolSupport::Full,
             )],
-            request_response::Config::default(),
+            rr_config,
         );
 
         // Public key protocol configuration using CBOR codec
+        let pk_config = request_response::Config::default()
+            .with_request_timeout(Duration::from_secs(15))
+            .with_max_concurrent_streams(16);
         let public_key_protocol = request_response::cbor::Behaviour::new(
             [(
                 StreamProtocol::new(PUBLIC_KEY_PROTOCOL_NAME),
                 ProtocolSupport::Full,
             )],
-            request_response::Config::default(),
+            pk_config,
         );
 
         // Identify configuration

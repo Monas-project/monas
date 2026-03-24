@@ -78,21 +78,28 @@ where
             errors: Vec::new(),
         };
 
-        // 1. Find providers for this content
-        let providers = match self.peer_network.find_content_providers(genesis_cid).await {
-            Ok(p) => p,
+        // 1. Get member nodes from content network
+        let network = match self
+            .content_network_repo
+            .read()
+            .await
+            .get_content_network(genesis_cid)
+            .await
+        {
+            Ok(Some(n)) => n,
+            Ok(None) => {
+                result
+                    .errors
+                    .push(format!("Content network not found: {}", genesis_cid));
+                return Ok(result);
+            }
             Err(e) => {
                 result
                     .errors
-                    .push(format!("Failed to find providers: {}", e));
+                    .push(format!("Failed to get content network: {}", e));
                 return Ok(result);
             }
         };
-
-        if providers.is_empty() {
-            tracing::debug!("No providers found for content {}", genesis_cid);
-            return Ok(result);
-        }
 
         // 2. Get local version to request only newer operations
         let local_version = self
@@ -102,9 +109,10 @@ where
             .ok()
             .and_then(|h| h.last().cloned());
 
-        // 3. Fetch operations from each provider
-        for provider in providers {
-            if provider == self.local_node_id {
+        // 3. Fetch operations from each member node
+        for node_id in network.member_nodes() {
+            let node_id_str = node_id.as_str();
+            if node_id_str == self.local_node_id {
                 continue; // Skip self
             }
 
@@ -112,7 +120,7 @@ where
 
             match self
                 .peer_network
-                .fetch_operations(&provider, genesis_cid, local_version.as_deref())
+                .fetch_operations(node_id_str, genesis_cid, local_version.as_deref())
                 .await
             {
                 Ok(ops) => {
@@ -127,14 +135,14 @@ where
                             tracing::debug!(
                                 "Applied {} operations from {} for content {}",
                                 applied,
-                                provider,
+                                node_id_str,
                                 genesis_cid
                             );
                         }
                         Err(e) => {
                             result.errors.push(format!(
                                 "Failed to apply operations from {}: {}",
-                                provider, e
+                                node_id_str, e
                             ));
                         }
                     }
@@ -142,7 +150,7 @@ where
                 Err(e) => {
                     result
                         .errors
-                        .push(format!("Failed to fetch from {}: {}", provider, e));
+                        .push(format!("Failed to fetch from {}: {}", node_id_str, e));
                 }
             }
         }
@@ -248,21 +256,27 @@ where
 
         for content_id in content_ids {
             // Check if we're a member
-            if let Ok(Some(network)) = self
+            // NOTE: Acquire read lock transiently to avoid holding it across sync_from_peers
+            // (which makes network calls with 30s timeouts). Holding the lock would block
+            // write acquisitions from the event handler, causing effective deadlock.
+            let is_member = self
                 .content_network_repo
                 .read()
                 .await
                 .get_content_network(&content_id)
                 .await
-            {
-                if network.has_member_str(&self.local_node_id) {
-                    match self.sync_from_peers(&content_id).await {
-                        Ok(result) => {
-                            results.push((content_id, result));
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to sync content {}: {}", content_id, e);
-                        }
+                .ok()
+                .flatten()
+                .map(|net| net.has_member_str(&self.local_node_id))
+                .unwrap_or(false);
+
+            if is_member {
+                match self.sync_from_peers(&content_id).await {
+                    Ok(result) => {
+                        results.push((content_id, result));
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to sync content {}: {}", content_id, e);
                     }
                 }
             }
@@ -326,19 +340,22 @@ mod tests {
         )
     }
 
-    fn create_service_with_providers(
+    fn create_service_with_members(
         local_node_id: &str,
-        providers: Vec<String>,
+        content_id: &str,
+        members: Vec<&str>,
         operations: Vec<crate::port::content_repository::SerializedOperation>,
     ) -> TestSyncService {
         let peer_network = Arc::new(
             MockPeerNetwork::new()
                 .with_local_peer_id(local_node_id)
-                .with_providers(providers)
                 .with_fetched_operations(operations),
         );
         let crdt_repo = Arc::new(MockContentRepository::new());
-        let content_network_repo = Arc::new(RwLock::new(MockContentNetworkRepository::new()));
+        let content_network_repo = Arc::new(RwLock::new(
+            MockContentNetworkRepository::new()
+                .with_network(create_test_network(content_id, members)),
+        ));
 
         ContentSyncService::new(
             peer_network,
@@ -349,21 +366,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_sync_from_peers_no_providers() {
+    async fn test_sync_from_peers_no_network() {
         let service = create_test_service("node-1");
 
         let result = service.sync_from_peers("content-1").await.unwrap();
 
         assert_eq!(result.operations_applied, 0);
         assert_eq!(result.providers_contacted, 0);
-        assert!(result.errors.is_empty());
+        assert!(!result.errors.is_empty());
+        assert!(result.errors[0].contains("Content network not found"));
     }
 
     #[tokio::test]
     async fn test_sync_from_peers_skips_self() {
-        let service = create_service_with_providers(
+        let service = create_service_with_members(
             "node-1",
-            vec!["node-1".to_string()], // Only self as provider
+            "content-1",
+            vec!["node-1"], // Only self as member
             vec![],
         );
 
@@ -380,8 +399,12 @@ mod tests {
             create_test_operation("content-1", "node-2"),
         ];
 
-        let service =
-            create_service_with_providers("node-1", vec!["node-2".to_string()], operations.clone());
+        let service = create_service_with_members(
+            "node-1",
+            "content-1",
+            vec!["node-1", "node-2"],
+            operations.clone(),
+        );
 
         let result = service.sync_from_peers("content-1").await.unwrap();
 
@@ -391,18 +414,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_sync_from_peers_with_multiple_providers() {
+    async fn test_sync_from_peers_with_multiple_members() {
         let operations = vec![create_test_operation("content-1", "node-2")];
 
-        let service = create_service_with_providers(
+        let service = create_service_with_members(
             "node-1",
-            vec!["node-2".to_string(), "node-3".to_string()],
+            "content-1",
+            vec!["node-1", "node-2", "node-3"],
             operations.clone(),
         );
 
         let result = service.sync_from_peers("content-1").await.unwrap();
 
-        // Both providers contacted (minus self), each returning the same operations
+        // Both other members contacted (minus self), each returning the same operations
         // which get applied (mock applies all)
         assert_eq!(result.providers_contacted, 2);
         assert!(result.errors.is_empty());
@@ -519,7 +543,6 @@ mod tests {
         let peer_network = Arc::new(
             MockPeerNetwork::new()
                 .with_local_peer_id("node-1")
-                .with_providers(vec!["node-2".to_string()])
                 .with_fetched_operations(vec![create_test_operation("content-1", "node-2")]),
         );
         let crdt_repo = Arc::new(MockContentRepository::new());

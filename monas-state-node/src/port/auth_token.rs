@@ -41,12 +41,10 @@ impl AuthContext {
 
 /// Request metadata for replay attack prevention
 ///
-/// This structure contains nonce and timestamp information to prevent
-/// replay attacks. It is used in conjunction with request signatures.
+/// This structure contains timestamp information to prevent replay attacks.
+/// It is used in conjunction with request signatures.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestMetadata {
-    /// Unique nonce (must be fresh)
-    pub nonce: String,
     /// Unix timestamp (seconds since epoch)
     pub timestamp: u64,
     /// Operation being performed
@@ -57,20 +55,9 @@ pub struct RequestMetadata {
 
 impl RequestMetadata {
     /// Create signing message for request signature
-    /// Format: "{operation}:{resource}:{timestamp}:{nonce}"
+    /// Format: "{operation}:{resource}:{timestamp}"
     pub fn signing_message(&self) -> String {
-        format!(
-            "{}:{}:{}:{}",
-            self.operation, self.resource, self.timestamp, self.nonce
-        )
-    }
-
-    /// Generate a random nonce
-    pub fn generate_nonce() -> String {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
-        let nonce_bytes: [u8; 32] = rng.gen();
-        hex::encode(nonce_bytes)
+        format!("{}:{}:{}", self.operation, self.resource, self.timestamp)
     }
 }
 
