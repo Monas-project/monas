@@ -1,6 +1,6 @@
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     routing::{get, post},
     Json, Router,
 };
@@ -10,7 +10,7 @@ use monas_sdk::models::content::{
 use monas_sdk::models::keypair::GenerateKeypairInput;
 use monas_sdk::models::share::{GetSharedContentInput, RevokeShareInput, ShareContentInput};
 use monas_sdk::models::state::{GetHistoryInput, GetLatestVersionInput, VerifyIntegrityInput};
-use monas_sdk::{ApiResponse, MonasController};
+use monas_sdk::{ApiResponse, MonasController, StateNodeAuthContext};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -73,9 +73,15 @@ async fn generate_keypair(
 
 async fn create_content(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(input): Json<CreateContentInput>,
 ) -> Json<ApiResponse<monas_sdk::models::content::CreateContentOutput>> {
-    Json(state.controller.create_content(input))
+    let auth = build_state_node_auth_context(&headers);
+    Json(
+        state
+            .controller
+            .create_content_with_auth(input, Some(&auth)),
+    )
 }
 
 async fn get_content(
@@ -92,18 +98,30 @@ async fn get_content(
 async fn update_content(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    headers: HeaderMap,
     Json(mut input): Json<UpdateContentInput>,
 ) -> Json<ApiResponse<monas_sdk::models::content::UpdateContentOutput>> {
     input.content_id = id;
-    Json(state.controller.update_content(input))
+    let auth = build_state_node_auth_context(&headers);
+    Json(
+        state
+            .controller
+            .update_content_with_auth(input, Some(&auth)),
+    )
 }
 
 async fn delete_content(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    headers: HeaderMap,
 ) -> Json<ApiResponse<monas_sdk::models::content::DeleteContentOutput>> {
     let input = DeleteContentInput { content_id: id };
-    Json(state.controller.delete_content(input))
+    let auth = build_state_node_auth_context(&headers);
+    Json(
+        state
+            .controller
+            .delete_content_with_auth(input, Some(&auth)),
+    )
 }
 
 async fn share_content(
@@ -115,9 +133,11 @@ async fn share_content(
 
 async fn revoke_share(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(input): Json<RevokeShareInput>,
 ) -> Json<ApiResponse<monas_sdk::models::share::RevokeShareOutput>> {
-    Json(state.controller.revoke_share(input))
+    let auth = build_state_node_auth_context(&headers);
+    Json(state.controller.revoke_share_with_auth(input, Some(&auth)))
 }
 
 async fn get_shared_content(
@@ -129,21 +149,58 @@ async fn get_shared_content(
 
 async fn get_latest_version(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(input): Json<GetLatestVersionInput>,
 ) -> Json<ApiResponse<monas_sdk::models::state::GetLatestVersionOutput>> {
-    Json(state.controller.get_latest_version(input))
+    let auth = build_state_node_auth_context(&headers);
+    Json(
+        state
+            .controller
+            .get_latest_version_with_auth(input, Some(&auth)),
+    )
 }
 
 async fn get_history(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(input): Json<GetHistoryInput>,
 ) -> Json<ApiResponse<monas_sdk::models::state::GetHistoryOutput>> {
-    Json(state.controller.get_history(input))
+    let auth = build_state_node_auth_context(&headers);
+    Json(state.controller.get_history_with_auth(input, Some(&auth)))
 }
 
 async fn verify_integrity(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(input): Json<VerifyIntegrityInput>,
 ) -> Json<ApiResponse<monas_sdk::models::state::VerifyIntegrityOutput>> {
-    Json(state.controller.verify_integrity(input))
+    let auth = build_state_node_auth_context(&headers);
+    Json(
+        state
+            .controller
+            .verify_integrity_with_auth(input, Some(&auth)),
+    )
+}
+
+fn build_state_node_auth_context(headers: &HeaderMap) -> StateNodeAuthContext {
+    let authorization = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(ToOwned::to_owned);
+
+    let request_signature = headers
+        .get("x-request-signature")
+        .and_then(|v| v.to_str().ok())
+        .map(ToOwned::to_owned);
+
+    let request_timestamp = headers
+        .get("x-request-timestamp")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+
+    StateNodeAuthContext {
+        authorization,
+        request_signature,
+        request_timestamp,
+    }
 }

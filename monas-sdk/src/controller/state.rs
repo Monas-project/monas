@@ -4,7 +4,7 @@ use base64::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::common::{generate_trace_id, ApiError, ApiResponse};
+use crate::common::{generate_trace_id, ApiError, ApiResponse, StateNodeAuthContext};
 use crate::models::state::{
     GetHistoryInput, GetHistoryOutput, GetLatestVersionInput, GetLatestVersionOutput,
     VerifyIntegrityInput, VerifyIntegrityOutput,
@@ -29,10 +29,23 @@ impl MonasController {
     fn state_node_get_string<T>(
         &self,
         url: &str,
+        auth: Option<&StateNodeAuthContext>,
         trace_id: String,
     ) -> Result<(u16, String), ApiResponse<T>> {
         let trace_id_for_call = trace_id.clone();
-        let resp = ureq::get(url)
+        let mut req = ureq::get(url);
+        if let Some(ctx) = auth {
+            if let Some(value) = &ctx.authorization {
+                req = req.header("Authorization", value);
+            }
+            if let Some(value) = &ctx.request_signature {
+                req = req.header("X-Request-Signature", value);
+            }
+            if let Some(value) = ctx.request_timestamp {
+                req = req.header("X-Request-Timestamp", &value.to_string());
+            }
+        }
+        let resp = req
             .config()
             .http_status_as_error(false)
             .build()
@@ -72,11 +85,12 @@ impl MonasController {
     fn get_state_node_history<T>(
         &self,
         content_id: &str,
+        auth: Option<&StateNodeAuthContext>,
         trace_id: String,
     ) -> Result<StateNodeContentHistoryResponse, ApiResponse<T>> {
         let url = format!("{}/content/{}/history", self.state_node_url, content_id);
 
-        let (status, body) = self.state_node_get_string::<T>(&url, trace_id.clone())?;
+        let (status, body) = self.state_node_get_string::<T>(&url, auth, trace_id.clone())?;
         if status >= 400 {
             let msg = serde_json::from_str::<StateNodeErrorResponse>(&body)
                 .ok()
@@ -97,6 +111,7 @@ impl MonasController {
         &self,
         content_id: &str,
         version: &str,
+        auth: Option<&StateNodeAuthContext>,
         trace_id: String,
     ) -> Result<StateNodeContentDataResponse, ApiResponse<T>> {
         let url = format!(
@@ -104,7 +119,7 @@ impl MonasController {
             self.state_node_url, content_id, version
         );
 
-        let (status, body) = self.state_node_get_string::<T>(&url, trace_id.clone())?;
+        let (status, body) = self.state_node_get_string::<T>(&url, auth, trace_id.clone())?;
         if status >= 400 {
             let msg = serde_json::from_str::<StateNodeErrorResponse>(&body)
                 .ok()
@@ -126,6 +141,15 @@ impl MonasController {
         &self,
         input: GetLatestVersionInput,
     ) -> ApiResponse<GetLatestVersionOutput> {
+        self.get_latest_version_with_auth(input, None)
+    }
+
+    /// コンテンツの最新バージョン（CID）を取得する（認証ヘッダ透過あり）
+    pub fn get_latest_version_with_auth(
+        &self,
+        input: GetLatestVersionInput,
+        auth: Option<&StateNodeAuthContext>,
+    ) -> ApiResponse<GetLatestVersionOutput> {
         let trace_id = generate_trace_id();
 
         if let Some(response) = Self::validate_state_content_id(&input.content_id, trace_id.clone())
@@ -133,9 +157,11 @@ impl MonasController {
             return response;
         }
 
-        let history = match self
-            .get_state_node_history::<GetLatestVersionOutput>(&input.content_id, trace_id.clone())
-        {
+        let history = match self.get_state_node_history::<GetLatestVersionOutput>(
+            &input.content_id,
+            auth,
+            trace_id.clone(),
+        ) {
             Ok(h) => h,
             Err(e) => return e,
         };
@@ -158,6 +184,15 @@ impl MonasController {
 
     /// コンテンツの更新履歴を取得する
     pub fn get_history(&self, input: GetHistoryInput) -> ApiResponse<GetHistoryOutput> {
+        self.get_history_with_auth(input, None)
+    }
+
+    /// コンテンツの更新履歴を取得する（認証ヘッダ透過あり）
+    pub fn get_history_with_auth(
+        &self,
+        input: GetHistoryInput,
+        auth: Option<&StateNodeAuthContext>,
+    ) -> ApiResponse<GetHistoryOutput> {
         let trace_id = generate_trace_id();
 
         if let Some(response) = Self::validate_state_content_id(&input.content_id, trace_id.clone())
@@ -165,9 +200,11 @@ impl MonasController {
             return response;
         }
 
-        let history = match self
-            .get_state_node_history::<GetHistoryOutput>(&input.content_id, trace_id.clone())
-        {
+        let history = match self.get_state_node_history::<GetHistoryOutput>(
+            &input.content_id,
+            auth,
+            trace_id.clone(),
+        ) {
             Ok(h) => h,
             Err(e) => return e,
         };
@@ -197,6 +234,15 @@ impl MonasController {
     pub fn verify_integrity(
         &self,
         input: VerifyIntegrityInput,
+    ) -> ApiResponse<VerifyIntegrityOutput> {
+        self.verify_integrity_with_auth(input, None)
+    }
+
+    /// 取得したコンテンツの整合性を検証する（認証ヘッダ透過あり）
+    pub fn verify_integrity_with_auth(
+        &self,
+        input: VerifyIntegrityInput,
+        auth: Option<&StateNodeAuthContext>,
     ) -> ApiResponse<VerifyIntegrityOutput> {
         let trace_id = generate_trace_id();
 
@@ -234,6 +280,7 @@ impl MonasController {
         } else {
             match self.get_state_node_history::<VerifyIntegrityOutput>(
                 &input.content_id,
+                auth,
                 trace_id.clone(),
             ) {
                 Ok(h) => h
@@ -257,6 +304,7 @@ impl MonasController {
         let state_node_data = match self.get_state_node_version_data::<VerifyIntegrityOutput>(
             &input.content_id,
             &version_to_check,
+            auth,
             trace_id.clone(),
         ) {
             Ok(d) => d,

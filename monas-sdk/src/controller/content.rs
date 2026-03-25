@@ -4,7 +4,7 @@ use base64::{
 };
 use chrono::Utc;
 
-use crate::common::{generate_trace_id, ApiError, ApiResponse};
+use crate::common::{generate_trace_id, ApiError, ApiResponse, StateNodeAuthContext};
 use crate::models::content::{
     CreateContentInput, CreateContentOutput, DeleteContentInput, DeleteContentOutput,
     GetContentInput, GetContentOutput, UpdateContentInput, UpdateContentOutput,
@@ -123,6 +123,7 @@ impl MonasController {
     fn send_create_to_state_node<T>(
         &self,
         encrypted_content: &[u8],
+        auth: Option<&StateNodeAuthContext>,
         trace_id: String,
     ) -> Option<ApiResponse<T>> {
         let encrypted_data_base64 = BASE64_STANDARD.encode(encrypted_content);
@@ -131,7 +132,19 @@ impl MonasController {
         };
 
         let state_node_url = format!("{}/content", self.state_node_url);
-        if let Err(e) = ureq::post(&state_node_url).send_json(state_node_request) {
+        let mut req = ureq::post(&state_node_url);
+        if let Some(ctx) = auth {
+            if let Some(value) = &ctx.authorization {
+                req = req.header("Authorization", value);
+            }
+            if let Some(value) = &ctx.request_signature {
+                req = req.header("X-Request-Signature", value);
+            }
+            if let Some(value) = ctx.request_timestamp {
+                req = req.header("X-Request-Timestamp", &value.to_string());
+            }
+        }
+        if let Err(e) = req.send_json(state_node_request) {
             let error_msg = format!("Failed to send request to State Node: {e}");
             return Some(ApiResponse::error(ApiError::Internal(error_msg), trace_id));
         }
@@ -141,10 +154,11 @@ impl MonasController {
 
     /// State Nodeにコンテンツを更新するリクエストを送信
     /// エラーがある場合はSome(ApiResponse)を返し、成功時はNoneを返す
-    fn send_update_to_state_node<T>(
+    pub(super) fn send_update_to_state_node<T>(
         &self,
         content_id: &str,
         encrypted_content: &[u8],
+        auth: Option<&StateNodeAuthContext>,
         trace_id: String,
     ) -> Option<ApiResponse<T>> {
         let encrypted_data_base64 = BASE64_STANDARD.encode(encrypted_content);
@@ -153,8 +167,50 @@ impl MonasController {
         };
 
         let state_node_url = format!("{}/content/{}", self.state_node_url, content_id);
-        if let Err(e) = ureq::put(&state_node_url).send_json(state_node_request) {
+        let mut req = ureq::put(&state_node_url);
+        if let Some(ctx) = auth {
+            if let Some(value) = &ctx.authorization {
+                req = req.header("Authorization", value);
+            }
+            if let Some(value) = &ctx.request_signature {
+                req = req.header("X-Request-Signature", value);
+            }
+            if let Some(value) = ctx.request_timestamp {
+                req = req.header("X-Request-Timestamp", &value.to_string());
+            }
+        }
+        if let Err(e) = req.send_json(state_node_request) {
             let error_msg = format!("Failed to send request to State Node: {e}");
+            return Some(ApiResponse::error(ApiError::Internal(error_msg), trace_id));
+        }
+
+        None
+    }
+
+    /// State Nodeにコンテンツ削除リクエストを送信
+    /// エラーがある場合はSome(ApiResponse)を返し、成功時はNoneを返す
+    fn send_delete_to_state_node<T>(
+        &self,
+        content_id: &str,
+        auth: Option<&StateNodeAuthContext>,
+        trace_id: String,
+    ) -> Option<ApiResponse<T>> {
+        let state_node_url = format!("{}/content/{}", self.state_node_url, content_id);
+        let mut req = ureq::delete(&state_node_url);
+        if let Some(ctx) = auth {
+            if let Some(value) = &ctx.authorization {
+                req = req.header("Authorization", value);
+            }
+            if let Some(value) = &ctx.request_signature {
+                req = req.header("X-Request-Signature", value);
+            }
+            if let Some(value) = ctx.request_timestamp {
+                req = req.header("X-Request-Timestamp", &value.to_string());
+            }
+        }
+
+        if let Err(e) = req.call() {
+            let error_msg = format!("Failed to send delete request to State Node: {e}");
             return Some(ApiResponse::error(ApiError::Internal(error_msg), trace_id));
         }
 
@@ -173,6 +229,15 @@ impl MonasController {
     /// 4. State Nodeに暗号化されたコンテンツを送信
     /// 5. 結果を返却
     pub fn create_content(&self, input: CreateContentInput) -> ApiResponse<CreateContentOutput> {
+        self.create_content_with_auth(input, None)
+    }
+
+    /// 新しいコンテンツを作成し、State Nodeに登録する（認証ヘッダ透過あり）
+    pub fn create_content_with_auth(
+        &self,
+        input: CreateContentInput,
+        auth: Option<&StateNodeAuthContext>,
+    ) -> ApiResponse<CreateContentOutput> {
         let trace_id = generate_trace_id();
 
         if input.content.is_empty() {
@@ -231,7 +296,7 @@ impl MonasController {
         };
 
         if let Some(response) =
-            self.send_create_to_state_node(&result.encrypted_content, trace_id.clone())
+            self.send_create_to_state_node(&result.encrypted_content, auth, trace_id.clone())
         {
             return response;
         }
@@ -307,6 +372,15 @@ impl MonasController {
     /// 5. State Nodeに暗号化されたコンテンツを送信
     /// 6. 結果を返却
     pub fn update_content(&self, input: UpdateContentInput) -> ApiResponse<UpdateContentOutput> {
+        self.update_content_with_auth(input, None)
+    }
+
+    /// 既存のコンテンツを更新する（認証ヘッダ透過あり）
+    pub fn update_content_with_auth(
+        &self,
+        input: UpdateContentInput,
+        auth: Option<&StateNodeAuthContext>,
+    ) -> ApiResponse<UpdateContentOutput> {
         let trace_id = generate_trace_id();
 
         // 1. 入力のバリデーション
@@ -360,6 +434,7 @@ impl MonasController {
         if let Some(response) = self.send_update_to_state_node(
             &original_content_id,
             &result.encrypted_content,
+            auth,
             trace_id.clone(),
         ) {
             return response;
@@ -386,6 +461,15 @@ impl MonasController {
     ///
     /// 注意: State Nodeへの削除リクエスト送信は未実装（State Node側のdeleteエンドポイント実装後に追加予定）
     pub fn delete_content(&self, input: DeleteContentInput) -> ApiResponse<DeleteContentOutput> {
+        self.delete_content_with_auth(input, None)
+    }
+
+    /// コンテンツを削除する（認証ヘッダ透過あり）
+    pub fn delete_content_with_auth(
+        &self,
+        input: DeleteContentInput,
+        auth: Option<&StateNodeAuthContext>,
+    ) -> ApiResponse<DeleteContentOutput> {
         let trace_id = generate_trace_id();
 
         // 1. 入力のバリデーション
@@ -413,7 +497,11 @@ impl MonasController {
             }
         };
 
-        // TODO: State Nodeに削除リクエストを送信
+        if let Some(response) =
+            self.send_delete_to_state_node(&input.content_id, auth, trace_id.clone())
+        {
+            return response;
+        }
 
         let output = DeleteContentOutput {
             content_id: result.content_id.as_str().to_string(),

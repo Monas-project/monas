@@ -69,6 +69,14 @@ async fn delete_content_round_trip_succeeds() {
         .with_status(200)
         .create_async()
         .await;
+    let delete_mock = server
+        .mock(
+            "DELETE",
+            mockito::Matcher::Regex(r"^/content/.+$".to_string()),
+        )
+        .with_status(200)
+        .create_async()
+        .await;
 
     let controller = MonasController::with_state_node_url(server.url());
     let create_response = controller.create_content(CreateContentInput {
@@ -90,6 +98,7 @@ async fn delete_content_round_trip_succeeds() {
     assert!(delete_response.success, "delete_content should succeed");
     assert!(delete_response.error.is_none(), "unexpected delete error");
     let deleted = delete_response.data.expect("delete should return data");
+    delete_mock.assert();
     assert!(deleted.deleted, "deleted flag should be true");
     assert_eq!(deleted.content_id, created.content_id);
 

@@ -1,13 +1,18 @@
 use chrono::Utc;
 use sha2::{Digest, Sha256};
 
-use crate::common::{decode_base64url, encode_base64url, generate_trace_id, ApiError, ApiResponse};
+use crate::common::{
+    decode_base64url, encode_base64url, generate_trace_id, ApiError, ApiResponse,
+    StateNodeAuthContext,
+};
 use crate::models::share::{
     GetSharedContentInput, GetSharedContentOutput, KeyEnvelope, Permission, RevokeShareInput,
     RevokeShareOutput, ShareContentInput, ShareContentOutput,
 };
 
-use monas_content::application_service::content_service::DecryptWithCekError;
+use monas_content::application_service::content_service::{
+    DecryptWithCekError, ReencryptContentCommand, ReencryptError,
+};
 use monas_content::application_service::share_service::{
     GrantShareCommand, RevokeShareCommand, ShareApplicationError, ShareService,
 };
@@ -34,6 +39,24 @@ pub(super) type ShareServiceInstance = ShareService<
 >;
 
 impl MonasController {
+    fn map_reencrypt_error(e: ReencryptError) -> ApiError {
+        match e {
+            ReencryptError::ContentNotFound => ApiError::NotFound("Content not found".into()),
+            ReencryptError::ContentDeleted => ApiError::NotFound("Content is deleted".into()),
+            ReencryptError::MissingContentEncryptionKey => {
+                ApiError::Internal("Missing content encryption key".into())
+            }
+            ReencryptError::Domain(err) => ApiError::Internal(format!("Domain error: {err:?}")),
+            ReencryptError::ContentRepository(err) => {
+                ApiError::Internal(format!("Content repository error: {err}"))
+            }
+            ReencryptError::KeyStore(err) => ApiError::Internal(format!("Key store error: {err}")),
+            ReencryptError::MissingEncryptedContent => {
+                ApiError::Internal("Missing encrypted content".into())
+            }
+        }
+    }
+
     fn validate_non_empty(field: &'static str, value: &str) -> Result<(), ApiError> {
         if value.is_empty() {
             return Err(ApiError::Validation(format!("{field} must not be empty")));
@@ -221,11 +244,21 @@ impl MonasController {
     /// 4. ShareService::revoke_shareを呼び出し（ACLの更新）
     /// 5. 結果を返却
     pub fn revoke_share(&self, input: RevokeShareInput) -> ApiResponse<RevokeShareOutput> {
+        self.revoke_share_with_auth(input, None)
+    }
+
+    /// コンテンツの共有を取り消す（認証ヘッダ透過あり）
+    pub fn revoke_share_with_auth(
+        &self,
+        input: RevokeShareInput,
+        auth: Option<&StateNodeAuthContext>,
+    ) -> ApiResponse<RevokeShareOutput> {
         let trace_id = generate_trace_id();
 
         // 1. 入力のバリデーション
         for (field, value) in [
             ("content_id", input.content_id.as_str()),
+            ("sender_public_key", input.sender_public_key.as_str()),
             ("recipient_public_key", input.recipient_public_key.as_str()),
         ] {
             if let Err(e) = Self::validate_non_empty(field, value) {
@@ -236,6 +269,13 @@ impl MonasController {
         // 2. ContentIdに変換
         let content_id = ContentId::new(input.content_id.clone());
 
+        let sender_public_key_bytes =
+            match Self::decode_base64url_field("sender_public_key", &input.sender_public_key) {
+                Ok(v) => v,
+                Err(e) => return ApiResponse::error(e, trace_id),
+            };
+        let sender_key_id = Self::compute_key_id_from_public_key(&sender_public_key_bytes);
+
         // 3. 共有先の公開鍵をデコードしてrecipient_key_idを計算
         let recipient_public_key_bytes =
             match Self::decode_base64url_field("recipient_public_key", &input.recipient_public_key)
@@ -245,8 +285,6 @@ impl MonasController {
             };
 
         let recipient_key_id = Self::compute_key_id_from_public_key(&recipient_public_key_bytes);
-        // 現行の SDK 入力モデルには sender 情報がないため、暫定的に recipient 由来で補う。
-        let sender_key_id = recipient_key_id.clone();
 
         // 4. ShareService::revoke_shareを呼び出し
         let cmd = RevokeShareCommand {
@@ -262,9 +300,24 @@ impl MonasController {
             }
         };
 
-        // TODO: State Node側へ権限の送信
+        // revoke後に再暗号し、State Nodeのバージョンを進める
+        let reencryption = match self.content_service.reencrypt(ReencryptContentCommand {
+            content_id: ContentId::new(input.content_id.clone()),
+        }) {
+            Ok(result) => result,
+            Err(e) => {
+                return ApiResponse::error(Self::map_reencrypt_error(e), trace_id);
+            }
+        };
 
-        // TODO: コンテンツの再暗号処理
+        if let Some(response) = self.send_update_to_state_node(
+            &input.content_id,
+            &reencryption.encrypted_content,
+            auth,
+            trace_id.clone(),
+        ) {
+            return response;
+        }
 
         let output = RevokeShareOutput {
             content_id: result.content_id.as_str().to_string(),

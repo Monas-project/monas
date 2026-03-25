@@ -61,6 +61,8 @@ pub struct ShareContentOutput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RevokeShareInput {
     pub content_id: String,
+    /// 送信者の公開鍵（base64url） - sender_key_idを計算するために使用
+    pub sender_public_key: String,
     pub recipient_public_key: String,
 }
 
