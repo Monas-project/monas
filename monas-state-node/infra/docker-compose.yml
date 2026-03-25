@@ -1,0 +1,94 @@
+services:
+  node1:
+    build:
+      context: ../..
+      dockerfile: monas-state-node/infra/docker/Dockerfile
+    environment:
+      - NODE_ROLE=bootstrap
+      - HTTP_LISTEN=0.0.0.0:8080
+      - P2P_PORT=9001
+      - DATA_DIR=/data
+      - LOG_LEVEL=info
+    ports:
+      - "8081:8080"
+    volumes:
+      - node1-data:/data
+    networks:
+      - monas-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health/ready"]
+      interval: 5s
+      timeout: 3s
+      start_period: 15s
+      retries: 5
+
+  node2:
+    build:
+      context: ../..
+      dockerfile: monas-state-node/infra/docker/Dockerfile
+    environment:
+      - NODE_ROLE=member
+      - HTTP_LISTEN=0.0.0.0:8080
+      - P2P_PORT=9001
+      - DATA_DIR=/data
+      - LOG_LEVEL=info
+    ports:
+      - "8082:8080"
+    volumes:
+      - node2-data:/data
+    networks:
+      - monas-net
+    depends_on:
+      node1:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        PEER_ID=$$(curl -sf http://node1:8080/node/info | grep -o '"peer_id":"[^"]*"' | cut -d'"' -f4)
+        echo "Bootstrap peer ID: $$PEER_ID"
+        exec state-node \
+          --data-dir /data \
+          --listen 0.0.0.0:8080 \
+          --p2p-port 9001 \
+          --log-level info \
+          --bootstrap "/ip4/$$(getent hosts node1 | awk '{print $$1}')/tcp/9001/p2p/$$PEER_ID"
+
+  node3:
+    build:
+      context: ../..
+      dockerfile: monas-state-node/infra/docker/Dockerfile
+    environment:
+      - NODE_ROLE=member
+      - HTTP_LISTEN=0.0.0.0:8080
+      - P2P_PORT=9001
+      - DATA_DIR=/data
+      - LOG_LEVEL=info
+    ports:
+      - "8083:8080"
+    volumes:
+      - node3-data:/data
+    networks:
+      - monas-net
+    depends_on:
+      node1:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        PEER_ID=$$(curl -sf http://node1:8080/node/info | grep -o '"peer_id":"[^"]*"' | cut -d'"' -f4)
+        echo "Bootstrap peer ID: $$PEER_ID"
+        exec state-node \
+          --data-dir /data \
+          --listen 0.0.0.0:8080 \
+          --p2p-port 9001 \
+          --log-level info \
+          --bootstrap "/ip4/$$(getent hosts node1 | awk '{print $$1}')/tcp/9001/p2p/$$PEER_ID"
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
+
+networks:
+  monas-net:
+    driver: bridge
