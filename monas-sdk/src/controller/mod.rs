@@ -9,6 +9,8 @@ use share::ShareServiceInstance;
 pub struct MonasController {
     /// State NodeのベースURL
     state_node_url: String,
+    /// Account(issuer)のベースURL
+    account_url: String,
     /// ContentService
     content_service: ContentServiceInstance,
     /// ShareService
@@ -23,12 +25,15 @@ impl MonasController {
     pub fn new() -> Self {
         let state_node_url = std::env::var("MONAS_STATE_NODE_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
+        let account_url =
+            std::env::var("MONAS_ACCOUNT_URL").unwrap_or_else(|_| "http://127.0.0.1:4002".into());
 
         let content_repository = Self::create_content_repository();
         let cek_store = Self::create_cek_store();
 
         Self {
             state_node_url,
+            account_url,
             content_service: Self::create_content_service(
                 content_repository.clone(),
                 cek_store.clone(),
@@ -39,11 +44,30 @@ impl MonasController {
 
     /// 明示的にState Node URLを指定してMonasControllerを生成
     pub fn with_state_node_url(state_node_url: impl Into<String>) -> Self {
+        let state_node_url = state_node_url.into();
+        let content_repository = Self::create_content_repository();
+        let cek_store = Self::create_cek_store();
+
+        Self {
+            // 開発/テスト互換のため、account_url は明示未指定時に state_node_url と同じ値を使う。
+            state_node_url: state_node_url.clone(),
+            account_url: state_node_url,
+            content_service: Self::create_content_service(
+                content_repository.clone(),
+                cek_store.clone(),
+            ),
+            share_service: Self::create_share_service(content_repository, cek_store),
+        }
+    }
+
+    /// State Node URL と Account URL を明示してMonasControllerを生成
+    pub fn with_urls(state_node_url: impl Into<String>, account_url: impl Into<String>) -> Self {
         let content_repository = Self::create_content_repository();
         let cek_store = Self::create_cek_store();
 
         Self {
             state_node_url: state_node_url.into(),
+            account_url: account_url.into(),
             content_service: Self::create_content_service(
                 content_repository.clone(),
                 cek_store.clone(),
