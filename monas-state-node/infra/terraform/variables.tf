@@ -1,3 +1,14 @@
+variable "aws_region" {
+  description = "AWS region"
+  type        = string
+  default     = "ap-northeast-1"
+}
+
+variable "aws_profile" {
+  description = "AWS CLI profile name"
+  type        = string
+}
+
 variable "node_name" {
   description = "Unique name for this state node (e.g., node1, node2)"
   type        = string
@@ -20,7 +31,19 @@ variable "node_role" {
 }
 
 variable "bootstrap_addr" {
-  description = "Bootstrap node multiaddr (e.g., /ip4/10.0.10.5/tcp/9001/p2p/12D3KooW...). Required for member nodes."
+  description = "Bootstrap node multiaddr (e.g., /ip4/10.0.10.5/tcp/9001/p2p/12D3KooW...). Optional, use bootstrap_dns instead for dynamic resolution."
+  type        = string
+  default     = ""
+}
+
+variable "bootstrap_dns" {
+  description = "Bootstrap node Cloud Map DNS name (e.g., node1.monas.local). Used for dynamic IP resolution."
+  type        = string
+  default     = ""
+}
+
+variable "bootstrap_peer_id" {
+  description = "Bootstrap node's libp2p Peer ID (e.g., 12D3KooW...). Required when using bootstrap_dns."
   type        = string
   default     = ""
 }
@@ -94,9 +117,8 @@ variable "log_level" {
 # --- Storage ---
 
 variable "efs_filesystem_id" {
-  description = "Existing EFS filesystem ID. If empty, a new one will be created."
+  description = "EFS filesystem ID from foundation"
   type        = string
-  default     = ""
 }
 
 # --- Service Discovery ---

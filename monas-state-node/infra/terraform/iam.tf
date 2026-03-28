@@ -55,7 +55,7 @@ resource "aws_iam_role_policy" "efs_access" {
         "elasticfilesystem:ClientWrite",
         "elasticfilesystem:ClientRootAccess"
       ]
-      Resource = "arn:aws:elasticfilesystem:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:file-system/${local.efs_filesystem_id}"
+      Resource = "arn:aws:elasticfilesystem:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:file-system/${var.efs_filesystem_id}"
     }]
   })
 }

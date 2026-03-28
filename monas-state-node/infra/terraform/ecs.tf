@@ -22,6 +22,8 @@ resource "aws_ecs_task_definition" "node" {
       environment = [
         { name = "NODE_ROLE", value = var.node_role },
         { name = "BOOTSTRAP_ADDR", value = var.bootstrap_addr },
+        { name = "BOOTSTRAP_DNS", value = var.bootstrap_dns },
+        { name = "BOOTSTRAP_PEER_ID", value = var.bootstrap_peer_id },
         { name = "HTTP_LISTEN", value = "0.0.0.0:${var.http_port}" },
         { name = "P2P_PORT", value = tostring(var.p2p_port) },
         { name = "DATA_DIR", value = "/data" },
@@ -64,7 +66,7 @@ resource "aws_ecs_task_definition" "node" {
     name = "node-data"
 
     efs_volume_configuration {
-      file_system_id     = local.efs_filesystem_id
+      file_system_id     = var.efs_filesystem_id
       transit_encryption = "ENABLED"
 
       authorization_config {
@@ -87,7 +89,7 @@ resource "aws_ecs_service" "node" {
   network_configuration {
     subnets          = var.subnet_ids
     security_groups  = [aws_security_group.node.id]
-    assign_public_ip = false
+    assign_public_ip = true
   }
 
   load_balancer {

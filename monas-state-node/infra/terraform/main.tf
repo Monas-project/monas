@@ -9,6 +9,11 @@ terraform {
   }
 }
 
+provider "aws" {
+  region  = var.aws_region
+  profile = var.aws_profile
+}
+
 locals {
   name_prefix = "monas-${var.node_name}"
   common_tags = merge(var.tags, {

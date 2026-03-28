@@ -16,13 +16,13 @@ resource "aws_security_group" "node" {
     security_groups = [var.alb_security_group_id]
   }
 
-  # P2P from within VPC
+  # P2P from anywhere (external nodes can connect)
   ingress {
-    description = "P2P from VPC"
+    description = "P2P from anywhere"
     from_port   = var.p2p_port
     to_port     = var.p2p_port
     protocol    = "tcp"
-    cidr_blocks = [data.aws_vpc.selected.cidr_block]
+    cidr_blocks = ["0.0.0.0/0"]
   }
 
   # Outbound
