@@ -127,9 +127,9 @@ impl MonasController {
             DomainPermission::Read => Ok(vec!["read".to_string()]),
             DomainPermission::Write => Ok(vec!["write".to_string()]),
             // Owner 権限の委譲は現フェーズ対象外。SDK境界で拒否する。
-            DomainPermission::Owner => {
-                Err(ApiError::Validation("owner permission is not supported for delegation".into()))
-            }
+            DomainPermission::Owner => Err(ApiError::Validation(
+                "owner permission is not supported for delegation".into(),
+            )),
         }
     }
 
@@ -532,7 +532,7 @@ impl MonasController {
         let output = GetSharedContentOutput {
             content_id: input.content_id,
             content: content_base64url,
-            version: input.version.unwrap_or_else(|| String::new()),
+            version: input.version.unwrap_or_default(),
             metadata: None, // TODO: メタデータを取得する機能を実装
         };
 

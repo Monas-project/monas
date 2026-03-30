@@ -1,4 +1,6 @@
-use crate::application_service::command::{IssueDelegatedTokenRequest, IssueDelegatedTokenResult, KeyTypeMapper};
+use crate::application_service::command::{
+    IssueDelegatedTokenRequest, IssueDelegatedTokenResult, KeyTypeMapper,
+};
 use crate::application_service::error::{AccountServiceError, IssueDelegatedTokenError, SignError};
 use crate::application_service::port::AccountKeyStore;
 use crate::domain::account::Account;
@@ -253,7 +255,8 @@ mod tests {
     fn issue_delegated_token_succeeds_with_p256() {
         let owner_store = InMemoryAccountKeyStore::default();
         let recipient_store = InMemoryAccountKeyStore::default();
-        let recipient_account = AccountService::create(&recipient_store, KeyTypeMapper::P256).unwrap();
+        let recipient_account =
+            AccountService::create(&recipient_store, KeyTypeMapper::P256).unwrap();
         AccountService::create(&owner_store, KeyTypeMapper::P256).unwrap();
 
         let req = IssueDelegatedTokenRequest {
@@ -281,7 +284,8 @@ mod tests {
     fn issue_delegated_token_fails_with_k256_owner_key() {
         let owner_store = InMemoryAccountKeyStore::default();
         let recipient_store = InMemoryAccountKeyStore::default();
-        let recipient_account = AccountService::create(&recipient_store, KeyTypeMapper::P256).unwrap();
+        let recipient_account =
+            AccountService::create(&recipient_store, KeyTypeMapper::P256).unwrap();
         AccountService::create(&owner_store, KeyTypeMapper::K256).unwrap();
 
         let req = IssueDelegatedTokenRequest {
@@ -292,6 +296,9 @@ mod tests {
         };
 
         let err = AccountService::issue_delegated_token(&owner_store, req).unwrap_err();
-        assert!(matches!(err, IssueDelegatedTokenError::UnsupportedAlgorithm(_)));
+        assert!(matches!(
+            err,
+            IssueDelegatedTokenError::UnsupportedAlgorithm(_)
+        ));
     }
 }

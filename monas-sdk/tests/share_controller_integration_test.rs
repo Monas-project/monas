@@ -92,7 +92,10 @@ async fn share_content_succeeds_after_content_creation() {
         !shared.key_envelope.ciphertext.is_empty(),
         "key_envelope.ciphertext should be set"
     );
-    assert!(shared.delegated_access.is_some(), "delegated_access should be set");
+    assert!(
+        shared.delegated_access.is_some(),
+        "delegated_access should be set"
+    );
     let delegated = shared
         .delegated_access
         .as_ref()
