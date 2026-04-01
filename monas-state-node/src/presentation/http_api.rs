@@ -56,15 +56,19 @@ pub fn create_router(state: AppState) -> Router {
         .finish()
         .unwrap();
 
-    Router::new()
+    // Health check endpoints - exempt from rate limiting for ALB health checks
+    let health_routes = Router::new()
+        .route("/health", get(health_check))
+        .route("/health/live", get(liveness_check))
+        .route("/health/ready", get(readiness_check));
+
+    // All other endpoints - rate limited
+    let api_routes = Router::new()
         // --- Public endpoints (no auth required) ---
         // These are intentionally unauthenticated for P2P peer discovery,
         // node coordination, and operational monitoring.
         // SECURITY NOTE: These endpoints expose only node/content IDs and
         // capacity metadata — never content data itself.
-        .route("/health", get(health_check))
-        .route("/health/live", get(liveness_check))
-        .route("/health/ready", get(readiness_check))
         .route("/node/info", get(node_info))
         .route("/node/register", post(register_node))
         .route("/nodes", get(list_nodes))
@@ -81,8 +85,6 @@ pub fn create_router(state: AppState) -> Router {
             "/content/:id/access/invalidate",
             post(invalidate_tokens_handler),
         )
-        // Request body size limit: 16 MiB
-        .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
         // Per-IP rate limit (inner layer, applied first)
         .layer(GovernorLayer {
             config: Arc::new(per_ip_config),
@@ -90,7 +92,12 @@ pub fn create_router(state: AppState) -> Router {
         // Global rate limit (outer layer)
         .layer(GovernorLayer {
             config: Arc::new(governor_config),
-        })
+        });
+
+    health_routes
+        .merge(api_routes)
+        // Request body size limit: 16 MiB
+        .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
         .with_state(state)
 }
 

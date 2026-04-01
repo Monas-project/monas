@@ -86,6 +86,9 @@ resource "aws_ecs_service" "node" {
   desired_count   = 1
   launch_type     = "FARGATE"
 
+  deployment_minimum_healthy_percent = 0
+  deployment_maximum_percent         = 100
+
   network_configuration {
     subnets          = var.subnet_ids
     security_groups  = [aws_security_group.node.id]
