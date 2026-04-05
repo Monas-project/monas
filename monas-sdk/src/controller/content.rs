@@ -351,7 +351,7 @@ impl MonasController {
         let output = GetContentOutput {
             content_id: result.content_id.as_str().to_string(),
             content: content_base64url,
-            version: input.version.unwrap_or_else(|| String::new()),
+            version: input.version.unwrap_or_default(),
             metadata: Some(metadata),
         };
 

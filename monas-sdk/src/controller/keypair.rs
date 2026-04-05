@@ -3,7 +3,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use crate::common::{generate_trace_id, ApiError, ApiResponse};
 use crate::models::keypair::{GenerateKeypairInput, GenerateKeypairOutput, KeyType};
 
-use monas_account::application_service::account_service::{AccountService, KeyTypeMapper};
+use monas_account::application_service::{AccountService, KeyTypeMapper};
 use monas_account::infrastructure::key_store::InMemoryAccountKeyStore;
 
 use super::MonasController;

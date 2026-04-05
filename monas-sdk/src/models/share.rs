@@ -50,7 +50,18 @@ pub struct ShareContentOutput {
     pub recipient_key_id: String,
     pub key_envelope: KeyEnvelope,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub delegated_access: Option<DelegatedAccessToken>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub shared_at: Option<String>,
+}
+
+/// delegated token の発行結果
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DelegatedAccessToken {
+    pub delegated_token: String,
+    pub issued_at: u64,
+    pub expires_at: u64,
+    pub jti: String,
 }
 
 // ============================================
@@ -164,6 +175,12 @@ mod tests {
                 wrapped_cek: "cek".into(),
                 ciphertext: "ct".into(),
             },
+            delegated_access: Some(DelegatedAccessToken {
+                delegated_token: "jwt".into(),
+                issued_at: 1,
+                expires_at: 2,
+                jti: "jti".into(),
+            }),
             shared_at: Some("2025-12-05T12:34:56Z".into()),
         };
         let json = serde_json::to_string(&output).unwrap();

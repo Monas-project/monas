@@ -1,4 +1,6 @@
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::common::{
@@ -6,8 +8,8 @@ use crate::common::{
     StateNodeAuthContext,
 };
 use crate::models::share::{
-    GetSharedContentInput, GetSharedContentOutput, KeyEnvelope, Permission, RevokeShareInput,
-    RevokeShareOutput, ShareContentInput, ShareContentOutput,
+    DelegatedAccessToken, GetSharedContentInput, GetSharedContentOutput, KeyEnvelope, Permission,
+    RevokeShareInput, RevokeShareOutput, ShareContentInput, ShareContentOutput,
 };
 
 use monas_content::application_service::content_service::{
@@ -28,6 +30,24 @@ use monas_content::infrastructure::{
 };
 
 use super::MonasController;
+
+const DEFAULT_DELEGATION_TTL_SECS: u64 = 3600;
+
+#[derive(Debug, Serialize)]
+struct IssueDelegatedTokenRequest {
+    recipient_public_key_base64: String,
+    content_id: String,
+    capabilities: Vec<String>,
+    ttl_secs: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct IssueDelegatedTokenResponse {
+    delegated_token: String,
+    issued_at: u64,
+    expires_at: u64,
+    jti: String,
+}
 
 /// ShareServiceの型エイリアス（可読性向上のため）
 pub(super) type ShareServiceInstance = ShareService<
@@ -100,6 +120,48 @@ impl MonasController {
             wrapped_cek: encode_base64url(recipient.wrapped_cek()),
             ciphertext: encode_base64url(domain_envelope.ciphertext()),
         }
+    }
+
+    fn permission_to_capabilities(permission: DomainPermission) -> Result<Vec<String>, ApiError> {
+        match permission {
+            DomainPermission::Read => Ok(vec!["read".to_string()]),
+            DomainPermission::Write => Ok(vec!["write".to_string()]),
+            // Owner 権限の委譲は現フェーズ対象外。SDK境界で拒否する。
+            DomainPermission::Owner => Err(ApiError::Validation(
+                "owner permission is not supported for delegation".into(),
+            )),
+        }
+    }
+
+    fn issue_delegated_token(
+        &self,
+        content_id: &str,
+        recipient_public_key_bytes: &[u8],
+        permission: DomainPermission,
+    ) -> Result<DelegatedAccessToken, ApiError> {
+        let issuer_url = format!("{}/issuer/delegate", self.account_url);
+        let req = IssueDelegatedTokenRequest {
+            recipient_public_key_base64: BASE64_STANDARD.encode(recipient_public_key_bytes),
+            content_id: content_id.to_string(),
+            capabilities: Self::permission_to_capabilities(permission)?,
+            ttl_secs: DEFAULT_DELEGATION_TTL_SECS,
+        };
+
+        let mut response = ureq::post(&issuer_url)
+            .send_json(req)
+            .map_err(|e| ApiError::Internal(format!("Failed to call issuer API: {e}")))?;
+
+        let body: IssueDelegatedTokenResponse = response
+            .body_mut()
+            .read_json()
+            .map_err(|e| ApiError::Internal(format!("Invalid issuer API response: {e}")))?;
+
+        Ok(DelegatedAccessToken {
+            delegated_token: body.delegated_token,
+            issued_at: body.issued_at,
+            expires_at: body.expires_at,
+            jti: body.jti,
+        })
     }
 
     /// ShareApplicationErrorをApiErrorにマッピング
@@ -202,8 +264,8 @@ impl MonasController {
         let cmd = GrantShareCommand {
             content_id: content_id.clone(),
             sender_key_id,
-            recipient_public_key: recipient_public_key_bytes,
-            permission,
+            recipient_public_key: recipient_public_key_bytes.clone(),
+            permission: permission.clone(),
         };
 
         let result = match self.share_service.grant_share(cmd) {
@@ -211,6 +273,15 @@ impl MonasController {
             Err(e) => {
                 return ApiResponse::error(Self::map_share_error(e), trace_id);
             }
+        };
+
+        let delegated_access = match self.issue_delegated_token(
+            &input.content_id,
+            &recipient_public_key_bytes,
+            permission,
+        ) {
+            Ok(token) => token,
+            Err(e) => return ApiResponse::error(e, trace_id),
         };
 
         // 7. KeyEnvelopeをSDK形式に変換
@@ -229,6 +300,7 @@ impl MonasController {
             sender_key_id: sender_key_id_b64,
             recipient_key_id: recipient_key_id_b64,
             key_envelope,
+            delegated_access: Some(delegated_access),
             shared_at: Some(Utc::now().to_rfc3339()),
         };
 
@@ -460,7 +532,7 @@ impl MonasController {
         let output = GetSharedContentOutput {
             content_id: input.content_id,
             content: content_base64url,
-            version: input.version.unwrap_or_else(|| String::new()),
+            version: input.version.unwrap_or_default(),
             metadata: None, // TODO: メタデータを取得する機能を実装
         };
 

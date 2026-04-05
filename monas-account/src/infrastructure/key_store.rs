@@ -1,9 +1,7 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use crate::application_service::account_service::{
-    AccountKeyStore, AccountKeyStoreError, StoredAccountKey,
-};
+use crate::application_service::{AccountKeyStore, AccountKeyStoreError, StoredAccountKey};
 
 /// プロセス内の `AccountKeyMaterial` を保存するインメモリ実装。
 ///
@@ -145,7 +143,7 @@ impl AccountKeyStore for SledAccountKeyStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::application_service::account_service::StoredAccountKey;
+    use crate::application_service::StoredAccountKey;
     use crate::infrastructure::key_pair::KeyAlgorithm;
 
     #[test]

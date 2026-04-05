@@ -24,7 +24,9 @@ async fn main() {
     // monas-sdk側でもenvを見るが、ここで明示的に読むことで挙動が分かりやすくなる
     let state_node_url =
         std::env::var("MONAS_STATE_NODE_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".into());
-    let controller = Arc::new(MonasController::with_state_node_url(state_node_url));
+    let account_url =
+        std::env::var("MONAS_ACCOUNT_URL").unwrap_or_else(|_| "http://127.0.0.1:4002".into());
+    let controller = Arc::new(MonasController::with_urls(state_node_url, account_url));
 
     let app_state = AppState { controller };
 

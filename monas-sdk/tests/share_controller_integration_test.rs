@@ -17,8 +17,17 @@ async fn share_content_succeeds_after_content_creation() {
         .with_status(200)
         .create_async()
         .await;
+    let delegate_mock = server
+        .mock("POST", "/issuer/delegate")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"delegated_token":"dummy.jwt.token","issued_at":1700000000,"expires_at":1700003600,"jti":"jti-1"}"#,
+        )
+        .create_async()
+        .await;
 
-    let controller = MonasController::with_state_node_url(server.url());
+    let controller = MonasController::with_urls(server.url(), server.url());
 
     let sender = controller
         .generate_keypair(GenerateKeypairInput {
@@ -83,6 +92,17 @@ async fn share_content_succeeds_after_content_creation() {
         !shared.key_envelope.ciphertext.is_empty(),
         "key_envelope.ciphertext should be set"
     );
+    assert!(
+        shared.delegated_access.is_some(),
+        "delegated_access should be set"
+    );
+    let delegated = shared
+        .delegated_access
+        .as_ref()
+        .expect("delegated_access should exist");
+    assert_eq!(delegated.delegated_token, "dummy.jwt.token");
+    assert_eq!(delegated.jti, "jti-1");
+    delegate_mock.assert();
 
     cleanup_content_artifacts();
 }
@@ -96,13 +116,22 @@ async fn revoke_share_updates_state_node_version() {
         .with_status(200)
         .create_async()
         .await;
+    let delegate_mock = server
+        .mock("POST", "/issuer/delegate")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"delegated_token":"dummy.jwt.token","issued_at":1700000000,"expires_at":1700003600,"jti":"jti-2"}"#,
+        )
+        .create_async()
+        .await;
     let update_mock = server
         .mock("PUT", mockito::Matcher::Regex(r"^/content/.+$".to_string()))
         .with_status(200)
         .create_async()
         .await;
 
-    let controller = MonasController::with_state_node_url(server.url());
+    let controller = MonasController::with_urls(server.url(), server.url());
 
     let sender = controller
         .generate_keypair(GenerateKeypairInput {
@@ -137,6 +166,7 @@ async fn revoke_share_updates_state_node_version() {
         permissions: vec![Permission::Write],
     });
     assert!(share_response.success, "share_content should succeed");
+    delegate_mock.assert();
 
     let revoke_response = controller.revoke_share(RevokeShareInput {
         content_id: created.content_id,
