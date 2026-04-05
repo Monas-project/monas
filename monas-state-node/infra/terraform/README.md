@@ -5,7 +5,7 @@
 ## Prerequisites
 
 - AWS アカウントと CLI 設定済み
-- Terraform >= 1.5
+- Terraform >= 1.6
 - 以下のAWSリソースが事前に必要:
   - VPC（プライベートサブネット付き）
   - ALB + HTTPS リスナー（ACM 証明書付き）
@@ -78,7 +78,7 @@ terraform apply \
 
 ```bash
 cd monas-state-node/infra
-docker-compose up --build
+docker compose up --build
 ```
 
 3ノードが起動します:
