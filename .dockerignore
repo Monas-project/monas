@@ -1,0 +1,12 @@
+target/
+**/target/
+.git/
+.idea/
+docs/
+*.profraw
+coverage/
+monas-state-node/data*/
+monas-state-node/logs/
+.terraform/
+*.tfstate
+*.tfvars
