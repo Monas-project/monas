@@ -8,7 +8,8 @@ use super::{
     ContentEncryptionKeyStore, ContentEncryptionKeyStoreError, ContentRepositoryError,
     CreateContentCommand, CreateContentResult, DeleteContentCommand, DeleteContentResult,
     FetchContentResult, MultiStorageContentRepository, ReencryptContentCommand,
-    ReencryptContentResult, UpdateContentCommand, UpdateContentResult,
+    ReencryptContentResult, RestoreDeletedContentCommand, RestoreDeletedContentResult,
+    UpdateContentCommand, UpdateContentResult,
 };
 
 /// コンテンツ作成ユースケースのアプリケーションサービス。
@@ -155,6 +156,7 @@ where
 
         let metadata = content.metadata().clone();
         let content_id = content.raw_id().clone();
+        let series_id = content.series_id().clone();
 
         let encrypted_content = content
             .encrypted_content()
@@ -163,6 +165,7 @@ where
 
         Ok(UpdateContentResult {
             content_id,
+            series_id,
             metadata,
             encrypted_content,
         })
@@ -301,6 +304,95 @@ where
         let content_id = deleted_content.raw_id().clone();
 
         Ok(DeleteContentResult { content_id })
+    }
+
+    /// 削除済みコンテンツを通常状態へ復元するユースケース。
+    ///
+    /// - 対象は既に存在し、かつ deleted 状態であること
+    /// - snapshot の平文から再暗号化して保存し直す
+    /// - 旧 CEK / 旧暗号文の完全一致は保証しない
+    pub fn restore_deleted(
+        &self,
+        cmd: RestoreDeletedContentCommand,
+    ) -> Result<RestoreDeletedContentResult, RestoreDeletedError> {
+        Self::validate_restore_deleted_command(&cmd)?;
+
+        let existing = match &cmd.provider {
+            Some(provider) => self
+                .content_repository
+                .find_from(provider.as_str(), &cmd.content_id),
+            None => self.content_repository.find_by_id(&cmd.content_id),
+        }
+        .map_err(RestoreDeletedError::Repository)?
+        .ok_or(RestoreDeletedError::NotFound)?;
+
+        if !existing.is_deleted() {
+            return Err(RestoreDeletedError::NotDeleted);
+        }
+
+        let key = self.key_generator.generate();
+        let (restored_content, _event) = Content::create(
+            cmd.name,
+            cmd.raw_content,
+            cmd.path,
+            cmd.provider.clone(),
+            &self.content_id_generator,
+            &key,
+            &self.encryptor,
+        )
+        .map_err(RestoreDeletedError::Domain)?;
+
+        if restored_content.raw_id() != &cmd.content_id {
+            return Err(RestoreDeletedError::Validation(
+                "snapshot raw_content does not match target content_id".into(),
+            ));
+        }
+
+        self.cek_store
+            .save(restored_content.raw_id(), &key)
+            .map_err(RestoreDeletedError::KeyStore)?;
+
+        match &cmd.provider {
+            Some(provider) => self.content_repository.save_to(
+                provider.as_str(),
+                restored_content.raw_id(),
+                &restored_content,
+            ),
+            None => self
+                .content_repository
+                .save(restored_content.raw_id(), &restored_content),
+        }
+        .map_err(RestoreDeletedError::Repository)?;
+
+        let metadata = restored_content.metadata().clone();
+        let content_id = restored_content.raw_id().clone();
+        let encrypted_content = restored_content
+            .encrypted_content()
+            .ok_or(RestoreDeletedError::MissingEncryptedContent)?
+            .clone();
+
+        Ok(RestoreDeletedContentResult {
+            content_id,
+            metadata,
+            encrypted_content,
+        })
+    }
+
+    fn validate_restore_deleted_command(
+        cmd: &RestoreDeletedContentCommand,
+    ) -> Result<(), RestoreDeletedError> {
+        if cmd.raw_content.is_empty() {
+            return Err(RestoreDeletedError::Validation(
+                "raw_content must not be empty".into(),
+            ));
+        }
+        if cmd.name.trim().is_empty() {
+            return Err(RestoreDeletedError::Validation("name must not be empty".into()));
+        }
+        if cmd.path.trim().is_empty() {
+            return Err(RestoreDeletedError::Validation("path must not be empty".into()));
+        }
+        Ok(())
     }
 
     /// コンテンツ再暗号化ユースケース。
@@ -486,6 +578,24 @@ pub enum FetchError {
     Repository(ContentRepositoryError),
     #[error("key-store error: {0}")]
     KeyStore(ContentEncryptionKeyStoreError),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RestoreDeletedError {
+    #[error("validation error: {0}")]
+    Validation(String),
+    #[error("content not found")]
+    NotFound,
+    #[error("content is not deleted")]
+    NotDeleted,
+    #[error("domain error: {0:?}")]
+    Domain(ContentError),
+    #[error("repository error: {0}")]
+    Repository(ContentRepositoryError),
+    #[error("key-store error: {0}")]
+    KeyStore(ContentEncryptionKeyStoreError),
+    #[error("missing encrypted content")]
+    MissingEncryptedContent,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1042,6 +1152,7 @@ mod tests {
 
         let updated = service.update(update_cmd).expect("update should succeed");
         assert_eq!(updated.metadata.name(), "new-name");
+        assert_eq!(updated.series_id, base_result.content_id);
 
         let guard = storage.lock().unwrap();
         let stored = guard
@@ -1194,6 +1305,83 @@ mod tests {
             Ok(_) => panic!("expected deleted error but got Ok"),
         };
         assert!(matches!(err, FetchError::Deleted));
+    }
+
+    #[test]
+    fn restore_deleted_success_recreates_active_content() {
+        let (repo, _) = TestContentRepository::new(false);
+        let (key_store, key_storage) = TestKeyStore::new(false, false);
+        let service = build_service(repo.clone(), TestKeyGenerator, TestEncryptor, key_store);
+
+        let raw = b"restore-me".to_vec();
+        let created = service
+            .create(CreateContentCommand {
+                name: "restore.txt".into(),
+                path: "/restore.txt".into(),
+                raw_content: raw.clone(),
+                provider: None,
+            })
+            .expect("create should succeed");
+
+        service
+            .delete(DeleteContentCommand {
+                content_id: created.content_id.clone(),
+                provider: None,
+            })
+            .expect("delete should succeed");
+
+        let restored = service
+            .restore_deleted(RestoreDeletedContentCommand {
+                content_id: created.content_id.clone(),
+                name: "restore.txt".into(),
+                path: "/restore.txt".into(),
+                raw_content: raw.clone(),
+                provider: None,
+            })
+            .expect("restore should succeed");
+
+        assert_eq!(restored.content_id, created.content_id);
+        assert_eq!(restored.metadata.name(), "restore.txt");
+        assert_eq!(restored.metadata.path(), "/restore.txt");
+
+        let fetched = service
+            .fetch(created.content_id.clone(), None)
+            .expect("fetch should succeed after restore");
+        assert_eq!(fetched.raw_content, raw);
+
+        let key_guard = key_storage.lock().expect("mutex poisoned");
+        assert!(
+            key_guard.contains_key(created.content_id.as_str()),
+            "restore should recreate the content encryption key"
+        );
+    }
+
+    #[test]
+    fn restore_deleted_rejects_active_content() {
+        let (repo, _) = TestContentRepository::new(false);
+        let (key_store, _) = TestKeyStore::new(false, false);
+        let service = build_service(repo, TestKeyGenerator, TestEncryptor, key_store);
+
+        let created = service
+            .create(CreateContentCommand {
+                name: "active.txt".into(),
+                path: "/active.txt".into(),
+                raw_content: b"active".to_vec(),
+                provider: None,
+            })
+            .expect("create should succeed");
+
+        let err = service
+            .restore_deleted(RestoreDeletedContentCommand {
+                content_id: created.content_id,
+                name: "active.txt".into(),
+                path: "/active.txt".into(),
+                raw_content: b"active".to_vec(),
+                provider: None,
+            })
+            .expect_err("restore should fail for active content");
+
+        assert!(matches!(err, RestoreDeletedError::NotDeleted));
     }
 
     #[test]

@@ -34,6 +34,7 @@ pub fn acquire_test_lock() -> TestProcessLock {
     }
 }
 
+#[allow(dead_code)]
 pub fn cleanup_content_artifacts() {
     for dir in ["content", "monas-sdk/content"] {
         if let Ok(entries) = std::fs::read_dir(dir) {

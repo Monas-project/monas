@@ -42,8 +42,6 @@ pub struct CreateContentOutput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetContentInput {
     pub content_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub version: Option<String>,
 }
 
 /// コンテンツ取得レスポンス
@@ -52,7 +50,6 @@ pub struct GetContentOutput {
     pub content_id: String,
     /// 復号されたコンテンツ（base64url）
     pub content: String,
-    pub version: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<ContentMetadata>,
 }
@@ -64,7 +61,8 @@ pub struct GetContentOutput {
 /// コンテンツ更新リクエスト
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateContentInput {
-    pub content_id: String,
+    /// 更新元として指定する版ID
+    pub base_version_id: String,
     /// 新しいコンテンツデータ（base64url）
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -74,8 +72,12 @@ pub struct UpdateContentInput {
 /// コンテンツ更新レスポンス
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateContentOutput {
-    pub content_id: String,
-    pub new_version: String,
+    /// 論理的に同一なコンテンツ系列を識別するID
+    pub series_id: String,
+    /// 更新元として使用した版ID
+    pub previous_version_id: String,
+    /// 更新後に作成された新しい版ID
+    pub version_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
 }
@@ -150,7 +152,6 @@ mod tests {
         let json = r#"{"content_id": "test_id"}"#;
         let input: GetContentInput = serde_json::from_str(json).unwrap();
         assert_eq!(input.content_id, "test_id");
-        assert!(input.version.is_none());
     }
 
     #[test]
@@ -158,26 +159,39 @@ mod tests {
         let output = GetContentOutput {
             content_id: "test_id".into(),
             content: "SGVsbG8gV29ybGQ=".into(),
-            version: "v1".into(),
             metadata: None,
         };
         let json = serde_json::to_string(&output).unwrap();
         assert!(json.contains("\"content_id\":\"test_id\""));
         assert!(json.contains("\"content\":\"SGVsbG8gV29ybGQ=\""));
-        assert!(json.contains("\"version\":\"v1\""));
         assert!(!json.contains("metadata"));
     }
 
     #[test]
     fn test_update_content_input() {
         let input = UpdateContentInput {
-            content_id: "test_id".into(),
+            base_version_id: "test_id".into(),
             content: "bmV3IGNvbnRlbnQ=".into(),
             metadata: None,
         };
         let json = serde_json::to_string(&input).unwrap();
-        assert!(json.contains("\"content_id\":\"test_id\""));
+        assert!(json.contains("\"base_version_id\":\"test_id\""));
         assert!(json.contains("\"content\":\"bmV3IGNvbnRlbnQ=\""));
+    }
+
+    #[test]
+    fn test_update_content_output() {
+        let output = UpdateContentOutput {
+            series_id: "series_id".into(),
+            previous_version_id: "prev_version".into(),
+            version_id: "new_version".into(),
+            updated_at: Some("2025-12-05T12:34:56Z".into()),
+        };
+        let json = serde_json::to_string(&output).unwrap();
+        assert!(json.contains("\"series_id\":\"series_id\""));
+        assert!(json.contains("\"previous_version_id\":\"prev_version\""));
+        assert!(json.contains("\"version_id\":\"new_version\""));
+        assert!(json.contains("\"updated_at\":\"2025-12-05T12:34:56Z\""));
     }
 
     #[test]

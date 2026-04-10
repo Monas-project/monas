@@ -10,7 +10,7 @@ use crate::models::state::{
     VerifyIntegrityInput, VerifyIntegrityOutput,
 };
 use crate::models::state_node::{
-    StateNodeContentDataResponse, StateNodeContentHistoryResponse, StateNodeErrorResponse,
+    StateNodeContentDataResponse, StateNodeContentHistoryResponse,
 };
 
 use super::MonasController;
@@ -33,19 +33,7 @@ impl MonasController {
         trace_id: String,
     ) -> Result<(u16, String), ApiResponse<T>> {
         let trace_id_for_call = trace_id.clone();
-        let mut req = ureq::get(url);
-        if let Some(ctx) = auth {
-            if let Some(value) = &ctx.authorization {
-                req = req.header("Authorization", value);
-            }
-            if let Some(value) = &ctx.request_signature {
-                req = req.header("X-Request-Signature", value);
-            }
-            if let Some(value) = ctx.request_timestamp {
-                req = req.header("X-Request-Timestamp", &value.to_string());
-            }
-        }
-        let resp = req
+        let resp = Self::attach_state_node_auth(ureq::get(url), auth)
             .config()
             .http_status_as_error(false)
             .build()
@@ -67,21 +55,6 @@ impl MonasController {
 
         Ok((status, body))
     }
-
-    fn map_state_node_status_error<T>(
-        status: u16,
-        body: Option<String>,
-        trace_id: String,
-    ) -> ApiResponse<T> {
-        let msg = body.unwrap_or_else(|| format!("State Node returned HTTP {status}"));
-        match status {
-            400 => ApiResponse::error(ApiError::Validation(msg), trace_id),
-            404 => ApiResponse::error(ApiError::NotFound(msg), trace_id),
-            408 => ApiResponse::error(ApiError::Timeout(msg), trace_id),
-            _ => ApiResponse::error(ApiError::Internal(msg), trace_id),
-        }
-    }
-
     fn get_state_node_history<T>(
         &self,
         content_id: &str,
@@ -91,12 +64,8 @@ impl MonasController {
         let url = format!("{}/content/{}/history", self.state_node_url, content_id);
 
         let (status, body) = self.state_node_get_string::<T>(&url, auth, trace_id.clone())?;
-        if status >= 400 {
-            let msg = serde_json::from_str::<StateNodeErrorResponse>(&body)
-                .ok()
-                .map(|e| e.error)
-                .or_else(|| (!body.is_empty()).then_some(body));
-            return Err(Self::map_state_node_status_error(status, msg, trace_id));
+        if let Some(err) = Self::try_state_node_http_error(status, &body, trace_id.clone()) {
+            return Err(err);
         }
 
         serde_json::from_str::<StateNodeContentHistoryResponse>(&body).map_err(|e| {
@@ -120,12 +89,8 @@ impl MonasController {
         );
 
         let (status, body) = self.state_node_get_string::<T>(&url, auth, trace_id.clone())?;
-        if status >= 400 {
-            let msg = serde_json::from_str::<StateNodeErrorResponse>(&body)
-                .ok()
-                .map(|e| e.error)
-                .or_else(|| (!body.is_empty()).then_some(body));
-            return Err(Self::map_state_node_status_error(status, msg, trace_id));
+        if let Some(err) = Self::try_state_node_http_error(status, &body, trace_id.clone()) {
+            return Err(err);
         }
 
         serde_json::from_str::<StateNodeContentDataResponse>(&body).map_err(|e| {
@@ -136,16 +101,10 @@ impl MonasController {
         })
     }
 
-    /// コンテンツの最新バージョン（CID）を取得する
+    /// コンテンツの最新バージョン（CID）を取得する。
+    ///
+    /// `auth` は State Node の `GET /content/:id/history` に転送する認証ヘッダ。本番では `Some` が必要。
     pub fn get_latest_version(
-        &self,
-        input: GetLatestVersionInput,
-    ) -> ApiResponse<GetLatestVersionOutput> {
-        self.get_latest_version_with_auth(input, None)
-    }
-
-    /// コンテンツの最新バージョン（CID）を取得する（認証ヘッダ透過あり）
-    pub fn get_latest_version_with_auth(
         &self,
         input: GetLatestVersionInput,
         auth: Option<&StateNodeAuthContext>,
@@ -182,13 +141,10 @@ impl MonasController {
         )
     }
 
-    /// コンテンツの更新履歴を取得する
-    pub fn get_history(&self, input: GetHistoryInput) -> ApiResponse<GetHistoryOutput> {
-        self.get_history_with_auth(input, None)
-    }
-
-    /// コンテンツの更新履歴を取得する（認証ヘッダ透過あり）
-    pub fn get_history_with_auth(
+    /// コンテンツの更新履歴を取得する。
+    ///
+    /// `auth` は State Node の `GET /content/:id/history` に転送する認証ヘッダ。本番では `Some` が必要。
+    pub fn get_history(
         &self,
         input: GetHistoryInput,
         auth: Option<&StateNodeAuthContext>,
@@ -225,21 +181,15 @@ impl MonasController {
         )
     }
 
-    /// 取得したコンテンツの整合性を検証する
+    /// 取得したコンテンツの整合性を検証する。
+    ///
+    /// `auth` は State Node の履歴・バージ取得 API に転送する認証ヘッダ。本番では `Some` が必要。
     ///
     /// 処理フロー:
     /// 1. コンテンツのハッシュを計算
     /// 2. State Nodeから取得した情報と比較
     /// 3. 一致すれば valid: true
     pub fn verify_integrity(
-        &self,
-        input: VerifyIntegrityInput,
-    ) -> ApiResponse<VerifyIntegrityOutput> {
-        self.verify_integrity_with_auth(input, None)
-    }
-
-    /// 取得したコンテンツの整合性を検証する（認証ヘッダ透過あり）
-    pub fn verify_integrity_with_auth(
         &self,
         input: VerifyIntegrityInput,
         auth: Option<&StateNodeAuthContext>,
@@ -288,16 +238,7 @@ impl MonasController {
                     .last()
                     .cloned()
                     .unwrap_or_else(|| input.content_id.clone()),
-                Err(_) => {
-                    return ApiResponse::success(
-                        VerifyIntegrityOutput {
-                            valid: false,
-                            computed_hash,
-                            reason: Some("failed to fetch history from state node".into()),
-                        },
-                        trace_id,
-                    );
-                }
+                Err(e) => return e,
             }
         };
 
@@ -308,29 +249,14 @@ impl MonasController {
             trace_id.clone(),
         ) {
             Ok(d) => d,
-            Err(_) => {
-                return ApiResponse::success(
-                    VerifyIntegrityOutput {
-                        valid: false,
-                        computed_hash,
-                        reason: Some(format!(
-                            "version not found on state node: {version_to_check}"
-                        )),
-                    },
-                    trace_id,
-                );
-            }
+            Err(e) => return e,
         };
 
         let state_bytes = match BASE64_STANDARD.decode(&state_node_data.data) {
             Ok(b) => b,
             Err(e) => {
-                return ApiResponse::success(
-                    VerifyIntegrityOutput {
-                        valid: false,
-                        computed_hash,
-                        reason: Some(format!("invalid base64 data from state node: {e}")),
-                    },
+                return ApiResponse::error(
+                    ApiError::Internal(format!("invalid base64 data from state node: {e}")),
                     trace_id,
                 );
             }

@@ -2,7 +2,9 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use mockito::Server;
 use monas_sdk::models::content::{ContentMetadata, CreateContentInput};
 use monas_sdk::models::keypair::{GenerateKeypairInput, KeyType};
-use monas_sdk::models::share::{Permission, RevokeShareInput, ShareContentInput};
+use monas_sdk::models::share::{
+    DecryptSharedContentInput, Permission, RevokeShareInput, ShareContentInput,
+};
 use monas_sdk::MonasController;
 
 mod support;
@@ -42,15 +44,18 @@ async fn share_content_succeeds_after_content_creation() {
         .data
         .expect("recipient keypair should be generated");
 
-    let create_response = controller.create_content(CreateContentInput {
-        content: URL_SAFE_NO_PAD.encode(b"share-target-content"),
-        metadata: Some(ContentMetadata {
-            name: Some("share.txt".to_string()),
-            content_type: Some("text/plain".to_string()),
-            created_at: None,
-            updated_at: None,
-        }),
-    });
+    let create_response = controller.create_content(
+        CreateContentInput {
+            content: URL_SAFE_NO_PAD.encode(b"share-target-content"),
+            metadata: Some(ContentMetadata {
+                name: Some("share.txt".to_string()),
+                content_type: Some("text/plain".to_string()),
+                created_at: None,
+                updated_at: None,
+            }),
+        },
+        None,
+    );
     assert!(create_response.success, "create_content should succeed");
     let created = create_response.data.expect("create should return data");
     create_mock.assert();
@@ -146,15 +151,18 @@ async fn revoke_share_updates_state_node_version() {
         .data
         .expect("recipient keypair should be generated");
 
-    let create_response = controller.create_content(CreateContentInput {
-        content: URL_SAFE_NO_PAD.encode(b"revoke-target-content"),
-        metadata: Some(ContentMetadata {
-            name: Some("revoke.txt".to_string()),
-            content_type: Some("text/plain".to_string()),
-            created_at: None,
-            updated_at: None,
-        }),
-    });
+    let create_response = controller.create_content(
+        CreateContentInput {
+            content: URL_SAFE_NO_PAD.encode(b"revoke-target-content"),
+            metadata: Some(ContentMetadata {
+                name: Some("revoke.txt".to_string()),
+                content_type: Some("text/plain".to_string()),
+                created_at: None,
+                updated_at: None,
+            }),
+        },
+        None,
+    );
     assert!(create_response.success, "create_content should succeed");
     let created = create_response.data.expect("create should return data");
     create_mock.assert();
@@ -168,17 +176,149 @@ async fn revoke_share_updates_state_node_version() {
     assert!(share_response.success, "share_content should succeed");
     delegate_mock.assert();
 
-    let revoke_response = controller.revoke_share(RevokeShareInput {
-        content_id: created.content_id,
-        sender_public_key: sender.public_key,
-        recipient_public_key: recipient.public_key,
-    });
+    let revoke_response = controller.revoke_share(
+        RevokeShareInput {
+            content_id: created.content_id,
+            sender_public_key: sender.public_key,
+            recipient_public_key: recipient.public_key,
+        },
+        None,
+    );
     assert!(
         revoke_response.success,
         "revoke_share should succeed: {:?}",
         revoke_response.error
     );
     update_mock.assert();
+
+    cleanup_content_artifacts();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn revoke_share_rolls_back_local_state_when_state_node_sync_fails() {
+    let _guard = acquire_test_lock();
+    let mut server = Server::new_async().await;
+    let create_mock = server
+        .mock("POST", "/content")
+        .with_status(200)
+        .create_async()
+        .await;
+    let delegate_mock = server
+        .mock("POST", "/issuer/delegate")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"delegated_token":"dummy.jwt.token","issued_at":1700000000,"expires_at":1700003600,"jti":"jti-rollback"}"#,
+        )
+        .create_async()
+        .await;
+    let failing_update_mock = server
+        .mock("PUT", mockito::Matcher::Regex(r"^/content/.+$".to_string()))
+        .with_status(500)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"error":"state sync failed"}"#)
+        .expect(1)
+        .create_async()
+        .await;
+    let succeeding_update_mock = server
+        .mock("PUT", mockito::Matcher::Regex(r"^/content/.+$".to_string()))
+        .with_status(200)
+        .expect(1)
+        .create_async()
+        .await;
+
+    let controller = MonasController::with_urls(server.url(), server.url());
+
+    let sender = controller
+        .generate_keypair(GenerateKeypairInput {
+            key_type: KeyType::Secp256r1,
+        })
+        .data
+        .expect("sender keypair should be generated");
+    let recipient = controller
+        .generate_keypair(GenerateKeypairInput {
+            key_type: KeyType::Secp256r1,
+        })
+        .data
+        .expect("recipient keypair should be generated");
+
+    let create_response = controller.create_content(
+        CreateContentInput {
+            content: URL_SAFE_NO_PAD.encode(b"revoke-rollback-target"),
+            metadata: Some(ContentMetadata {
+                name: Some("revoke-rollback.txt".to_string()),
+                content_type: Some("text/plain".to_string()),
+                created_at: None,
+                updated_at: None,
+            }),
+        },
+        None,
+    );
+    assert!(create_response.success, "create_content should succeed");
+    let created = create_response.data.expect("create should return data");
+    create_mock.assert();
+
+    let share_response = controller.share_content(ShareContentInput {
+        content_id: created.content_id.clone(),
+        sender_public_key: sender.public_key.clone(),
+        recipient_public_key: recipient.public_key.clone(),
+        permissions: vec![Permission::Read],
+    });
+    assert!(share_response.success, "share_content should succeed");
+    let shared = share_response.data.expect("share should return data");
+    delegate_mock.assert();
+
+    let revoke_response = controller.revoke_share(
+        RevokeShareInput {
+            content_id: created.content_id.clone(),
+            sender_public_key: sender.public_key.clone(),
+            recipient_public_key: recipient.public_key.clone(),
+        },
+        None,
+    );
+    assert!(
+        !revoke_response.success,
+        "revoke_share should fail when state sync fails"
+    );
+    failing_update_mock.assert();
+
+    let get_shared_response = controller.decrypt_shared_content(DecryptSharedContentInput {
+        content_id: created.content_id.clone(),
+        private_key: recipient.private_key.clone(),
+        sender_key_id: shared.sender_key_id.clone(),
+        recipient_key_id: shared.recipient_key_id.clone(),
+        key_envelope: shared.key_envelope.clone(),
+        version: None,
+    });
+    assert!(
+        get_shared_response.success,
+        "old share should still work after rollback: {:?}",
+        get_shared_response.error
+    );
+    let decrypted = get_shared_response
+        .data
+        .expect("shared content should be available after rollback");
+    assert_eq!(
+        URL_SAFE_NO_PAD
+            .decode(decrypted.content)
+            .expect("rolled back content should be base64url"),
+        b"revoke-rollback-target"
+    );
+
+    let second_revoke_response = controller.revoke_share(
+        RevokeShareInput {
+            content_id: created.content_id,
+            sender_public_key: sender.public_key,
+            recipient_public_key: recipient.public_key,
+        },
+        None,
+    );
+    assert!(
+        second_revoke_response.success,
+        "revoke_share should succeed after rollback restored local state: {:?}",
+        second_revoke_response.error
+    );
+    succeeding_update_mock.assert();
 
     cleanup_content_artifacts();
 }

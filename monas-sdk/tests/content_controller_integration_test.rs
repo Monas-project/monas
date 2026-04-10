@@ -5,8 +5,15 @@ use monas_sdk::models::content::{
 };
 use monas_sdk::ApiError;
 use monas_sdk::MonasController;
+use sha2::{Digest, Sha256};
 mod support;
 use support::{acquire_test_lock, cleanup_content_artifacts};
+
+fn compute_content_id(raw_content: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(raw_content);
+    format!("{:x}", hasher.finalize())
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn create_content_and_get_content_round_trip_succeeds_with_mock_state_node() {
@@ -34,7 +41,7 @@ async fn create_content_and_get_content_round_trip_succeeds_with_mock_state_node
         }),
     };
 
-    let create_response = controller.create_content(create_input);
+    let create_response = controller.create_content(create_input, None);
     assert!(create_response.success, "create_content should succeed");
     assert!(create_response.error.is_none(), "unexpected create error");
 
@@ -45,7 +52,6 @@ async fn create_content_and_get_content_round_trip_succeeds_with_mock_state_node
 
     let get_response = controller.get_content(GetContentInput {
         content_id: created.content_id,
-        version: None,
     });
 
     assert!(get_response.success, "get_content should succeed");
@@ -79,7 +85,8 @@ async fn delete_content_round_trip_succeeds() {
         .await;
 
     let controller = MonasController::with_state_node_url(server.url());
-    let create_response = controller.create_content(CreateContentInput {
+    let create_response = controller.create_content(
+        CreateContentInput {
         content: URL_SAFE_NO_PAD.encode(b"before-delete"),
         metadata: Some(ContentMetadata {
             name: Some("delete.txt".to_string()),
@@ -87,14 +94,19 @@ async fn delete_content_round_trip_succeeds() {
             created_at: None,
             updated_at: None,
         }),
-    });
+    },
+        None,
+    );
     assert!(create_response.success, "create_content should succeed");
     let created = create_response.data.expect("create should return data");
     create_mock.assert();
 
-    let delete_response = controller.delete_content(DeleteContentInput {
-        content_id: created.content_id.clone(),
-    });
+    let delete_response = controller.delete_content(
+        DeleteContentInput {
+            content_id: created.content_id.clone(),
+        },
+        None,
+    );
     assert!(delete_response.success, "delete_content should succeed");
     assert!(delete_response.error.is_none(), "unexpected delete error");
     let deleted = delete_response.data.expect("delete should return data");
@@ -104,7 +116,6 @@ async fn delete_content_round_trip_succeeds() {
 
     let get_response = controller.get_content(GetContentInput {
         content_id: created.content_id,
-        version: None,
     });
     assert!(
         !get_response.success,
@@ -125,6 +136,83 @@ async fn delete_content_round_trip_succeeds() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn delete_content_rolls_back_locally_when_state_node_delete_fails() {
+    let _guard = acquire_test_lock();
+    let mut server = Server::new_async().await;
+    let create_mock = server
+        .mock("POST", "/content")
+        .with_status(200)
+        .create_async()
+        .await;
+    let delete_mock = server
+        .mock(
+            "DELETE",
+            mockito::Matcher::Regex(r"^/content/.+$".to_string()),
+        )
+        .with_status(500)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"error":"delete failed"}"#)
+        .create_async()
+        .await;
+
+    let controller = MonasController::with_state_node_url(server.url());
+    let raw_content = b"delete-rollback";
+    let create_response = controller.create_content(
+        CreateContentInput {
+            content: URL_SAFE_NO_PAD.encode(raw_content),
+            metadata: Some(ContentMetadata {
+                name: Some("rollback.txt".to_string()),
+                content_type: Some("text/plain".to_string()),
+                created_at: None,
+                updated_at: None,
+            }),
+        },
+        None,
+    );
+    assert!(create_response.success, "create_content should succeed");
+    let created = create_response.data.expect("create should return data");
+    create_mock.assert();
+
+    let delete_response = controller.delete_content(
+        DeleteContentInput {
+            content_id: created.content_id.clone(),
+        },
+        None,
+    );
+    assert!(
+        !delete_response.success,
+        "delete_content should fail when state node delete fails"
+    );
+    delete_mock.assert();
+
+    let get_response = controller.get_content(GetContentInput {
+        content_id: created.content_id.clone(),
+    });
+    assert!(
+        get_response.success,
+        "get_content should succeed after local rollback"
+    );
+    let fetched = get_response.data.expect("get should return data");
+    let fetched_bytes = URL_SAFE_NO_PAD
+        .decode(fetched.content)
+        .expect("fetched content should be base64url");
+    assert_eq!(fetched_bytes, raw_content);
+
+    let second_delete_response = controller.delete_content(
+        DeleteContentInput {
+            content_id: created.content_id,
+        },
+        None,
+    );
+    assert!(
+        !second_delete_response.success,
+        "delete should remain re-executable after rollback"
+    );
+
+    cleanup_content_artifacts();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn update_content_round_trip_succeeds_with_mock_state_node() {
     let _guard = acquire_test_lock();
     let mut server = Server::new_async().await;
@@ -133,15 +221,11 @@ async fn update_content_round_trip_succeeds_with_mock_state_node() {
         .with_status(200)
         .create_async()
         .await;
-    let update_mock = server
-        .mock("PUT", mockito::Matcher::Regex(r"^/content/.+$".to_string()))
-        .with_status(200)
-        .create_async()
-        .await;
 
     let controller = MonasController::with_state_node_url(server.url());
 
-    let create_response = controller.create_content(CreateContentInput {
+    let create_response = controller.create_content(
+        CreateContentInput {
         content: URL_SAFE_NO_PAD.encode(b"before-update"),
         metadata: Some(ContentMetadata {
             name: Some("before.txt".to_string()),
@@ -149,39 +233,276 @@ async fn update_content_round_trip_succeeds_with_mock_state_node() {
             created_at: None,
             updated_at: None,
         }),
-    });
+    },
+        None,
+    );
     assert!(create_response.success, "create_content should succeed");
     let created = create_response.data.expect("create should return data");
     create_mock.assert();
+    let update_mock = server
+        .mock(
+            "PUT",
+            mockito::Matcher::Exact(format!("/content/{}", created.content_id)),
+        )
+        .expect(2)
+        .with_status(200)
+        .create_async()
+        .await;
 
-    let update_response = controller.update_content(UpdateContentInput {
-        content_id: created.content_id,
-        content: URL_SAFE_NO_PAD.encode(b"after-update"),
-        metadata: Some(ContentMetadata {
-            name: Some("after.txt".to_string()),
-            content_type: None,
-            created_at: None,
-            updated_at: None,
-        }),
-    });
-    assert!(update_response.success, "update_content should succeed");
-    assert!(update_response.error.is_none(), "unexpected update error");
-    let updated = update_response.data.expect("update should return data");
+    let first_update_response = controller.update_content(
+        UpdateContentInput {
+            base_version_id: created.content_id.clone(),
+            content: URL_SAFE_NO_PAD.encode(b"after-update"),
+            metadata: Some(ContentMetadata {
+                name: Some("after.txt".to_string()),
+                content_type: None,
+                created_at: None,
+                updated_at: None,
+            }),
+        },
+        None,
+    );
+    assert!(
+        first_update_response.success,
+        "first update_content should succeed"
+    );
+    assert!(
+        first_update_response.error.is_none(),
+        "unexpected first update error"
+    );
+    let first_updated = first_update_response
+        .data
+        .expect("first update should return data");
+    assert_eq!(first_updated.series_id, created.content_id);
+    assert_eq!(first_updated.previous_version_id, first_updated.series_id);
+
+    let second_update_response = controller.update_content(
+        UpdateContentInput {
+            base_version_id: first_updated.version_id.clone(),
+            content: URL_SAFE_NO_PAD.encode(b"after-second-update"),
+            metadata: Some(ContentMetadata {
+                name: Some("after-second.txt".to_string()),
+                content_type: None,
+                created_at: None,
+                updated_at: None,
+            }),
+        },
+        None,
+    );
+    assert!(
+        second_update_response.success,
+        "second update_content should succeed"
+    );
+    assert!(
+        second_update_response.error.is_none(),
+        "unexpected second update error"
+    );
+    let second_updated = second_update_response
+        .data
+        .expect("second update should return data");
     update_mock.assert();
+    assert_eq!(second_updated.series_id, created.content_id);
+    assert_eq!(second_updated.previous_version_id, first_updated.version_id);
 
     let get_response = controller.get_content(GetContentInput {
-        content_id: updated.new_version,
-        version: None,
+        content_id: second_updated.version_id,
     });
     assert!(
         get_response.success,
-        "get_content should succeed after update"
+        "get_content should succeed after second update"
     );
     let fetched = get_response.data.expect("get should return data");
     let fetched_bytes = URL_SAFE_NO_PAD
         .decode(fetched.content)
         .expect("updated content should be base64url");
-    assert_eq!(fetched_bytes, b"after-update");
+    assert_eq!(fetched_bytes, b"after-second-update");
+
+    cleanup_content_artifacts();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn create_content_rolls_back_locally_when_state_node_create_fails_and_can_retry() {
+    let _guard = acquire_test_lock();
+    let mut server = Server::new_async().await;
+    let failing_create_mock = server
+        .mock("POST", "/content")
+        .with_status(500)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"error":"create failed"}"#)
+        .expect(1)
+        .create_async()
+        .await;
+
+    let controller = MonasController::with_state_node_url(server.url());
+    let raw_content = b"create-rollback";
+    let create_input = CreateContentInput {
+        content: URL_SAFE_NO_PAD.encode(raw_content),
+        metadata: Some(ContentMetadata {
+            name: Some("create-rollback.txt".to_string()),
+            content_type: Some("text/plain".to_string()),
+            created_at: None,
+            updated_at: None,
+        }),
+    };
+
+    let first_response = controller.create_content(create_input.clone(), None);
+    assert!(
+        !first_response.success,
+        "create_content should fail when state node create fails"
+    );
+    failing_create_mock.assert();
+
+    let succeeding_create_mock = server
+        .mock("POST", "/content")
+        .with_status(200)
+        .expect(1)
+        .create_async()
+        .await;
+
+    let second_response = controller.create_content(create_input, None);
+    assert!(
+        second_response.success,
+        "create_content should be retryable after rollback: {:?}",
+        second_response.error
+    );
+    let created = second_response.data.expect("second create should return data");
+    succeeding_create_mock.assert();
+
+    let get_response = controller.get_content(GetContentInput {
+        content_id: created.content_id,
+    });
+    assert!(get_response.success, "created content should be readable");
+    let fetched = get_response.data.expect("get should return data");
+    let fetched_bytes = URL_SAFE_NO_PAD
+        .decode(fetched.content)
+        .expect("fetched content should be base64url");
+    assert_eq!(fetched_bytes, raw_content);
+
+    cleanup_content_artifacts();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn update_content_rolls_back_new_version_when_state_node_update_fails() {
+    let _guard = acquire_test_lock();
+    let mut server = Server::new_async().await;
+    let create_mock = server
+        .mock("POST", "/content")
+        .with_status(200)
+        .create_async()
+        .await;
+
+    let controller = MonasController::with_state_node_url(server.url());
+    let original_raw = b"before-update-rollback";
+    let create_response = controller.create_content(
+        CreateContentInput {
+            content: URL_SAFE_NO_PAD.encode(original_raw),
+            metadata: Some(ContentMetadata {
+                name: Some("before-rollback.txt".to_string()),
+                content_type: Some("text/plain".to_string()),
+                created_at: None,
+                updated_at: None,
+            }),
+        },
+        None,
+    );
+    assert!(create_response.success, "create_content should succeed");
+    let created = create_response.data.expect("create should return data");
+    create_mock.assert();
+
+    let updated_raw = b"after-update-rollback";
+    let failed_update_mock = server
+        .mock(
+            "PUT",
+            mockito::Matcher::Exact(format!("/content/{}", created.content_id)),
+        )
+        .with_status(500)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"error":"update failed"}"#)
+        .expect(1)
+        .create_async()
+        .await;
+
+    let failed_update = controller.update_content(
+        UpdateContentInput {
+            base_version_id: created.content_id.clone(),
+            content: URL_SAFE_NO_PAD.encode(updated_raw),
+            metadata: Some(ContentMetadata {
+                name: Some("after-rollback.txt".to_string()),
+                content_type: None,
+                created_at: None,
+                updated_at: None,
+            }),
+        },
+        None,
+    );
+    assert!(
+        !failed_update.success,
+        "update_content should fail when state node update fails"
+    );
+    failed_update_mock.assert();
+
+    let old_version_response = controller.get_content(GetContentInput {
+        content_id: created.content_id.clone(),
+    });
+    assert!(
+        old_version_response.success,
+        "base version should still be readable after rollback"
+    );
+    let old_version = old_version_response.data.expect("old version should exist");
+    let old_bytes = URL_SAFE_NO_PAD
+        .decode(old_version.content)
+        .expect("old content should be base64url");
+    assert_eq!(old_bytes, original_raw);
+
+    let expected_new_version_id = compute_content_id(updated_raw);
+    let rolled_back_version_response = controller.get_content(GetContentInput {
+        content_id: expected_new_version_id.clone(),
+    });
+    assert!(
+        !rolled_back_version_response.success,
+        "rolled back version should not remain readable"
+    );
+    match rolled_back_version_response.error {
+        Some(ApiError::NotFound(msg)) => {
+            assert!(
+                msg.contains("deleted") || msg.contains("not found"),
+                "unexpected rolled back version error: {msg}"
+            );
+        }
+        other => panic!("expected NotFound for rolled back version, got: {other:?}"),
+    }
+
+    let succeeding_update_mock = server
+        .mock(
+            "PUT",
+            mockito::Matcher::Exact(format!("/content/{}", created.content_id)),
+        )
+        .with_status(200)
+        .expect(1)
+        .create_async()
+        .await;
+
+    let second_update = controller.update_content(
+        UpdateContentInput {
+            base_version_id: created.content_id.clone(),
+            content: URL_SAFE_NO_PAD.encode(updated_raw),
+            metadata: Some(ContentMetadata {
+                name: Some("after-rollback.txt".to_string()),
+                content_type: None,
+                created_at: None,
+                updated_at: None,
+            }),
+        },
+        None,
+    );
+    assert!(
+        second_update.success,
+        "update_content should be retryable after rollback: {:?}",
+        second_update.error
+    );
+    let updated = second_update.data.expect("second update should return data");
+    succeeding_update_mock.assert();
+    assert_eq!(updated.version_id, expected_new_version_id);
 
     cleanup_content_artifacts();
 }

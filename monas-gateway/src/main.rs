@@ -8,7 +8,9 @@ use monas_sdk::models::content::{
     CreateContentInput, DeleteContentInput, GetContentInput, UpdateContentInput,
 };
 use monas_sdk::models::keypair::GenerateKeypairInput;
-use monas_sdk::models::share::{GetSharedContentInput, RevokeShareInput, ShareContentInput};
+use monas_sdk::models::share::{
+    DecryptSharedContentInput, RevokeShareInput, ShareContentInput,
+};
 use monas_sdk::models::state::{GetHistoryInput, GetLatestVersionInput, VerifyIntegrityInput};
 use monas_sdk::{ApiResponse, MonasController, StateNodeAuthContext};
 use std::net::SocketAddr;
@@ -41,7 +43,7 @@ async fn main() {
         // share
         .route("/share", post(share_content))
         .route("/share/revoke", post(revoke_share))
-        .route("/share/get", post(get_shared_content))
+        .route("/share/decrypt", post(decrypt_shared_content))
         // state
         .route("/state/latest-version", post(get_latest_version))
         .route("/state/history", post(get_history))
@@ -69,32 +71,29 @@ async fn health() -> StatusCode {
 async fn generate_keypair(
     State(state): State<AppState>,
     Json(input): Json<GenerateKeypairInput>,
-) -> Json<ApiResponse<monas_sdk::models::keypair::GenerateKeypairOutput>> {
-    Json(state.controller.generate_keypair(input))
+) -> (StatusCode, Json<ApiResponse<monas_sdk::models::keypair::GenerateKeypairOutput>>) {
+    api_json(state.controller.generate_keypair(input))
 }
 
 async fn create_content(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(input): Json<CreateContentInput>,
-) -> Json<ApiResponse<monas_sdk::models::content::CreateContentOutput>> {
+) -> (StatusCode, Json<ApiResponse<monas_sdk::models::content::CreateContentOutput>>) {
     let auth = build_state_node_auth_context(&headers);
-    Json(
+    api_json(
         state
             .controller
-            .create_content_with_auth(input, Some(&auth)),
+            .create_content(input, Some(&auth)),
     )
 }
 
 async fn get_content(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Json<ApiResponse<monas_sdk::models::content::GetContentOutput>> {
-    let input = GetContentInput {
-        content_id: id,
-        version: None,
-    };
-    Json(state.controller.get_content(input))
+) -> (StatusCode, Json<ApiResponse<monas_sdk::models::content::GetContentOutput>>) {
+    let input = GetContentInput { content_id: id };
+    api_json(state.controller.get_content(input))
 }
 
 async fn update_content(
@@ -102,13 +101,13 @@ async fn update_content(
     Path(id): Path<String>,
     headers: HeaderMap,
     Json(mut input): Json<UpdateContentInput>,
-) -> Json<ApiResponse<monas_sdk::models::content::UpdateContentOutput>> {
-    input.content_id = id;
+) -> (StatusCode, Json<ApiResponse<monas_sdk::models::content::UpdateContentOutput>>) {
+    input.base_version_id = id;
     let auth = build_state_node_auth_context(&headers);
-    Json(
+    api_json(
         state
             .controller
-            .update_content_with_auth(input, Some(&auth)),
+            .update_content(input, Some(&auth)),
     )
 }
 
@@ -116,49 +115,49 @@ async fn delete_content(
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
-) -> Json<ApiResponse<monas_sdk::models::content::DeleteContentOutput>> {
+) -> (StatusCode, Json<ApiResponse<monas_sdk::models::content::DeleteContentOutput>>) {
     let input = DeleteContentInput { content_id: id };
     let auth = build_state_node_auth_context(&headers);
-    Json(
+    api_json(
         state
             .controller
-            .delete_content_with_auth(input, Some(&auth)),
+            .delete_content(input, Some(&auth)),
     )
 }
 
 async fn share_content(
     State(state): State<AppState>,
     Json(input): Json<ShareContentInput>,
-) -> Json<ApiResponse<monas_sdk::models::share::ShareContentOutput>> {
-    Json(state.controller.share_content(input))
+) -> (StatusCode, Json<ApiResponse<monas_sdk::models::share::ShareContentOutput>>) {
+    api_json(state.controller.share_content(input))
 }
 
 async fn revoke_share(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(input): Json<RevokeShareInput>,
-) -> Json<ApiResponse<monas_sdk::models::share::RevokeShareOutput>> {
+) -> (StatusCode, Json<ApiResponse<monas_sdk::models::share::RevokeShareOutput>>) {
     let auth = build_state_node_auth_context(&headers);
-    Json(state.controller.revoke_share_with_auth(input, Some(&auth)))
+    api_json(state.controller.revoke_share(input, Some(&auth)))
 }
 
-async fn get_shared_content(
+async fn decrypt_shared_content(
     State(state): State<AppState>,
-    Json(input): Json<GetSharedContentInput>,
-) -> Json<ApiResponse<monas_sdk::models::share::GetSharedContentOutput>> {
-    Json(state.controller.get_shared_content(input))
+    Json(input): Json<DecryptSharedContentInput>,
+) -> (StatusCode, Json<ApiResponse<monas_sdk::models::share::DecryptSharedContentOutput>>) {
+    api_json(state.controller.decrypt_shared_content(input))
 }
 
 async fn get_latest_version(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(input): Json<GetLatestVersionInput>,
-) -> Json<ApiResponse<monas_sdk::models::state::GetLatestVersionOutput>> {
+) -> (StatusCode, Json<ApiResponse<monas_sdk::models::state::GetLatestVersionOutput>>) {
     let auth = build_state_node_auth_context(&headers);
-    Json(
+    api_json(
         state
             .controller
-            .get_latest_version_with_auth(input, Some(&auth)),
+            .get_latest_version(input, Some(&auth)),
     )
 }
 
@@ -166,22 +165,89 @@ async fn get_history(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(input): Json<GetHistoryInput>,
-) -> Json<ApiResponse<monas_sdk::models::state::GetHistoryOutput>> {
+) -> (StatusCode, Json<ApiResponse<monas_sdk::models::state::GetHistoryOutput>>) {
     let auth = build_state_node_auth_context(&headers);
-    Json(state.controller.get_history_with_auth(input, Some(&auth)))
+    api_json(state.controller.get_history(input, Some(&auth)))
 }
 
 async fn verify_integrity(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(input): Json<VerifyIntegrityInput>,
-) -> Json<ApiResponse<monas_sdk::models::state::VerifyIntegrityOutput>> {
+) -> (StatusCode, Json<ApiResponse<monas_sdk::models::state::VerifyIntegrityOutput>>) {
     let auth = build_state_node_auth_context(&headers);
-    Json(
+    api_json(
         state
             .controller
-            .verify_integrity_with_auth(input, Some(&auth)),
+            .verify_integrity(input, Some(&auth)),
     )
+}
+
+fn api_json<T>(response: ApiResponse<T>) -> (StatusCode, Json<ApiResponse<T>>) {
+    let status = response
+        .error
+        .as_ref()
+        .and_then(|error| StatusCode::from_u16(error.status_code()).ok())
+        .unwrap_or(StatusCode::OK);
+    (status, Json(response))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use monas_sdk::ApiError;
+    use monas_sdk::models::content::{ContentMetadata, CreateContentInput};
+    use std::sync::Arc;
+
+    #[test]
+    fn api_json_uses_error_status_code() {
+        let response: ApiResponse<()> =
+            ApiResponse::error(ApiError::Forbidden("forbidden".into()), "trace_test".into());
+        let (status, Json(body)) = api_json(response);
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(!body.success);
+    }
+
+    #[test]
+    fn api_json_returns_ok_on_success() {
+        let response = ApiResponse::success("ok", "trace_test".into());
+        let (status, Json(body)) = api_json(response);
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.success);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_content_handler_returns_bad_request_for_invalid_input() {
+        let controller = Arc::new(MonasController::with_state_node_url("http://127.0.0.1:8080"));
+        let state = State(AppState { controller });
+        let headers = HeaderMap::new();
+        let input = Json(CreateContentInput {
+            content: String::new(),
+            metadata: Some(ContentMetadata {
+                name: Some("invalid.txt".into()),
+                content_type: None,
+                created_at: None,
+                updated_at: None,
+            }),
+        });
+
+        let (status, Json(body)) = create_content(state, headers, input).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(!body.success);
+        assert!(matches!(body.error, Some(ApiError::Validation(_))));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_content_handler_returns_not_found_for_missing_local_content() {
+        let controller = Arc::new(MonasController::with_state_node_url("http://127.0.0.1:8080"));
+        let state = State(AppState { controller });
+        let path = Path(String::from("missing-content-id"));
+
+        let (status, Json(body)) = get_content(state, path).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(!body.success);
+        assert!(matches!(body.error, Some(ApiError::NotFound(_))));
+    }
 }
 
 fn build_state_node_auth_context(headers: &HeaderMap) -> StateNodeAuthContext {

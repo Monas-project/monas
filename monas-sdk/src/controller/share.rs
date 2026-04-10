@@ -8,19 +8,22 @@ use crate::common::{
     StateNodeAuthContext,
 };
 use crate::models::share::{
-    DelegatedAccessToken, GetSharedContentInput, GetSharedContentOutput, KeyEnvelope, Permission,
-    RevokeShareInput, RevokeShareOutput, ShareContentInput, ShareContentOutput,
+    DecryptSharedContentInput, DecryptSharedContentOutput, DelegatedAccessToken, KeyEnvelope,
+    Permission, RevokeShareInput, RevokeShareOutput, ShareContentInput, ShareContentOutput,
 };
 
 use monas_content::application_service::content_service::{
-    DecryptWithCekError, ReencryptContentCommand, ReencryptError,
+    ContentEncryptionKeyStore, ContentRepository, DecryptWithCekError, ReencryptContentCommand,
+    ReencryptError,
 };
 use monas_content::application_service::share_service::{
-    GrantShareCommand, RevokeShareCommand, ShareApplicationError, ShareService,
+    GrantShareCommand, RevokeShareCommand, ShareApplicationError, ShareRepository, ShareService,
 };
+use monas_content::domain::content::{Content, ContentEncryptionKey};
 use monas_content::domain::content_id::ContentId;
 use monas_content::domain::share::{
     key_envelope::{KeyEnvelope as DomainKeyEnvelope, KeyWrapAlgorithm, WrappedRecipientKey},
+    Share,
     KeyId, Permission as DomainPermission,
 };
 use monas_content::infrastructure::{
@@ -57,6 +60,13 @@ pub(super) type ShareServiceInstance = ShareService<
     InMemoryPublicKeyDirectory,
     HpkeV1KeyWrapping,
 >;
+
+#[derive(Clone)]
+struct RevokeShareLocalSnapshot {
+    share: Share,
+    content: Content,
+    cek: ContentEncryptionKey,
+}
 
 impl MonasController {
     fn map_reencrypt_error(e: ReencryptError) -> ApiError {
@@ -203,6 +213,61 @@ impl MonasController {
         }
     }
 
+    fn capture_revoke_share_snapshot(
+        &self,
+        content_id: &ContentId,
+    ) -> Result<RevokeShareLocalSnapshot, ApiError> {
+        let share = self
+            .share_service
+            .share_repository
+            .load(content_id)
+            .map_err(|e| ApiError::Internal(format!("Share repository error: {e}")))?
+            .ok_or_else(|| ApiError::NotFound("Content not found for sharing".into()))?;
+
+        let content = self
+            .share_service
+            .content_repository
+            .find_by_id(content_id)
+            .map_err(|e| ApiError::Internal(format!("Content repository error: {e}")))?
+            .ok_or_else(|| ApiError::NotFound("Content not found".into()))?;
+
+        let cek = self
+            .share_service
+            .cek_store
+            .load(content_id)
+            .map_err(|e| ApiError::Internal(format!("Key store error: {e}")))?
+            .ok_or_else(|| ApiError::Internal("Missing content encryption key".into()))?;
+
+        Ok(RevokeShareLocalSnapshot {
+            share,
+            content,
+            cek,
+        })
+    }
+
+    fn restore_revoke_share_snapshot(
+        &self,
+        snapshot: &RevokeShareLocalSnapshot,
+    ) -> Result<(), ApiError> {
+        self.share_service
+            .share_repository
+            .save(&snapshot.share)
+            .map_err(|e| ApiError::Internal(format!("Share repository restore error: {e}")))?;
+
+        let content_id = snapshot.content.raw_id().clone();
+        self.share_service
+            .content_repository
+            .save(&content_id, &snapshot.content)
+            .map_err(|e| ApiError::Internal(format!("Content repository restore error: {e}")))?;
+
+        self.share_service
+            .cek_store
+            .save(&content_id, &snapshot.cek)
+            .map_err(|e| ApiError::Internal(format!("Key store restore error: {e}")))?;
+
+        Ok(())
+    }
+
     /// コンテンツを他のユーザーと共有する
     ///
     /// 処理フロー:
@@ -212,8 +277,9 @@ impl MonasController {
     /// 4. 共有先の公開鍵をデコード
     /// 5. Permissionを変換
     /// 6. ShareService::grant_shareを呼び出し（パーミッション追加とKeyEnvelope生成）
-    /// 7. KeyEnvelopeをSDK形式に変換
-    /// 8. 結果を返却
+    /// 7. 委譲トークン発行に失敗した場合は revoke_share（ドメイン）で ACL を巻き戻す
+    /// 8. KeyEnvelopeをSDK形式に変換
+    /// 9. 結果を返却
     pub fn share_content(&self, input: ShareContentInput) -> ApiResponse<ShareContentOutput> {
         let trace_id = generate_trace_id();
 
@@ -281,7 +347,22 @@ impl MonasController {
             permission,
         ) {
             Ok(token) => token,
-            Err(e) => return ApiResponse::error(e, trace_id),
+            Err(e) => {
+                let rollback_cmd = RevokeShareCommand {
+                    content_id: content_id.clone(),
+                    sender_key_id: sender_key_id_for_output.clone(),
+                    recipient_key_id: result.recipient_key_id.clone(),
+                };
+                if let Err(rb) = self.share_service.revoke_share(rollback_cmd) {
+                    return ApiResponse::error(
+                        ApiError::Internal(format!(
+                            "Delegated token issuance failed; rollback (revoke_share) also failed: {rb} (original: {e})"
+                        )),
+                        trace_id,
+                    );
+                }
+                return ApiResponse::error(e, trace_id);
+            }
         };
 
         // 7. KeyEnvelopeをSDK形式に変換
@@ -307,20 +388,18 @@ impl MonasController {
         ApiResponse::success(output, trace_id)
     }
 
-    /// コンテンツの共有を取り消す
+    /// コンテンツの共有を取り消す。
+    ///
+    /// `auth` は State Node へ送る `PUT /content/:id`（再暗号化後の同期）に転送する認証ヘッダ。本番では `Some` が必要。
     ///
     /// 処理フロー:
     /// 1. 入力のバリデーション
     /// 2. ContentIdに変換
     /// 3. 共有先の公開鍵をデコードしてrecipient_key_idを計算
     /// 4. ShareService::revoke_shareを呼び出し（ACLの更新）
-    /// 5. 結果を返却
-    pub fn revoke_share(&self, input: RevokeShareInput) -> ApiResponse<RevokeShareOutput> {
-        self.revoke_share_with_auth(input, None)
-    }
-
-    /// コンテンツの共有を取り消す（認証ヘッダ透過あり）
-    pub fn revoke_share_with_auth(
+    /// 5. State Node に更新を送信
+    /// 6. 結果を返却
+    pub fn revoke_share(
         &self,
         input: RevokeShareInput,
         auth: Option<&StateNodeAuthContext>,
@@ -340,6 +419,11 @@ impl MonasController {
 
         // 2. ContentIdに変換
         let content_id = ContentId::new(input.content_id.clone());
+
+        let snapshot = match self.capture_revoke_share_snapshot(&content_id) {
+            Ok(snapshot) => snapshot,
+            Err(e) => return ApiResponse::error(e, trace_id),
+        };
 
         let sender_public_key_bytes =
             match Self::decode_base64url_field("sender_public_key", &input.sender_public_key) {
@@ -388,6 +472,19 @@ impl MonasController {
             auth,
             trace_id.clone(),
         ) {
+            if let Err(restore_err) = self.restore_revoke_share_snapshot(&snapshot) {
+                let remote_message = response
+                    .error
+                    .as_ref()
+                    .map(|e| format!("{e:?}"))
+                    .unwrap_or_else(|| "unknown state node update failure".into());
+                return ApiResponse::error(
+                    ApiError::Internal(format!(
+                        "State Node revoke sync failed and local rollback also failed: remote={remote_message}, restore={restore_err}"
+                    )),
+                    trace_id,
+                );
+            }
             return response;
         }
 
@@ -401,7 +498,7 @@ impl MonasController {
         ApiResponse::success(output, trace_id)
     }
 
-    /// 共有されたコンテンツを取得し、復号する
+    /// 共有されたコンテンツ payload を復号する
     ///
     /// 処理フロー:
     /// 1. 入力のバリデーション
@@ -413,10 +510,10 @@ impl MonasController {
     /// 7. ShareService::unwrap_cek_from_envelopeを呼び出してCEKを取得
     /// 8. ContentService::decrypt_with_cekを呼び出してコンテンツを復号
     /// 9. 結果を返却
-    pub fn get_shared_content(
+    pub fn decrypt_shared_content(
         &self,
-        input: GetSharedContentInput,
-    ) -> ApiResponse<GetSharedContentOutput> {
+        input: DecryptSharedContentInput,
+    ) -> ApiResponse<DecryptSharedContentOutput> {
         let trace_id = generate_trace_id();
 
         // 1. 入力のバリデーション
@@ -529,7 +626,7 @@ impl MonasController {
 
         let content_base64url = encode_base64url(&raw_content);
 
-        let output = GetSharedContentOutput {
+        let output = DecryptSharedContentOutput {
             content_id: input.content_id,
             content: content_base64url,
             version: input.version.unwrap_or_default(),

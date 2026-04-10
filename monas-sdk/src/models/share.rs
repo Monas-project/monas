@@ -88,12 +88,12 @@ pub struct RevokeShareOutput {
 }
 
 // ============================================
-// get_shared_content
+// decrypt_shared_content
 // ============================================
 
-/// 共有コンテンツ取得リクエスト
+/// 共有コンテンツ復号リクエスト
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GetSharedContentInput {
+pub struct DecryptSharedContentInput {
     pub content_id: String,
     pub private_key: String,
     pub sender_key_id: String,
@@ -103,9 +103,9 @@ pub struct GetSharedContentInput {
     pub version: Option<String>,
 }
 
-/// 共有コンテンツ取得レスポンス
+/// 共有コンテンツ復号レスポンス
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GetSharedContentOutput {
+pub struct DecryptSharedContentOutput {
     pub content_id: String,
     /// 復号されたコンテンツ（base64url）
     pub content: String,
@@ -201,8 +201,8 @@ mod tests {
     }
 
     #[test]
-    fn test_get_shared_content_input() {
-        let input = GetSharedContentInput {
+    fn test_decrypt_shared_content_input() {
+        let input = DecryptSharedContentInput {
             content_id: "test_id".into(),
             private_key: "test_key".into(),
             sender_key_id: "sender_key_id".into(),

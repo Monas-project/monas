@@ -7,11 +7,11 @@ pub struct StateNodeCreateContentRequest {
     pub data: String,
 }
 
-/// State Nodeからのコンテンツ作成レスポンス
+/// State Nodeからのコンテンツ作成レスポンス（`POST /content` → 201 Created）
 #[derive(Debug, Deserialize)]
 pub struct StateNodeCreateContentResponse {
+    #[serde(default)]
     pub content_id: String,
-    pub member_nodes: Vec<String>,
 }
 
 /// State Nodeへのコンテンツ更新リクエスト
@@ -21,11 +21,22 @@ pub struct StateNodeUpdateContentRequest {
     pub data: String,
 }
 
-/// State Nodeからのコンテンツ更新レスポンス
+/// State Nodeからのコンテンツ更新レスポンス（`PUT /content/:id`）
 #[derive(Debug, Deserialize)]
 pub struct StateNodeUpdateContentResponse {
+    #[serde(default)]
     pub content_id: String,
+    #[serde(default)]
     pub updated: bool,
+}
+
+/// State Nodeからのコンテンツ削除レスポンス（`DELETE /content/:id`）
+#[derive(Debug, Deserialize)]
+pub struct StateNodeDeleteContentResponse {
+    #[serde(default)]
+    pub content_id: String,
+    #[serde(default)]
+    pub deleted: bool,
 }
 
 /// State Nodeからのコンテンツ履歴レスポンス

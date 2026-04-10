@@ -39,6 +39,7 @@ pub struct UpdateContentCommand {
 #[derive(Debug)]
 pub struct UpdateContentResult {
     pub content_id: ContentId,
+    pub series_id: ContentId,
     pub metadata: Metadata,
     pub encrypted_content: Vec<u8>,
 }
@@ -54,6 +55,24 @@ pub struct DeleteContentCommand {
 #[derive(Debug)]
 pub struct DeleteContentResult {
     pub content_id: ContentId,
+}
+
+/// 削除済みコンテンツ復元ユースケースの入力。
+#[derive(Debug)]
+pub struct RestoreDeletedContentCommand {
+    pub content_id: ContentId,
+    pub name: String,
+    pub path: String,
+    pub raw_content: Vec<u8>,
+    pub provider: Option<StorageProvider>,
+}
+
+/// 削除済みコンテンツ復元ユースケースの出力。
+#[derive(Debug)]
+pub struct RestoreDeletedContentResult {
+    pub content_id: ContentId,
+    pub metadata: Metadata,
+    pub encrypted_content: Vec<u8>,
 }
 
 /// コンテンツ取得（fetch）ユースケースの出力。
