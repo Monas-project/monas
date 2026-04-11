@@ -3192,6 +3192,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "dotenv",
+ "hex",
  "mockito",
  "monas-account",
  "monas-content",

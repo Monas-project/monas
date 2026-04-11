@@ -1,10 +1,12 @@
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use base64::{
+    engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD},
+    Engine,
+};
 use mockito::Server;
 use monas_sdk::models::content::{
     ContentMetadata, CreateContentInput, DeleteContentInput, GetContentInput, UpdateContentInput,
 };
-use monas_sdk::ApiError;
-use monas_sdk::MonasController;
+use monas_sdk::{ApiError, MonasController, StateNodeAuthContext};
 use sha2::{Digest, Sha256};
 mod support;
 use support::{acquire_test_lock, cleanup_content_artifacts};
@@ -23,7 +25,7 @@ async fn create_content_and_get_content_round_trip_succeeds_with_mock_state_node
         .mock("POST", "/content")
         .with_status(200)
         .with_header("content-type", "application/json")
-        .with_body(r#"{"ok":true}"#)
+        .with_body(r#"{"content_id":"bafkqaaa-test-remote"}"#)
         .create_async()
         .await;
 
@@ -48,6 +50,10 @@ async fn create_content_and_get_content_round_trip_succeeds_with_mock_state_node
     let created = create_response
         .data
         .expect("create_content should return data");
+    assert_eq!(
+        created.remote_content_id.as_deref(),
+        Some("bafkqaaa-test-remote")
+    );
     create_mock.assert();
 
     let get_response = controller.get_content(GetContentInput {
@@ -73,6 +79,8 @@ async fn delete_content_round_trip_succeeds() {
     let create_mock = server
         .mock("POST", "/content")
         .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"content_id":"bafkdelete-roundtrip"}"#)
         .create_async()
         .await;
     let delete_mock = server
@@ -87,14 +95,14 @@ async fn delete_content_round_trip_succeeds() {
     let controller = MonasController::with_state_node_url(server.url());
     let create_response = controller.create_content(
         CreateContentInput {
-        content: URL_SAFE_NO_PAD.encode(b"before-delete"),
-        metadata: Some(ContentMetadata {
-            name: Some("delete.txt".to_string()),
-            content_type: Some("text/plain".to_string()),
-            created_at: None,
-            updated_at: None,
-        }),
-    },
+            content: URL_SAFE_NO_PAD.encode(b"before-delete"),
+            metadata: Some(ContentMetadata {
+                name: Some("delete.txt".to_string()),
+                content_type: Some("text/plain".to_string()),
+                created_at: None,
+                updated_at: None,
+            }),
+        },
         None,
     );
     assert!(create_response.success, "create_content should succeed");
@@ -103,7 +111,11 @@ async fn delete_content_round_trip_succeeds() {
 
     let delete_response = controller.delete_content(
         DeleteContentInput {
-            content_id: created.content_id.clone(),
+            local_content_id: created.content_id.clone(),
+            remote_content_id: created
+                .remote_content_id
+                .clone()
+                .expect("create should return remote_content_id"),
         },
         None,
     );
@@ -142,6 +154,8 @@ async fn delete_content_rolls_back_locally_when_state_node_delete_fails() {
     let create_mock = server
         .mock("POST", "/content")
         .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"content_id":"bafkdelete-rollback"}"#)
         .create_async()
         .await;
     let delete_mock = server
@@ -175,7 +189,11 @@ async fn delete_content_rolls_back_locally_when_state_node_delete_fails() {
 
     let delete_response = controller.delete_content(
         DeleteContentInput {
-            content_id: created.content_id.clone(),
+            local_content_id: created.content_id.clone(),
+            remote_content_id: created
+                .remote_content_id
+                .clone()
+                .expect("create should return remote_content_id"),
         },
         None,
     );
@@ -200,7 +218,10 @@ async fn delete_content_rolls_back_locally_when_state_node_delete_fails() {
 
     let second_delete_response = controller.delete_content(
         DeleteContentInput {
-            content_id: created.content_id,
+            local_content_id: created.content_id,
+            remote_content_id: created
+                .remote_content_id
+                .expect("create should return remote_content_id"),
         },
         None,
     );
@@ -219,6 +240,8 @@ async fn update_content_round_trip_succeeds_with_mock_state_node() {
     let create_mock = server
         .mock("POST", "/content")
         .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"content_id":"bafkupdate-roundtrip"}"#)
         .create_async()
         .await;
 
@@ -226,14 +249,14 @@ async fn update_content_round_trip_succeeds_with_mock_state_node() {
 
     let create_response = controller.create_content(
         CreateContentInput {
-        content: URL_SAFE_NO_PAD.encode(b"before-update"),
-        metadata: Some(ContentMetadata {
-            name: Some("before.txt".to_string()),
-            content_type: Some("text/plain".to_string()),
-            created_at: None,
-            updated_at: None,
-        }),
-    },
+            content: URL_SAFE_NO_PAD.encode(b"before-update"),
+            metadata: Some(ContentMetadata {
+                name: Some("before.txt".to_string()),
+                content_type: Some("text/plain".to_string()),
+                created_at: None,
+                updated_at: None,
+            }),
+        },
         None,
     );
     assert!(create_response.success, "create_content should succeed");
@@ -242,7 +265,13 @@ async fn update_content_round_trip_succeeds_with_mock_state_node() {
     let update_mock = server
         .mock(
             "PUT",
-            mockito::Matcher::Exact(format!("/content/{}", created.content_id)),
+            mockito::Matcher::Exact(format!(
+                "/content/{}",
+                created
+                    .remote_content_id
+                    .as_ref()
+                    .expect("create should return remote_content_id")
+            )),
         )
         .expect(2)
         .with_status(200)
@@ -251,7 +280,11 @@ async fn update_content_round_trip_succeeds_with_mock_state_node() {
 
     let first_update_response = controller.update_content(
         UpdateContentInput {
-            base_version_id: created.content_id.clone(),
+            local_content_id: created.content_id.clone(),
+            remote_content_id: created
+                .remote_content_id
+                .clone()
+                .expect("create should return remote_content_id"),
             content: URL_SAFE_NO_PAD.encode(b"after-update"),
             metadata: Some(ContentMetadata {
                 name: Some("after.txt".to_string()),
@@ -278,7 +311,11 @@ async fn update_content_round_trip_succeeds_with_mock_state_node() {
 
     let second_update_response = controller.update_content(
         UpdateContentInput {
-            base_version_id: first_updated.version_id.clone(),
+            local_content_id: first_updated.version_id.clone(),
+            remote_content_id: created
+                .remote_content_id
+                .clone()
+                .expect("create should return remote_content_id"),
             content: URL_SAFE_NO_PAD.encode(b"after-second-update"),
             metadata: Some(ContentMetadata {
                 name: Some("after-second.txt".to_string()),
@@ -365,7 +402,9 @@ async fn create_content_rolls_back_locally_when_state_node_create_fails_and_can_
         "create_content should be retryable after rollback: {:?}",
         second_response.error
     );
-    let created = second_response.data.expect("second create should return data");
+    let created = second_response
+        .data
+        .expect("second create should return data");
     succeeding_create_mock.assert();
 
     let get_response = controller.get_content(GetContentInput {
@@ -382,12 +421,113 @@ async fn create_content_rolls_back_locally_when_state_node_create_fails_and_can_
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn create_content_uses_account_signature_for_state_node_request() {
+    let _guard = acquire_test_lock();
+    let mut state_node_server = Server::new_async().await;
+    let mut account_server = Server::new_async().await;
+
+    let account_sign_mock = account_server
+        .mock("POST", "/accounts/sign")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"signature_base64":"c2lnbmVk","public_key_base64":"AQID","algorithm":"P256"}"#,
+        )
+        .expect(1)
+        .create_async()
+        .await;
+
+    let create_mock = state_node_server
+        .mock("POST", "/content")
+        .match_header("authorization", "user:010203")
+        .match_header("x-request-signature", "c2lnbmVk")
+        .match_header("x-request-timestamp", "1717171717")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"ok":true}"#)
+        .expect(1)
+        .create_async()
+        .await;
+
+    let controller = MonasController::with_urls(state_node_server.url(), account_server.url());
+    let auth = StateNodeAuthContext {
+        authorization: Some("Bearer old".into()),
+        request_signature: Some("old-signature".into()),
+        request_timestamp: Some(1_717_171_717),
+    };
+
+    let response = controller.create_content(
+        CreateContentInput {
+            content: URL_SAFE_NO_PAD.encode(b"account-signed-content"),
+            metadata: Some(ContentMetadata {
+                name: Some("account-signed.txt".to_string()),
+                content_type: Some("text/plain".to_string()),
+                created_at: None,
+                updated_at: None,
+            }),
+        },
+        Some(&auth),
+    );
+
+    assert!(response.success, "create_content should succeed");
+    account_sign_mock.assert();
+    create_mock.assert();
+    cleanup_content_artifacts();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn create_content_fails_fast_when_account_key_is_not_p256() {
+    let _guard = acquire_test_lock();
+    let state_node_server = Server::new_async().await;
+    let mut account_server = Server::new_async().await;
+
+    let account_sign_mock = account_server
+        .mock("POST", "/accounts/sign")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"signature_base64":"c2lnbmVk","public_key_base64":"AQID","algorithm":"K256"}"#,
+        )
+        .expect(1)
+        .create_async()
+        .await;
+
+    let controller = MonasController::with_urls(state_node_server.url(), account_server.url());
+    let auth = StateNodeAuthContext {
+        authorization: None,
+        request_signature: None,
+        request_timestamp: Some(1_717_171_717),
+    };
+
+    let response = controller.create_content(
+        CreateContentInput {
+            content: URL_SAFE_NO_PAD.encode(b"account-signing-with-k256"),
+            metadata: Some(ContentMetadata {
+                name: Some("invalid-algorithm.txt".to_string()),
+                content_type: Some("text/plain".to_string()),
+                created_at: None,
+                updated_at: None,
+            }),
+        },
+        Some(&auth),
+    );
+
+    assert!(!response.success, "create_content should fail");
+    assert!(matches!(response.error, Some(ApiError::Validation(_))));
+    account_sign_mock.assert();
+    let _ = state_node_server;
+    cleanup_content_artifacts();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn update_content_rolls_back_new_version_when_state_node_update_fails() {
     let _guard = acquire_test_lock();
     let mut server = Server::new_async().await;
     let create_mock = server
         .mock("POST", "/content")
         .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"content_id":"bafkupdate-rollback"}"#)
         .create_async()
         .await;
 
@@ -413,7 +553,13 @@ async fn update_content_rolls_back_new_version_when_state_node_update_fails() {
     let failed_update_mock = server
         .mock(
             "PUT",
-            mockito::Matcher::Exact(format!("/content/{}", created.content_id)),
+            mockito::Matcher::Exact(format!(
+                "/content/{}",
+                created
+                    .remote_content_id
+                    .as_ref()
+                    .expect("create should return remote_content_id")
+            )),
         )
         .with_status(500)
         .with_header("content-type", "application/json")
@@ -424,7 +570,11 @@ async fn update_content_rolls_back_new_version_when_state_node_update_fails() {
 
     let failed_update = controller.update_content(
         UpdateContentInput {
-            base_version_id: created.content_id.clone(),
+            local_content_id: created.content_id.clone(),
+            remote_content_id: created
+                .remote_content_id
+                .clone()
+                .expect("create should return remote_content_id"),
             content: URL_SAFE_NO_PAD.encode(updated_raw),
             metadata: Some(ContentMetadata {
                 name: Some("after-rollback.txt".to_string()),
@@ -475,7 +625,13 @@ async fn update_content_rolls_back_new_version_when_state_node_update_fails() {
     let succeeding_update_mock = server
         .mock(
             "PUT",
-            mockito::Matcher::Exact(format!("/content/{}", created.content_id)),
+            mockito::Matcher::Exact(format!(
+                "/content/{}",
+                created
+                    .remote_content_id
+                    .as_ref()
+                    .expect("create should return remote_content_id")
+            )),
         )
         .with_status(200)
         .expect(1)
@@ -484,7 +640,11 @@ async fn update_content_rolls_back_new_version_when_state_node_update_fails() {
 
     let second_update = controller.update_content(
         UpdateContentInput {
-            base_version_id: created.content_id.clone(),
+            local_content_id: created.content_id.clone(),
+            remote_content_id: created
+                .remote_content_id
+                .clone()
+                .expect("create should return remote_content_id"),
             content: URL_SAFE_NO_PAD.encode(updated_raw),
             metadata: Some(ContentMetadata {
                 name: Some("after-rollback.txt".to_string()),
@@ -500,9 +660,100 @@ async fn update_content_rolls_back_new_version_when_state_node_update_fails() {
         "update_content should be retryable after rollback: {:?}",
         second_update.error
     );
-    let updated = second_update.data.expect("second update should return data");
+    let updated = second_update
+        .data
+        .expect("second update should return data");
     succeeding_update_mock.assert();
     assert_eq!(updated.version_id, expected_new_version_id);
 
+    cleanup_content_artifacts();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_content_uses_account_signature_for_metadata_request() {
+    let _guard = acquire_test_lock();
+    let mut state_node_server = Server::new_async().await;
+    let mut account_server = Server::new_async().await;
+
+    let create_mock = state_node_server
+        .mock("POST", "/content")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"content_id":"bafkdelete-signed"}"#)
+        .expect(1)
+        .create_async()
+        .await;
+
+    let controller = MonasController::with_urls(state_node_server.url(), account_server.url());
+    let created = controller
+        .create_content(
+            CreateContentInput {
+                content: URL_SAFE_NO_PAD.encode(b"delete-account-signed"),
+                metadata: Some(ContentMetadata {
+                    name: Some("delete-account-signed.txt".to_string()),
+                    content_type: Some("text/plain".to_string()),
+                    created_at: None,
+                    updated_at: None,
+                }),
+            },
+            None,
+        )
+        .data
+        .expect("create should return data");
+    create_mock.assert();
+
+    let expected_signing_message =
+        BASE64_STANDARD.encode(format!("delete:{}:1818181818", "bafkdelete-signed").as_bytes());
+
+    let account_sign_mock = account_server
+        .mock("POST", "/accounts/sign")
+        .match_body(mockito::Matcher::PartialJsonString(
+            format!(r#"{{"message_base64":"{expected_signing_message}"}}"#),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"signature_base64":"bWV0YS1zaWc=","public_key_base64":"BAUG","algorithm":"P256"}"#,
+        )
+        .expect(1)
+        .create_async()
+        .await;
+
+    let delete_mock = state_node_server
+        .mock(
+            "DELETE",
+            mockito::Matcher::Exact("/content/bafkdelete-signed".to_string()),
+        )
+        .match_header("authorization", "user:040506")
+        .match_header("x-request-signature", "bWV0YS1zaWc=")
+        .match_header("x-request-timestamp", "1818181818")
+        .with_status(200)
+        .expect(1)
+        .create_async()
+        .await;
+
+    let auth = StateNodeAuthContext {
+        authorization: None,
+        request_signature: None,
+        request_timestamp: Some(1_818_181_818),
+    };
+
+    let response = controller.delete_content(
+        DeleteContentInput {
+            local_content_id: created.content_id,
+            remote_content_id: created
+                .remote_content_id
+                .expect("create should return remote_content_id"),
+        },
+        Some(&auth),
+    );
+
+    assert!(
+        response.success,
+        "delete_content should succeed: {:?}",
+        response.error
+    );
+    account_sign_mock.assert();
+    delete_mock.assert();
     cleanup_content_artifacts();
 }

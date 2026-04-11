@@ -31,6 +31,8 @@ pub struct CreateContentInput {
 pub struct CreateContentOutput {
     pub content_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_content_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
 }
 
@@ -61,8 +63,10 @@ pub struct GetContentOutput {
 /// コンテンツ更新リクエスト
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateContentInput {
-    /// 更新元として指定する版ID
-    pub base_version_id: String,
+    /// SDK ローカルで管理する更新元の版ID
+    pub local_content_id: String,
+    /// State Node へ送る系列ID
+    pub remote_content_id: String,
     /// 新しいコンテンツデータ（base64url）
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -89,7 +93,10 @@ pub struct UpdateContentOutput {
 /// コンテンツ削除リクエスト
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeleteContentInput {
-    pub content_id: String,
+    /// SDK ローカルで管理する削除対象ID
+    pub local_content_id: String,
+    /// State Node へ送る系列ID
+    pub remote_content_id: String,
 }
 
 /// コンテンツ削除レスポンス
@@ -140,10 +147,12 @@ mod tests {
     fn test_create_content_output() {
         let output = CreateContentOutput {
             content_id: "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi".into(),
+            remote_content_id: Some("bafkreiabc".into()),
             created_at: Some("2025-12-05T12:34:56Z".into()),
         };
         let json = serde_json::to_string(&output).unwrap();
         assert!(json.contains("\"content_id\""));
+        assert!(json.contains("\"remote_content_id\":\"bafkreiabc\""));
         assert!(json.contains("\"created_at\":\"2025-12-05T12:34:56Z\""));
     }
 
@@ -170,12 +179,14 @@ mod tests {
     #[test]
     fn test_update_content_input() {
         let input = UpdateContentInput {
-            base_version_id: "test_id".into(),
+            local_content_id: "local_id".into(),
+            remote_content_id: "bafkremote".into(),
             content: "bmV3IGNvbnRlbnQ=".into(),
             metadata: None,
         };
         let json = serde_json::to_string(&input).unwrap();
-        assert!(json.contains("\"base_version_id\":\"test_id\""));
+        assert!(json.contains("\"local_content_id\":\"local_id\""));
+        assert!(json.contains("\"remote_content_id\":\"bafkremote\""));
         assert!(json.contains("\"content\":\"bmV3IGNvbnRlbnQ=\""));
     }
 

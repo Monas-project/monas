@@ -175,7 +175,10 @@ async fn verify_integrity_keeps_false_only_for_actual_content_mismatch() {
         None,
     );
 
-    assert!(response.success, "verify_integrity should compare successfully");
+    assert!(
+        response.success,
+        "verify_integrity should compare successfully"
+    );
     version_mock.assert();
     let output = response.data.expect("verify_integrity should return data");
     assert!(!output.valid, "content mismatch should remain valid=false");

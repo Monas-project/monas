@@ -3,6 +3,8 @@ use base64::{
     Engine,
 };
 use chrono::Utc;
+use sha2::{Digest, Sha256};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::common::{generate_trace_id, ApiError, ApiResponse, StateNodeAuthContext};
 use crate::models::content::{
@@ -55,6 +57,18 @@ struct StoredContentSnapshot {
     cek: ContentEncryptionKey,
 }
 
+#[derive(serde::Serialize)]
+struct AccountSignRequest {
+    message_base64: String,
+}
+
+#[derive(serde::Deserialize)]
+struct AccountSignResponse {
+    signature_base64: String,
+    public_key_base64: String,
+    algorithm: String,
+}
+
 impl MonasController {
     pub(super) fn attach_state_node_auth<Any>(
         mut req: ureq::RequestBuilder<Any>,
@@ -72,6 +86,157 @@ impl MonasController {
             }
         }
         req
+    }
+
+    fn current_unix_timestamp() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
+    fn build_content_signature_message(content_bytes: &[u8], timestamp: u64) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(content_bytes);
+        hasher.update(timestamp.to_be_bytes());
+        hex::encode(hasher.finalize())
+    }
+
+    fn build_metadata_signature_message(operation: &str, resource: &str, timestamp: u64) -> String {
+        format!("{operation}:{resource}:{timestamp}")
+    }
+
+    fn map_account_http_status_to_api_response<T>(
+        status: u16,
+        message: String,
+        trace_id: String,
+    ) -> ApiResponse<T> {
+        match status {
+            400 => ApiResponse::error(ApiError::Validation(message), trace_id),
+            404 => ApiResponse::error(ApiError::NotFound(message), trace_id),
+            408 => ApiResponse::error(ApiError::Timeout(message), trace_id),
+            _ => ApiResponse::error(ApiError::Internal(message), trace_id),
+        }
+    }
+
+    fn try_account_http_error<T>(
+        status: u16,
+        body: &str,
+        trace_id: String,
+    ) -> Option<ApiResponse<T>> {
+        if (200..300).contains(&status) {
+            return None;
+        }
+
+        let message = body.trim();
+        Some(Self::map_account_http_status_to_api_response(
+            status,
+            if message.is_empty() {
+                format!("Account service returned HTTP {status}")
+            } else {
+                message.to_string()
+            },
+            trace_id,
+        ))
+    }
+
+    fn sign_state_node_message_with_account<T>(
+        &self,
+        signing_message: &str,
+        timestamp: u64,
+        trace_id: &str,
+    ) -> Result<StateNodeAuthContext, ApiResponse<T>> {
+        let sign_url = format!("{}/accounts/sign", self.account_url);
+        let request = AccountSignRequest {
+            message_base64: BASE64_STANDARD.encode(signing_message.as_bytes()),
+        };
+        let response = ureq::post(&sign_url).send_json(request).map_err(|e| {
+            ApiResponse::error(
+                ApiError::Internal(format!(
+                    "Failed to sign state node request via account: {e}"
+                )),
+                trace_id.to_string(),
+            )
+        })?;
+        let status = response.status().as_u16();
+        let body = response.into_body().read_to_string().map_err(|e| {
+            ApiResponse::error(
+                ApiError::Internal(format!("Failed to read account sign response body: {e}")),
+                trace_id.to_string(),
+            )
+        })?;
+        if let Some(response) = Self::try_account_http_error(status, &body, trace_id.to_string()) {
+            return Err(response);
+        }
+
+        let sign_response: AccountSignResponse = serde_json::from_str(&body).map_err(|e| {
+            ApiResponse::error(
+                ApiError::Internal(format!("Invalid account sign response JSON: {e}")),
+                trace_id.to_string(),
+            )
+        })?;
+        if !sign_response.algorithm.eq_ignore_ascii_case("P256") {
+            return Err(ApiResponse::error(
+                ApiError::Validation(format!(
+                    "Stored account key must be P256 for state node signing, got {}",
+                    sign_response.algorithm
+                )),
+                trace_id.to_string(),
+            ));
+        }
+        let public_key_bytes = BASE64_STANDARD
+            .decode(&sign_response.public_key_base64)
+            .map_err(|e| {
+                ApiResponse::error(
+                    ApiError::Internal(format!(
+                        "Invalid public_key_base64 from account sign response: {e}"
+                    )),
+                    trace_id.to_string(),
+                )
+            })?;
+        let authorization = format!("user:{}", hex::encode(public_key_bytes));
+
+        Ok(StateNodeAuthContext {
+            authorization: Some(authorization),
+            request_signature: Some(sign_response.signature_base64),
+            request_timestamp: Some(timestamp),
+        })
+    }
+
+    fn prepare_state_node_content_auth<T>(
+        &self,
+        auth: Option<&StateNodeAuthContext>,
+        content_bytes: &[u8],
+        trace_id: &str,
+    ) -> Result<Option<StateNodeAuthContext>, ApiResponse<T>> {
+        let Some(ctx) = auth else {
+            return Ok(None);
+        };
+        let timestamp = ctx
+            .request_timestamp
+            .unwrap_or_else(Self::current_unix_timestamp);
+        let signing_message = Self::build_content_signature_message(content_bytes, timestamp);
+        self.sign_state_node_message_with_account(&signing_message, timestamp, trace_id)
+            .map(Some)
+    }
+
+    fn prepare_state_node_metadata_auth<T>(
+        &self,
+        auth: Option<&StateNodeAuthContext>,
+        operation: &str,
+        resource: &str,
+        trace_id: &str,
+    ) -> Result<Option<StateNodeAuthContext>, ApiResponse<T>> {
+        let Some(ctx) = auth else {
+            return Ok(None);
+        };
+        let timestamp = ctx
+            .request_timestamp
+            .unwrap_or_else(Self::current_unix_timestamp);
+        let signing_message =
+            Self::build_metadata_signature_message(operation, resource, timestamp);
+        self.sign_state_node_message_with_account(&signing_message, timestamp, trace_id)
+            .map(Some)
     }
 
     pub(super) fn state_node_error_message_from_body(body: &str) -> Option<String> {
@@ -114,7 +279,9 @@ impl MonasController {
                 t.to_string()
             }
         });
-        Some(Self::map_state_node_http_status_to_api_response(status, msg, trace_id))
+        Some(Self::map_state_node_http_status_to_api_response(
+            status, msg, trace_id,
+        ))
     }
 
     /// FetchErrorをApiErrorにマッピング
@@ -159,10 +326,10 @@ impl MonasController {
         match e {
             RestoreDeletedError::Validation(msg) => ApiError::Validation(msg),
             RestoreDeletedError::NotFound => ApiError::NotFound("Content not found".into()),
-            RestoreDeletedError::NotDeleted => {
-                ApiError::Conflict("Content is not deleted".into())
+            RestoreDeletedError::NotDeleted => ApiError::Conflict("Content is not deleted".into()),
+            RestoreDeletedError::Domain(err) => {
+                ApiError::Internal(format!("Domain error: {err:?}"))
             }
-            RestoreDeletedError::Domain(err) => ApiError::Internal(format!("Domain error: {err:?}")),
             RestoreDeletedError::Repository(err) => {
                 ApiError::Internal(format!("Repository error: {err}"))
             }
@@ -320,25 +487,47 @@ impl MonasController {
     }
 
     /// State Node に `POST /content` を送る（`http_api::create_content` と同じ契約）。
-    /// エラー時は `Some`、成功時は `None`。2xx かつ本文がある場合は JSON を検証する。
+    /// 成功時は State Node が返した content_id（空文字は `None`）を返す。
     fn send_create_to_state_node<T>(
         &self,
         encrypted_content: &[u8],
         auth: Option<&StateNodeAuthContext>,
         trace_id: String,
-    ) -> Option<ApiResponse<T>> {
+    ) -> Result<Option<String>, ApiResponse<T>> {
         let encrypted_data_base64 = BASE64_STANDARD.encode(encrypted_content);
         let state_node_request = StateNodeCreateContentRequest {
             data: encrypted_data_base64,
         };
+        let request_body = match serde_json::to_string(&state_node_request) {
+            Ok(body) => body,
+            Err(e) => {
+                return Err(ApiResponse::error(
+                    ApiError::Internal(format!(
+                        "Failed to serialize State Node create request: {e}"
+                    )),
+                    trace_id,
+                ));
+            }
+        };
+        let signed_auth = match self.prepare_state_node_content_auth(
+            auth,
+            encrypted_content,
+            &trace_id,
+        ) {
+            Ok(auth) => auth,
+            Err(response) => return Err(response),
+        };
 
         let state_node_url = format!("{}/content", self.state_node_url);
-        let req = Self::attach_state_node_auth(ureq::post(&state_node_url), auth);
+        let req = Self::attach_state_node_auth(
+            ureq::post(&state_node_url).header("Content-Type", "application/json"),
+            signed_auth.as_ref(),
+        );
 
-        let resp = match req.send_json(state_node_request) {
+        let resp = match req.send(request_body) {
             Ok(r) => r,
             Err(e) => {
-                return Some(ApiResponse::error(
+                return Err(ApiResponse::error(
                     ApiError::Internal(format!("Failed to send request to State Node: {e}")),
                     trace_id,
                 ));
@@ -349,7 +538,7 @@ impl MonasController {
         let body = match resp.into_body().read_to_string() {
             Ok(s) => s,
             Err(e) => {
-                return Some(ApiResponse::error(
+                return Err(ApiResponse::error(
                     ApiError::Internal(format!("Failed to read State Node response body: {e}")),
                     trace_id,
                 ));
@@ -357,16 +546,23 @@ impl MonasController {
         };
 
         if let Some(err) = Self::try_state_node_http_error(status, &body, trace_id.clone()) {
-            return Some(err);
+            return Err(err);
         }
 
         if body.trim().is_empty() {
-            return None;
+            return Ok(None);
         }
 
         match serde_json::from_str::<StateNodeCreateContentResponse>(&body) {
-            Ok(_) => None,
-            Err(e) => Some(ApiResponse::error(
+            Ok(parsed) => {
+                let remote_content_id = if parsed.content_id.is_empty() {
+                    None
+                } else {
+                    Some(parsed.content_id)
+                };
+                Ok(remote_content_id)
+            }
+            Err(e) => Err(ApiResponse::error(
                 ApiError::Internal(format!("Invalid State Node create response JSON: {e}")),
                 trace_id,
             )),
@@ -385,11 +581,33 @@ impl MonasController {
         let state_node_request = StateNodeUpdateContentRequest {
             data: encrypted_data_base64,
         };
+        let request_body = match serde_json::to_string(&state_node_request) {
+            Ok(body) => body,
+            Err(e) => {
+                return Some(ApiResponse::error(
+                    ApiError::Internal(format!(
+                        "Failed to serialize State Node update request: {e}"
+                    )),
+                    trace_id,
+                ));
+            }
+        };
+        let signed_auth = match self.prepare_state_node_content_auth(
+            auth,
+            encrypted_content,
+            &trace_id,
+        ) {
+                Ok(auth) => auth,
+                Err(response) => return Some(response),
+        };
 
         let state_node_url = format!("{}/content/{}", self.state_node_url, content_id);
-        let req = Self::attach_state_node_auth(ureq::put(&state_node_url), auth);
+        let req = Self::attach_state_node_auth(
+            ureq::put(&state_node_url).header("Content-Type", "application/json"),
+            signed_auth.as_ref(),
+        );
 
-        let resp = match req.send_json(state_node_request) {
+        let resp = match req.send(request_body) {
             Ok(r) => r,
             Err(e) => {
                 return Some(ApiResponse::error(
@@ -445,7 +663,12 @@ impl MonasController {
         trace_id: String,
     ) -> Option<ApiResponse<T>> {
         let state_node_url = format!("{}/content/{}", self.state_node_url, content_id);
-        let req = Self::attach_state_node_auth(ureq::delete(&state_node_url), auth);
+        let signed_auth =
+            match self.prepare_state_node_metadata_auth(auth, "delete", content_id, &trace_id) {
+                Ok(auth) => auth,
+                Err(response) => return Some(response),
+            };
+        let req = Self::attach_state_node_auth(ureq::delete(&state_node_url), signed_auth.as_ref());
 
         let resp = match req.call() {
             Ok(r) => r,
@@ -570,27 +793,30 @@ impl MonasController {
             }
         };
 
-        if let Some(response) =
-            self.send_create_to_state_node(&result.encrypted_content, auth, trace_id.clone())
-        {
-            if let Err(rollback_err) = self.rollback_created_content(result.content_id.clone()) {
-                let remote_message = response
-                    .error
-                    .as_ref()
-                    .map(|e| format!("{e:?}"))
-                    .unwrap_or_else(|| "unknown state node create failure".into());
-                return ApiResponse::error(
-                    ApiError::Internal(format!(
-                        "State Node create failed and local rollback also failed: remote={remote_message}, rollback={rollback_err}"
-                    )),
-                    trace_id,
-                );
-            }
-            return response;
-        }
+        let remote_content_id =
+            match self.send_create_to_state_node(&result.encrypted_content, auth, trace_id.clone()) {
+                Ok(remote_content_id) => remote_content_id,
+                Err(response) => {
+                    if let Err(rollback_err) = self.rollback_created_content(result.content_id.clone()) {
+                        let remote_message = response
+                            .error
+                            .as_ref()
+                            .map(|e| format!("{e:?}"))
+                            .unwrap_or_else(|| "unknown state node create failure".into());
+                        return ApiResponse::error(
+                            ApiError::Internal(format!(
+                                "State Node create failed and local rollback also failed: remote={remote_message}, rollback={rollback_err}"
+                            )),
+                            trace_id,
+                        );
+                    }
+                    return response;
+                }
+            };
 
         let output = CreateContentOutput {
             content_id: result.content_id.as_str().to_string(),
+            remote_content_id,
             created_at: Some(Utc::now().to_rfc3339()),
         };
 
@@ -650,7 +876,7 @@ impl MonasController {
     /// `auth` は State Node に転送する認証ヘッダ（ゲートウェイ等から透過）。本番では `Some` が必要。
     ///
     /// 処理フロー:
-    /// 1. 入力のバリデーション（base_version_id, contentまたはmetadata.name）
+    /// 1. 入力のバリデーション（local_content_id, remote_content_id, contentまたはmetadata.name）
     /// 2. ContentIdに変換（更新元の版IDを保存）
     /// 3. 更新内容を準備（new_name, new_raw_content）
     /// 4. ContentService::updateを呼び出して以下を実行:
@@ -668,15 +894,21 @@ impl MonasController {
         let trace_id = generate_trace_id();
 
         // 1. 入力のバリデーション
-        if input.base_version_id.is_empty() {
+        if input.local_content_id.is_empty() {
             return ApiResponse::error(
-                ApiError::Validation("base_version_id must not be empty".into()),
+                ApiError::Validation("local_content_id must not be empty".into()),
+                trace_id,
+            );
+        }
+        if input.remote_content_id.is_empty() {
+            return ApiResponse::error(
+                ApiError::Validation("remote_content_id must not be empty".into()),
                 trace_id,
             );
         }
 
         // 2. ContentIdに変換
-        let base_version_id = input.base_version_id.clone();
+        let base_version_id = input.local_content_id.clone();
         let content_id = ContentId::new(base_version_id.clone());
         let before_update = match self.capture_stored_content_snapshot(&content_id) {
             Ok(snapshot) => snapshot,
@@ -723,7 +955,7 @@ impl MonasController {
         };
 
         if let Some(response) = self.send_update_to_state_node(
-            result.series_id.as_str(),
+            &input.remote_content_id,
             &result.encrypted_content,
             auth,
             trace_id.clone(),
@@ -776,12 +1008,18 @@ impl MonasController {
         let trace_id = generate_trace_id();
 
         // 1. 入力のバリデーション
-        if let Some(response) = Self::validate_content_id(&input.content_id, trace_id.clone()) {
+        if let Some(response) = Self::validate_content_id(&input.local_content_id, trace_id.clone()) {
             return response;
+        }
+        if input.remote_content_id.is_empty() {
+            return ApiResponse::error(
+                ApiError::Validation("remote_content_id must not be empty".into()),
+                trace_id,
+            );
         }
 
         // 2. ContentIdに変換
-        let content_id = ContentId::new(input.content_id.clone());
+        let content_id = ContentId::new(input.local_content_id.clone());
 
         let snapshot = match self.capture_local_content_snapshot(content_id.clone()) {
             Ok(snapshot) => snapshot,
@@ -808,7 +1046,7 @@ impl MonasController {
         };
 
         if let Some(response) =
-            self.send_delete_to_state_node(&input.content_id, auth, trace_id.clone())
+            self.send_delete_to_state_node(&input.remote_content_id, auth, trace_id.clone())
         {
             if let Err(restore_err) = self.restore_deleted_from_snapshot(&snapshot) {
                 let remote_message = response
@@ -816,7 +1054,8 @@ impl MonasController {
                     .as_ref()
                     .map(|e| format!("{e:?}"))
                     .unwrap_or_else(|| "unknown state node delete failure".into());
-                let rollback_message = format!("{:?}", Self::map_restore_deleted_error(restore_err));
+                let rollback_message =
+                    format!("{:?}", Self::map_restore_deleted_error(restore_err));
                 return ApiResponse::error(
                     ApiError::Internal(format!(
                         "State Node delete failed and local restore also failed: remote={remote_message}, restore={rollback_message}"
@@ -834,5 +1073,28 @@ impl MonasController {
         };
 
         ApiResponse::success(output, trace_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_content_signature_message_hashes_content_bytes_and_timestamp() {
+        let message = MonasController::build_content_signature_message(b"abc", 42);
+        assert_eq!(message.len(), 64);
+        assert_ne!(
+            message,
+            MonasController::build_content_signature_message(b"abc", 43)
+        );
+    }
+
+    #[test]
+    fn build_metadata_signature_message_formats_operation_resource_and_timestamp() {
+        assert_eq!(
+            MonasController::build_metadata_signature_message("delete", "test", 42),
+            "delete:test:42"
+        );
     }
 }

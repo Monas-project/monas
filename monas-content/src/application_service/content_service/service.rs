@@ -387,10 +387,14 @@ where
             ));
         }
         if cmd.name.trim().is_empty() {
-            return Err(RestoreDeletedError::Validation("name must not be empty".into()));
+            return Err(RestoreDeletedError::Validation(
+                "name must not be empty".into(),
+            ));
         }
         if cmd.path.trim().is_empty() {
-            return Err(RestoreDeletedError::Validation("path must not be empty".into()));
+            return Err(RestoreDeletedError::Validation(
+                "path must not be empty".into(),
+            ));
         }
         Ok(())
     }

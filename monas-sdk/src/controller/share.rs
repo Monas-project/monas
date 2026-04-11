@@ -23,8 +23,7 @@ use monas_content::domain::content::{Content, ContentEncryptionKey};
 use monas_content::domain::content_id::ContentId;
 use monas_content::domain::share::{
     key_envelope::{KeyEnvelope as DomainKeyEnvelope, KeyWrapAlgorithm, WrappedRecipientKey},
-    Share,
-    KeyId, Permission as DomainPermission,
+    KeyId, Permission as DomainPermission, Share,
 };
 use monas_content::infrastructure::{
     key_store::InMemoryContentEncryptionKeyStore, key_wrapping::HpkeV1KeyWrapping,

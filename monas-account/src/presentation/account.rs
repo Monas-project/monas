@@ -11,9 +11,11 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 
 use crate::application_service::{
-    AccountService, IssueDelegatedTokenError, IssueDelegatedTokenRequest, SignError,
+    AccountKeyStore, AccountService, IssueDelegatedTokenError, IssueDelegatedTokenRequest,
+    SignError,
 };
 use crate::domain::delegation::DelegatedCapability;
+use crate::infrastructure::key_pair::KeyAlgorithm;
 
 use super::AppState;
 
@@ -37,6 +39,8 @@ pub struct SignRequest {
 #[derive(Serialize)]
 pub struct SignResponse {
     pub signature_base64: String,
+    pub public_key_base64: String,
+    pub algorithm: String,
 }
 
 #[derive(Deserialize)]
@@ -114,6 +118,12 @@ async fn sign_account(
         )
     })?;
 
+    let stored = state
+        .key_store
+        .load()
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "account key not found".to_string()))?;
+
     let (sig, _rec_id) = AccountService::sign(&state.key_store, &msg).map_err(|e| {
         let status = match e {
             SignError::NotFound => StatusCode::NOT_FOUND,
@@ -123,8 +133,18 @@ async fn sign_account(
     })?;
 
     let signature_base64 = BASE64_STANDARD.encode(&sig);
+    let public_key_base64 = BASE64_STANDARD.encode(&stored.public_key);
+    let algorithm = match stored.algorithm {
+        KeyAlgorithm::K256 => "K256",
+        KeyAlgorithm::P256 => "P256",
+    }
+    .to_string();
 
-    Ok(Json(SignResponse { signature_base64 }))
+    Ok(Json(SignResponse {
+        signature_base64,
+        public_key_base64,
+        algorithm,
+    }))
 }
 
 fn parse_capabilities(values: &[String]) -> Result<Vec<DelegatedCapability>, (StatusCode, String)> {

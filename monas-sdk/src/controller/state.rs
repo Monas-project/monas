@@ -9,9 +9,7 @@ use crate::models::state::{
     GetHistoryInput, GetHistoryOutput, GetLatestVersionInput, GetLatestVersionOutput,
     VerifyIntegrityInput, VerifyIntegrityOutput,
 };
-use crate::models::state_node::{
-    StateNodeContentDataResponse, StateNodeContentHistoryResponse,
-};
+use crate::models::state_node::{StateNodeContentDataResponse, StateNodeContentHistoryResponse};
 
 use super::MonasController;
 
