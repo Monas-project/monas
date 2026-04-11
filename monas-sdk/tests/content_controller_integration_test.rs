@@ -707,9 +707,9 @@ async fn delete_content_uses_account_signature_for_metadata_request() {
 
     let account_sign_mock = account_server
         .mock("POST", "/accounts/sign")
-        .match_body(mockito::Matcher::PartialJsonString(
-            format!(r#"{{"message_base64":"{expected_signing_message}"}}"#),
-        ))
+        .match_body(mockito::Matcher::PartialJsonString(format!(
+            r#"{{"message_base64":"{expected_signing_message}"}}"#
+        )))
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(

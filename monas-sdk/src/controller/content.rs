@@ -509,14 +509,8 @@ impl MonasController {
                 ));
             }
         };
-        let signed_auth = match self.prepare_state_node_content_auth(
-            auth,
-            encrypted_content,
-            &trace_id,
-        ) {
-            Ok(auth) => auth,
-            Err(response) => return Err(response),
-        };
+        let signed_auth =
+            self.prepare_state_node_content_auth(auth, encrypted_content, &trace_id)?;
 
         let state_node_url = format!("{}/content", self.state_node_url);
         let req = Self::attach_state_node_auth(
@@ -592,14 +586,11 @@ impl MonasController {
                 ));
             }
         };
-        let signed_auth = match self.prepare_state_node_content_auth(
-            auth,
-            encrypted_content,
-            &trace_id,
-        ) {
+        let signed_auth =
+            match self.prepare_state_node_content_auth(auth, encrypted_content, &trace_id) {
                 Ok(auth) => auth,
                 Err(response) => return Some(response),
-        };
+            };
 
         let state_node_url = format!("{}/content/{}", self.state_node_url, content_id);
         let req = Self::attach_state_node_auth(
@@ -793,26 +784,30 @@ impl MonasController {
             }
         };
 
-        let remote_content_id =
-            match self.send_create_to_state_node(&result.encrypted_content, auth, trace_id.clone()) {
-                Ok(remote_content_id) => remote_content_id,
-                Err(response) => {
-                    if let Err(rollback_err) = self.rollback_created_content(result.content_id.clone()) {
-                        let remote_message = response
-                            .error
-                            .as_ref()
-                            .map(|e| format!("{e:?}"))
-                            .unwrap_or_else(|| "unknown state node create failure".into());
-                        return ApiResponse::error(
+        let remote_content_id = match self.send_create_to_state_node(
+            &result.encrypted_content,
+            auth,
+            trace_id.clone(),
+        ) {
+            Ok(remote_content_id) => remote_content_id,
+            Err(response) => {
+                if let Err(rollback_err) = self.rollback_created_content(result.content_id.clone())
+                {
+                    let remote_message = response
+                        .error
+                        .as_ref()
+                        .map(|e| format!("{e:?}"))
+                        .unwrap_or_else(|| "unknown state node create failure".into());
+                    return ApiResponse::error(
                             ApiError::Internal(format!(
                                 "State Node create failed and local rollback also failed: remote={remote_message}, rollback={rollback_err}"
                             )),
                             trace_id,
                         );
-                    }
-                    return response;
                 }
-            };
+                return response;
+            }
+        };
 
         let output = CreateContentOutput {
             content_id: result.content_id.as_str().to_string(),
@@ -1008,7 +1003,8 @@ impl MonasController {
         let trace_id = generate_trace_id();
 
         // 1. 入力のバリデーション
-        if let Some(response) = Self::validate_content_id(&input.local_content_id, trace_id.clone()) {
+        if let Some(response) = Self::validate_content_id(&input.local_content_id, trace_id.clone())
+        {
             return response;
         }
         if input.remote_content_id.is_empty() {

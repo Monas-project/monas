@@ -204,6 +204,29 @@ fn api_json<T>(response: ApiResponse<T>) -> (StatusCode, Json<ApiResponse<T>>) {
     (status, Json(response))
 }
 
+fn build_state_node_auth_context(headers: &HeaderMap) -> StateNodeAuthContext {
+    let authorization = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(ToOwned::to_owned);
+
+    let request_signature = headers
+        .get("x-request-signature")
+        .and_then(|v| v.to_str().ok())
+        .map(ToOwned::to_owned);
+
+    let request_timestamp = headers
+        .get("x-request-timestamp")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+
+    StateNodeAuthContext {
+        authorization,
+        request_signature,
+        request_timestamp,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,28 +286,5 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert!(!body.success);
         assert!(matches!(body.error, Some(ApiError::NotFound(_))));
-    }
-}
-
-fn build_state_node_auth_context(headers: &HeaderMap) -> StateNodeAuthContext {
-    let authorization = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .map(ToOwned::to_owned);
-
-    let request_signature = headers
-        .get("x-request-signature")
-        .and_then(|v| v.to_str().ok())
-        .map(ToOwned::to_owned);
-
-    let request_timestamp = headers
-        .get("x-request-timestamp")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok());
-
-    StateNodeAuthContext {
-        authorization,
-        request_signature,
-        request_timestamp,
     }
 }
