@@ -4,7 +4,9 @@
 //! using crsl-lib for CRDT-based content versioning.
 
 use crate::domain::access_policy::AccessPolicy;
-use crate::port::content_repository::{CommitResult, ContentRepository, SerializedOperation};
+use crate::port::content_repository::{
+    CommitResult, ContentRepository, PreparedCreate, SerializedOperation,
+};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -469,12 +471,112 @@ impl ContentRepository for CrslCrdtRepository {
 
         Ok(genesis_cids.into_iter().collect())
     }
+
+    async fn prepare_create_operations(
+        &self,
+        data: &[u8],
+        author: &str,
+        owner_identity: Option<crate::domain::identity::Identity>,
+    ) -> Result<PreparedCreate> {
+        // Strategy: open an ephemeral CRDT repository in a fresh temp dir,
+        // replay the same create+update_access_policy flow there, extract the
+        // resulting `SerializedOperation`s (which carry explicit node
+        // timestamps), then drop the ephemeral repo. The TempDir's Drop
+        // removes the LevelDB files. `self` is never touched, so the caller
+        // (the creator node) never retains a local copy of the content.
+        let temp_dir =
+            tempfile::tempdir().context("Failed to create temp dir for prepare_create")?;
+        let ephemeral = CrslCrdtRepository::open(temp_dir.path().join("crdt"))
+            .context("Failed to open ephemeral CRDT repo")?;
+
+        let commit = ephemeral
+            .create_content(data, author, None)
+            .await
+            .context("ephemeral create_content failed")?;
+        let genesis_cid = commit.genesis_cid;
+
+        if let Some(identity) = owner_identity {
+            let content_id_vo = crate::domain::value_objects::ContentId::new(genesis_cid.clone())
+                .map_err(|e| anyhow::anyhow!("invalid genesis_cid: {}", e))?;
+            let policy = AccessPolicy::new(content_id_vo, identity);
+            ephemeral
+                .update_access_policy(&genesis_cid, policy, author)
+                .await
+                .context("ephemeral update_access_policy failed")?;
+        }
+
+        let operations = ephemeral
+            .get_operations(&genesis_cid, None)
+            .await
+            .context("ephemeral get_operations failed")?;
+
+        // `temp_dir` goes out of scope here: LevelDB files are removed.
+        drop(ephemeral);
+        drop(temp_dir);
+
+        Ok(PreparedCreate {
+            genesis_cid,
+            operations,
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn test_prepare_create_operations_is_deterministic_across_repos() {
+        // Creator prepares operations without persisting to its own store.
+        let creator_tmp = tempdir().unwrap();
+        let creator_repo = CrslCrdtRepository::open(creator_tmp.path().join("crdt")).unwrap();
+
+        let data = b"hello from creator";
+        let prepared = creator_repo
+            .prepare_create_operations(data, "author-a", None)
+            .await
+            .unwrap();
+
+        // Creator's own repo must be untouched by prepare_create_operations.
+        assert_eq!(
+            creator_repo.list_contents().await.unwrap().len(),
+            0,
+            "prepare_create_operations must not persist to the creator's repo"
+        );
+        assert!(
+            creator_repo
+                .get_latest(&prepared.genesis_cid)
+                .await
+                .unwrap()
+                .is_none(),
+            "creator should not have data for the prepared genesis_cid"
+        );
+        assert!(
+            !prepared.operations.is_empty(),
+            "prepared.operations should contain at least the Create op"
+        );
+
+        // A receiver applies the operations and must end up with the same
+        // genesis_cid and the same content data.
+        let receiver_tmp = tempdir().unwrap();
+        let receiver_repo = CrslCrdtRepository::open(receiver_tmp.path().join("crdt")).unwrap();
+        let applied = receiver_repo
+            .apply_operations(&prepared.operations)
+            .await
+            .unwrap();
+        assert_eq!(applied, prepared.operations.len());
+
+        let received_data = receiver_repo
+            .get_latest(&prepared.genesis_cid)
+            .await
+            .unwrap();
+        assert_eq!(
+            received_data.as_deref(),
+            Some(&data[..]),
+            "receiver should end up with the creator's payload under the same genesis_cid"
+        );
+    }
 
     #[tokio::test]
     async fn test_create_and_get_content() {

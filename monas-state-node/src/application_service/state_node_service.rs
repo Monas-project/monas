@@ -3,7 +3,6 @@
 use crate::domain::access_control::{
     AccessControlError, AccessControlUpdate, ContentAccessControl,
 };
-use crate::domain::access_policy::AccessPolicy;
 use crate::domain::auth_capability::AuthCapability;
 use crate::domain::content_network::ContentNetwork;
 use crate::domain::errors::{CrdtError, NetworkError, StateNodeError};
@@ -482,13 +481,17 @@ where
         // New content doesn't have an access policy yet, so authorization would always fail.
         // The authenticated user becomes the owner with full permissions.
 
-        // 3. Save content to CRDT repository first (without access policy; policy is added after genesis_cid is known)
-        let commit_result = self
+        // 3. Prepare create + access-policy operations WITHOUT persisting on A.
+        // A is intentionally not a member of the new network, so it must not
+        // retain a local CRDT copy. The helper runs the create flow in an
+        // ephemeral repo and returns the serialized ops + deterministic CID.
+        let prepared = self
             .crdt_repo
-            .create_content(data, &self.local_node_id, None)
+            .prepare_create_operations(data, &self.local_node_id, Some(owner_identity))
             .await
             .map_err(|e| StateNodeError::CrdtError(CrdtError::StorageError(e.to_string())))?;
-        let content_id = commit_result.genesis_cid;
+        let content_id = prepared.genesis_cid;
+        let operations = prepared.operations;
 
         // 4. Find closest peers for content placement
         let key = compute_dht_key(&content_id);
@@ -523,19 +526,20 @@ where
             return Err(StateNodeError::NoAvailableMembers);
         }
 
-        // 5. Create content network with PeerId-based NodeIds
+        // 5. Save a local `ContentNetwork` record on A (the creator).
+        //    The creator is NOT a CRDT member, but it must remember the
+        //    member set so it can relay subsequent update/delete/read
+        //    requests from clients. Without this record, node A would return
+        //    404 for any follow-up request on the content it just created.
         let first_node = crate::domain::value_objects::NodeId::from_string(selected[0].clone())?;
         let mut network = ContentNetwork::new(
             crate::domain::value_objects::ContentId::new(content_id.clone())?,
             first_node,
         )?;
-
-        // Add remaining members
         for node_id in selected.iter().skip(1) {
             let node_id_vo = crate::domain::value_objects::NodeId::from_string(node_id.clone())?;
             network.add_member(node_id_vo);
         }
-
         if let Err(e) = self
             .content_repo
             .write()
@@ -543,29 +547,42 @@ where
             .save_content_network(network)
             .await
         {
-            // Rollback: CRDT content was created but network save failed.
-            // Log the orphaned CRDT entry for cleanup. The CRDT data is append-only
-            // so we can't delete it, but without a ContentNetwork it won't be served.
-            tracing::error!(
-                "Failed to save content network for {}, CRDT entry orphaned: {}",
-                content_id,
-                e
-            );
             return Err(StateNodeError::StorageError(e.to_string()));
         }
 
-        // 7. Create access policy for authenticated owner and embed in CRDT
-        if let Err(e) = async {
-            let content_id_vo = ContentId::new(content_id.clone())?;
-            let policy = AccessPolicy::new(content_id_vo, owner_identity);
-            self.crdt_repo
-                .update_access_policy(&content_id, policy, &self.local_node_id)
+        // 6. Push the prepared operations to every selected member, carrying
+        // a `PushBootstrap` payload so the receiver can create its local
+        // ContentNetwork record inline (before the Gossipsub event arrives).
+        let bootstrap = crate::port::peer_network::PushBootstrap {
+            creator_node_id: self.local_node_id.clone(),
+            member_nodes: selected.clone(),
+            created_at: current_timestamp(),
+        };
+
+        let mut successes = 0usize;
+        let mut last_err: Option<StateNodeError> = None;
+        for member_id in &selected {
+            match self
+                .peer_network
+                .push_operations(member_id, &content_id, &operations, Some(bootstrap.clone()))
                 .await
-                .map_err(|e| StateNodeError::CrdtError(CrdtError::StorageError(e.to_string())))
+            {
+                Ok(_) => successes += 1,
+                Err(e) => {
+                    tracing::warn!(
+                        "push_operations to member {} failed during create_content: {}",
+                        member_id,
+                        e
+                    );
+                    last_err = Some(StateNodeError::NetworkError(
+                        NetworkError::ConnectionFailed(e.to_string()),
+                    ));
+                }
+            }
         }
-        .await
-        {
-            // Rollback: remove the content network since access policy failed
+        if successes == 0 {
+            // Rollback: no member accepted the push, so the ContentNetwork
+            // record we just saved is orphaned. Best-effort cleanup.
             if let Err(cleanup_err) = self
                 .content_repo
                 .write()
@@ -574,40 +591,17 @@ where
                 .await
             {
                 tracing::error!(
-                    "Failed to rollback content network for {}: {}",
+                    "Failed to rollback content network after push failure for {}: {}",
                     content_id,
                     cleanup_err
                 );
             }
-            return Err(e);
+            return Err(last_err.unwrap_or(StateNodeError::NoAvailableMembers));
         }
 
-        // 7.5. Push CRDT operations (including AccessPolicy) to member nodes
-        // This ensures members have the data before the Gossipsub event triggers relay requests
-        {
-            let operations = self
-                .crdt_repo
-                .get_operations(&content_id, None)
-                .await
-                .map_err(|e| StateNodeError::CrdtError(CrdtError::StorageError(e.to_string())))?;
-
-            if !operations.is_empty() {
-                for member_id in &selected {
-                    if let Err(e) = self
-                        .peer_network
-                        .push_operations(member_id, &content_id, &operations)
-                        .await
-                    {
-                        tracing::warn!(
-                            "Failed to push CRDT operations to member {}: {} (will rely on Gossipsub sync)",
-                            member_id, e
-                        );
-                    }
-                }
-            }
-        }
-
-        // 8. Create and publish event both locally and to the network
+        // 6. Publish `Event::ContentCreated` via Gossipsub as a best-effort
+        // notification for non-member nodes (indexing, UI, etc.). Members
+        // already have the data and network record from step 5.
         let event = Event::ContentCreated {
             content_id,
             creator_node_id: self.local_node_id.clone(),
@@ -1056,7 +1050,7 @@ where
                         }
                         if let Err(e) = self
                             .peer_network
-                            .push_operations(member_id, content_id, &operations)
+                            .push_operations(member_id, content_id, &operations, None)
                             .await
                         {
                             tracing::warn!(

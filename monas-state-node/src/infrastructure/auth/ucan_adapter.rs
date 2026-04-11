@@ -511,6 +511,14 @@ mod tests {
                 is_new: false,
             })
         }
+        async fn prepare_create_operations(
+            &self,
+            _data: &[u8],
+            _author: &str,
+            _owner_identity: Option<crate::domain::identity::Identity>,
+        ) -> Result<crate::port::content_repository::PreparedCreate> {
+            unimplemented!()
+        }
     }
 
     /// Helper to create an owner Identity from a TestKeyPair's public key
