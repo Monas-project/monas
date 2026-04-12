@@ -211,47 +211,50 @@ presentation/   Axum HTTP API (port: 8080)
 
 ### 作成
 
-```
-1. クライアントがコンテンツを作成
-2. CEKを生成し、AES-256-CTRで暗号化
-3. plainCid = sha256(raw_content) を計算
-4. encCid = sha256(plainCid || 0x00 || ciphertext) を計算
-5. ストレージ抽象化層を通じてユーザー選択のストレージに保存
-6. state-nodeにCreate操作（op）を送信
-7. XOR距離でN台のstate-nodeが選ばれ、Content Networkを構築
-8. Network内でopが同期され完了
+```mermaid
+flowchart TD
+  A([コンテンツ作成]) --> B[CEK生成 / AES暗号化 / CID計算]
+  B --> C[Storage Abstractionに保存]
+  B --> D[state-nodeにCreate op送信]
+  D --> E[XOR距離でN台選択]
+  E --> F([Content Network構築・同期完了])
 ```
 
 ### 共有（ユーザーAからユーザーBへ）
 
-```
-1. AはBの公開鍵を使ってCEKをHPKEでラップ → KeyEnvelope生成
-2. AはBにTokenとKeyEnvelopeをクライアント間で直接送付
-   （state-nodeは関与しない）
-3. TokenにはBへの権限（Read / Write / Owner）が記載
-4. BはKeyEnvelopeから自分の秘密鍵でCEKを取り出す
-5. BはCEKで暗号化コンテンツを復号し、内容を得る
+
+```mermaid
+flowchart TD
+  A([共有開始]) --> B[Bの公開鍵でCEKをHPKEラップ]
+  B --> C[KeyEnvelope + Token生成]
+  C --> D[BにToken + KeyEnvelopeを直接送付]
+  D --> E[BがKeyEnvelopeからCEKを取り出し]
+  E --> F([BがCEKでコンテンツを復号])
 ```
 
 ### 更新（Write権限を持つユーザーBによる編集）
 
-```
-1. BがコンテンツをCEKで復号・編集・再暗号化
-2. BがContent NetworkのState-nodeにUpdate操作を送信
-3. state-nodeはBのTokenを検証し、Write権限を確認
-4. 問題なければstate（CRDT）に操作を適用
-5. 他のstate-nodeに同期
+```mermaid
+flowchart TD
+  A([編集開始]) --> B[CEKで復号 / 編集 / 再暗号化]
+  B --> C[state-nodeにUpdate op送信]
+  C --> D{Token検証 / Write権限確認}
+  D -->|OK| E[CRDTに操作を適用]
+  E --> F([他ノードへ同期])
+  D -->|NG| G([拒否])
 ```
 
 ### アクセス取り消し
 
-```
-1. オーナーAが新しいCEKを生成し、コンテンツを再暗号化（reencrypt）
-2. 既存のKeyEnvelopeは旧CEKを指すため無効化される
-3. アクセスを継続させたいユーザーには新CEKで新KeyEnvelopeを発行
-4. state-nodeのmin_valid_issued_atを更新し、旧Tokenを失効
-```
 
+```mermaid
+flowchart TD
+  A([取り消し開始]) --> B[新CEK生成 / コンテンツを再暗号化]
+  B --> C[旧KeyEnvelopeが無効化される]
+  B --> D[継続ユーザーに新KeyEnvelope発行]
+  B --> E[state-nodeのmin_valid_issued_atを更新]
+  E --> F([旧Token一括失効])
+```
 ---
 
 ## 8. CIDによるコンテンツアドレッシング
