@@ -478,44 +478,95 @@ impl ContentRepository for CrslCrdtRepository {
         author: &str,
         owner_identity: Option<crate::domain::identity::Identity>,
     ) -> Result<PreparedCreate> {
-        // Strategy: open an ephemeral CRDT repository in a fresh temp dir,
-        // replay the same create+update_access_policy flow there, extract the
-        // resulting `SerializedOperation`s (which carry explicit node
-        // timestamps), then drop the ephemeral repo. The TempDir's Drop
-        // removes the LevelDB files. `self` is never touched, so the caller
-        // (the creator node) never retains a local copy of the content.
-        let temp_dir =
-            tempfile::tempdir().context("Failed to create temp dir for prepare_create")?;
-        let ephemeral = CrslCrdtRepository::open(temp_dir.path().join("crdt"))
-            .context("Failed to open ephemeral CRDT repo")?;
+        use crsl_lib::crdt::timestamp::next_monotonic_timestamp;
+        use crsl_lib::dasl::node::Node;
 
-        let commit = ephemeral
-            .create_content(data, author, None)
-            .await
-            .context("ephemeral create_content failed")?;
-        let genesis_cid = commit.genesis_cid;
+        let mut operations = Vec::new();
 
+        // 1. Build the Create operation and compute genesis CID via pure math
+        //    (Node serialization + SHA-256). No storage is touched.
+        let placeholder = Self::generate_placeholder_cid(data);
+        let create_payload = ContentPayload {
+            data: data.to_vec(),
+            access_policy: None,
+        };
+        let create_op = Operation::new(
+            placeholder,
+            OperationType::Create(create_payload.clone()),
+            author.to_string(),
+        );
+        let create_ts = next_monotonic_timestamp();
+        let genesis_node = Node::<ContentPayload, ContentMetadata>::new_genesis(
+            create_payload,
+            create_ts,
+            ContentMetadata::default(),
+        );
+        let genesis_cid = genesis_node
+            .content_id()
+            .map_err(|e| anyhow::anyhow!("Failed to compute genesis CID: {}", e))?;
+
+        let create_op_serialized = serde_json::to_vec(&{
+            let mut op = create_op;
+            op.genesis = genesis_cid;
+            op.node_timestamp = Some(create_ts);
+            op
+        })
+        .context("Failed to serialize create operation")?;
+
+        operations.push(SerializedOperation {
+            data: create_op_serialized,
+            genesis_cid: genesis_cid.to_string(),
+            author: author.to_string(),
+            timestamp: create_ts,
+            node_timestamp: create_ts,
+        });
+
+        // 2. Optionally build an AccessPolicy Update operation
         if let Some(identity) = owner_identity {
-            let content_id_vo = crate::domain::value_objects::ContentId::new(genesis_cid.clone())
-                .map_err(|e| anyhow::anyhow!("invalid genesis_cid: {}", e))?;
+            let content_id_vo =
+                crate::domain::value_objects::ContentId::new(genesis_cid.to_string())
+                    .map_err(|e| anyhow::anyhow!("invalid genesis_cid: {}", e))?;
             let policy = AccessPolicy::new(content_id_vo, identity);
-            ephemeral
-                .update_access_policy(&genesis_cid, policy, author)
-                .await
-                .context("ephemeral update_access_policy failed")?;
+            let update_payload = ContentPayload {
+                data: data.to_vec(),
+                access_policy: Some(policy),
+            };
+            let update_op = Operation::new(
+                genesis_cid,
+                OperationType::Update(update_payload.clone()),
+                author.to_string(),
+            );
+            let update_ts = next_monotonic_timestamp();
+            let update_node = Node::<ContentPayload, ContentMetadata>::new_child(
+                update_payload,
+                vec![genesis_cid],
+                genesis_cid,
+                update_ts,
+                ContentMetadata::default(),
+            );
+            let _update_cid = update_node
+                .content_id()
+                .map_err(|e| anyhow::anyhow!("Failed to compute update CID: {}", e))?;
+
+            let update_op_serialized = serde_json::to_vec(&{
+                let mut op = update_op;
+                op.parents = vec![genesis_cid];
+                op.node_timestamp = Some(update_ts);
+                op
+            })
+            .context("Failed to serialize update operation")?;
+
+            operations.push(SerializedOperation {
+                data: update_op_serialized,
+                genesis_cid: genesis_cid.to_string(),
+                author: author.to_string(),
+                timestamp: update_ts,
+                node_timestamp: update_ts,
+            });
         }
 
-        let operations = ephemeral
-            .get_operations(&genesis_cid, None)
-            .await
-            .context("ephemeral get_operations failed")?;
-
-        // `temp_dir` goes out of scope here: LevelDB files are removed.
-        drop(ephemeral);
-        drop(temp_dir);
-
         Ok(PreparedCreate {
-            genesis_cid,
+            genesis_cid: genesis_cid.to_string(),
             operations,
         })
     }
