@@ -1035,8 +1035,7 @@ impl Libp2pNetwork {
                 // impersonation. Requiring that `local_peer` appear in
                 // `member_nodes` stops a malicious peer from fabricating a
                 // network on an unrelated victim node. The residual risk
-                // matches the Gossipsub ContentCreated trust model and is
-                // acceptable for dev-team nodes.
+                // matches the Gossipsub ContentCreated trust model.
                 if bs.creator_node_id != sender_peer {
                     return Err(format!(
                         "bootstrap creator_node_id {} does not match sender {}",

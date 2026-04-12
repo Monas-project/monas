@@ -122,9 +122,9 @@ async fn spawn_test_node() -> TestNode {
     let crdt_repo_dyn: Arc<dyn ContentRepository> = crdt_repo.clone();
     let data_dir = temp_dir.path().to_path_buf();
 
-    // Important: wire the content_network_repo into the network so the
-    // PushOperations handler performs the membership check (same as production
-    // via StateNode::new). Without this, the bug is masked.
+    // Wire the content_network_repo into the network so the PushOperations
+    // handler performs the membership check (same as StateNode::new).
+    // Without this, the bug is masked.
     let content_repo_dyn: Arc<
         RwLock<dyn monas_state_node::port::persistence::PersistentContentRepository + Send + Sync>,
     > = content_repo.clone();
