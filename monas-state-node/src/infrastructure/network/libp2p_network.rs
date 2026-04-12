@@ -1740,6 +1740,36 @@ impl Libp2pNetwork {
     }
 }
 
+impl Libp2pNetwork {
+    async fn send_push_operations(
+        &self,
+        peer_id: &str,
+        genesis_cid: &str,
+        operations: &[SerializedOperation],
+        bootstrap: Option<PushBootstrap>,
+    ) -> Result<usize> {
+        let peer_id = PeerId::from_str(peer_id)
+            .map_err(|_| anyhow::anyhow!("Invalid peer ID: {}", peer_id))?;
+
+        let (tx, rx) = oneshot::channel();
+        self.command_tx
+            .send(SwarmCommand::PushOperations {
+                peer_id,
+                genesis_cid: genesis_cid.to_string(),
+                operations: operations.to_vec(),
+                bootstrap,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("Failed to send command"))?;
+
+        tokio::time::timeout(PEER_NETWORK_TIMEOUT, rx)
+            .await
+            .map_err(|_| anyhow::anyhow!("push_operations timed out"))?
+            .map_err(|_| anyhow::anyhow!("Failed to receive response"))?
+    }
+}
+
 #[async_trait]
 impl PeerNetwork for Libp2pNetwork {
     async fn find_closest_peers(&self, key: Vec<u8>, k: usize) -> Result<Vec<String>> {
@@ -1937,27 +1967,20 @@ impl PeerNetwork for Libp2pNetwork {
         peer_id: &str,
         genesis_cid: &str,
         operations: &[SerializedOperation],
-        bootstrap: Option<PushBootstrap>,
     ) -> Result<usize> {
-        let peer_id = PeerId::from_str(peer_id)
-            .map_err(|_| anyhow::anyhow!("Invalid peer ID: {}", peer_id))?;
-
-        let (tx, rx) = oneshot::channel();
-        self.command_tx
-            .send(SwarmCommand::PushOperations {
-                peer_id,
-                genesis_cid: genesis_cid.to_string(),
-                operations: operations.to_vec(),
-                bootstrap,
-                reply: tx,
-            })
+        self.send_push_operations(peer_id, genesis_cid, operations, None)
             .await
-            .map_err(|_| anyhow::anyhow!("Failed to send command"))?;
+    }
 
-        tokio::time::timeout(PEER_NETWORK_TIMEOUT, rx)
+    async fn push_operations_with_bootstrap(
+        &self,
+        peer_id: &str,
+        genesis_cid: &str,
+        operations: &[SerializedOperation],
+        bootstrap: PushBootstrap,
+    ) -> Result<usize> {
+        self.send_push_operations(peer_id, genesis_cid, operations, Some(bootstrap))
             .await
-            .map_err(|_| anyhow::anyhow!("push_operations timed out"))?
-            .map_err(|_| anyhow::anyhow!("Failed to receive response"))?
     }
 
     async fn broadcast_operation(

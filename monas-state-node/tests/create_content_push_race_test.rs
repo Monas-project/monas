@@ -311,7 +311,7 @@ async fn push_operations_rejects_unknown_network_without_bootstrap() {
 
     let result = a
         .network
-        .push_operations(&b.network.local_peer_id(), fake_cid, &empty_ops, None)
+        .push_operations(&b.network.local_peer_id(), fake_cid, &empty_ops)
         .await;
 
     assert!(

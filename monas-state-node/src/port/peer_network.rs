@@ -90,22 +90,29 @@ pub trait PeerNetwork: Send + Sync {
         since_version: Option<&str>,
     ) -> Result<Vec<SerializedOperation>>;
 
-    /// Push CRDT operations to a peer.
+    /// Push CRDT operations to a peer that already knows this content network.
     ///
-    /// Uses RequestResponse protocol to send operations to a peer.
-    /// Returns the number of operations accepted by the peer.
-    ///
-    /// `bootstrap` must be `Some` on the very first push for a new content
-    /// network (so the receiver can persist a `ContentNetwork` record before
-    /// running the membership check). Subsequent update/delete pushes pass
-    /// `None`; the receiver then enforces that the sender is already a known
-    /// member.
+    /// The receiver verifies the sender is a known member. For the very first
+    /// push to a brand-new network use [`push_operations_with_bootstrap`]
+    /// instead.
     async fn push_operations(
         &self,
         peer_id: &str,
         genesis_cid: &str,
         operations: &[SerializedOperation],
-        bootstrap: Option<PushBootstrap>,
+    ) -> Result<usize>;
+
+    /// Push CRDT operations together with a bootstrap payload that lets the
+    /// receiver persist its `ContentNetwork` record inline.
+    ///
+    /// Only used by `create_content` for the first push to member nodes that
+    /// haven't received the `Event::ContentCreated` gossipsub message yet.
+    async fn push_operations_with_bootstrap(
+        &self,
+        peer_id: &str,
+        genesis_cid: &str,
+        operations: &[SerializedOperation],
+        bootstrap: PushBootstrap,
     ) -> Result<usize>;
 
     /// Broadcast a new operation to interested peers via Gossipsub.

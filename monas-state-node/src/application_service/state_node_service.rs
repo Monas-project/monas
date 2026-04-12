@@ -564,7 +564,12 @@ where
         for member_id in &selected {
             match self
                 .peer_network
-                .push_operations(member_id, &content_id, &operations, Some(bootstrap.clone()))
+                .push_operations_with_bootstrap(
+                    member_id,
+                    &content_id,
+                    &operations,
+                    bootstrap.clone(),
+                )
                 .await
             {
                 Ok(_) => successes += 1,
@@ -1050,7 +1055,7 @@ where
                         }
                         if let Err(e) = self
                             .peer_network
-                            .push_operations(member_id, content_id, &operations, None)
+                            .push_operations(member_id, content_id, &operations)
                             .await
                         {
                             tracing::warn!(

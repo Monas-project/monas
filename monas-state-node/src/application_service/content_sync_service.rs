@@ -215,7 +215,7 @@ where
 
             match self
                 .peer_network
-                .push_operations(node_id_str, genesis_cid, &operations, None)
+                .push_operations(node_id_str, genesis_cid, &operations)
                 .await
             {
                 Ok(accepted) => {

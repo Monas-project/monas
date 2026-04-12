@@ -221,7 +221,16 @@ mod tests {
             _peer_id: &str,
             _genesis_cid: &str,
             _operations: &[SerializedOperation],
-            _bootstrap: Option<crate::port::peer_network::PushBootstrap>,
+        ) -> Result<usize> {
+            Ok(0)
+        }
+
+        async fn push_operations_with_bootstrap(
+            &self,
+            _peer_id: &str,
+            _genesis_cid: &str,
+            _operations: &[SerializedOperation],
+            _bootstrap: crate::port::peer_network::PushBootstrap,
         ) -> Result<usize> {
             Ok(0)
         }

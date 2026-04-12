@@ -170,7 +170,16 @@ impl PeerNetwork for MockPeerNetwork {
         _peer_id: &str,
         _genesis_cid: &str,
         operations: &[SerializedOperation],
-        _bootstrap: Option<crate::port::peer_network::PushBootstrap>,
+    ) -> Result<usize> {
+        Ok(operations.len())
+    }
+
+    async fn push_operations_with_bootstrap(
+        &self,
+        _peer_id: &str,
+        _genesis_cid: &str,
+        operations: &[SerializedOperation],
+        _bootstrap: crate::port::peer_network::PushBootstrap,
     ) -> Result<usize> {
         Ok(operations.len())
     }
