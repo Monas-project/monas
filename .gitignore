@@ -49,7 +49,6 @@ coverage/
 tarpaulin-report.html
 
 monas-state-node/data*/
-/docs
 
 # Terraform
 *.tfvars
