@@ -492,10 +492,11 @@ where
 
         // 4. Find closest peers for content placement
         let key = compute_dht_key(&content_id);
-        let k = 3usize;
+        let k = self.min_replication_factor;
+        // Request k+1 so that excluding the creator still leaves k candidates.
         let closest = self
             .peer_network
-            .find_closest_peers(key, k)
+            .find_closest_peers(key, k + 1)
             .await
             .map_err(|e| {
                 StateNodeError::NetworkError(NetworkError::ConnectionFailed(e.to_string()))
@@ -517,8 +518,8 @@ where
         scored.sort_by(|a, b| b.0.cmp(&a.0));
         let selected: Vec<String> = scored.into_iter().take(k).map(|(_, pid)| pid).collect();
 
-        // Validate that we have at least one member node
-        if selected.is_empty() {
+        // Require the full replication factor to preserve BFT quorum (3f+1).
+        if selected.len() < k {
             return Err(StateNodeError::NoAvailableMembers);
         }
 
@@ -1236,7 +1237,9 @@ where
         scored.sort_by(|a, b| b.0.cmp(&a.0));
         let selected: Vec<String> = scored.into_iter().take(count).map(|(_, pid)| pid).collect();
 
-        if selected.is_empty() {
+        // Require the full requested count; degrading silently would break
+        // replication assumptions for callers relying on BFT quorum.
+        if selected.len() < count {
             return Err(StateNodeError::NoAvailableMembers);
         }
 
@@ -2126,10 +2129,15 @@ mod tests {
         let mut capacities = HashMap::new();
         capacities.insert("peer-1".to_string(), 500);
         capacities.insert("peer-2".to_string(), 1000);
+        capacities.insert("peer-3".to_string(), 700);
 
         let service = create_service_with_peers(
             "node-1",
-            vec!["peer-1".to_string(), "peer-2".to_string()],
+            vec![
+                "peer-1".to_string(),
+                "peer-2".to_string(),
+                "peer-3".to_string(),
+            ],
             capacities,
         );
 
@@ -2151,7 +2159,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(creator_node_id, "node-1");
-                assert!(!member_nodes.is_empty());
+                assert_eq!(member_nodes.len(), 3);
                 assert_eq!(content_size, 9); // "test data" length
             }
             _ => panic!("Expected ContentCreated event"),
@@ -2159,14 +2167,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_create_content_excludes_creator() {
+    async fn test_create_content_excludes_creator_preserves_quorum() {
+        // Regression for #42: when the creator is among the closest peers,
+        // we must still end up with exactly min_replication_factor members.
         let mut capacities = HashMap::new();
         capacities.insert("node-1".to_string(), 1000); // Creator
-        capacities.insert("peer-1".to_string(), 500);
+        capacities.insert("peer-1".to_string(), 900);
+        capacities.insert("peer-2".to_string(), 800);
+        capacities.insert("peer-3".to_string(), 700);
 
         let service = create_service_with_peers(
             "node-1",
-            vec!["node-1".to_string(), "peer-1".to_string()],
+            vec![
+                "node-1".to_string(),
+                "peer-1".to_string(),
+                "peer-2".to_string(),
+                "peer-3".to_string(),
+            ],
             capacities,
         );
 
@@ -2182,12 +2199,45 @@ mod tests {
 
         match event {
             Event::ContentCreated { member_nodes, .. } => {
-                // Creator should be excluded from members
                 assert!(!member_nodes.contains(&"node-1".to_string()));
-                assert!(member_nodes.contains(&"peer-1".to_string()));
+                assert_eq!(member_nodes.len(), 3);
             }
             _ => panic!("Expected ContentCreated event"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_create_content_fails_when_insufficient_peers_after_exclusion() {
+        // Only two non-creator peers available: cannot meet replication factor of 3.
+        let mut capacities = HashMap::new();
+        capacities.insert("node-1".to_string(), 1000);
+        capacities.insert("peer-1".to_string(), 500);
+        capacities.insert("peer-2".to_string(), 400);
+
+        let service = create_service_with_peers(
+            "node-1",
+            vec![
+                "node-1".to_string(),
+                "peer-1".to_string(),
+                "peer-2".to_string(),
+            ],
+            capacities,
+        );
+
+        let result = service
+            .create_content(
+                b"test data",
+                Some(&test_token()),
+                Some(&test_request_signature()),
+                None,
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("No available member nodes found"));
     }
 
     #[tokio::test]
