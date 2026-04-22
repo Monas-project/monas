@@ -1,8 +1,12 @@
 use serde::{Deserialize, Serialize};
 
 /// 鍵の種類
+///
+/// `#[non_exhaustive]` のため、将来新しい鍵種が追加されても下流の `match` は壊れない
+/// （必ず `_ =>` のフォールスルーを入れること）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum KeyType {
     Secp256k1,
     Secp256r1,

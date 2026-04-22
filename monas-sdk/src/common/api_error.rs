@@ -2,8 +2,12 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// SDK全体で使用する統一エラー型
+///
+/// `#[non_exhaustive]` を付けているため、将来 variant を追加しても SemVer 非破壊。
+/// 下流クレートは必ず `_ =>` のフォールスルーを入れて match すること。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "message")]
+#[non_exhaustive]
 pub enum ApiError {
     /// 入力データ不足・形式不一致 (400)
     Validation(String),
