@@ -367,11 +367,15 @@ async fn revoke_share_rollback_fires_on_inner_share_service_error() {
     let controller = MonasController::with_urls(server.url(), server.url());
 
     let sender = controller
-        .generate_keypair(GenerateKeypairInput { key_type: KeyType::Secp256r1 })
+        .generate_keypair(GenerateKeypairInput {
+            key_type: KeyType::Secp256r1,
+        })
         .data
         .expect("sender keypair");
     let recipient = controller
-        .generate_keypair(GenerateKeypairInput { key_type: KeyType::Secp256r1 })
+        .generate_keypair(GenerateKeypairInput {
+            key_type: KeyType::Secp256r1,
+        })
         .data
         .expect("recipient keypair");
 
@@ -412,7 +416,11 @@ async fn revoke_share_rollback_fires_on_inner_share_service_error() {
         },
         None,
     );
-    assert!(first.success, "first revoke should succeed: {:?}", first.error);
+    assert!(
+        first.success,
+        "first revoke should succeed: {:?}",
+        first.error
+    );
     first_update_mock.assert();
 
     // 2 回目: ACL に recipient が既に無いので share_service.revoke_share で失敗する。

@@ -7,8 +7,8 @@ use monas_sdk::models::content::{
     ContentMetadata, CreateContentInput, DeleteContentInput, GetContentInput, UpdateContentInput,
 };
 use monas_sdk::{ApiError, MonasConfig, MonasController, StateNodeAuthContext};
-use std::time::{Duration, Instant};
 use sha2::{Digest, Sha256};
+use std::time::{Duration, Instant};
 mod support;
 use support::{acquire_test_lock, cleanup_content_artifacts};
 
@@ -829,7 +829,8 @@ async fn create_content_returns_timeout_when_state_node_hangs() {
     let addr = listener.local_addr().expect("local_addr");
     let url = format!("http://{addr}");
 
-    let config = MonasConfig::new(url.clone(), url).with_request_timeout(Duration::from_millis(200));
+    let config =
+        MonasConfig::new(url.clone(), url).with_request_timeout(Duration::from_millis(200));
     let controller = MonasController::with_config(config);
 
     let input = CreateContentInput {

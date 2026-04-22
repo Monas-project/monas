@@ -558,9 +558,7 @@ impl MonasController {
                 // silent に None を返すと「二度と操作できないコンテンツ」を量産してしまう。
                 if parsed.content_id.trim().is_empty() {
                     return Err(ApiResponse::error(
-                        ApiError::Internal(
-                            "State Node responded without content_id".into(),
-                        ),
+                        ApiError::Internal("State Node responded without content_id".into()),
                         trace_id,
                     ));
                 }
@@ -671,10 +669,8 @@ impl MonasController {
                 Ok(auth) => auth,
                 Err(response) => return Some(response),
             };
-        let req = Self::attach_state_node_auth(
-            self.agent.delete(&state_node_url),
-            signed_auth.as_ref(),
-        );
+        let req =
+            Self::attach_state_node_auth(self.agent.delete(&state_node_url), signed_auth.as_ref());
 
         let resp = match req.call() {
             Ok(r) => r,
