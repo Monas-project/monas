@@ -514,7 +514,7 @@ where
             .filter(|peer| peer != &self.local_node_id) // Exclude creator
             .map(|peer| (caps.get(&peer).cloned().unwrap_or(0), peer))
             .collect();
-        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        scored.sort_by_key(|b| std::cmp::Reverse(b.0));
         let selected: Vec<String> = scored.into_iter().take(k).map(|(_, pid)| pid).collect();
 
         // Validate that we have at least one member node
@@ -1233,7 +1233,7 @@ where
             .filter(|peer| !network.has_member_str(peer)) // Exclude existing members
             .map(|peer| (caps.get(&peer).cloned().unwrap_or(0), peer))
             .collect();
-        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        scored.sort_by_key(|b| std::cmp::Reverse(b.0));
         let selected: Vec<String> = scored.into_iter().take(count).map(|(_, pid)| pid).collect();
 
         if selected.is_empty() {
