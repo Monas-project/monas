@@ -453,7 +453,19 @@ impl MonasController {
         let result = match self.share_service.revoke_share(cmd) {
             Ok(result) => result,
             Err(e) => {
-                return ApiResponse::error(Self::map_share_error(e), trace_id);
+                // ShareService::revoke_share は share_repository を先に save してから envelope を
+                // 生成するため、途中で失敗した場合も ACL は既に変更されている可能性がある。
+                // snapshot から share/content/cek を復元する。
+                let primary = Self::map_share_error(e);
+                if let Err(restore_err) = self.restore_revoke_share_snapshot(&snapshot) {
+                    return ApiResponse::error(
+                        ApiError::Internal(format!(
+                            "Revoke failed and local rollback also failed: revoke={primary}, restore={restore_err}"
+                        )),
+                        trace_id,
+                    );
+                }
+                return ApiResponse::error(primary, trace_id);
             }
         };
 
@@ -463,7 +475,19 @@ impl MonasController {
         }) {
             Ok(result) => result,
             Err(e) => {
-                return ApiResponse::error(Self::map_reencrypt_error(e), trace_id);
+                // reencrypt に失敗した時点で ACL は既に変更済み。
+                // snapshot 復元をせずに return すると ACL だけが剥がれた中途半端な状態が残るため、
+                // ここでロールバックする。
+                let primary = Self::map_reencrypt_error(e);
+                if let Err(restore_err) = self.restore_revoke_share_snapshot(&snapshot) {
+                    return ApiResponse::error(
+                        ApiError::Internal(format!(
+                            "Reencrypt failed and local rollback also failed: reencrypt={primary}, restore={restore_err}"
+                        )),
+                        trace_id,
+                    );
+                }
+                return ApiResponse::error(primary, trace_id);
             }
         };
 
