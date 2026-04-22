@@ -150,11 +150,9 @@ impl MonasController {
         let request = AccountSignRequest {
             message_base64: BASE64_STANDARD.encode(signing_message.as_bytes()),
         };
-        let response = ureq::post(&sign_url).send_json(request).map_err(|e| {
+        let response = self.agent.post(&sign_url).send_json(request).map_err(|e| {
             ApiResponse::error(
-                ApiError::Internal(format!(
-                    "Failed to sign state node request via account: {e}"
-                )),
+                ApiError::from_ureq_error("Failed to sign state node request via account", e),
                 trace_id.to_string(),
             )
         })?;
@@ -514,7 +512,9 @@ impl MonasController {
 
         let state_node_url = format!("{}/content", self.state_node_url);
         let req = Self::attach_state_node_auth(
-            ureq::post(&state_node_url).header("Content-Type", "application/json"),
+            self.agent
+                .post(&state_node_url)
+                .header("Content-Type", "application/json"),
             signed_auth.as_ref(),
         );
 
@@ -522,7 +522,7 @@ impl MonasController {
             Ok(r) => r,
             Err(e) => {
                 return Err(ApiResponse::error(
-                    ApiError::Internal(format!("Failed to send request to State Node: {e}")),
+                    ApiError::from_ureq_error("Failed to send request to State Node", e),
                     trace_id,
                 ));
             }
@@ -594,7 +594,9 @@ impl MonasController {
 
         let state_node_url = format!("{}/content/{}", self.state_node_url, content_id);
         let req = Self::attach_state_node_auth(
-            ureq::put(&state_node_url).header("Content-Type", "application/json"),
+            self.agent
+                .put(&state_node_url)
+                .header("Content-Type", "application/json"),
             signed_auth.as_ref(),
         );
 
@@ -602,7 +604,7 @@ impl MonasController {
             Ok(r) => r,
             Err(e) => {
                 return Some(ApiResponse::error(
-                    ApiError::Internal(format!("Failed to send request to State Node: {e}")),
+                    ApiError::from_ureq_error("Failed to send request to State Node", e),
                     trace_id,
                 ));
             }
@@ -659,13 +661,16 @@ impl MonasController {
                 Ok(auth) => auth,
                 Err(response) => return Some(response),
             };
-        let req = Self::attach_state_node_auth(ureq::delete(&state_node_url), signed_auth.as_ref());
+        let req = Self::attach_state_node_auth(
+            self.agent.delete(&state_node_url),
+            signed_auth.as_ref(),
+        );
 
         let resp = match req.call() {
             Ok(r) => r,
             Err(e) => {
                 return Some(ApiResponse::error(
-                    ApiError::Internal(format!("Failed to send delete request to State Node: {e}")),
+                    ApiError::from_ureq_error("Failed to send delete request to State Node", e),
                     trace_id,
                 ));
             }

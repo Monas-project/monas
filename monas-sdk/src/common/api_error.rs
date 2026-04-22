@@ -50,6 +50,19 @@ impl ApiError {
             ApiError::Internal(_) => 500,
         }
     }
+
+    /// ureq の送信系エラーを `ApiError` に変換する。
+    ///
+    /// `ureq::Error::Timeout(_)` は `ApiError::Timeout` にマップし、
+    /// それ以外は `ApiError::Internal` (先頭に `context` を付ける) にまとめる。
+    pub fn from_ureq_error(context: &str, err: ureq::Error) -> Self {
+        match err {
+            ureq::Error::Timeout(_) => {
+                ApiError::Timeout(format!("{context}: request timed out ({err})"))
+            }
+            other => ApiError::Internal(format!("{context}: {other}")),
+        }
+    }
 }
 
 #[cfg(test)]

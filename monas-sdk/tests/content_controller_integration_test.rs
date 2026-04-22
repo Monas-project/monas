@@ -6,7 +6,8 @@ use mockito::Server;
 use monas_sdk::models::content::{
     ContentMetadata, CreateContentInput, DeleteContentInput, GetContentInput, UpdateContentInput,
 };
-use monas_sdk::{ApiError, MonasController, StateNodeAuthContext};
+use monas_sdk::{ApiError, MonasConfig, MonasController, StateNodeAuthContext};
+use std::time::{Duration, Instant};
 use sha2::{Digest, Sha256};
 mod support;
 use support::{acquire_test_lock, cleanup_content_artifacts};
@@ -755,5 +756,52 @@ async fn delete_content_uses_account_signature_for_metadata_request() {
     );
     account_sign_mock.assert();
     delete_mock.assert();
+    cleanup_content_artifacts();
+}
+
+/// §2: `MonasConfig::with_request_timeout` が効き、State Node がハングする場合に
+/// `ApiError::Timeout` が設定した時間内に返ることを検証する。
+///
+/// TcpListener を bind するが accept しないダミーサーバを立てる。
+/// OS によっては connect は成功するが read/write が応答しないため、
+/// 設定したグローバルタイムアウトで打ち切られるはず。
+#[tokio::test(flavor = "multi_thread")]
+async fn create_content_returns_timeout_when_state_node_hangs() {
+    let _guard = acquire_test_lock();
+
+    // accept しないダミーサーバ
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let url = format!("http://{addr}");
+
+    let config = MonasConfig::new(url.clone(), url).with_request_timeout(Duration::from_millis(200));
+    let controller = MonasController::with_config(config);
+
+    let input = CreateContentInput {
+        content: URL_SAFE_NO_PAD.encode(b"timeout test"),
+        metadata: Some(ContentMetadata {
+            name: Some("timeout.txt".into()),
+            content_type: Some("text/plain".into()),
+            created_at: None,
+            updated_at: None,
+        }),
+    };
+
+    let started = Instant::now();
+    let response = controller.create_content(input, None);
+    let elapsed = started.elapsed();
+
+    assert!(!response.success, "should fail due to timeout");
+    match response.error {
+        Some(ApiError::Timeout(_)) => {}
+        other => panic!("expected ApiError::Timeout, got {other:?}"),
+    }
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "timeout should fire well under 3s, took {elapsed:?}"
+    );
+
+    // listener は drop で自動的に閉じる。念のため明示。
+    drop(listener);
     cleanup_content_artifacts();
 }

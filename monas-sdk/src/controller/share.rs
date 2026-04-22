@@ -156,9 +156,11 @@ impl MonasController {
             ttl_secs: DEFAULT_DELEGATION_TTL_SECS,
         };
 
-        let mut response = ureq::post(&issuer_url)
+        let mut response = self
+            .agent
+            .post(&issuer_url)
             .send_json(req)
-            .map_err(|e| ApiError::Internal(format!("Failed to call issuer API: {e}")))?;
+            .map_err(|e| ApiError::from_ureq_error("Failed to call issuer API", e))?;
 
         let body: IssueDelegatedTokenResponse = response
             .body_mut()
