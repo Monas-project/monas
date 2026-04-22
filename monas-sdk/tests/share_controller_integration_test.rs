@@ -17,6 +17,8 @@ async fn share_content_succeeds_after_content_creation() {
     let create_mock = server
         .mock("POST", "/content")
         .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"content_id":"share-test-remote"}"#)
         .create_async()
         .await;
     let delegate_mock = server
@@ -119,6 +121,8 @@ async fn revoke_share_updates_state_node_version() {
     let create_mock = server
         .mock("POST", "/content")
         .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"content_id":"share-test-remote"}"#)
         .create_async()
         .await;
     let delegate_mock = server
@@ -201,6 +205,8 @@ async fn revoke_share_rolls_back_local_state_when_state_node_sync_fails() {
     let create_mock = server
         .mock("POST", "/content")
         .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"content_id":"share-test-remote"}"#)
         .create_async()
         .await;
     let delegate_mock = server
@@ -334,7 +340,13 @@ async fn revoke_share_rolls_back_local_state_when_state_node_sync_fails() {
 async fn revoke_share_rollback_fires_on_inner_share_service_error() {
     let _guard = acquire_test_lock();
     let mut server = Server::new_async().await;
-    let create_mock = server.mock("POST", "/content").with_status(200).create_async().await;
+    let create_mock = server
+        .mock("POST", "/content")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"content_id":"share-test-remote"}"#)
+        .create_async()
+        .await;
     let delegate_mock = server
         .mock("POST", "/issuer/delegate")
         .with_status(200)

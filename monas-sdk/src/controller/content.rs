@@ -544,17 +544,27 @@ impl MonasController {
         }
 
         if body.trim().is_empty() {
-            return Ok(None);
+            return Err(ApiResponse::error(
+                ApiError::Internal(
+                    "State Node create response is empty; expected content_id".into(),
+                ),
+                trace_id,
+            ));
         }
 
         match serde_json::from_str::<StateNodeCreateContentResponse>(&body) {
             Ok(parsed) => {
-                let remote_content_id = if parsed.content_id.is_empty() {
-                    None
-                } else {
-                    Some(parsed.content_id)
-                };
-                Ok(remote_content_id)
+                // 空 content_id は update/delete 以降で必須のキーとなるため成功扱いにしない。
+                // silent に None を返すと「二度と操作できないコンテンツ」を量産してしまう。
+                if parsed.content_id.trim().is_empty() {
+                    return Err(ApiResponse::error(
+                        ApiError::Internal(
+                            "State Node responded without content_id".into(),
+                        ),
+                        trace_id,
+                    ));
+                }
+                Ok(Some(parsed.content_id))
             }
             Err(e) => Err(ApiResponse::error(
                 ApiError::Internal(format!("Invalid State Node create response JSON: {e}")),
