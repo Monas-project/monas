@@ -22,18 +22,6 @@ pub struct MonasController {
 }
 
 impl MonasController {
-    /// 環境変数からState Node URLを取得してMonasControllerを生成
-    ///
-    /// 環境変数 `MONAS_STATE_NODE_URL` が設定されている場合はそれを使用し、
-    /// 設定されていない場合はデフォルト値 `http://127.0.0.1:8080` を使用
-    pub fn new() -> Self {
-        let state_node_url = std::env::var("MONAS_STATE_NODE_URL")
-            .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
-        let account_url =
-            std::env::var("MONAS_ACCOUNT_URL").unwrap_or_else(|_| "http://127.0.0.1:4002".into());
-        Self::with_config(MonasConfig::new(state_node_url, account_url))
-    }
-
     /// 明示的にState Node URLを指定してMonasControllerを生成
     pub fn with_state_node_url(state_node_url: impl Into<String>) -> Self {
         let url = state_node_url.into();
@@ -129,8 +117,3 @@ impl MonasController {
     }
 }
 
-impl Default for MonasController {
-    fn default() -> Self {
-        Self::new()
-    }
-}

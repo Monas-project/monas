@@ -49,9 +49,14 @@ impl MonasController {
 mod tests {
     use super::*;
 
+    /// テスト用コントローラ。generate_keypair は HTTP を使わないため URL は任意のダミー値でよい。
+    fn test_controller() -> MonasController {
+        MonasController::with_urls("http://127.0.0.1:8080", "http://127.0.0.1:4002")
+    }
+
     #[test]
     fn test_generate_keypair_secp256k1_success() {
-        let controller = MonasController::new();
+        let controller = test_controller();
         let input = GenerateKeypairInput {
             key_type: KeyType::Secp256k1,
         };
@@ -68,7 +73,7 @@ mod tests {
 
     #[test]
     fn test_generate_keypair_secp256r1_success() {
-        let controller = MonasController::new();
+        let controller = test_controller();
         let input = GenerateKeypairInput {
             key_type: KeyType::Secp256r1,
         };
@@ -85,7 +90,7 @@ mod tests {
 
     #[test]
     fn test_generate_keypair_key_length_secp256k1() {
-        let controller = MonasController::new();
+        let controller = test_controller();
         let input = GenerateKeypairInput {
             key_type: KeyType::Secp256k1,
         };
@@ -104,7 +109,7 @@ mod tests {
 
     #[test]
     fn test_generate_keypair_key_length_secp256r1() {
-        let controller = MonasController::new();
+        let controller = test_controller();
         let input = GenerateKeypairInput {
             key_type: KeyType::Secp256r1,
         };
@@ -123,7 +128,7 @@ mod tests {
 
     #[test]
     fn test_generate_keypair_trace_id_format() {
-        let controller = MonasController::new();
+        let controller = test_controller();
         let input = GenerateKeypairInput {
             key_type: KeyType::Secp256k1,
         };
@@ -137,7 +142,7 @@ mod tests {
 
     #[test]
     fn test_generate_keypair_randomness() {
-        let controller = MonasController::new();
+        let controller = test_controller();
 
         let input1 = GenerateKeypairInput {
             key_type: KeyType::Secp256k1,
@@ -159,7 +164,7 @@ mod tests {
 
     #[test]
     fn test_generate_keypair_different_trace_ids() {
-        let controller = MonasController::new();
+        let controller = test_controller();
 
         let input1 = GenerateKeypairInput {
             key_type: KeyType::Secp256k1,
