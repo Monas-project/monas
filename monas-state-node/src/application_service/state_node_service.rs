@@ -585,9 +585,14 @@ where
                 }
             }
         }
-        if successes == 0 {
-            // Rollback: no member accepted the push, so the ContentNetwork
-            // record we just saved is orphaned. Best-effort cleanup.
+        // Require every selected member to accept the push so the replicated
+        // state matches the BFT quorum enforced at selection time (3f+1). A
+        // partial success would leave the ContentNetwork record claiming
+        // members that never received the operations, and later
+        // update/delete/read requests routed to those members would fail.
+        if successes < k {
+            // Rollback: the ContentNetwork record we just saved is not backed
+            // by a full quorum. Best-effort cleanup.
             if let Err(cleanup_err) = self
                 .content_repo
                 .write()
