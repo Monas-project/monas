@@ -604,9 +604,9 @@ where
             return Err(last_err.unwrap_or(StateNodeError::NoAvailableMembers));
         }
 
-        // 6. Publish `Event::ContentCreated` via Gossipsub as a best-effort
+        // 7. Publish `Event::ContentCreated` via Gossipsub as a best-effort
         // notification for non-member nodes (indexing, UI, etc.). Members
-        // already have the data and network record from step 5.
+        // already have the data and network record from step 6.
         let event = Event::ContentCreated {
             content_id,
             creator_node_id: self.local_node_id.clone(),
