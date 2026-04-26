@@ -174,6 +174,16 @@ impl PeerNetwork for MockPeerNetwork {
         Ok(operations.len())
     }
 
+    async fn push_operations_with_bootstrap(
+        &self,
+        _peer_id: &str,
+        _genesis_cid: &str,
+        operations: &[SerializedOperation],
+        _bootstrap: crate::port::peer_network::PushBootstrap,
+    ) -> Result<usize> {
+        Ok(operations.len())
+    }
+
     async fn broadcast_operation(
         &self,
         _genesis_cid: &str,
@@ -440,6 +450,27 @@ impl ContentRepository for MockContentRepository {
             genesis_cid: genesis_cid.to_string(),
             version_cid,
             is_new: false,
+        })
+    }
+
+    async fn prepare_create_operations(
+        &self,
+        data: &[u8],
+        _author: &str,
+        _owner_identity: Option<crate::domain::identity::Identity>,
+    ) -> Result<crate::port::content_repository::PreparedCreate> {
+        let mut next = self.next_cid.lock().await;
+        let genesis_cid = format!("genesis-cid-{}", *next);
+        *next += 1;
+        Ok(crate::port::content_repository::PreparedCreate {
+            genesis_cid,
+            operations: vec![SerializedOperation {
+                data: data.to_vec(),
+                genesis_cid: "genesis-cid-mock".to_string(),
+                author: "mock".to_string(),
+                timestamp: 0,
+                node_timestamp: 0,
+            }],
         })
     }
 }

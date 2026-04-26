@@ -260,6 +260,52 @@ fi
 
 log_info "作成されたコンテンツID: $CONTENT_ID"
 
+# ============================================================================
+# Step 2.5: create直後の即時read検証 (push-before-announce race の回帰テスト)
+# ----------------------------------------------------------------------------
+# gossipsub settle に依存せず、create_content から戻った直後に member ノードが
+# CRDT データを保持していることを確認する。push_operations が bootstrap 付きで
+# member に同期配信される必要がある。sleep は TCP/swarm がレスポンスを
+# 受け取るのに必要な最小限 (200ms) のみ。
+# ============================================================================
+
+echo ""
+echo -e "${BLUE}=== Step 2.5: 作成直後の即時同期検証 ===${NC}"
+echo ""
+sleep 0.2
+log_step "全ノードから content データを即座に取得できるか確認"
+
+IMMEDIATE_MEMBERS=0
+for port in 8080 8081 8082; do
+    generate_signature "$ACCOUNT1_PRIVATE_KEY" "read" "content"
+    DATA_RESPONSE=$(curl -s "http://127.0.0.1:$port/content/$CONTENT_ID/data" \
+        -H "Authorization: Bearer $ACCOUNT1_KEY_ID" \
+        -H "X-Request-Signature: $LAST_SIGNATURE" \
+        -H "X-Request-Timestamp: $LAST_TIMESTAMP" 2>/dev/null)
+    if echo "$DATA_RESPONSE" | jq -e '.data' > /dev/null 2>&1; then
+        FETCHED_DATA=$(echo "$DATA_RESPONSE" | jq -r '.data' 2>/dev/null)
+        if [ -n "$FETCHED_DATA" ] && [ "$FETCHED_DATA" != "null" ]; then
+            DECODED=$(echo "$FETCHED_DATA" | base64 -d 2>/dev/null || echo "(decode failed)")
+            log_info "  ノード (ポート $port): data=$DECODED (member: data あり)"
+            ((IMMEDIATE_MEMBERS++))
+        else
+            log_info "  ノード (ポート $port): member だが data が空"
+        fi
+    else
+        log_info "  ノード (ポート $port): member ではない"
+    fi
+done
+
+log_test "少なくとも1つの member が create 直後にデータを保持していること (push-before-announce race の回帰防止)"
+if [ "$IMMEDIATE_MEMBERS" -ge 1 ]; then
+    log_success "即時同期 OK: $IMMEDIATE_MEMBERS 個の member がデータを保持"
+    ((TESTS_PASSED++))
+else
+    log_fail "即時同期 NG: どの member も create 直後にデータを取得できませんでした"
+    log_fail "  → push_operations が bootstrap なしで reject されている可能性があります"
+    ((TESTS_FAILED++))
+fi
+
 # content_networkの形成を確認（各ノードでcontentsリストを確認）
 sleep 2
 log_step "content_networkの形成を確認"

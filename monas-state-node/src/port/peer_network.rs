@@ -3,7 +3,30 @@
 use crate::port::content_repository::SerializedOperation;
 use anyhow::Result;
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+/// Payload that bootstraps a brand-new content network on the receiver of
+/// a `PushOperations` request.
+///
+/// The first push for a newly-created content network races the gossipsub
+/// `Event::ContentCreated` broadcast. The member receiving the push may not
+/// yet have a `ContentNetwork` record for this genesis, so the push itself
+/// must carry enough membership metadata for the receiver to decide whether
+/// to accept the push and persist the network record inline.
+///
+/// Subsequent (update/delete) pushes leave this as `None`; the receiver then
+/// enforces strict membership against its existing record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PushBootstrap {
+    /// The peer_id of the creator sending this push.
+    pub creator_node_id: String,
+    /// The member set (peer_ids) for the new network. The receiver rejects
+    /// the push unless its own peer_id is present in this list.
+    pub member_nodes: Vec<String>,
+    /// Wall-clock timestamp at creation, for auditability.
+    pub created_at: u64,
+}
 
 /// Abstract interface for peer-to-peer network operations.
 ///
@@ -67,15 +90,29 @@ pub trait PeerNetwork: Send + Sync {
         since_version: Option<&str>,
     ) -> Result<Vec<SerializedOperation>>;
 
-    /// Push CRDT operations to a peer.
+    /// Push CRDT operations to a peer that already knows this content network.
     ///
-    /// Uses RequestResponse protocol to send operations to a peer.
-    /// Returns the number of operations accepted by the peer.
+    /// The receiver verifies the sender is a known member. For the very first
+    /// push to a brand-new network use [`push_operations_with_bootstrap`]
+    /// instead.
     async fn push_operations(
         &self,
         peer_id: &str,
         genesis_cid: &str,
         operations: &[SerializedOperation],
+    ) -> Result<usize>;
+
+    /// Push CRDT operations together with a bootstrap payload that lets the
+    /// receiver persist its `ContentNetwork` record inline.
+    ///
+    /// Only used by `create_content` for the first push to member nodes that
+    /// haven't received the `Event::ContentCreated` gossipsub message yet.
+    async fn push_operations_with_bootstrap(
+        &self,
+        peer_id: &str,
+        genesis_cid: &str,
+        operations: &[SerializedOperation],
+        bootstrap: PushBootstrap,
     ) -> Result<usize>;
 
     /// Broadcast a new operation to interested peers via Gossipsub.

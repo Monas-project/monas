@@ -4,7 +4,9 @@
 //! using crsl-lib for CRDT-based content versioning.
 
 use crate::domain::access_policy::AccessPolicy;
-use crate::port::content_repository::{CommitResult, ContentRepository, SerializedOperation};
+use crate::port::content_repository::{
+    CommitResult, ContentRepository, PreparedCreate, SerializedOperation,
+};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -469,12 +471,163 @@ impl ContentRepository for CrslCrdtRepository {
 
         Ok(genesis_cids.into_iter().collect())
     }
+
+    async fn prepare_create_operations(
+        &self,
+        data: &[u8],
+        author: &str,
+        owner_identity: Option<crate::domain::identity::Identity>,
+    ) -> Result<PreparedCreate> {
+        use crsl_lib::crdt::timestamp::next_monotonic_timestamp;
+        use crsl_lib::dasl::node::Node;
+
+        let mut operations = Vec::new();
+
+        // 1. Build the Create operation and compute genesis CID via pure math
+        //    (Node serialization + SHA-256). No storage is touched.
+        let placeholder = Self::generate_placeholder_cid(data);
+        let create_payload = ContentPayload {
+            data: data.to_vec(),
+            access_policy: None,
+        };
+        let create_op = Operation::new(
+            placeholder,
+            OperationType::Create(create_payload.clone()),
+            author.to_string(),
+        );
+        let create_ts = next_monotonic_timestamp();
+        let genesis_node = Node::<ContentPayload, ContentMetadata>::new_genesis(
+            create_payload,
+            create_ts,
+            ContentMetadata::default(),
+        );
+        let genesis_cid = genesis_node
+            .content_id()
+            .map_err(|e| anyhow::anyhow!("Failed to compute genesis CID: {}", e))?;
+
+        let create_op_serialized = serde_json::to_vec(&{
+            let mut op = create_op;
+            op.genesis = genesis_cid;
+            op.node_timestamp = Some(create_ts);
+            op
+        })
+        .context("Failed to serialize create operation")?;
+
+        operations.push(SerializedOperation {
+            data: create_op_serialized,
+            genesis_cid: genesis_cid.to_string(),
+            author: author.to_string(),
+            timestamp: create_ts,
+            node_timestamp: create_ts,
+        });
+
+        // 2. Optionally build an AccessPolicy Update operation
+        if let Some(identity) = owner_identity {
+            let content_id_vo =
+                crate::domain::value_objects::ContentId::new(genesis_cid.to_string())
+                    .map_err(|e| anyhow::anyhow!("invalid genesis_cid: {}", e))?;
+            let policy = AccessPolicy::new(content_id_vo, identity);
+            let update_payload = ContentPayload {
+                data: data.to_vec(),
+                access_policy: Some(policy),
+            };
+            let update_op = Operation::new(
+                genesis_cid,
+                OperationType::Update(update_payload.clone()),
+                author.to_string(),
+            );
+            let update_ts = next_monotonic_timestamp();
+            let update_node = Node::<ContentPayload, ContentMetadata>::new_child(
+                update_payload,
+                vec![genesis_cid],
+                genesis_cid,
+                update_ts,
+                ContentMetadata::default(),
+            );
+            let _update_cid = update_node
+                .content_id()
+                .map_err(|e| anyhow::anyhow!("Failed to compute update CID: {}", e))?;
+
+            let update_op_serialized = serde_json::to_vec(&{
+                let mut op = update_op;
+                op.parents = vec![genesis_cid];
+                op.node_timestamp = Some(update_ts);
+                op
+            })
+            .context("Failed to serialize update operation")?;
+
+            operations.push(SerializedOperation {
+                data: update_op_serialized,
+                genesis_cid: genesis_cid.to_string(),
+                author: author.to_string(),
+                timestamp: update_ts,
+                node_timestamp: update_ts,
+            });
+        }
+
+        Ok(PreparedCreate {
+            genesis_cid: genesis_cid.to_string(),
+            operations,
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn test_prepare_create_operations_is_deterministic_across_repos() {
+        // Creator prepares operations without persisting to its own store.
+        let creator_tmp = tempdir().unwrap();
+        let creator_repo = CrslCrdtRepository::open(creator_tmp.path().join("crdt")).unwrap();
+
+        let data = b"hello from creator";
+        let prepared = creator_repo
+            .prepare_create_operations(data, "author-a", None)
+            .await
+            .unwrap();
+
+        // Creator's own repo must be untouched by prepare_create_operations.
+        assert_eq!(
+            creator_repo.list_contents().await.unwrap().len(),
+            0,
+            "prepare_create_operations must not persist to the creator's repo"
+        );
+        assert!(
+            creator_repo
+                .get_latest(&prepared.genesis_cid)
+                .await
+                .unwrap()
+                .is_none(),
+            "creator should not have data for the prepared genesis_cid"
+        );
+        assert!(
+            !prepared.operations.is_empty(),
+            "prepared.operations should contain at least the Create op"
+        );
+
+        // A receiver applies the operations and must end up with the same
+        // genesis_cid and the same content data.
+        let receiver_tmp = tempdir().unwrap();
+        let receiver_repo = CrslCrdtRepository::open(receiver_tmp.path().join("crdt")).unwrap();
+        let applied = receiver_repo
+            .apply_operations(&prepared.operations)
+            .await
+            .unwrap();
+        assert_eq!(applied, prepared.operations.len());
+
+        let received_data = receiver_repo
+            .get_latest(&prepared.genesis_cid)
+            .await
+            .unwrap();
+        assert_eq!(
+            received_data.as_deref(),
+            Some(&data[..]),
+            "receiver should end up with the creator's payload under the same genesis_cid"
+        );
+    }
 
     #[tokio::test]
     async fn test_create_and_get_content() {

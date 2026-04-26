@@ -8,7 +8,7 @@
 //! - WebRTC and TCP transports
 
 use super::behaviour::{BehaviourConfig, NodeBehaviour, NodeBehaviourEvent};
-use super::protocol::{ContentRequest, ContentResponse};
+use super::protocol::{ContentRequest, ContentResponse, PushBootstrap};
 use super::public_key_protocol::{NodePublicKey, PublicKeyRequest, PublicKeyResponse};
 use super::transport;
 use crate::domain::events::Event;
@@ -166,6 +166,7 @@ enum SwarmCommand {
         peer_id: PeerId,
         genesis_cid: String,
         operations: Vec<SerializedOperation>,
+        bootstrap: Option<PushBootstrap>,
         reply: oneshot::Sender<Result<usize>>,
     },
     GetProviders {
@@ -634,6 +635,7 @@ impl Libp2pNetwork {
                 peer_id,
                 genesis_cid,
                 operations,
+                bootstrap,
                 reply,
             } => {
                 // Convert SerializedOperation to Vec<u8> for wire format
@@ -646,6 +648,7 @@ impl Libp2pNetwork {
                     ContentRequest::PushOperations {
                         genesis_cid,
                         operations: wire_ops,
+                        bootstrap,
                     },
                 );
                 pending.operation_pushes.insert(request_id, reply);
@@ -993,6 +996,90 @@ impl Libp2pNetwork {
         }
     }
 
+    /// Decide whether an incoming `PushOperations` request should be accepted,
+    /// given the receiver's local state and the optional bootstrap payload.
+    ///
+    /// Returns `Ok(())` if the push should be accepted (may have persisted a
+    /// new `ContentNetwork` as a side effect when bootstrapping) or `Err(msg)`
+    /// with a human-readable rejection reason the caller can forward as a
+    /// `ContentResponse::Error`.
+    async fn validate_push_eligibility(
+        repo: &Arc<RwLock<dyn crate::port::persistence::PersistentContentRepository + Send + Sync>>,
+        genesis_cid: &str,
+        sender_peer: &str,
+        local_peer: &str,
+        bootstrap: Option<&PushBootstrap>,
+    ) -> std::result::Result<(), String> {
+        let existing = repo
+            .read()
+            .await
+            .get_content_network(genesis_cid)
+            .await
+            .ok()
+            .flatten();
+
+        match (existing, bootstrap) {
+            (Some(net), _) => {
+                if net.has_member_str(sender_peer) {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "Peer {} is not a member of content network {}",
+                        sender_peer, genesis_cid
+                    ))
+                }
+            }
+            (None, Some(bs)) => {
+                // SECURITY: libp2p transport authenticates `sender_peer`, so
+                // binding `sender_peer == bs.creator_node_id` stops creator
+                // impersonation. Requiring that `local_peer` appear in
+                // `member_nodes` stops a malicious peer from fabricating a
+                // network on an unrelated victim node. The residual risk
+                // matches the Gossipsub ContentCreated trust model.
+                if bs.creator_node_id != sender_peer {
+                    return Err(format!(
+                        "bootstrap creator_node_id {} does not match sender {}",
+                        bs.creator_node_id, sender_peer
+                    ));
+                }
+                if !bs.member_nodes.contains(&local_peer.to_string()) {
+                    return Err(format!(
+                        "local node {} is not in declared member set for {}",
+                        local_peer, genesis_cid
+                    ));
+                }
+                if bs.member_nodes.is_empty() {
+                    return Err("bootstrap member_nodes is empty".to_string());
+                }
+
+                use crate::domain::content_network::ContentNetwork;
+                use crate::domain::value_objects::{ContentId, NodeId};
+
+                let content_id_vo = ContentId::new(genesis_cid.to_string())
+                    .map_err(|e| format!("invalid genesis_cid: {}", e))?;
+                let first_node = NodeId::from_string(bs.member_nodes[0].clone())
+                    .map_err(|e| format!("invalid node_id in bootstrap: {}", e))?;
+                let mut net = ContentNetwork::new(content_id_vo, first_node)
+                    .map_err(|e| format!("failed to build ContentNetwork: {}", e))?;
+                for extra in bs.member_nodes.iter().skip(1) {
+                    let n = NodeId::from_string(extra.clone())
+                        .map_err(|e| format!("invalid node_id in bootstrap: {}", e))?;
+                    net.add_member(n);
+                }
+                repo.write()
+                    .await
+                    .save_content_network(net)
+                    .await
+                    .map_err(|e| format!("failed to persist bootstrapped network: {}", e))?;
+                Ok(())
+            }
+            (None, None) => Err(format!(
+                "unknown content network {} and no bootstrap provided",
+                genesis_cid
+            )),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn handle_incoming_request(
         swarm: &mut Swarm<NodeBehaviour>,
@@ -1263,25 +1350,31 @@ impl Libp2pNetwork {
             ContentRequest::PushOperations {
                 genesis_cid,
                 operations,
+                bootstrap,
             } => {
-                // Verify peer is a member of the content network
+                // The receiver decides whether to accept this push. Cases:
+                //   1. Local ContentNetwork exists for this genesis: sender must
+                //      be a known member. `bootstrap` is ignored to prevent a
+                //      member from rewriting the member set.
+                //   2. No local record AND bootstrap present: accept if the sender
+                //      is the claimed creator and we're in the declared member
+                //      set, then persist the ContentNetwork inline.
+                //   3. No local record AND no bootstrap: reject (unknown network).
+                //   4. `content_network_repo` is None (some test configurations):
+                //      fall through to apply_operations — legacy behavior.
                 if let Some(repo) = content_network_repo {
-                    let is_member = repo
-                        .read()
-                        .await
-                        .get_content_network(&genesis_cid)
-                        .await
-                        .ok()
-                        .flatten()
-                        .map(|net| net.has_member_str(&peer.to_string()))
-                        .unwrap_or(false);
-                    if !is_member {
-                        let response = ContentResponse::Error {
-                            message: format!(
-                                "Peer {} is not a member of content network {}",
-                                peer, genesis_cid
-                            ),
-                        };
+                    let local_id = swarm.local_peer_id().to_string();
+                    let validation = Self::validate_push_eligibility(
+                        repo,
+                        &genesis_cid,
+                        &peer.to_string(),
+                        &local_id,
+                        bootstrap.as_ref(),
+                    )
+                    .await;
+
+                    if let Err(reason) = validation {
+                        let response = ContentResponse::Error { message: reason };
                         if let Err(e) = swarm
                             .behaviour_mut()
                             .request_response
@@ -1647,6 +1740,36 @@ impl Libp2pNetwork {
     }
 }
 
+impl Libp2pNetwork {
+    async fn send_push_operations(
+        &self,
+        peer_id: &str,
+        genesis_cid: &str,
+        operations: &[SerializedOperation],
+        bootstrap: Option<PushBootstrap>,
+    ) -> Result<usize> {
+        let peer_id = PeerId::from_str(peer_id)
+            .map_err(|_| anyhow::anyhow!("Invalid peer ID: {}", peer_id))?;
+
+        let (tx, rx) = oneshot::channel();
+        self.command_tx
+            .send(SwarmCommand::PushOperations {
+                peer_id,
+                genesis_cid: genesis_cid.to_string(),
+                operations: operations.to_vec(),
+                bootstrap,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("Failed to send command"))?;
+
+        tokio::time::timeout(PEER_NETWORK_TIMEOUT, rx)
+            .await
+            .map_err(|_| anyhow::anyhow!("push_operations timed out"))?
+            .map_err(|_| anyhow::anyhow!("Failed to receive response"))?
+    }
+}
+
 #[async_trait]
 impl PeerNetwork for Libp2pNetwork {
     async fn find_closest_peers(&self, key: Vec<u8>, k: usize) -> Result<Vec<String>> {
@@ -1845,24 +1968,19 @@ impl PeerNetwork for Libp2pNetwork {
         genesis_cid: &str,
         operations: &[SerializedOperation],
     ) -> Result<usize> {
-        let peer_id = PeerId::from_str(peer_id)
-            .map_err(|_| anyhow::anyhow!("Invalid peer ID: {}", peer_id))?;
-
-        let (tx, rx) = oneshot::channel();
-        self.command_tx
-            .send(SwarmCommand::PushOperations {
-                peer_id,
-                genesis_cid: genesis_cid.to_string(),
-                operations: operations.to_vec(),
-                reply: tx,
-            })
+        self.send_push_operations(peer_id, genesis_cid, operations, None)
             .await
-            .map_err(|_| anyhow::anyhow!("Failed to send command"))?;
+    }
 
-        tokio::time::timeout(PEER_NETWORK_TIMEOUT, rx)
+    async fn push_operations_with_bootstrap(
+        &self,
+        peer_id: &str,
+        genesis_cid: &str,
+        operations: &[SerializedOperation],
+        bootstrap: PushBootstrap,
+    ) -> Result<usize> {
+        self.send_push_operations(peer_id, genesis_cid, operations, Some(bootstrap))
             .await
-            .map_err(|_| anyhow::anyhow!("push_operations timed out"))?
-            .map_err(|_| anyhow::anyhow!("Failed to receive response"))?
     }
 
     async fn broadcast_operation(

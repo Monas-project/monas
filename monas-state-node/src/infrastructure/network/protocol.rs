@@ -6,6 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::port::peer_network::PushBootstrap;
+
 /// Protocol name for capacity queries.
 pub const CAPACITY_PROTOCOL: &str = "/monas/capacity/1.0.0";
 
@@ -36,6 +38,11 @@ pub enum ContentRequest {
         genesis_cid: String,
         /// Serialized operations (JSON-encoded)
         operations: Vec<Vec<u8>>,
+        /// If set, the receiver is allowed to bootstrap a local
+        /// `ContentNetwork` record from this payload (only the first push
+        /// for a given genesis_cid carries this; update/delete pushes leave
+        /// this as `None`).
+        bootstrap: Option<PushBootstrap>,
     },
     /// Relay an update request to a member node.
     UpdateContent {

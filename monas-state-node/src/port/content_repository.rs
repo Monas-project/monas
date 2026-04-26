@@ -35,6 +35,19 @@ pub struct CommitResult {
     pub is_new: bool,
 }
 
+/// Result of preparing a set of operations for a new content network
+/// without persisting them locally.
+///
+/// The creator uses this to derive a deterministic `genesis_cid` and a
+/// vector of `SerializedOperation` values it can ship to member nodes via
+/// `push_operations`. The operations carry explicit `node_timestamp`s, so
+/// when members call `apply_operations` they reproduce the exact same CIDs.
+#[derive(Debug, Clone)]
+pub struct PreparedCreate {
+    pub genesis_cid: String,
+    pub operations: Vec<SerializedOperation>,
+}
+
 /// Abstract interface for versioned content storage.
 ///
 /// This trait provides methods for:
@@ -176,4 +189,25 @@ pub trait ContentRepository: Send + Sync {
         access_policy: AccessPolicy,
         author: &str,
     ) -> Result<CommitResult>;
+
+    /// Build the operations needed to create new content (Create + an
+    /// optional AccessPolicy Update) **without** persisting anything in
+    /// `self`.
+    ///
+    /// This exists so the creator node can ship a brand-new content network
+    /// to members via `push_operations` without retaining a local copy
+    /// (the creator is intentionally excluded from the member set). The
+    /// returned `genesis_cid` and `SerializedOperation` values are
+    /// deterministic — applying them via `apply_operations` on a member
+    /// produces the same CIDs.
+    ///
+    /// If `owner_identity` is `Some`, the helper also generates an
+    /// `AccessPolicy` bound to the genesis_cid with that owner and appends
+    /// a policy-update operation to the returned list.
+    async fn prepare_create_operations(
+        &self,
+        data: &[u8],
+        author: &str,
+        owner_identity: Option<crate::domain::identity::Identity>,
+    ) -> Result<PreparedCreate>;
 }
