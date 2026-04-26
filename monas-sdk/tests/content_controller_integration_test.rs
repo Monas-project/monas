@@ -6,8 +6,9 @@ use mockito::Server;
 use monas_sdk::models::content::{
     ContentMetadata, CreateContentInput, DeleteContentInput, GetContentInput, UpdateContentInput,
 };
-use monas_sdk::{ApiError, MonasController, StateNodeAuthContext};
+use monas_sdk::{ApiError, MonasConfig, MonasController, StateNodeAuthContext};
 use sha2::{Digest, Sha256};
+use std::time::{Duration, Instant};
 mod support;
 use support::{acquire_test_lock, cleanup_content_artifacts};
 
@@ -392,6 +393,8 @@ async fn create_content_rolls_back_locally_when_state_node_create_fails_and_can_
     let succeeding_create_mock = server
         .mock("POST", "/content")
         .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"content_id":"bafkcreate-retry"}"#)
         .expect(1)
         .create_async()
         .await;
@@ -444,7 +447,7 @@ async fn create_content_uses_account_signature_for_state_node_request() {
         .match_header("x-request-timestamp", "1717171717")
         .with_status(200)
         .with_header("content-type", "application/json")
-        .with_body(r#"{"ok":true}"#)
+        .with_body(r#"{"content_id":"remote-id-for-auth-test"}"#)
         .expect(1)
         .create_async()
         .await;
@@ -755,5 +758,106 @@ async fn delete_content_uses_account_signature_for_metadata_request() {
     );
     account_sign_mock.assert();
     delete_mock.assert();
+    cleanup_content_artifacts();
+}
+
+/// §4: State Node が content_id を返さない場合 (例: `{"ok":true}`) は成功扱いせず
+/// `ApiError::Internal` にする。
+///
+/// 以前は `StateNodeCreateContentResponse.content_id` が `#[serde(default)]` で
+/// 空文字を許容していたため、silent に `remote_content_id=None` の CreateContentOutput が
+/// 返り、後続の update/delete で `remote_content_id` が必須になると二度と操作できない
+/// コンテンツが量産される状態だった。
+#[tokio::test(flavor = "multi_thread")]
+async fn create_content_fails_when_state_node_omits_content_id() {
+    let _guard = acquire_test_lock();
+    let mut server = Server::new_async().await;
+    let _create_mock = server
+        .mock("POST", "/content")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"ok":true}"#)
+        .expect(1)
+        .create_async()
+        .await;
+
+    let controller = MonasController::with_state_node_url(server.url());
+
+    let response = controller.create_content(
+        CreateContentInput {
+            content: URL_SAFE_NO_PAD.encode(b"silent-none-repro"),
+            metadata: Some(ContentMetadata {
+                name: Some("silent-none.txt".into()),
+                content_type: Some("text/plain".into()),
+                created_at: None,
+                updated_at: None,
+            }),
+        },
+        None,
+    );
+
+    assert!(
+        !response.success,
+        "create_content must NOT succeed when state node omits content_id"
+    );
+    match response.error {
+        Some(ApiError::Internal(msg)) => {
+            let lower = msg.to_lowercase();
+            assert!(
+                lower.contains("content_id"),
+                "error message should mention content_id, got: {msg}"
+            );
+        }
+        other => panic!("expected ApiError::Internal about content_id, got {other:?}"),
+    }
+
+    cleanup_content_artifacts();
+}
+
+/// §2: `MonasConfig::with_request_timeout` が効き、State Node がハングする場合に
+/// `ApiError::Timeout` が設定した時間内に返ることを検証する。
+///
+/// TcpListener を bind するが accept しないダミーサーバを立てる。
+/// OS によっては connect は成功するが read/write が応答しないため、
+/// 設定したグローバルタイムアウトで打ち切られるはず。
+#[tokio::test(flavor = "multi_thread")]
+async fn create_content_returns_timeout_when_state_node_hangs() {
+    let _guard = acquire_test_lock();
+
+    // accept しないダミーサーバ
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let url = format!("http://{addr}");
+
+    let config =
+        MonasConfig::new(url.clone(), url).with_request_timeout(Duration::from_millis(200));
+    let controller = MonasController::with_config(config);
+
+    let input = CreateContentInput {
+        content: URL_SAFE_NO_PAD.encode(b"timeout test"),
+        metadata: Some(ContentMetadata {
+            name: Some("timeout.txt".into()),
+            content_type: Some("text/plain".into()),
+            created_at: None,
+            updated_at: None,
+        }),
+    };
+
+    let started = Instant::now();
+    let response = controller.create_content(input, None);
+    let elapsed = started.elapsed();
+
+    assert!(!response.success, "should fail due to timeout");
+    match response.error {
+        Some(ApiError::Timeout(_)) => {}
+        other => panic!("expected ApiError::Timeout, got {other:?}"),
+    }
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "timeout should fire well under 3s, took {elapsed:?}"
+    );
+
+    // listener は drop で自動的に閉じる。念のため明示。
+    drop(listener);
     cleanup_content_artifacts();
 }

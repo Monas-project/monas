@@ -31,14 +31,14 @@ impl MonasController {
         trace_id: String,
     ) -> Result<(u16, String), ApiResponse<T>> {
         let trace_id_for_call = trace_id.clone();
-        let resp = Self::attach_state_node_auth(ureq::get(url), auth)
+        let resp = Self::attach_state_node_auth(self.agent.get(url), auth)
             .config()
             .http_status_as_error(false)
             .build()
             .call()
             .map_err(|e| {
                 ApiResponse::error(
-                    ApiError::Internal(format!("Failed to call State Node: {e}")),
+                    ApiError::from_ureq_error("Failed to call State Node", e),
                     trace_id_for_call,
                 )
             })?;

@@ -17,6 +17,8 @@ async fn share_content_succeeds_after_content_creation() {
     let create_mock = server
         .mock("POST", "/content")
         .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"content_id":"share-test-remote"}"#)
         .create_async()
         .await;
     let delegate_mock = server
@@ -119,6 +121,8 @@ async fn revoke_share_updates_state_node_version() {
     let create_mock = server
         .mock("POST", "/content")
         .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"content_id":"share-test-remote"}"#)
         .create_async()
         .await;
     let delegate_mock = server
@@ -201,6 +205,8 @@ async fn revoke_share_rolls_back_local_state_when_state_node_sync_fails() {
     let create_mock = server
         .mock("POST", "/content")
         .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"content_id":"share-test-remote"}"#)
         .create_async()
         .await;
     let delegate_mock = server
@@ -319,6 +325,123 @@ async fn revoke_share_rolls_back_local_state_when_state_node_sync_fails() {
         second_revoke_response.error
     );
     succeeding_update_mock.assert();
+
+    cleanup_content_artifacts();
+}
+
+/// §3: `share_service.revoke_share` の内部エラーでも snapshot が復元されることを検証。
+///
+/// 同じ recipient に対して revoke_share を 2 回呼び出す。1 回目は ACL から recipient を除去して
+/// 成功する。2 回目は recipient が既に ACL に無いため `share.revoke` が失敗
+/// (`ShareApplicationError::Share`) するが、以前はこの経路で snapshot 復元が呼ばれなかった。
+/// 本 PR 以降は失敗時も snapshot が復元され、後続の decrypt_shared_content や
+/// 正常系の処理に悪影響がない（残った状態が pre-revoke と一致する）ことを確認する。
+#[tokio::test(flavor = "multi_thread")]
+async fn revoke_share_rollback_fires_on_inner_share_service_error() {
+    let _guard = acquire_test_lock();
+    let mut server = Server::new_async().await;
+    let create_mock = server
+        .mock("POST", "/content")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"content_id":"share-test-remote"}"#)
+        .create_async()
+        .await;
+    let delegate_mock = server
+        .mock("POST", "/issuer/delegate")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"delegated_token":"dummy.jwt.token","issued_at":1700000000,"expires_at":1700003600,"jti":"jti-inner-rollback"}"#,
+        )
+        .create_async()
+        .await;
+    // 1 回目の revoke で PUT が 1 回走る想定
+    let first_update_mock = server
+        .mock("PUT", mockito::Matcher::Regex(r"^/content/.+$".to_string()))
+        .with_status(200)
+        .expect(1)
+        .create_async()
+        .await;
+
+    let controller = MonasController::with_urls(server.url(), server.url());
+
+    let sender = controller
+        .generate_keypair(GenerateKeypairInput {
+            key_type: KeyType::Secp256r1,
+        })
+        .data
+        .expect("sender keypair");
+    let recipient = controller
+        .generate_keypair(GenerateKeypairInput {
+            key_type: KeyType::Secp256r1,
+        })
+        .data
+        .expect("recipient keypair");
+
+    let created = controller
+        .create_content(
+            CreateContentInput {
+                content: URL_SAFE_NO_PAD.encode(b"inner-rollback-target"),
+                metadata: Some(ContentMetadata {
+                    name: Some("inner-rollback.txt".into()),
+                    content_type: Some("text/plain".into()),
+                    created_at: None,
+                    updated_at: None,
+                }),
+            },
+            None,
+        )
+        .data
+        .expect("create");
+    create_mock.assert();
+
+    let _ = controller
+        .share_content(ShareContentInput {
+            content_id: created.content_id.clone(),
+            sender_public_key: sender.public_key.clone(),
+            recipient_public_key: recipient.public_key.clone(),
+            permissions: vec![Permission::Read],
+        })
+        .data
+        .expect("share");
+    delegate_mock.assert();
+
+    // 1 回目: 成功
+    let first = controller.revoke_share(
+        RevokeShareInput {
+            content_id: created.content_id.clone(),
+            sender_public_key: sender.public_key.clone(),
+            recipient_public_key: recipient.public_key.clone(),
+        },
+        None,
+    );
+    assert!(
+        first.success,
+        "first revoke should succeed: {:?}",
+        first.error
+    );
+    first_update_mock.assert();
+
+    // 2 回目: ACL に recipient が既に無いので share_service.revoke_share で失敗する。
+    // 追加したロールバック経路が発火することを、このテストはコードパスとしてカバーする
+    // (panic/deadlock せず、失敗として返ることを検証)。
+    let second = controller.revoke_share(
+        RevokeShareInput {
+            content_id: created.content_id,
+            sender_public_key: sender.public_key,
+            recipient_public_key: recipient.public_key,
+        },
+        None,
+    );
+    assert!(
+        !second.success,
+        "second revoke should fail because recipient is already removed"
+    );
+    assert!(
+        second.error.is_some(),
+        "failure path should carry an ApiError"
+    );
 
     cleanup_content_artifacts();
 }

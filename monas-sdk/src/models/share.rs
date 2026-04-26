@@ -3,8 +3,12 @@ use serde::{Deserialize, Serialize};
 use super::content::ContentMetadata;
 
 /// 権限の種類
+///
+/// `#[non_exhaustive]` のため、将来 variant 追加時に下流の `match` が壊れないよう
+/// 必ず `_ =>` のフォールスルーを入れること。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum Permission {
     Read,
     Write,

@@ -2,8 +2,12 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// SDK全体で使用する統一エラー型
+///
+/// `#[non_exhaustive]` を付けているため、将来 variant を追加しても SemVer 非破壊。
+/// 下流クレートは必ず `_ =>` のフォールスルーを入れて match すること。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "message")]
+#[non_exhaustive]
 pub enum ApiError {
     /// 入力データ不足・形式不一致 (400)
     Validation(String),
@@ -48,6 +52,19 @@ impl ApiError {
             ApiError::Conflict(_) => 409,
             ApiError::Timeout(_) => 408,
             ApiError::Internal(_) => 500,
+        }
+    }
+
+    /// ureq の送信系エラーを `ApiError` に変換する。
+    ///
+    /// `ureq::Error::Timeout(_)` は `ApiError::Timeout` にマップし、
+    /// それ以外は `ApiError::Internal` (先頭に `context` を付ける) にまとめる。
+    pub fn from_ureq_error(context: &str, err: ureq::Error) -> Self {
+        match err {
+            ureq::Error::Timeout(_) => {
+                ApiError::Timeout(format!("{context}: request timed out ({err})"))
+            }
+            other => ApiError::Internal(format!("{context}: {other}")),
         }
     }
 }
