@@ -36,10 +36,11 @@ pub(super) fn combine_rollback_failure(
         "{context} failed and local {rollback_label} also failed: \
          {primary_label}={primary}, {rollback_label}={rollback_err}"
     );
-    // `ApiError` は `#[non_exhaustive]`。crate 内では現在の variant 列挙でカバーできるが、
-    // 将来 crate 外で variant が増えた場合に備えて safety net を残す意図で
-    // `unreachable_patterns` 警告を抑止する。
-    #[allow(unreachable_patterns)]
+    // `ApiError` は `#[non_exhaustive]` だが crate 内では全 variant が見えるので、
+    // catch-all を置かずに全 variant を明示列挙する。
+    // 将来 `ApiError` に新 variant が追加された場合、ここが compile error になり
+    // 「variant をどう保持/分類するか」を決め忘れる事故を防ぐ
+    // (catch-all で `Internal` に collapse すると 401/404/408/409 が 500 化する旧バグの再発になる)。
     match primary {
         ApiError::Validation(_) => ApiError::Validation(suffix),
         ApiError::Unauthorized(_) => ApiError::Unauthorized(suffix),
@@ -48,7 +49,6 @@ pub(super) fn combine_rollback_failure(
         ApiError::Conflict(_) => ApiError::Conflict(suffix),
         ApiError::Timeout(_) => ApiError::Timeout(suffix),
         ApiError::Internal(_) => ApiError::Internal(suffix),
-        _ => ApiError::Internal(suffix),
     }
 }
 

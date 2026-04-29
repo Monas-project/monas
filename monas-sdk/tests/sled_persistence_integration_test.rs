@@ -3,8 +3,10 @@
 //! PR #29 review (architecture / implementation 軸) で指摘された:
 //! - 「同じ sled DB ファイルを CEK と Share で共有させる」設計が
 //!   実装と一致していなかった (`sled::open(dir)` を 2 度呼んで起動時に
-//!   `Resource temporarily unavailable` で panic)
+//!   `Resource temporarily unavailable` で `MonasController::with_config`
+//!   が `Err`、`monas-gateway/src/main.rs::main` が `.expect()` で panic)
 //! - sled persistence の round-trip テストが無い
+//! - flock 衝突を直接 pin する negative test が無い
 //!
 //! の regression test。
 //!
@@ -85,6 +87,37 @@ fn sled_persistence_creates_dir_if_missing() {
         dir
     );
     drop(controller);
+
+    cleanup_dir(&dir);
+}
+
+/// 「`sled::open(dir)` を同一プロセスから同じ path に対して 2 度呼ぶと、
+/// 2 度目は排他 flock 取得に失敗する」という、cycle 2 で diagnose した
+/// 根本原因を直接 pin する negative test。
+///
+/// この test が pass することは「`SledContentEncryptionKeyStore::open(dir)` と
+/// `SledShareRepository::open(dir)` を別々に呼ぶ実装に戻すと壊れる」ことの
+/// 根拠になる。`MonasController::create_persistence` は単一 `sled::open` +
+/// `Db::clone()` でこの flock 衝突を回避している。
+#[test]
+fn sled_open_twice_on_same_dir_fails_due_to_flock() {
+    let dir = tmp_dir("double-open");
+
+    let first = sled::open(&dir).expect("first sled::open should succeed");
+
+    // 2 度目は flock 競合で失敗するはず。エラー variant 自体は OS / sled バージョン
+    // に依存するので「Err である」だけを assert する (Resource temporarily unavailable
+    // / WouldBlock / IO 等のいずれかが返る)。
+    let second = sled::open(&dir);
+    assert!(
+        second.is_err(),
+        "second sled::open on the same dir must fail while first is still open"
+    );
+
+    drop(first);
+    // first を drop すれば flock が解放され再 open できる
+    let third = sled::open(&dir).expect("after dropping first, third sled::open should succeed");
+    drop(third);
 
     cleanup_dir(&dir);
 }
