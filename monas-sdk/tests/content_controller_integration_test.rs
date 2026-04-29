@@ -1,3 +1,8 @@
+// Integration tests intentionally use the test/dev-only constructors
+// (`MonasController::with_state_node_url` / `with_urls`) marked
+// `#[deprecated]` for production gateways.
+#![allow(deprecated)]
+
 use base64::{
     engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD},
     Engine,

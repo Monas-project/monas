@@ -6,7 +6,7 @@ mod state;
 use std::sync::Arc;
 
 use content::{ContentServiceInstance, DynCekStore};
-use share::{DynShareRepository, ShareServiceInstance};
+use share::{DynPublicKeyDirectory, DynShareRepository, ShareServiceInstance};
 
 use crate::common::{ApiError, MonasConfig, PersistenceConfig};
 
@@ -71,8 +71,17 @@ pub struct MonasController {
 impl MonasController {
     /// 明示的にState Node URLを指定してMonasControllerを生成 (in-memory persistence)。
     ///
-    /// 本番 gateway はこのコンストラクタを使ってはならない。
-    /// 必ず `with_config` + `MonasConfig::with_persistence_dir(...)` を使うこと。
+    /// **このコンストラクタは test/開発専用。** 本番 gateway は必ず
+    /// `with_config` + `MonasConfig::with_persistence_dir(...)` を使うこと。
+    /// in-memory persistence のため、再起動で CEK / share / public-key directory が
+    /// 全て揮発する。
+    ///
+    /// TODO(pr46-followup): `#[cfg(any(test, feature = "test-util"))]` で
+    /// 本番 binary から完全に消す型レベル強制は別 PR で扱う。現時点では
+    /// `#[deprecated]` で build 時 warning を出すに留める。
+    #[deprecated(
+        note = "test/dev-only constructor: use MonasController::with_config(MonasConfig::new(...).with_persistence_dir(...)) for production gateways"
+    )]
     pub fn with_state_node_url(state_node_url: impl Into<String>) -> Self {
         let url = state_node_url.into();
         // 開発/テスト互換のため、account_url は明示未指定時に state_node_url と同じ値を使う。
@@ -82,8 +91,13 @@ impl MonasController {
 
     /// State Node URL と Account URL を明示してMonasControllerを生成 (in-memory persistence)。
     ///
-    /// 本番 gateway はこのコンストラクタを使ってはならない。
-    /// 必ず `with_config` + `MonasConfig::with_persistence_dir(...)` を使うこと。
+    /// **このコンストラクタは test/開発専用。** 本番 gateway は必ず
+    /// `with_config` + `MonasConfig::with_persistence_dir(...)` を使うこと。
+    /// in-memory persistence のため、再起動で CEK / share / public-key directory が
+    /// 全て揮発する。
+    #[deprecated(
+        note = "test/dev-only constructor: use MonasController::with_config(MonasConfig::new(...).with_persistence_dir(...)) for production gateways"
+    )]
     pub fn with_urls(state_node_url: impl Into<String>, account_url: impl Into<String>) -> Self {
         Self::with_config(MonasConfig::new(state_node_url, account_url))
             .expect("InMemory persistence must not fail to open")
@@ -98,8 +112,16 @@ impl MonasController {
     /// `InMemory` persistence は揮発するため、本番 gateway は必ず
     /// `MonasConfig::with_persistence_dir(...)` で sled backend を指定すること。
     pub fn with_config(config: MonasConfig) -> Result<Self, ApiError> {
+        // TODO(pr46-followup architecture):
+        // The SDK still constructs in-process `ContentService` + `ShareService`,
+        // making it a parallel authoritative tier alongside State Node. This is
+        // a *deferred* item from the PR #29 review; see PR #46 description's
+        // "Out of scope" section. The proper fix is either (a) make the SDK a
+        // stateless thin client and push CEK / share ownership to State Node,
+        // or (b) define an explicit pluggable port for CEK ownership semantics.
         let content_repository = Self::create_content_repository();
-        let (cek_store, share_repository) = Self::create_persistence(&config.persistence)?;
+        let (cek_store, share_repository, public_key_directory) =
+            Self::create_persistence(&config.persistence)?;
         let agent = Self::build_agent(&config);
 
         Ok(Self {
@@ -115,6 +137,7 @@ impl MonasController {
                 content_repository,
                 cek_store,
                 share_repository,
+                public_key_directory,
             ),
         })
     }
@@ -128,26 +151,33 @@ impl MonasController {
     }
 
     /// ContentRepositoryのインスタンスを作成するヘルパーメソッド
+    ///
+    /// TODO(pr46-followup): content body は依然 `MultiStorageRepository::in_memory` 固定で、
+    /// `Sled` モードを選んでも暗号文ローカルキャッシュは再起動で揮発する。
+    /// State Node が canonical なので decrypt 自体は復元可能 (CEK は sled で永続化済) だが、
+    /// SDK ローカルキャッシュ層も pluggable 化するのは別 PR で扱う (PR #46 description 参照)。
     fn create_content_repository() -> monas_content::infrastructure::MultiStorageRepository {
         use monas_content::infrastructure::MultiStorageRepository;
         let registry = std::sync::Arc::new(monas_filesync::init_registry_default());
         MultiStorageRepository::in_memory(registry, "local")
     }
 
-    /// `PersistenceConfig` から CEK ストアと Share repository の動的インスタンスを構築する。
+    /// `PersistenceConfig` から CEK ストア / Share repository / Public key directory の
+    /// 動的インスタンスを構築する。
     ///
     /// `InMemory` 選択時は揮発する旨の警告を stderr に 1 度だけ出す。
     ///
     /// `Sled { dir }` 選択時は **単一の `sled::Db`** を 1 度だけ open し、
-    /// CEK ストアと Share repository の両方に共有させる。sled は path 単位で
+    /// CEK / Share / Public key directory の 3 ストアに共有させる。sled は path 単位で
     /// 排他 flock を取るため、同じディレクトリを 2 度 open すると 2 個目が
-    /// 起動時 panic する (`MONAS_PERSISTENCE_DIR` 設定時の本番経路で必ず再現)。
-    /// キー空間は `cek:` / `share:` プレフィックスで分離されている。
+    /// 失敗する (`MONAS_PERSISTENCE_DIR` 設定時の本番経路で必ず再現)。
+    /// キー空間は `cek:` / `share:` / `pubkey:` プレフィックスで分離されている。
     fn create_persistence(
         persistence: &PersistenceConfig,
-    ) -> Result<(DynCekStore, DynShareRepository), ApiError> {
+    ) -> Result<(DynCekStore, DynShareRepository, DynPublicKeyDirectory), ApiError> {
         use monas_content::infrastructure::{
             key_store::{InMemoryContentEncryptionKeyStore, SledContentEncryptionKeyStore},
+            public_key_directory::{InMemoryPublicKeyDirectory, SledPublicKeyDirectory},
             share_repository::{InMemoryShareRepository, SledShareRepository},
         };
 
@@ -155,12 +185,13 @@ impl MonasController {
             PersistenceConfig::InMemory => {
                 eprintln!(
                     "monas-sdk: PersistenceConfig::InMemory is in use. \
-                     CEK and share data are kept in memory only and will be lost on restart. \
+                     CEK / share / public-key data are kept in memory only and will be lost on restart. \
                      Use MonasConfig::with_persistence_dir(<path>) for production gateways."
                 );
                 let cek: DynCekStore = Arc::new(InMemoryContentEncryptionKeyStore::default());
                 let share: DynShareRepository = Arc::new(InMemoryShareRepository::default());
-                Ok((cek, share))
+                let pkd: DynPublicKeyDirectory = Arc::new(InMemoryPublicKeyDirectory::default());
+                Ok((cek, share, pkd))
             }
             PersistenceConfig::Sled { dir } => {
                 if let Err(e) = std::fs::create_dir_all(dir) {
@@ -169,15 +200,17 @@ impl MonasController {
                     )));
                 }
                 // sled は path 単位で flock を取るので 1 度だけ開く。
-                // `sled::Db` は Arc ベースで Clone 可能なので、両ストアに同じ Db を渡す。
+                // `sled::Db` は Arc ベースで Clone 可能なので、3 つのストアに同じ Db を渡す。
                 let db = sled::open(dir).map_err(|e| {
                     ApiError::Internal(format!("failed to open sled DB at {dir:?}: {e}"))
                 })?;
                 let cek = SledContentEncryptionKeyStore::with_db(db.clone());
-                let share = SledShareRepository::with_db(db);
+                let share = SledShareRepository::with_db(db.clone());
+                let pkd = SledPublicKeyDirectory::with_db(db);
                 let cek: DynCekStore = Arc::new(cek);
                 let share: DynShareRepository = Arc::new(share);
-                Ok((cek, share))
+                let pkd: DynPublicKeyDirectory = Arc::new(pkd);
+                Ok((cek, share, pkd))
             }
         }
     }
@@ -207,17 +240,16 @@ impl MonasController {
         content_repository: monas_content::infrastructure::MultiStorageRepository,
         cek_store: DynCekStore,
         share_repository: DynShareRepository,
+        public_key_directory: DynPublicKeyDirectory,
     ) -> ShareServiceInstance {
         use monas_content::application_service::share_service::ShareService;
-        use monas_content::infrastructure::{
-            key_wrapping::HpkeV1KeyWrapping, public_key_directory::InMemoryPublicKeyDirectory,
-        };
+        use monas_content::infrastructure::key_wrapping::HpkeV1KeyWrapping;
 
         ShareService {
             share_repository,
             content_repository,
             cek_store,
-            public_key_directory: InMemoryPublicKeyDirectory::default(),
+            public_key_directory,
             key_wrapper: HpkeV1KeyWrapping,
         }
     }

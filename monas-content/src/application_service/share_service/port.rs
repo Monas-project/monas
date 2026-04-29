@@ -55,6 +55,26 @@ pub trait PublicKeyDirectory {
     fn delete_public_key(&self, key_id: &KeyId) -> Result<(), PublicKeyDirectoryError>;
 }
 
+/// `Arc<dyn PublicKeyDirectory + Send + Sync>` を `ShareService` の型パラメータに
+/// 直接渡せるようにする blanket impl。
+impl<T: PublicKeyDirectory + ?Sized> PublicKeyDirectory for std::sync::Arc<T> {
+    fn compute_key_id(&self, public_key: &[u8]) -> KeyId {
+        (**self).compute_key_id(public_key)
+    }
+
+    fn register_public_key(&self, public_key: &[u8]) -> Result<KeyId, PublicKeyDirectoryError> {
+        (**self).register_public_key(public_key)
+    }
+
+    fn find_public_key(&self, key_id: &KeyId) -> Result<Option<Vec<u8>>, PublicKeyDirectoryError> {
+        (**self).find_public_key(key_id)
+    }
+
+    fn delete_public_key(&self, key_id: &KeyId) -> Result<(), PublicKeyDirectoryError> {
+        (**self).delete_public_key(key_id)
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PublicKeyDirectoryError {
     #[error("lookup error: {0}")]

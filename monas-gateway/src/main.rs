@@ -278,6 +278,7 @@ fn build_state_node_auth_context(headers: &HeaderMap) -> StateNodeAuthContext {
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // tests use the test/dev-only `with_state_node_url` constructor
 mod tests {
     use super::*;
     use monas_sdk::models::content::{ContentMetadata, CreateContentInput};

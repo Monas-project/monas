@@ -1,3 +1,6 @@
+// Integration tests intentionally use the test/dev-only `with_state_node_url` constructor.
+#![allow(deprecated)]
+
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use mockito::Server;
 use monas_sdk::models::state::{GetHistoryInput, VerifyIntegrityInput};
