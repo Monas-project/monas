@@ -1,3 +1,4 @@
+mod async_api;
 mod content;
 mod keypair;
 mod share;
@@ -9,6 +10,48 @@ use share::{DynShareRepository, ShareServiceInstance};
 
 use crate::common::{ApiError, MonasConfig, PersistenceConfig};
 
+/// プライマリ操作が失敗し、補償 (rollback / restore) も失敗した場合に返すべき
+/// 単一 `ApiError` を組み立てる helper。
+///
+/// PR #29 review (design 軸 / `ApiError::Internal` collapse) で指摘されたとおり、
+/// 何も考えず `ApiError::Internal(format!(...))` に潰すと
+/// 元の 401 / 404 / 408 / 409 が一律 500 に化けて呼び出し側が誤った対応を取る。
+///
+/// この helper は:
+/// - `primary` が `Internal` でない場合 → primary の variant を保ったまま、
+///   message に rollback 失敗情報を suffix として追記する。
+/// - `primary` が `Internal` の場合 → 従来通り `Internal` のまま結合する。
+///
+/// `context` は呼び出し側固有のラベル (例: "State Node create").
+/// `primary_label` / `rollback_label` は message を読みやすくするための識別子
+/// (例: "remote" / "rollback").
+pub(super) fn combine_rollback_failure(
+    primary: ApiError,
+    rollback_err: impl std::fmt::Display,
+    context: &str,
+    primary_label: &str,
+    rollback_label: &str,
+) -> ApiError {
+    let suffix = format!(
+        "{context} failed and local {rollback_label} also failed: \
+         {primary_label}={primary}, {rollback_label}={rollback_err}"
+    );
+    // `ApiError` は `#[non_exhaustive]`。crate 内では現在の variant 列挙でカバーできるが、
+    // 将来 crate 外で variant が増えた場合に備えて safety net を残す意図で
+    // `unreachable_patterns` 警告を抑止する。
+    #[allow(unreachable_patterns)]
+    match primary {
+        ApiError::Validation(_) => ApiError::Validation(suffix),
+        ApiError::Unauthorized(_) => ApiError::Unauthorized(suffix),
+        ApiError::Forbidden(_) => ApiError::Forbidden(suffix),
+        ApiError::NotFound(_) => ApiError::NotFound(suffix),
+        ApiError::Conflict(_) => ApiError::Conflict(suffix),
+        ApiError::Timeout(_) => ApiError::Timeout(suffix),
+        ApiError::Internal(_) => ApiError::Internal(suffix),
+        _ => ApiError::Internal(suffix),
+    }
+}
+
 /// MonasController - SDK のオーケストレーター
 pub struct MonasController {
     /// State NodeのベースURL
@@ -17,6 +60,8 @@ pub struct MonasController {
     pub(super) account_url: String,
     /// 全 HTTP 呼び出しで共有する ureq Agent (タイムアウト等を保持)
     pub(super) agent: ureq::Agent,
+    /// `X-Request-Timestamp` の許容 skew (Gateway 経由で渡された timestamp が古すぎる/未来すぎる場合 reject)
+    pub(super) request_timestamp_skew: std::time::Duration,
     /// ContentService
     content_service: ContentServiceInstance,
     /// ShareService
@@ -61,6 +106,7 @@ impl MonasController {
             state_node_url: config.state_node_url,
             account_url: config.account_url,
             agent,
+            request_timestamp_skew: config.request_timestamp_skew,
             content_service: Self::create_content_service(
                 content_repository.clone(),
                 cek_store.clone(),

@@ -18,6 +18,20 @@ fn compute_content_id(raw_content: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+/// `X-Request-Timestamp` の skew チェックを実質的に無効化した `MonasController`。
+///
+/// 古い固定値 (e.g. `1_717_171_717`) で署名検証する旧来テスト用のヘルパ。
+/// 本番運用ではこの設定を使わない。
+fn controller_for_legacy_timestamps(
+    state_node_url: String,
+    account_url: String,
+) -> MonasController {
+    let config = MonasConfig::new(state_node_url, account_url)
+        // 100 年以上の skew を許容することで、テスト固定 timestamp の絶対値を気にしなくてよくする。
+        .with_request_timestamp_skew(Duration::from_secs(60 * 60 * 24 * 365 * 100));
+    MonasController::with_config(config).expect("with_config")
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn create_content_and_get_content_round_trip_succeeds_with_mock_state_node() {
     let _guard = acquire_test_lock();
@@ -452,7 +466,8 @@ async fn create_content_uses_account_signature_for_state_node_request() {
         .create_async()
         .await;
 
-    let controller = MonasController::with_urls(state_node_server.url(), account_server.url());
+    let controller =
+        controller_for_legacy_timestamps(state_node_server.url(), account_server.url());
     let auth = StateNodeAuthContext {
         authorization: Some("Bearer old".into()),
         request_signature: Some("old-signature".into()),
@@ -495,7 +510,8 @@ async fn create_content_fails_fast_when_account_key_is_not_p256() {
         .create_async()
         .await;
 
-    let controller = MonasController::with_urls(state_node_server.url(), account_server.url());
+    let controller =
+        controller_for_legacy_timestamps(state_node_server.url(), account_server.url());
     let auth = StateNodeAuthContext {
         authorization: None,
         request_signature: None,
@@ -687,7 +703,8 @@ async fn delete_content_uses_account_signature_for_metadata_request() {
         .create_async()
         .await;
 
-    let controller = MonasController::with_urls(state_node_server.url(), account_server.url());
+    let controller =
+        controller_for_legacy_timestamps(state_node_server.url(), account_server.url());
     let created = controller
         .create_content(
             CreateContentInput {

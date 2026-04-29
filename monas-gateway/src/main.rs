@@ -83,7 +83,11 @@ async fn generate_keypair(
     StatusCode,
     Json<ApiResponse<monas_sdk::models::keypair::GenerateKeypairOutput>>,
 ) {
-    api_json(state.controller.generate_keypair(input))
+    api_json(
+        Arc::clone(&state.controller)
+            .generate_keypair_async(input)
+            .await,
+    )
 }
 
 async fn create_content(
@@ -95,7 +99,11 @@ async fn create_content(
     Json<ApiResponse<monas_sdk::models::content::CreateContentOutput>>,
 ) {
     let auth = build_state_node_auth_context(&headers);
-    api_json(state.controller.create_content(input, Some(&auth)))
+    api_json(
+        Arc::clone(&state.controller)
+            .create_content_async(input, Some(auth))
+            .await,
+    )
 }
 
 async fn get_content(
@@ -106,7 +114,7 @@ async fn get_content(
     Json<ApiResponse<monas_sdk::models::content::GetContentOutput>>,
 ) {
     let input = GetContentInput { content_id: id };
-    api_json(state.controller.get_content(input))
+    api_json(Arc::clone(&state.controller).get_content_async(input).await)
 }
 
 async fn update_content(
@@ -120,7 +128,11 @@ async fn update_content(
 ) {
     input.local_content_id = id;
     let auth = build_state_node_auth_context(&headers);
-    api_json(state.controller.update_content(input, Some(&auth)))
+    api_json(
+        Arc::clone(&state.controller)
+            .update_content_async(input, Some(auth))
+            .await,
+    )
 }
 
 async fn delete_content(
@@ -134,7 +146,11 @@ async fn delete_content(
 ) {
     input.local_content_id = id;
     let auth = build_state_node_auth_context(&headers);
-    api_json(state.controller.delete_content(input, Some(&auth)))
+    api_json(
+        Arc::clone(&state.controller)
+            .delete_content_async(input, Some(auth))
+            .await,
+    )
 }
 
 async fn share_content(
@@ -144,7 +160,11 @@ async fn share_content(
     StatusCode,
     Json<ApiResponse<monas_sdk::models::share::ShareContentOutput>>,
 ) {
-    api_json(state.controller.share_content(input))
+    api_json(
+        Arc::clone(&state.controller)
+            .share_content_async(input)
+            .await,
+    )
 }
 
 async fn revoke_share(
@@ -156,7 +176,11 @@ async fn revoke_share(
     Json<ApiResponse<monas_sdk::models::share::RevokeShareOutput>>,
 ) {
     let auth = build_state_node_auth_context(&headers);
-    api_json(state.controller.revoke_share(input, Some(&auth)))
+    api_json(
+        Arc::clone(&state.controller)
+            .revoke_share_async(input, Some(auth))
+            .await,
+    )
 }
 
 async fn decrypt_shared_content(
@@ -166,7 +190,11 @@ async fn decrypt_shared_content(
     StatusCode,
     Json<ApiResponse<monas_sdk::models::share::DecryptSharedContentOutput>>,
 ) {
-    api_json(state.controller.decrypt_shared_content(input))
+    api_json(
+        Arc::clone(&state.controller)
+            .decrypt_shared_content_async(input)
+            .await,
+    )
 }
 
 async fn get_latest_version(
@@ -178,7 +206,11 @@ async fn get_latest_version(
     Json<ApiResponse<monas_sdk::models::state::GetLatestVersionOutput>>,
 ) {
     let auth = build_state_node_auth_context(&headers);
-    api_json(state.controller.get_latest_version(input, Some(&auth)))
+    api_json(
+        Arc::clone(&state.controller)
+            .get_latest_version_async(input, Some(auth))
+            .await,
+    )
 }
 
 async fn get_history(
@@ -190,7 +222,11 @@ async fn get_history(
     Json<ApiResponse<monas_sdk::models::state::GetHistoryOutput>>,
 ) {
     let auth = build_state_node_auth_context(&headers);
-    api_json(state.controller.get_history(input, Some(&auth)))
+    api_json(
+        Arc::clone(&state.controller)
+            .get_history_async(input, Some(auth))
+            .await,
+    )
 }
 
 async fn verify_integrity(
@@ -202,7 +238,11 @@ async fn verify_integrity(
     Json<ApiResponse<monas_sdk::models::state::VerifyIntegrityOutput>>,
 ) {
     let auth = build_state_node_auth_context(&headers);
-    api_json(state.controller.verify_integrity(input, Some(&auth)))
+    api_json(
+        Arc::clone(&state.controller)
+            .verify_integrity_async(input, Some(auth))
+            .await,
+    )
 }
 
 fn api_json<T>(response: ApiResponse<T>) -> (StatusCode, Json<ApiResponse<T>>) {

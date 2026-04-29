@@ -363,9 +363,13 @@ impl MonasController {
                 };
                 if let Err(rb) = self.share_service.revoke_share(rollback_cmd) {
                     return ApiResponse::error(
-                        ApiError::Internal(format!(
-                            "Delegated token issuance failed; rollback (revoke_share) also failed: {rb} (original: {e})"
-                        )),
+                        super::combine_rollback_failure(
+                            e,
+                            rb,
+                            "Delegated token issuance",
+                            "issuance",
+                            "rollback",
+                        ),
                         trace_id,
                     );
                 }
@@ -466,9 +470,13 @@ impl MonasController {
                 let primary = Self::map_share_error(e);
                 if let Err(restore_err) = self.restore_revoke_share_snapshot(&snapshot) {
                     return ApiResponse::error(
-                        ApiError::Internal(format!(
-                            "Revoke failed and local rollback also failed: revoke={primary}, restore={restore_err}"
-                        )),
+                        super::combine_rollback_failure(
+                            primary,
+                            restore_err,
+                            "Revoke",
+                            "revoke",
+                            "restore",
+                        ),
                         trace_id,
                     );
                 }
@@ -493,9 +501,13 @@ impl MonasController {
                 let primary = Self::map_reencrypt_error(e);
                 if let Err(restore_err) = self.restore_revoke_share_snapshot(&snapshot) {
                     return ApiResponse::error(
-                        ApiError::Internal(format!(
-                            "Reencrypt failed and local rollback also failed: reencrypt={primary}, restore={restore_err}"
-                        )),
+                        super::combine_rollback_failure(
+                            primary,
+                            restore_err,
+                            "Reencrypt",
+                            "reencrypt",
+                            "restore",
+                        ),
                         trace_id,
                     );
                 }
@@ -510,15 +522,17 @@ impl MonasController {
             trace_id.clone(),
         ) {
             if let Err(restore_err) = self.restore_revoke_share_snapshot(&snapshot) {
-                let remote_message = response
-                    .error
-                    .as_ref()
-                    .map(|e| format!("{e:?}"))
-                    .unwrap_or_else(|| "unknown state node update failure".into());
+                let primary = response.error.clone().unwrap_or_else(|| {
+                    ApiError::Internal("unknown state node update failure".into())
+                });
                 return ApiResponse::error(
-                    ApiError::Internal(format!(
-                        "State Node revoke sync failed and local rollback also failed: remote={remote_message}, restore={restore_err}"
-                    )),
+                    super::combine_rollback_failure(
+                        primary,
+                        restore_err,
+                        "State Node revoke sync",
+                        "remote",
+                        "restore",
+                    ),
                     trace_id,
                 );
             }

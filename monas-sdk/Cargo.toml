@@ -21,6 +21,9 @@ url = "2.5"
 dotenv = "0.15"
 sha2 = "0.10"
 hex = "0.4.3"
+# `rt` だけを有効化。SDK 自身はランタイムを起動せず、呼び出し側 (例: gateway) が
+# 用意した tokio runtime 上で `spawn_blocking` を呼ぶためだけに使う。
+tokio = { version = "1.49.0", features = ["rt"] }
 
 [dev-dependencies]
 mockito = "1.7.2"

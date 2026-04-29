@@ -53,20 +53,33 @@ pub struct MonasConfig {
     pub request_timeout: Duration,
     /// ローカル persistence backend (CEK + Share)
     pub persistence: PersistenceConfig,
+    /// Gateway 側から転送された `X-Request-Timestamp` の許容ズレ幅。
+    ///
+    /// SDK は `prepare_state_node_*_auth` で `|now - ts| <= skew` を検証してから
+    /// 署名する。範囲外なら `ApiError::Unauthorized` を返し、リプレイ防御線を SDK に置く。
+    /// State Node 側でも window check されているはずだが、両側で検証する方が安全。
+    pub request_timestamp_skew: Duration,
 }
 
 /// `MonasConfig` の既定タイムアウト。
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// `MonasConfig` の既定 timestamp skew (60 秒)。
+///
+/// ノード間時刻同期の現実的な誤差 (数秒〜数十秒) を許容しつつ、
+/// 数分以上ずれた timestamp は受け付けない。
+pub const DEFAULT_REQUEST_TIMESTAMP_SKEW: Duration = Duration::from_secs(60);
+
 impl MonasConfig {
     /// 最小限の設定で `MonasConfig` を生成する。タイムアウトは `DEFAULT_REQUEST_TIMEOUT`、
-    /// persistence は `InMemory` (テスト用既定値)。
+    /// persistence は `InMemory` (テスト用既定値)、skew は `DEFAULT_REQUEST_TIMESTAMP_SKEW`。
     pub fn new(state_node_url: impl Into<String>, account_url: impl Into<String>) -> Self {
         Self {
             state_node_url: state_node_url.into(),
             account_url: account_url.into(),
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             persistence: PersistenceConfig::InMemory,
+            request_timestamp_skew: DEFAULT_REQUEST_TIMESTAMP_SKEW,
         }
     }
 
@@ -88,6 +101,12 @@ impl MonasConfig {
     /// persistence backend を任意の `PersistenceConfig` に差し替える。
     pub fn with_persistence(mut self, persistence: PersistenceConfig) -> Self {
         self.persistence = persistence;
+        self
+    }
+
+    /// `X-Request-Timestamp` の許容 skew を差し替える。
+    pub fn with_request_timestamp_skew(mut self, skew: Duration) -> Self {
+        self.request_timestamp_skew = skew;
         self
     }
 }

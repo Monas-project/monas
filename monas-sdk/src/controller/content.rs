@@ -210,6 +210,33 @@ impl MonasController {
         })
     }
 
+    /// Gateway から渡された `X-Request-Timestamp` を受け取り、許容 skew 内なら採用、
+    /// 範囲外なら `ApiError::Unauthorized`。値が未指定なら現在時刻を使う。
+    ///
+    /// State Node 側でも同様の検証が行われている前提だが、SDK 側でも独立に検証することで
+    /// 「未来 timestamp で signed message を作らせる」replay/forge 経路を SDK 入口で塞ぐ。
+    fn resolve_request_timestamp<T>(
+        &self,
+        ctx: &StateNodeAuthContext,
+        trace_id: &str,
+    ) -> Result<u64, ApiResponse<T>> {
+        let now = Self::current_unix_timestamp();
+        let Some(ts) = ctx.request_timestamp else {
+            return Ok(now);
+        };
+        let skew = self.request_timestamp_skew.as_secs();
+        let diff = ts.abs_diff(now);
+        if diff > skew {
+            return Err(ApiResponse::error(
+                ApiError::Unauthorized(format!(
+                    "X-Request-Timestamp out of acceptable window (|now - ts| = {diff}s, max = {skew}s)"
+                )),
+                trace_id.to_string(),
+            ));
+        }
+        Ok(ts)
+    }
+
     fn prepare_state_node_content_auth<T>(
         &self,
         auth: Option<&StateNodeAuthContext>,
@@ -219,9 +246,7 @@ impl MonasController {
         let Some(ctx) = auth else {
             return Ok(None);
         };
-        let timestamp = ctx
-            .request_timestamp
-            .unwrap_or_else(Self::current_unix_timestamp);
+        let timestamp = self.resolve_request_timestamp(ctx, trace_id)?;
         let signing_message = Self::build_content_signature_message(content_bytes, timestamp);
         self.sign_state_node_message_with_account(&signing_message, timestamp, trace_id)
             .map(Some)
@@ -237,9 +262,7 @@ impl MonasController {
         let Some(ctx) = auth else {
             return Ok(None);
         };
-        let timestamp = ctx
-            .request_timestamp
-            .unwrap_or_else(Self::current_unix_timestamp);
+        let timestamp = self.resolve_request_timestamp(ctx, trace_id)?;
         let signing_message =
             Self::build_metadata_signature_message(operation, resource, timestamp);
         self.sign_state_node_message_with_account(&signing_message, timestamp, trace_id)
@@ -804,30 +827,31 @@ impl MonasController {
             }
         };
 
-        let remote_content_id = match self.send_create_to_state_node(
-            &result.encrypted_content,
-            auth,
-            trace_id.clone(),
-        ) {
-            Ok(remote_content_id) => remote_content_id,
-            Err(response) => {
-                if let Err(rollback_err) = self.rollback_created_content(result.content_id.clone())
-                {
-                    let remote_message = response
-                        .error
-                        .as_ref()
-                        .map(|e| format!("{e:?}"))
-                        .unwrap_or_else(|| "unknown state node create failure".into());
-                    return ApiResponse::error(
-                            ApiError::Internal(format!(
-                                "State Node create failed and local rollback also failed: remote={remote_message}, rollback={rollback_err}"
-                            )),
+        let remote_content_id =
+            match self.send_create_to_state_node(&result.encrypted_content, auth, trace_id.clone())
+            {
+                Ok(remote_content_id) => remote_content_id,
+                Err(response) => {
+                    if let Err(rollback_err) =
+                        self.rollback_created_content(result.content_id.clone())
+                    {
+                        let primary = response.error.clone().unwrap_or_else(|| {
+                            ApiError::Internal("unknown state node create failure".into())
+                        });
+                        return ApiResponse::error(
+                            super::combine_rollback_failure(
+                                primary,
+                                rollback_err,
+                                "State Node create",
+                                "remote",
+                                "rollback",
+                            ),
                             trace_id,
                         );
+                    }
+                    return response;
                 }
-                return response;
-            }
-        };
+            };
 
         let output = CreateContentOutput {
             content_id: result.content_id.as_str().to_string(),
@@ -978,15 +1002,17 @@ impl MonasController {
             if let Err(rollback_err) =
                 self.rollback_updated_content(&before_update, &result.content_id)
             {
-                let remote_message = response
-                    .error
-                    .as_ref()
-                    .map(|e| format!("{e:?}"))
-                    .unwrap_or_else(|| "unknown state node update failure".into());
+                let primary = response.error.clone().unwrap_or_else(|| {
+                    ApiError::Internal("unknown state node update failure".into())
+                });
                 return ApiResponse::error(
-                    ApiError::Internal(format!(
-                        "State Node update failed and local rollback also failed: remote={remote_message}, rollback={rollback_err}"
-                    )),
+                    super::combine_rollback_failure(
+                        primary,
+                        rollback_err,
+                        "State Node update",
+                        "remote",
+                        "rollback",
+                    ),
                     trace_id,
                 );
             }
@@ -1065,17 +1091,18 @@ impl MonasController {
             self.send_delete_to_state_node(&input.remote_content_id, auth, trace_id.clone())
         {
             if let Err(restore_err) = self.restore_deleted_from_snapshot(&snapshot) {
-                let remote_message = response
-                    .error
-                    .as_ref()
-                    .map(|e| format!("{e:?}"))
-                    .unwrap_or_else(|| "unknown state node delete failure".into());
-                let rollback_message =
-                    format!("{:?}", Self::map_restore_deleted_error(restore_err));
+                let primary = response.error.clone().unwrap_or_else(|| {
+                    ApiError::Internal("unknown state node delete failure".into())
+                });
+                let restore_message = Self::map_restore_deleted_error(restore_err);
                 return ApiResponse::error(
-                    ApiError::Internal(format!(
-                        "State Node delete failed and local restore also failed: remote={remote_message}, restore={rollback_message}"
-                    )),
+                    super::combine_rollback_failure(
+                        primary,
+                        restore_message,
+                        "State Node delete",
+                        "remote",
+                        "restore",
+                    ),
                     trace_id,
                 );
             }
