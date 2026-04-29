@@ -91,6 +91,103 @@ fn sled_persistence_creates_dir_if_missing() {
     cleanup_dir(&dir);
 }
 
+/// `SledContentEncryptionKeyStore`、`SledShareRepository::with_db` 経由ではなく、
+/// CEK と PublicKeyDirectory の sled-backed round-trip を pin する。
+/// 同じ dir に書き込んでから controller を drop し、新しい sled DB ハンドルで
+/// 再 open して、書き込んだ data を find できることを確認する。
+///
+/// PR #29 review (cycle 5 diagnosis 軸) で「fix が実際に動くことの execution-level
+/// 検証が無い」と指摘されたのを受けて、cycle 4 で plug した persistence の
+/// round-trip を実際の data flow で固定する。
+#[test]
+fn sled_cek_store_persists_across_reopen() {
+    use monas_content::application_service::content_service::ContentEncryptionKeyStore;
+    use monas_content::domain::content::encryption::ContentEncryptionKey;
+    use monas_content::domain::content_id::ContentId;
+    use monas_content::infrastructure::key_store::SledContentEncryptionKeyStore;
+
+    let dir = tmp_dir("cek-rt");
+    let cid = ContentId::new("round-trip-cek-content-id".to_string());
+    let key = ContentEncryptionKey(vec![0x42; 32]);
+
+    {
+        let db = sled::open(&dir).expect("first open");
+        let store = SledContentEncryptionKeyStore::with_db(db);
+        store.save(&cid, &key).expect("save CEK");
+    } // store + db drop -> flock release
+
+    let db = sled::open(&dir).expect("reopen");
+    let store = SledContentEncryptionKeyStore::with_db(db);
+    let loaded = store.load(&cid).expect("load CEK").expect("CEK present");
+    assert_eq!(
+        loaded.0, key.0,
+        "CEK bytes must match after sled reopen with the same dir"
+    );
+
+    cleanup_dir(&dir);
+}
+
+#[test]
+fn sled_public_key_directory_persists_across_reopen() {
+    use monas_content::application_service::share_service::PublicKeyDirectory;
+    use monas_content::infrastructure::public_key_directory::SledPublicKeyDirectory;
+
+    let dir = tmp_dir("pkd-rt");
+    let pubkey = vec![0xab; 65];
+
+    let key_id = {
+        let db = sled::open(&dir).expect("first open");
+        let pkd = SledPublicKeyDirectory::with_db(db);
+        pkd.register_public_key(&pubkey)
+            .expect("register pubkey returns KeyId")
+    }; // pkd + db drop
+
+    let db = sled::open(&dir).expect("reopen");
+    let pkd = SledPublicKeyDirectory::with_db(db);
+    let found = pkd
+        .find_public_key(&key_id)
+        .expect("find_public_key")
+        .expect("registered key must be found after reopen");
+    assert_eq!(
+        found, pubkey,
+        "registered public key bytes must match after sled reopen"
+    );
+
+    cleanup_dir(&dir);
+}
+
+#[test]
+fn sled_share_repository_persists_across_reopen() {
+    use monas_content::application_service::share_service::ShareRepository;
+    use monas_content::domain::content_id::ContentId;
+    use monas_content::domain::share::Share;
+    use monas_content::infrastructure::share_repository::SledShareRepository;
+
+    let dir = tmp_dir("share-rt");
+    let cid = ContentId::new("round-trip-share-content-id".to_string());
+    let share_before = Share::new(cid.clone());
+
+    {
+        let db = sled::open(&dir).expect("first open");
+        let repo = SledShareRepository::with_db(db);
+        repo.save(&share_before).expect("save share");
+    } // repo + db drop
+
+    let db = sled::open(&dir).expect("reopen");
+    let repo = SledShareRepository::with_db(db);
+    let loaded = repo
+        .load(&cid)
+        .expect("load share")
+        .expect("share must be found after reopen");
+    assert_eq!(
+        loaded.content_id().as_str(),
+        cid.as_str(),
+        "loaded share's content_id must match what was saved"
+    );
+
+    cleanup_dir(&dir);
+}
+
 /// 「`sled::open(dir)` を同一プロセスから同じ path に対して 2 度呼ぶと、
 /// 2 度目は排他 flock 取得に失敗する」という、cycle 2 で diagnose した
 /// 根本原因を直接 pin する negative test。
