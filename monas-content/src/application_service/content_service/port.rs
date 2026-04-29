@@ -78,6 +78,31 @@ pub trait ContentEncryptionKeyStore {
     fn delete(&self, content_id: &ContentId) -> Result<(), ContentEncryptionKeyStoreError>;
 }
 
+/// `Arc<dyn ContentEncryptionKeyStore + Send + Sync>` を `ContentService` の
+/// 型パラメータに直接渡せるようにする blanket impl。
+///
+/// SDK 側で persistence backend を実行時に切り替える (in-memory / sled / その他) ために必要。
+impl<T: ContentEncryptionKeyStore + ?Sized> ContentEncryptionKeyStore for std::sync::Arc<T> {
+    fn save(
+        &self,
+        content_id: &ContentId,
+        key: &ContentEncryptionKey,
+    ) -> Result<(), ContentEncryptionKeyStoreError> {
+        (**self).save(content_id, key)
+    }
+
+    fn load(
+        &self,
+        content_id: &ContentId,
+    ) -> Result<Option<ContentEncryptionKey>, ContentEncryptionKeyStoreError> {
+        (**self).load(content_id)
+    }
+
+    fn delete(&self, content_id: &ContentId) -> Result<(), ContentEncryptionKeyStoreError> {
+        (**self).delete(content_id)
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ContentEncryptionKeyStoreError {
     #[error("storage error: {0}")]

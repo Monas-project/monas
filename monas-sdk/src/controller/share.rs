@@ -26,8 +26,7 @@ use monas_content::domain::share::{
     KeyId, Permission as DomainPermission, Share,
 };
 use monas_content::infrastructure::{
-    key_store::InMemoryContentEncryptionKeyStore, key_wrapping::HpkeV1KeyWrapping,
-    public_key_directory::InMemoryPublicKeyDirectory, share_repository::InMemoryShareRepository,
+    key_wrapping::HpkeV1KeyWrapping, public_key_directory::InMemoryPublicKeyDirectory,
     MultiStorageRepository,
 };
 
@@ -51,13 +50,21 @@ struct IssueDelegatedTokenResponse {
     jti: String,
 }
 
-/// ShareServiceの型エイリアス（可読性向上のため）
+/// ShareServiceの型エイリアス（可読性向上のため）。
+///
+/// share repository と CEK ストアは `Arc<dyn …>` を受けるので、
+/// in-memory / sled などの persistence backend を実行時に切り替えられる。
 pub(super) type ShareServiceInstance = ShareService<
-    InMemoryShareRepository,
+    DynShareRepository,
     MultiStorageRepository,
-    InMemoryContentEncryptionKeyStore,
+    super::content::DynCekStore,
     InMemoryPublicKeyDirectory,
     HpkeV1KeyWrapping,
+>;
+
+/// SDK が使う share repository の動的型。
+pub(super) type DynShareRepository = std::sync::Arc<
+    dyn monas_content::application_service::share_service::ShareRepository + Send + Sync,
 >;
 
 #[derive(Clone)]

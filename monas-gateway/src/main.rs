@@ -10,7 +10,7 @@ use monas_sdk::models::content::{
 use monas_sdk::models::keypair::GenerateKeypairInput;
 use monas_sdk::models::share::{DecryptSharedContentInput, RevokeShareInput, ShareContentInput};
 use monas_sdk::models::state::{GetHistoryInput, GetLatestVersionInput, VerifyIntegrityInput};
-use monas_sdk::{ApiResponse, MonasController, StateNodeAuthContext};
+use monas_sdk::{ApiResponse, MonasConfig, MonasController, StateNodeAuthContext};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -26,7 +26,17 @@ async fn main() {
         std::env::var("MONAS_STATE_NODE_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".into());
     let account_url =
         std::env::var("MONAS_ACCOUNT_URL").unwrap_or_else(|_| "http://127.0.0.1:4002".into());
-    let controller = Arc::new(MonasController::with_urls(state_node_url, account_url));
+
+    // 本番運用は MONAS_PERSISTENCE_DIR を必ず設定する。未設定時は in-memory にフォールバックし、
+    // SDK 側で stderr に警告が出る (CEK と share が再起動で揮発する)。
+    let mut config = MonasConfig::new(state_node_url, account_url);
+    if let Ok(dir) = std::env::var("MONAS_PERSISTENCE_DIR") {
+        config = config.with_persistence_dir(dir);
+    }
+    let controller = Arc::new(
+        MonasController::with_config(config)
+            .expect("failed to initialize MonasController persistence"),
+    );
 
     let app_state = AppState { controller };
 

@@ -831,7 +831,7 @@ async fn create_content_returns_timeout_when_state_node_hangs() {
 
     let config =
         MonasConfig::new(url.clone(), url).with_request_timeout(Duration::from_millis(200));
-    let controller = MonasController::with_config(config);
+    let controller = MonasController::with_config(config).expect("with_config");
 
     let input = CreateContentInput {
         content: URL_SAFE_NO_PAD.encode(b"timeout test"),

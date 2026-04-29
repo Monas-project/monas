@@ -26,19 +26,28 @@ use monas_content::domain::content_id::ContentId;
 use monas_content::infrastructure::{
     content_id::Sha256ContentIdGenerator,
     encryption::{Aes256CtrContentEncryption, OsRngContentEncryptionKeyGenerator},
-    key_store::InMemoryContentEncryptionKeyStore,
     MultiStorageRepository,
 };
 
 use super::MonasController;
 
-/// ContentServiceの型エイリアス（可読性向上のため）
+/// ContentServiceの型エイリアス（可読性向上のため）。
+///
+/// CEK ストアは `Arc<dyn ContentEncryptionKeyStore + Send + Sync>` を受けるので、
+/// 実行時に in-memory / sled などの persistence backend を切り替えられる。
 pub(super) type ContentServiceInstance = ContentService<
     Sha256ContentIdGenerator,
     MultiStorageRepository,
     OsRngContentEncryptionKeyGenerator,
     Aes256CtrContentEncryption,
-    InMemoryContentEncryptionKeyStore,
+    DynCekStore,
+>;
+
+/// SDK が共通で使う CEK ストアの動的型。
+pub(super) type DynCekStore = std::sync::Arc<
+    dyn monas_content::application_service::content_service::ContentEncryptionKeyStore
+        + Send
+        + Sync,
 >;
 
 #[derive(Clone)]

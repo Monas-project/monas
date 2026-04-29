@@ -14,6 +14,18 @@ pub trait ShareRepository {
     fn save(&self, share: &Share) -> Result<(), ShareRepositoryError>;
 }
 
+/// `Arc<dyn ShareRepository + Send + Sync>` を `ShareService` の型パラメータに
+/// 直接渡せるようにする blanket impl。
+impl<T: ShareRepository + ?Sized> ShareRepository for std::sync::Arc<T> {
+    fn load(&self, content_id: &ContentId) -> Result<Option<Share>, ShareRepositoryError> {
+        (**self).load(content_id)
+    }
+
+    fn save(&self, share: &Share) -> Result<(), ShareRepositoryError> {
+        (**self).save(share)
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ShareRepositoryError {
     #[error("storage error: {0}")]
