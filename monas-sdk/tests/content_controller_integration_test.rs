@@ -878,3 +878,88 @@ async fn create_content_returns_timeout_when_state_node_hangs() {
     drop(listener);
     cleanup_content_artifacts();
 }
+
+/// `X-Request-Timestamp` が許容 skew (default 60s) を大きく超える場合、
+/// SDK は signing 前に `ApiError::Unauthorized` を返し HTTP を一切叩かない
+/// ことを確認する。PR #29 review (blocker 3) で導入した clamp の regression test。
+#[tokio::test(flavor = "multi_thread")]
+async fn create_content_rejects_far_future_timestamp_with_unauthorized() {
+    let _guard = acquire_test_lock();
+
+    // ダミー URL で十分。clamp が先に発火して HTTP は走らない。
+    let controller = MonasController::with_state_node_url("http://127.0.0.1:1");
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let auth = StateNodeAuthContext {
+        authorization: Some("Bearer x".into()),
+        request_signature: None,
+        // 1 時間先の timestamp。default 60s skew を遥かに超える。
+        request_timestamp: Some(now + 3600),
+    };
+
+    let response = controller.create_content(
+        CreateContentInput {
+            content: URL_SAFE_NO_PAD.encode(b"freshness-test"),
+            metadata: Some(ContentMetadata {
+                name: Some("freshness.txt".into()),
+                content_type: Some("text/plain".into()),
+                created_at: None,
+                updated_at: None,
+            }),
+        },
+        Some(&auth),
+    );
+
+    assert!(!response.success, "create_content must fail due to clamp");
+    match response.error {
+        Some(ApiError::Unauthorized(msg)) => {
+            assert!(
+                msg.contains("X-Request-Timestamp"),
+                "unexpected message: {msg}"
+            );
+            assert!(msg.contains("out of acceptable window"), "msg={msg}");
+        }
+        other => panic!("expected Unauthorized, got {other:?}"),
+    }
+
+    cleanup_content_artifacts();
+}
+
+/// `X-Request-Timestamp` が許容 skew を「過去側」に大きく超える場合も
+/// `ApiError::Unauthorized` を返す。replay 防御の対称性確認。
+#[tokio::test(flavor = "multi_thread")]
+async fn create_content_rejects_far_past_timestamp_with_unauthorized() {
+    let _guard = acquire_test_lock();
+    let controller = MonasController::with_state_node_url("http://127.0.0.1:1");
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let auth = StateNodeAuthContext {
+        authorization: None,
+        request_signature: None,
+        // 1 時間前 (default 60s skew を遥かに超える)
+        request_timestamp: Some(now.saturating_sub(3600)),
+    };
+
+    let response = controller.create_content(
+        CreateContentInput {
+            content: URL_SAFE_NO_PAD.encode(b"freshness-past-test"),
+            metadata: Some(ContentMetadata {
+                name: Some("freshness-past.txt".into()),
+                content_type: Some("text/plain".into()),
+                created_at: None,
+                updated_at: None,
+            }),
+        },
+        Some(&auth),
+    );
+
+    assert!(!response.success);
+    assert!(matches!(response.error, Some(ApiError::Unauthorized(_))));
+    cleanup_content_artifacts();
+}

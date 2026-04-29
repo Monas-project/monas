@@ -11,19 +11,14 @@ use std::time::Duration;
 ///   既存コンテンツが復号不能になる。
 /// - `Sled { dir }`: 指定ディレクトリ配下に sled DB を開いて CEK と Share を保存する。
 ///   プロセス再起動を跨いで CEK を保持できる本番想定の構成。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub enum PersistenceConfig {
     /// In-memory backend. テスト用既定値。
+    #[default]
     InMemory,
     /// sled-backed backend. 指定ディレクトリ配下に DB を開く。
     Sled { dir: PathBuf },
-}
-
-impl Default for PersistenceConfig {
-    fn default() -> Self {
-        Self::InMemory
-    }
 }
 
 /// SDK の設定値。

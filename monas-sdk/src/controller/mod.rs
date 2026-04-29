@@ -137,8 +137,12 @@ impl MonasController {
     /// `PersistenceConfig` から CEK ストアと Share repository の動的インスタンスを構築する。
     ///
     /// `InMemory` 選択時は揮発する旨の警告を stderr に 1 度だけ出す。
-    /// `Sled { dir }` 選択時は同一の sled DB を CEK と Share で共有する
-    /// (キー空間はそれぞれ `cek:` / `share:` プレフィックスで分離されている)。
+    ///
+    /// `Sled { dir }` 選択時は **単一の `sled::Db`** を 1 度だけ open し、
+    /// CEK ストアと Share repository の両方に共有させる。sled は path 単位で
+    /// 排他 flock を取るため、同じディレクトリを 2 度 open すると 2 個目が
+    /// 起動時 panic する (`MONAS_PERSISTENCE_DIR` 設定時の本番経路で必ず再現)。
+    /// キー空間は `cek:` / `share:` プレフィックスで分離されている。
     fn create_persistence(
         persistence: &PersistenceConfig,
     ) -> Result<(DynCekStore, DynShareRepository), ApiError> {
@@ -164,14 +168,13 @@ impl MonasController {
                         "failed to create persistence dir {dir:?}: {e}"
                     )));
                 }
-                let cek = SledContentEncryptionKeyStore::open(dir).map_err(|e| {
-                    ApiError::Internal(format!("failed to open sled CEK store at {dir:?}: {e}"))
+                // sled は path 単位で flock を取るので 1 度だけ開く。
+                // `sled::Db` は Arc ベースで Clone 可能なので、両ストアに同じ Db を渡す。
+                let db = sled::open(dir).map_err(|e| {
+                    ApiError::Internal(format!("failed to open sled DB at {dir:?}: {e}"))
                 })?;
-                let share = SledShareRepository::open(dir).map_err(|e| {
-                    ApiError::Internal(format!(
-                        "failed to open sled share repository at {dir:?}: {e}"
-                    ))
-                })?;
+                let cek = SledContentEncryptionKeyStore::with_db(db.clone());
+                let share = SledShareRepository::with_db(db);
                 let cek: DynCekStore = Arc::new(cek);
                 let share: DynShareRepository = Arc::new(share);
                 Ok((cek, share))
@@ -217,5 +220,124 @@ impl MonasController {
             public_key_directory: InMemoryPublicKeyDirectory::default(),
             key_wrapper: HpkeV1KeyWrapping,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `combine_rollback_failure` は `primary` の variant を保ち、message に
+    /// rollback 情報を suffix として追加する。
+    /// PR #29 review (design 軸) で指摘された「ApiError::Internal collapse」を
+    /// regression として固定するためのテスト。
+    #[test]
+    fn combine_rollback_failure_preserves_validation_variant() {
+        let combined = combine_rollback_failure(
+            ApiError::Validation("bad".into()),
+            "boom",
+            "Op",
+            "primary",
+            "rollback",
+        );
+        assert!(matches!(combined, ApiError::Validation(_)));
+        let msg = combined.to_string();
+        assert!(msg.contains("Op failed"), "msg={msg}");
+        assert!(msg.contains("primary=Validation error: bad"), "msg={msg}");
+        assert!(msg.contains("rollback=boom"), "msg={msg}");
+    }
+
+    #[test]
+    fn combine_rollback_failure_preserves_unauthorized_variant() {
+        let combined = combine_rollback_failure(
+            ApiError::Unauthorized("nope".into()),
+            "rb-fail",
+            "Sign",
+            "primary",
+            "rollback",
+        );
+        assert!(matches!(combined, ApiError::Unauthorized(_)));
+        assert_eq!(combined.status_code(), 401);
+    }
+
+    #[test]
+    fn combine_rollback_failure_preserves_forbidden_variant() {
+        let combined = combine_rollback_failure(
+            ApiError::Forbidden("no".into()),
+            "rb",
+            "Op",
+            "primary",
+            "rollback",
+        );
+        assert!(matches!(combined, ApiError::Forbidden(_)));
+        assert_eq!(combined.status_code(), 403);
+    }
+
+    #[test]
+    fn combine_rollback_failure_preserves_not_found_variant() {
+        let combined = combine_rollback_failure(
+            ApiError::NotFound("missing".into()),
+            "rb",
+            "Op",
+            "primary",
+            "rollback",
+        );
+        assert!(matches!(combined, ApiError::NotFound(_)));
+        assert_eq!(combined.status_code(), 404);
+    }
+
+    #[test]
+    fn combine_rollback_failure_preserves_conflict_variant() {
+        let combined = combine_rollback_failure(
+            ApiError::Conflict("dup".into()),
+            "rb",
+            "Op",
+            "primary",
+            "rollback",
+        );
+        assert!(matches!(combined, ApiError::Conflict(_)));
+        assert_eq!(combined.status_code(), 409);
+    }
+
+    #[test]
+    fn combine_rollback_failure_preserves_timeout_variant() {
+        let combined = combine_rollback_failure(
+            ApiError::Timeout("hang".into()),
+            "rb",
+            "Op",
+            "primary",
+            "rollback",
+        );
+        assert!(matches!(combined, ApiError::Timeout(_)));
+        assert_eq!(combined.status_code(), 408);
+    }
+
+    #[test]
+    fn combine_rollback_failure_preserves_internal_variant() {
+        let combined = combine_rollback_failure(
+            ApiError::Internal("oops".into()),
+            "rb",
+            "Op",
+            "primary",
+            "rollback",
+        );
+        assert!(matches!(combined, ApiError::Internal(_)));
+        assert_eq!(combined.status_code(), 500);
+    }
+
+    #[test]
+    fn combine_rollback_failure_message_contains_labels() {
+        let combined = combine_rollback_failure(
+            ApiError::NotFound("x".into()),
+            "y",
+            "ContextOp",
+            "remote",
+            "restore",
+        );
+        let msg = combined.to_string();
+        assert!(msg.contains("ContextOp failed"));
+        assert!(msg.contains("local restore also failed"));
+        assert!(msg.contains("remote=Not found: x"));
+        assert!(msg.contains("restore=y"));
     }
 }
