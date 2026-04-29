@@ -478,6 +478,11 @@ impl MonasController {
                 // reencrypt に失敗した時点で ACL は既に変更済み。
                 // snapshot 復元をせずに return すると ACL だけが剥がれた中途半端な状態が残るため、
                 // ここでロールバックする。
+                //
+                // TODO(pr29-followup): この経路は SDK 公開 API だけでは安定して再現できないため
+                // integration test が存在しない。test-hook feature を導入してから
+                // tests/share_controller_integration_test.rs にカバレッジを追加する。
+                // 参考: PR #45 commit 392d6f1 の本文。
                 let primary = Self::map_reencrypt_error(e);
                 if let Err(restore_err) = self.restore_revoke_share_snapshot(&snapshot) {
                     return ApiResponse::error(
