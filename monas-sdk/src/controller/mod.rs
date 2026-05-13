@@ -4,11 +4,12 @@ mod keypair;
 mod share;
 mod state;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use content::{ContentServiceInstance, DynCekStore};
 use share::{DynPublicKeyDirectory, DynShareRepository, ShareServiceInstance};
 
-use crate::common::{ApiError, MonasConfig, PersistenceConfig};
+use crate::common::{ApiError, ApiResponse, MonasConfig, PersistenceConfig, StateNodeAuthContext};
 
 /// プライマリ操作が失敗し、補償 (rollback / restore) も失敗した場合に返すべき
 /// 単一 `ApiError` を組み立てる helper。
@@ -69,6 +70,44 @@ pub struct MonasController {
 }
 
 impl MonasController {
+    pub(super) fn current_unix_timestamp() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
+    /// Validate a caller-supplied State Node request timestamp.
+    ///
+    /// `auth: None` callers are handled by the caller and remain the dev/test
+    /// unsigned path. Once an auth context exists, timestamp must be present and
+    /// inside the configured skew window; otherwise a gateway can turn missing
+    /// or malformed replay metadata into a freshly signed request.
+    pub(super) fn resolve_request_timestamp<T>(
+        &self,
+        ctx: &StateNodeAuthContext,
+        trace_id: &str,
+    ) -> Result<u64, ApiResponse<T>> {
+        let now = Self::current_unix_timestamp();
+        let Some(ts) = ctx.request_timestamp else {
+            return Err(ApiResponse::error(
+                ApiError::Unauthorized("X-Request-Timestamp is required".into()),
+                trace_id.to_string(),
+            ));
+        };
+        let skew = self.request_timestamp_skew.as_secs();
+        let diff = ts.abs_diff(now);
+        if diff > skew {
+            return Err(ApiResponse::error(
+                ApiError::Unauthorized(format!(
+                    "X-Request-Timestamp out of acceptable window (|now - ts| = {diff}s, max = {skew}s)"
+                )),
+                trace_id.to_string(),
+            ));
+        }
+        Ok(ts)
+    }
+
     /// 明示的にState Node URLを指定してMonasControllerを生成 (in-memory persistence)。
     ///
     /// **このコンストラクタは test/開発専用。** 本番 gateway は必ず

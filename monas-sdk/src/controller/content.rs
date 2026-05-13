@@ -4,7 +4,6 @@ use base64::{
 };
 use chrono::Utc;
 use sha2::{Digest, Sha256};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::common::{generate_trace_id, ApiError, ApiResponse, StateNodeAuthContext};
 use crate::models::content::{
@@ -95,13 +94,6 @@ impl MonasController {
             }
         }
         req
-    }
-
-    fn current_unix_timestamp() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
     }
 
     fn build_content_signature_message(content_bytes: &[u8], timestamp: u64) -> String {
@@ -208,33 +200,6 @@ impl MonasController {
             request_signature: Some(sign_response.signature_base64),
             request_timestamp: Some(timestamp),
         })
-    }
-
-    /// Gateway から渡された `X-Request-Timestamp` を受け取り、許容 skew 内なら採用、
-    /// 範囲外なら `ApiError::Unauthorized`。値が未指定なら現在時刻を使う。
-    ///
-    /// State Node 側でも同様の検証が行われている前提だが、SDK 側でも独立に検証することで
-    /// 「未来 timestamp で signed message を作らせる」replay/forge 経路を SDK 入口で塞ぐ。
-    fn resolve_request_timestamp<T>(
-        &self,
-        ctx: &StateNodeAuthContext,
-        trace_id: &str,
-    ) -> Result<u64, ApiResponse<T>> {
-        let now = Self::current_unix_timestamp();
-        let Some(ts) = ctx.request_timestamp else {
-            return Ok(now);
-        };
-        let skew = self.request_timestamp_skew.as_secs();
-        let diff = ts.abs_diff(now);
-        if diff > skew {
-            return Err(ApiResponse::error(
-                ApiError::Unauthorized(format!(
-                    "X-Request-Timestamp out of acceptable window (|now - ts| = {diff}s, max = {skew}s)"
-                )),
-                trace_id.to_string(),
-            ));
-        }
-        Ok(ts)
     }
 
     fn prepare_state_node_content_auth<T>(

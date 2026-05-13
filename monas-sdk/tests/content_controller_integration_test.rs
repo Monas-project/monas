@@ -933,6 +933,43 @@ async fn create_content_rejects_far_future_timestamp_with_unauthorized() {
     cleanup_content_artifacts();
 }
 
+/// `auth: Some` で timestamp が欠落している場合は、SDK が現在時刻で補完して
+/// 再署名してはいけない。Gateway 側の parse failure / missing header が `None`
+/// に潰れた場合の replay bypass を防ぐ regression test。
+#[tokio::test(flavor = "multi_thread")]
+async fn create_content_rejects_missing_timestamp_with_unauthorized() {
+    let _guard = acquire_test_lock();
+    let controller = MonasController::with_state_node_url("http://127.0.0.1:1");
+    let auth = StateNodeAuthContext {
+        authorization: Some("Bearer x".into()),
+        request_signature: None,
+        request_timestamp: None,
+    };
+
+    let response = controller.create_content(
+        CreateContentInput {
+            content: URL_SAFE_NO_PAD.encode(b"freshness-missing-test"),
+            metadata: Some(ContentMetadata {
+                name: Some("freshness-missing.txt".into()),
+                content_type: Some("text/plain".into()),
+                created_at: None,
+                updated_at: None,
+            }),
+        },
+        Some(&auth),
+    );
+
+    assert!(!response.success);
+    match response.error {
+        Some(ApiError::Unauthorized(msg)) => {
+            assert!(msg.contains("X-Request-Timestamp"), "msg={msg}");
+            assert!(msg.contains("required"), "msg={msg}");
+        }
+        other => panic!("expected Unauthorized, got {other:?}"),
+    }
+    cleanup_content_artifacts();
+}
+
 /// `X-Request-Timestamp` が許容 skew を「過去側」に大きく超える場合も
 /// `ApiError::Unauthorized` を返す。replay 防御の対称性確認。
 #[tokio::test(flavor = "multi_thread")]

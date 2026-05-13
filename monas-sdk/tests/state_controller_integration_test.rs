@@ -3,11 +3,34 @@
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use mockito::Server;
-use monas_sdk::models::state::{GetHistoryInput, VerifyIntegrityInput};
-use monas_sdk::{ApiError, MonasController};
+use monas_sdk::models::state::{GetHistoryInput, GetLatestVersionInput, VerifyIntegrityInput};
+use monas_sdk::{ApiError, MonasController, StateNodeAuthContext};
 
 mod support;
 use support::acquire_test_lock;
+
+fn now_unix_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+fn stale_auth_context() -> StateNodeAuthContext {
+    StateNodeAuthContext {
+        authorization: Some("Bearer x".into()),
+        request_signature: Some("sig".into()),
+        request_timestamp: Some(now_unix_timestamp().saturating_sub(3600)),
+    }
+}
+
+fn missing_timestamp_auth_context() -> StateNodeAuthContext {
+    StateNodeAuthContext {
+        authorization: Some("Bearer x".into()),
+        request_signature: Some("sig".into()),
+        request_timestamp: None,
+    }
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn get_history_maps_state_node_401_to_unauthorized() {
@@ -36,6 +59,74 @@ async fn get_history_maps_state_node_401_to_unauthorized() {
         Some(ApiError::Unauthorized(msg)) => assert!(msg.contains("missing auth")),
         other => panic!("expected Unauthorized, got: {other:?}"),
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn get_history_rejects_missing_timestamp_with_unauthorized() {
+    let _guard = acquire_test_lock();
+    let controller = MonasController::with_state_node_url("http://127.0.0.1:1");
+    let auth = missing_timestamp_auth_context();
+
+    let response = controller.get_history(
+        GetHistoryInput {
+            content_id: "test-content".into(),
+            limit: 10,
+        },
+        Some(&auth),
+    );
+
+    assert!(!response.success);
+    match response.error {
+        Some(ApiError::Unauthorized(msg)) => {
+            assert!(msg.contains("X-Request-Timestamp"), "msg={msg}");
+            assert!(msg.contains("required"), "msg={msg}");
+        }
+        other => panic!("expected Unauthorized, got: {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn get_latest_version_rejects_stale_timestamp_with_unauthorized() {
+    let _guard = acquire_test_lock();
+    let controller = MonasController::with_state_node_url("http://127.0.0.1:1");
+    let auth = stale_auth_context();
+
+    let response = controller.get_latest_version(
+        GetLatestVersionInput {
+            content_id: "test-content".into(),
+        },
+        Some(&auth),
+    );
+
+    assert!(!response.success);
+    match response.error {
+        Some(ApiError::Unauthorized(msg)) => {
+            assert!(
+                msg.contains("out of acceptable window"),
+                "unexpected message: {msg}"
+            );
+        }
+        other => panic!("expected Unauthorized, got: {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn verify_integrity_rejects_stale_timestamp_with_unauthorized() {
+    let _guard = acquire_test_lock();
+    let controller = MonasController::with_state_node_url("http://127.0.0.1:1");
+    let auth = stale_auth_context();
+
+    let response = controller.verify_integrity(
+        VerifyIntegrityInput {
+            content_id: "test-content".into(),
+            content: URL_SAFE_NO_PAD.encode(b"hello"),
+            expected_version: Some("v1".into()),
+        },
+        Some(&auth),
+    );
+
+    assert!(!response.success);
+    assert!(matches!(response.error, Some(ApiError::Unauthorized(_))));
 }
 
 #[tokio::test(flavor = "multi_thread")]

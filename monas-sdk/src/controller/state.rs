@@ -30,6 +30,10 @@ impl MonasController {
         auth: Option<&StateNodeAuthContext>,
         trace_id: String,
     ) -> Result<(u16, String), ApiResponse<T>> {
+        if let Some(ctx) = auth {
+            self.resolve_request_timestamp::<T>(ctx, &trace_id)?;
+        }
+
         let trace_id_for_call = trace_id.clone();
         let resp = Self::attach_state_node_auth(self.agent.get(url), auth)
             .config()
