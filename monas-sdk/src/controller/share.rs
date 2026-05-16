@@ -25,11 +25,7 @@ use monas_content::domain::share::{
     key_envelope::{KeyEnvelope as DomainKeyEnvelope, KeyWrapAlgorithm, WrappedRecipientKey},
     KeyId, Permission as DomainPermission, Share,
 };
-use monas_content::infrastructure::{
-    key_store::InMemoryContentEncryptionKeyStore, key_wrapping::HpkeV1KeyWrapping,
-    public_key_directory::InMemoryPublicKeyDirectory, share_repository::InMemoryShareRepository,
-    MultiStorageRepository,
-};
+use monas_content::infrastructure::{key_wrapping::HpkeV1KeyWrapping, MultiStorageRepository};
 
 use super::MonasController;
 
@@ -51,13 +47,26 @@ struct IssueDelegatedTokenResponse {
     jti: String,
 }
 
-/// ShareServiceの型エイリアス（可読性向上のため）
+/// ShareServiceの型エイリアス（可読性向上のため）。
+///
+/// share repository / CEK ストア / public key directory は `Arc<dyn …>` を受けるので、
+/// in-memory / sled などの persistence backend を実行時に切り替えられる。
 pub(super) type ShareServiceInstance = ShareService<
-    InMemoryShareRepository,
+    DynShareRepository,
     MultiStorageRepository,
-    InMemoryContentEncryptionKeyStore,
-    InMemoryPublicKeyDirectory,
+    super::content::DynCekStore,
+    DynPublicKeyDirectory,
     HpkeV1KeyWrapping,
+>;
+
+/// SDK が使う share repository の動的型。
+pub(super) type DynShareRepository = std::sync::Arc<
+    dyn monas_content::application_service::share_service::ShareRepository + Send + Sync,
+>;
+
+/// SDK が使う PublicKeyDirectory の動的型。
+pub(super) type DynPublicKeyDirectory = std::sync::Arc<
+    dyn monas_content::application_service::share_service::PublicKeyDirectory + Send + Sync,
 >;
 
 #[derive(Clone)]
@@ -356,9 +365,13 @@ impl MonasController {
                 };
                 if let Err(rb) = self.share_service.revoke_share(rollback_cmd) {
                     return ApiResponse::error(
-                        ApiError::Internal(format!(
-                            "Delegated token issuance failed; rollback (revoke_share) also failed: {rb} (original: {e})"
-                        )),
+                        super::combine_rollback_failure(
+                            e,
+                            rb,
+                            "Delegated token issuance",
+                            "issuance",
+                            "rollback",
+                        ),
                         trace_id,
                     );
                 }
@@ -459,9 +472,13 @@ impl MonasController {
                 let primary = Self::map_share_error(e);
                 if let Err(restore_err) = self.restore_revoke_share_snapshot(&snapshot) {
                     return ApiResponse::error(
-                        ApiError::Internal(format!(
-                            "Revoke failed and local rollback also failed: revoke={primary}, restore={restore_err}"
-                        )),
+                        super::combine_rollback_failure(
+                            primary,
+                            restore_err,
+                            "Revoke",
+                            "revoke",
+                            "restore",
+                        ),
                         trace_id,
                     );
                 }
@@ -478,12 +495,21 @@ impl MonasController {
                 // reencrypt に失敗した時点で ACL は既に変更済み。
                 // snapshot 復元をせずに return すると ACL だけが剥がれた中途半端な状態が残るため、
                 // ここでロールバックする。
+                //
+                // TODO(pr29-followup): この経路は SDK 公開 API だけでは安定して再現できないため
+                // integration test が存在しない。test-hook feature を導入してから
+                // tests/share_controller_integration_test.rs にカバレッジを追加する。
+                // 参考: PR #45 commit 392d6f1 の本文。
                 let primary = Self::map_reencrypt_error(e);
                 if let Err(restore_err) = self.restore_revoke_share_snapshot(&snapshot) {
                     return ApiResponse::error(
-                        ApiError::Internal(format!(
-                            "Reencrypt failed and local rollback also failed: reencrypt={primary}, restore={restore_err}"
-                        )),
+                        super::combine_rollback_failure(
+                            primary,
+                            restore_err,
+                            "Reencrypt",
+                            "reencrypt",
+                            "restore",
+                        ),
                         trace_id,
                     );
                 }
@@ -498,15 +524,17 @@ impl MonasController {
             trace_id.clone(),
         ) {
             if let Err(restore_err) = self.restore_revoke_share_snapshot(&snapshot) {
-                let remote_message = response
-                    .error
-                    .as_ref()
-                    .map(|e| format!("{e:?}"))
-                    .unwrap_or_else(|| "unknown state node update failure".into());
+                let primary = response.error.clone().unwrap_or_else(|| {
+                    ApiError::Internal("unknown state node update failure".into())
+                });
                 return ApiResponse::error(
-                    ApiError::Internal(format!(
-                        "State Node revoke sync failed and local rollback also failed: remote={remote_message}, restore={restore_err}"
-                    )),
+                    super::combine_rollback_failure(
+                        primary,
+                        restore_err,
+                        "State Node revoke sync",
+                        "remote",
+                        "restore",
+                    ),
                     trace_id,
                 );
             }

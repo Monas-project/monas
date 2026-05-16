@@ -4,7 +4,6 @@ use base64::{
 };
 use chrono::Utc;
 use sha2::{Digest, Sha256};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::common::{generate_trace_id, ApiError, ApiResponse, StateNodeAuthContext};
 use crate::models::content::{
@@ -26,19 +25,28 @@ use monas_content::domain::content_id::ContentId;
 use monas_content::infrastructure::{
     content_id::Sha256ContentIdGenerator,
     encryption::{Aes256CtrContentEncryption, OsRngContentEncryptionKeyGenerator},
-    key_store::InMemoryContentEncryptionKeyStore,
     MultiStorageRepository,
 };
 
 use super::MonasController;
 
-/// ContentServiceの型エイリアス（可読性向上のため）
+/// ContentServiceの型エイリアス（可読性向上のため）。
+///
+/// CEK ストアは `Arc<dyn ContentEncryptionKeyStore + Send + Sync>` を受けるので、
+/// 実行時に in-memory / sled などの persistence backend を切り替えられる。
 pub(super) type ContentServiceInstance = ContentService<
     Sha256ContentIdGenerator,
     MultiStorageRepository,
     OsRngContentEncryptionKeyGenerator,
     Aes256CtrContentEncryption,
-    InMemoryContentEncryptionKeyStore,
+    DynCekStore,
+>;
+
+/// SDK が共通で使う CEK ストアの動的型。
+pub(super) type DynCekStore = std::sync::Arc<
+    dyn monas_content::application_service::content_service::ContentEncryptionKeyStore
+        + Send
+        + Sync,
 >;
 
 #[derive(Clone)]
@@ -86,13 +94,6 @@ impl MonasController {
             }
         }
         req
-    }
-
-    fn current_unix_timestamp() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
     }
 
     fn build_content_signature_message(content_bytes: &[u8], timestamp: u64) -> String {
@@ -210,9 +211,7 @@ impl MonasController {
         let Some(ctx) = auth else {
             return Ok(None);
         };
-        let timestamp = ctx
-            .request_timestamp
-            .unwrap_or_else(Self::current_unix_timestamp);
+        let timestamp = self.resolve_request_timestamp(ctx, trace_id)?;
         let signing_message = Self::build_content_signature_message(content_bytes, timestamp);
         self.sign_state_node_message_with_account(&signing_message, timestamp, trace_id)
             .map(Some)
@@ -228,9 +227,7 @@ impl MonasController {
         let Some(ctx) = auth else {
             return Ok(None);
         };
-        let timestamp = ctx
-            .request_timestamp
-            .unwrap_or_else(Self::current_unix_timestamp);
+        let timestamp = self.resolve_request_timestamp(ctx, trace_id)?;
         let signing_message =
             Self::build_metadata_signature_message(operation, resource, timestamp);
         self.sign_state_node_message_with_account(&signing_message, timestamp, trace_id)
@@ -795,30 +792,31 @@ impl MonasController {
             }
         };
 
-        let remote_content_id = match self.send_create_to_state_node(
-            &result.encrypted_content,
-            auth,
-            trace_id.clone(),
-        ) {
-            Ok(remote_content_id) => remote_content_id,
-            Err(response) => {
-                if let Err(rollback_err) = self.rollback_created_content(result.content_id.clone())
-                {
-                    let remote_message = response
-                        .error
-                        .as_ref()
-                        .map(|e| format!("{e:?}"))
-                        .unwrap_or_else(|| "unknown state node create failure".into());
-                    return ApiResponse::error(
-                            ApiError::Internal(format!(
-                                "State Node create failed and local rollback also failed: remote={remote_message}, rollback={rollback_err}"
-                            )),
+        let remote_content_id =
+            match self.send_create_to_state_node(&result.encrypted_content, auth, trace_id.clone())
+            {
+                Ok(remote_content_id) => remote_content_id,
+                Err(response) => {
+                    if let Err(rollback_err) =
+                        self.rollback_created_content(result.content_id.clone())
+                    {
+                        let primary = response.error.clone().unwrap_or_else(|| {
+                            ApiError::Internal("unknown state node create failure".into())
+                        });
+                        return ApiResponse::error(
+                            super::combine_rollback_failure(
+                                primary,
+                                rollback_err,
+                                "State Node create",
+                                "remote",
+                                "rollback",
+                            ),
                             trace_id,
                         );
+                    }
+                    return response;
                 }
-                return response;
-            }
-        };
+            };
 
         let output = CreateContentOutput {
             content_id: result.content_id.as_str().to_string(),
@@ -969,15 +967,17 @@ impl MonasController {
             if let Err(rollback_err) =
                 self.rollback_updated_content(&before_update, &result.content_id)
             {
-                let remote_message = response
-                    .error
-                    .as_ref()
-                    .map(|e| format!("{e:?}"))
-                    .unwrap_or_else(|| "unknown state node update failure".into());
+                let primary = response.error.clone().unwrap_or_else(|| {
+                    ApiError::Internal("unknown state node update failure".into())
+                });
                 return ApiResponse::error(
-                    ApiError::Internal(format!(
-                        "State Node update failed and local rollback also failed: remote={remote_message}, rollback={rollback_err}"
-                    )),
+                    super::combine_rollback_failure(
+                        primary,
+                        rollback_err,
+                        "State Node update",
+                        "remote",
+                        "rollback",
+                    ),
                     trace_id,
                 );
             }
@@ -1056,17 +1056,18 @@ impl MonasController {
             self.send_delete_to_state_node(&input.remote_content_id, auth, trace_id.clone())
         {
             if let Err(restore_err) = self.restore_deleted_from_snapshot(&snapshot) {
-                let remote_message = response
-                    .error
-                    .as_ref()
-                    .map(|e| format!("{e:?}"))
-                    .unwrap_or_else(|| "unknown state node delete failure".into());
-                let rollback_message =
-                    format!("{:?}", Self::map_restore_deleted_error(restore_err));
+                let primary = response.error.clone().unwrap_or_else(|| {
+                    ApiError::Internal("unknown state node delete failure".into())
+                });
+                let restore_message = Self::map_restore_deleted_error(restore_err);
                 return ApiResponse::error(
-                    ApiError::Internal(format!(
-                        "State Node delete failed and local restore also failed: remote={remote_message}, restore={rollback_message}"
-                    )),
+                    super::combine_rollback_failure(
+                        primary,
+                        restore_message,
+                        "State Node delete",
+                        "remote",
+                        "restore",
+                    ),
                     trace_id,
                 );
             }

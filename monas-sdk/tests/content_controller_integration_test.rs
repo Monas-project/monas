@@ -1,3 +1,8 @@
+// Integration tests intentionally use the test/dev-only constructors
+// (`MonasController::with_state_node_url` / `with_urls`) marked
+// `#[deprecated]` for production gateways.
+#![allow(deprecated)]
+
 use base64::{
     engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD},
     Engine,
@@ -16,6 +21,20 @@ fn compute_content_id(raw_content: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(raw_content);
     format!("{:x}", hasher.finalize())
+}
+
+/// `X-Request-Timestamp` の skew チェックを実質的に無効化した `MonasController`。
+///
+/// 古い固定値 (e.g. `1_717_171_717`) で署名検証する旧来テスト用のヘルパ。
+/// 本番運用ではこの設定を使わない。
+fn controller_for_legacy_timestamps(
+    state_node_url: String,
+    account_url: String,
+) -> MonasController {
+    let config = MonasConfig::new(state_node_url, account_url)
+        // 100 年以上の skew を許容することで、テスト固定 timestamp の絶対値を気にしなくてよくする。
+        .with_request_timestamp_skew(Duration::from_secs(60 * 60 * 24 * 365 * 100));
+    MonasController::with_config(config).expect("with_config")
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -452,7 +471,8 @@ async fn create_content_uses_account_signature_for_state_node_request() {
         .create_async()
         .await;
 
-    let controller = MonasController::with_urls(state_node_server.url(), account_server.url());
+    let controller =
+        controller_for_legacy_timestamps(state_node_server.url(), account_server.url());
     let auth = StateNodeAuthContext {
         authorization: Some("Bearer old".into()),
         request_signature: Some("old-signature".into()),
@@ -495,7 +515,8 @@ async fn create_content_fails_fast_when_account_key_is_not_p256() {
         .create_async()
         .await;
 
-    let controller = MonasController::with_urls(state_node_server.url(), account_server.url());
+    let controller =
+        controller_for_legacy_timestamps(state_node_server.url(), account_server.url());
     let auth = StateNodeAuthContext {
         authorization: None,
         request_signature: None,
@@ -687,7 +708,8 @@ async fn delete_content_uses_account_signature_for_metadata_request() {
         .create_async()
         .await;
 
-    let controller = MonasController::with_urls(state_node_server.url(), account_server.url());
+    let controller =
+        controller_for_legacy_timestamps(state_node_server.url(), account_server.url());
     let created = controller
         .create_content(
             CreateContentInput {
@@ -831,7 +853,7 @@ async fn create_content_returns_timeout_when_state_node_hangs() {
 
     let config =
         MonasConfig::new(url.clone(), url).with_request_timeout(Duration::from_millis(200));
-    let controller = MonasController::with_config(config);
+    let controller = MonasController::with_config(config).expect("with_config");
 
     let input = CreateContentInput {
         content: URL_SAFE_NO_PAD.encode(b"timeout test"),
@@ -859,5 +881,127 @@ async fn create_content_returns_timeout_when_state_node_hangs() {
 
     // listener は drop で自動的に閉じる。念のため明示。
     drop(listener);
+    cleanup_content_artifacts();
+}
+
+/// `X-Request-Timestamp` が許容 skew (default 60s) を大きく超える場合、
+/// SDK は signing 前に `ApiError::Unauthorized` を返し HTTP を一切叩かない
+/// ことを確認する。PR #29 review (blocker 3) で導入した clamp の regression test。
+#[tokio::test(flavor = "multi_thread")]
+async fn create_content_rejects_far_future_timestamp_with_unauthorized() {
+    let _guard = acquire_test_lock();
+
+    // ダミー URL で十分。clamp が先に発火して HTTP は走らない。
+    let controller = MonasController::with_state_node_url("http://127.0.0.1:1");
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let auth = StateNodeAuthContext {
+        authorization: Some("Bearer x".into()),
+        request_signature: None,
+        // 1 時間先の timestamp。default 60s skew を遥かに超える。
+        request_timestamp: Some(now + 3600),
+    };
+
+    let response = controller.create_content(
+        CreateContentInput {
+            content: URL_SAFE_NO_PAD.encode(b"freshness-test"),
+            metadata: Some(ContentMetadata {
+                name: Some("freshness.txt".into()),
+                content_type: Some("text/plain".into()),
+                created_at: None,
+                updated_at: None,
+            }),
+        },
+        Some(&auth),
+    );
+
+    assert!(!response.success, "create_content must fail due to clamp");
+    match response.error {
+        Some(ApiError::Unauthorized(msg)) => {
+            assert!(
+                msg.contains("X-Request-Timestamp"),
+                "unexpected message: {msg}"
+            );
+            assert!(msg.contains("out of acceptable window"), "msg={msg}");
+        }
+        other => panic!("expected Unauthorized, got {other:?}"),
+    }
+
+    cleanup_content_artifacts();
+}
+
+/// `auth: Some` で timestamp が欠落している場合は、SDK が現在時刻で補完して
+/// 再署名してはいけない。Gateway 側の parse failure / missing header が `None`
+/// に潰れた場合の replay bypass を防ぐ regression test。
+#[tokio::test(flavor = "multi_thread")]
+async fn create_content_rejects_missing_timestamp_with_unauthorized() {
+    let _guard = acquire_test_lock();
+    let controller = MonasController::with_state_node_url("http://127.0.0.1:1");
+    let auth = StateNodeAuthContext {
+        authorization: Some("Bearer x".into()),
+        request_signature: None,
+        request_timestamp: None,
+    };
+
+    let response = controller.create_content(
+        CreateContentInput {
+            content: URL_SAFE_NO_PAD.encode(b"freshness-missing-test"),
+            metadata: Some(ContentMetadata {
+                name: Some("freshness-missing.txt".into()),
+                content_type: Some("text/plain".into()),
+                created_at: None,
+                updated_at: None,
+            }),
+        },
+        Some(&auth),
+    );
+
+    assert!(!response.success);
+    match response.error {
+        Some(ApiError::Unauthorized(msg)) => {
+            assert!(msg.contains("X-Request-Timestamp"), "msg={msg}");
+            assert!(msg.contains("required"), "msg={msg}");
+        }
+        other => panic!("expected Unauthorized, got {other:?}"),
+    }
+    cleanup_content_artifacts();
+}
+
+/// `X-Request-Timestamp` が許容 skew を「過去側」に大きく超える場合も
+/// `ApiError::Unauthorized` を返す。replay 防御の対称性確認。
+#[tokio::test(flavor = "multi_thread")]
+async fn create_content_rejects_far_past_timestamp_with_unauthorized() {
+    let _guard = acquire_test_lock();
+    let controller = MonasController::with_state_node_url("http://127.0.0.1:1");
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let auth = StateNodeAuthContext {
+        authorization: None,
+        request_signature: None,
+        // 1 時間前 (default 60s skew を遥かに超える)
+        request_timestamp: Some(now.saturating_sub(3600)),
+    };
+
+    let response = controller.create_content(
+        CreateContentInput {
+            content: URL_SAFE_NO_PAD.encode(b"freshness-past-test"),
+            metadata: Some(ContentMetadata {
+                name: Some("freshness-past.txt".into()),
+                content_type: Some("text/plain".into()),
+                created_at: None,
+                updated_at: None,
+            }),
+        },
+        Some(&auth),
+    );
+
+    assert!(!response.success);
+    assert!(matches!(response.error, Some(ApiError::Unauthorized(_))));
     cleanup_content_artifacts();
 }

@@ -14,6 +14,18 @@ pub trait ShareRepository {
     fn save(&self, share: &Share) -> Result<(), ShareRepositoryError>;
 }
 
+/// `Arc<dyn ShareRepository + Send + Sync>` を `ShareService` の型パラメータに
+/// 直接渡せるようにする blanket impl。
+impl<T: ShareRepository + ?Sized> ShareRepository for std::sync::Arc<T> {
+    fn load(&self, content_id: &ContentId) -> Result<Option<Share>, ShareRepositoryError> {
+        (**self).load(content_id)
+    }
+
+    fn save(&self, share: &Share) -> Result<(), ShareRepositoryError> {
+        (**self).save(share)
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ShareRepositoryError {
     #[error("storage error: {0}")]
@@ -41,6 +53,26 @@ pub trait PublicKeyDirectory {
     /// - 補償トランザクション（ロールバック）に使用する。
     /// - 存在しない KeyId を削除しようとしてもエラーにならない（冪等）。
     fn delete_public_key(&self, key_id: &KeyId) -> Result<(), PublicKeyDirectoryError>;
+}
+
+/// `Arc<dyn PublicKeyDirectory + Send + Sync>` を `ShareService` の型パラメータに
+/// 直接渡せるようにする blanket impl。
+impl<T: PublicKeyDirectory + ?Sized> PublicKeyDirectory for std::sync::Arc<T> {
+    fn compute_key_id(&self, public_key: &[u8]) -> KeyId {
+        (**self).compute_key_id(public_key)
+    }
+
+    fn register_public_key(&self, public_key: &[u8]) -> Result<KeyId, PublicKeyDirectoryError> {
+        (**self).register_public_key(public_key)
+    }
+
+    fn find_public_key(&self, key_id: &KeyId) -> Result<Option<Vec<u8>>, PublicKeyDirectoryError> {
+        (**self).find_public_key(key_id)
+    }
+
+    fn delete_public_key(&self, key_id: &KeyId) -> Result<(), PublicKeyDirectoryError> {
+        (**self).delete_public_key(key_id)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

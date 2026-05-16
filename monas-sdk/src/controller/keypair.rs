@@ -46,6 +46,7 @@ impl MonasController {
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // tests intentionally use the test/dev-only constructors
 mod tests {
     use super::*;
 

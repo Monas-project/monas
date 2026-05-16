@@ -10,7 +10,9 @@ use monas_sdk::models::content::{
 use monas_sdk::models::keypair::GenerateKeypairInput;
 use monas_sdk::models::share::{DecryptSharedContentInput, RevokeShareInput, ShareContentInput};
 use monas_sdk::models::state::{GetHistoryInput, GetLatestVersionInput, VerifyIntegrityInput};
-use monas_sdk::{ApiResponse, MonasController, StateNodeAuthContext};
+use monas_sdk::{
+    generate_trace_id, ApiError, ApiResponse, MonasConfig, MonasController, StateNodeAuthContext,
+};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -26,7 +28,17 @@ async fn main() {
         std::env::var("MONAS_STATE_NODE_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".into());
     let account_url =
         std::env::var("MONAS_ACCOUNT_URL").unwrap_or_else(|_| "http://127.0.0.1:4002".into());
-    let controller = Arc::new(MonasController::with_urls(state_node_url, account_url));
+
+    // 本番運用は MONAS_PERSISTENCE_DIR を必ず設定する。未設定時は in-memory にフォールバックし、
+    // SDK 側で stderr に警告が出る (CEK と share が再起動で揮発する)。
+    let mut config = MonasConfig::new(state_node_url, account_url);
+    if let Ok(dir) = std::env::var("MONAS_PERSISTENCE_DIR") {
+        config = config.with_persistence_dir(dir);
+    }
+    let controller = Arc::new(
+        MonasController::with_config(config)
+            .expect("failed to initialize MonasController persistence"),
+    );
 
     let app_state = AppState { controller };
 
@@ -73,7 +85,11 @@ async fn generate_keypair(
     StatusCode,
     Json<ApiResponse<monas_sdk::models::keypair::GenerateKeypairOutput>>,
 ) {
-    api_json(state.controller.generate_keypair(input))
+    api_json(
+        Arc::clone(&state.controller)
+            .generate_keypair_async(input)
+            .await,
+    )
 }
 
 async fn create_content(
@@ -84,8 +100,15 @@ async fn create_content(
     StatusCode,
     Json<ApiResponse<monas_sdk::models::content::CreateContentOutput>>,
 ) {
-    let auth = build_state_node_auth_context(&headers);
-    api_json(state.controller.create_content(input, Some(&auth)))
+    let auth = match build_state_node_auth_context(&headers) {
+        Ok(auth) => auth,
+        Err(error) => return auth_error_json(error),
+    };
+    api_json(
+        Arc::clone(&state.controller)
+            .create_content_async(input, Some(auth))
+            .await,
+    )
 }
 
 async fn get_content(
@@ -96,7 +119,7 @@ async fn get_content(
     Json<ApiResponse<monas_sdk::models::content::GetContentOutput>>,
 ) {
     let input = GetContentInput { content_id: id };
-    api_json(state.controller.get_content(input))
+    api_json(Arc::clone(&state.controller).get_content_async(input).await)
 }
 
 async fn update_content(
@@ -109,8 +132,15 @@ async fn update_content(
     Json<ApiResponse<monas_sdk::models::content::UpdateContentOutput>>,
 ) {
     input.local_content_id = id;
-    let auth = build_state_node_auth_context(&headers);
-    api_json(state.controller.update_content(input, Some(&auth)))
+    let auth = match build_state_node_auth_context(&headers) {
+        Ok(auth) => auth,
+        Err(error) => return auth_error_json(error),
+    };
+    api_json(
+        Arc::clone(&state.controller)
+            .update_content_async(input, Some(auth))
+            .await,
+    )
 }
 
 async fn delete_content(
@@ -123,8 +153,15 @@ async fn delete_content(
     Json<ApiResponse<monas_sdk::models::content::DeleteContentOutput>>,
 ) {
     input.local_content_id = id;
-    let auth = build_state_node_auth_context(&headers);
-    api_json(state.controller.delete_content(input, Some(&auth)))
+    let auth = match build_state_node_auth_context(&headers) {
+        Ok(auth) => auth,
+        Err(error) => return auth_error_json(error),
+    };
+    api_json(
+        Arc::clone(&state.controller)
+            .delete_content_async(input, Some(auth))
+            .await,
+    )
 }
 
 async fn share_content(
@@ -134,7 +171,11 @@ async fn share_content(
     StatusCode,
     Json<ApiResponse<monas_sdk::models::share::ShareContentOutput>>,
 ) {
-    api_json(state.controller.share_content(input))
+    api_json(
+        Arc::clone(&state.controller)
+            .share_content_async(input)
+            .await,
+    )
 }
 
 async fn revoke_share(
@@ -145,8 +186,15 @@ async fn revoke_share(
     StatusCode,
     Json<ApiResponse<monas_sdk::models::share::RevokeShareOutput>>,
 ) {
-    let auth = build_state_node_auth_context(&headers);
-    api_json(state.controller.revoke_share(input, Some(&auth)))
+    let auth = match build_state_node_auth_context(&headers) {
+        Ok(auth) => auth,
+        Err(error) => return auth_error_json(error),
+    };
+    api_json(
+        Arc::clone(&state.controller)
+            .revoke_share_async(input, Some(auth))
+            .await,
+    )
 }
 
 async fn decrypt_shared_content(
@@ -156,7 +204,11 @@ async fn decrypt_shared_content(
     StatusCode,
     Json<ApiResponse<monas_sdk::models::share::DecryptSharedContentOutput>>,
 ) {
-    api_json(state.controller.decrypt_shared_content(input))
+    api_json(
+        Arc::clone(&state.controller)
+            .decrypt_shared_content_async(input)
+            .await,
+    )
 }
 
 async fn get_latest_version(
@@ -167,8 +219,15 @@ async fn get_latest_version(
     StatusCode,
     Json<ApiResponse<monas_sdk::models::state::GetLatestVersionOutput>>,
 ) {
-    let auth = build_state_node_auth_context(&headers);
-    api_json(state.controller.get_latest_version(input, Some(&auth)))
+    let auth = match build_state_node_auth_context(&headers) {
+        Ok(auth) => auth,
+        Err(error) => return auth_error_json(error),
+    };
+    api_json(
+        Arc::clone(&state.controller)
+            .get_latest_version_async(input, Some(auth))
+            .await,
+    )
 }
 
 async fn get_history(
@@ -179,8 +238,15 @@ async fn get_history(
     StatusCode,
     Json<ApiResponse<monas_sdk::models::state::GetHistoryOutput>>,
 ) {
-    let auth = build_state_node_auth_context(&headers);
-    api_json(state.controller.get_history(input, Some(&auth)))
+    let auth = match build_state_node_auth_context(&headers) {
+        Ok(auth) => auth,
+        Err(error) => return auth_error_json(error),
+    };
+    api_json(
+        Arc::clone(&state.controller)
+            .get_history_async(input, Some(auth))
+            .await,
+    )
 }
 
 async fn verify_integrity(
@@ -191,8 +257,15 @@ async fn verify_integrity(
     StatusCode,
     Json<ApiResponse<monas_sdk::models::state::VerifyIntegrityOutput>>,
 ) {
-    let auth = build_state_node_auth_context(&headers);
-    api_json(state.controller.verify_integrity(input, Some(&auth)))
+    let auth = match build_state_node_auth_context(&headers) {
+        Ok(auth) => auth,
+        Err(error) => return auth_error_json(error),
+    };
+    api_json(
+        Arc::clone(&state.controller)
+            .verify_integrity_async(input, Some(auth))
+            .await,
+    )
 }
 
 fn api_json<T>(response: ApiResponse<T>) -> (StatusCode, Json<ApiResponse<T>>) {
@@ -204,7 +277,11 @@ fn api_json<T>(response: ApiResponse<T>) -> (StatusCode, Json<ApiResponse<T>>) {
     (status, Json(response))
 }
 
-fn build_state_node_auth_context(headers: &HeaderMap) -> StateNodeAuthContext {
+fn auth_error_json<T>(error: ApiError) -> (StatusCode, Json<ApiResponse<T>>) {
+    api_json(ApiResponse::error(error, generate_trace_id()))
+}
+
+fn build_state_node_auth_context(headers: &HeaderMap) -> Result<StateNodeAuthContext, ApiError> {
     let authorization = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -217,22 +294,56 @@ fn build_state_node_auth_context(headers: &HeaderMap) -> StateNodeAuthContext {
 
     let request_timestamp = headers
         .get("x-request-timestamp")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok());
+        .ok_or_else(|| ApiError::Unauthorized("X-Request-Timestamp is required".into()))?
+        .to_str()
+        .map_err(|_| {
+            ApiError::Unauthorized("X-Request-Timestamp must be a valid Unix timestamp".into())
+        })?
+        .parse::<u64>()
+        .map_err(|_| {
+            ApiError::Unauthorized("X-Request-Timestamp must be a valid Unix timestamp".into())
+        })?;
 
-    StateNodeAuthContext {
+    Ok(StateNodeAuthContext {
         authorization,
         request_signature,
-        request_timestamp,
-    }
+        request_timestamp: Some(request_timestamp),
+    })
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // tests use the test/dev-only `with_state_node_url` constructor
 mod tests {
     use super::*;
     use monas_sdk::models::content::{ContentMetadata, CreateContentInput};
-    use monas_sdk::ApiError;
     use std::sync::Arc;
+
+    fn headers_with_timestamp(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-request-timestamp", value.parse().unwrap());
+        headers
+    }
+
+    fn current_timestamp_header() -> HeaderMap {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .to_string();
+        headers_with_timestamp(&ts)
+    }
+
+    fn valid_create_input() -> Json<CreateContentInput> {
+        Json(CreateContentInput {
+            content: "Z2F0ZXdheS1jb250ZW50".into(),
+            metadata: Some(ContentMetadata {
+                name: Some("gateway.txt".into()),
+                content_type: None,
+                created_at: None,
+                updated_at: None,
+            }),
+        })
+    }
 
     #[test]
     fn api_json_uses_error_status_code() {
@@ -257,7 +368,7 @@ mod tests {
             "http://127.0.0.1:8080",
         ));
         let state = State(AppState { controller });
-        let headers = HeaderMap::new();
+        let headers = current_timestamp_header();
         let input = Json(CreateContentInput {
             content: String::new(),
             metadata: Some(ContentMetadata {
@@ -272,6 +383,45 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(!body.success);
         assert!(matches!(body.error, Some(ApiError::Validation(_))));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_content_handler_rejects_missing_timestamp() {
+        let controller = Arc::new(MonasController::with_state_node_url(
+            "http://127.0.0.1:8080",
+        ));
+        let state = State(AppState { controller });
+        let headers = HeaderMap::new();
+
+        let (status, Json(body)) = create_content(state, headers, valid_create_input()).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(!body.success);
+        match body.error {
+            Some(ApiError::Unauthorized(msg)) => {
+                assert!(msg.contains("X-Request-Timestamp"), "msg={msg}");
+                assert!(msg.contains("required"), "msg={msg}");
+            }
+            other => panic!("expected Unauthorized, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_content_handler_rejects_malformed_timestamp() {
+        let controller = Arc::new(MonasController::with_state_node_url(
+            "http://127.0.0.1:8080",
+        ));
+        let state = State(AppState { controller });
+        let headers = headers_with_timestamp("not-a-number");
+
+        let (status, Json(body)) = create_content(state, headers, valid_create_input()).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(!body.success);
+        match body.error {
+            Some(ApiError::Unauthorized(msg)) => {
+                assert!(msg.contains("valid Unix timestamp"), "msg={msg}");
+            }
+            other => panic!("expected Unauthorized, got {other:?}"),
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

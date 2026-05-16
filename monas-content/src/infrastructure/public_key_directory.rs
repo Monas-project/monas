@@ -89,6 +89,14 @@ impl SledPublicKeyDirectory {
         Ok(Self { db })
     }
 
+    /// 既存の `sled::Db` ハンドルを共有してインスタンスを構築する。
+    ///
+    /// `SledContentEncryptionKeyStore` / `SledShareRepository` と同一の sled DB を
+    /// 共有する場合に使う (キー空間は `pubkey:` プレフィックスで分離)。
+    pub fn with_db(db: sled::Db) -> Self {
+        Self { db }
+    }
+
     fn make_key(key_id: &KeyId) -> String {
         format!("pubkey:{}", hex::encode(key_id.as_bytes()))
     }
