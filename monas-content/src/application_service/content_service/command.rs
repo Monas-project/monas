@@ -4,8 +4,11 @@ use crate::domain::{content::metadata::Metadata, content_id::ContentId};
 /// コンテンツ作成ユースケースの入力。
 #[derive(Debug)]
 pub struct CreateContentCommand {
+    /// コンテンツ名
     pub name: String,
+    /// 論理パス
     pub path: String,
+    /// コンテンツの生データ
     pub raw_content: Vec<u8>,
     /// 保存先のストレージプロバイダー。
     /// `None` の場合はデフォルトプロバイダーに保存される。
@@ -20,6 +23,7 @@ pub struct CreateContentResult {
     /// コンテンツ暗号化に用いた鍵から導出される公開情報など。
     /// 具体的な意味づけは後続の設計で決める。
     pub public_key: String,
+    pub encrypted_content: Vec<u8>,
 }
 
 /// コンテンツ更新ユースケースの入力。
@@ -35,7 +39,9 @@ pub struct UpdateContentCommand {
 #[derive(Debug)]
 pub struct UpdateContentResult {
     pub content_id: ContentId,
+    pub series_id: ContentId,
     pub metadata: Metadata,
+    pub encrypted_content: Vec<u8>,
 }
 
 /// コンテンツ削除ユースケースの入力。
@@ -49,6 +55,24 @@ pub struct DeleteContentCommand {
 #[derive(Debug)]
 pub struct DeleteContentResult {
     pub content_id: ContentId,
+}
+
+/// 削除済みコンテンツ復元ユースケースの入力。
+#[derive(Debug)]
+pub struct RestoreDeletedContentCommand {
+    pub content_id: ContentId,
+    pub name: String,
+    pub path: String,
+    pub raw_content: Vec<u8>,
+    pub provider: Option<StorageProvider>,
+}
+
+/// 削除済みコンテンツ復元ユースケースの出力。
+#[derive(Debug)]
+pub struct RestoreDeletedContentResult {
+    pub content_id: ContentId,
+    pub metadata: Metadata,
+    pub encrypted_content: Vec<u8>,
 }
 
 /// コンテンツ取得（fetch）ユースケースの出力。

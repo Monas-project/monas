@@ -9,13 +9,7 @@ use std::sync::Arc;
 use axum::{routing::get, Router};
 
 use crate::{
-    application_service::{
-        content_service::{
-            ContentCreatedOperation, ContentDeletedOperation, ContentService,
-            ContentUpdatedOperation, StateNodeClient, StateNodeClientError,
-        },
-        share_service::ShareService,
-    },
+    application_service::{content_service::ContentService, share_service::ShareService},
     infrastructure::{
         content_id::Sha256ContentIdGenerator,
         encryption::{Aes256CtrContentEncryption, OsRngContentEncryptionKeyGenerator},
@@ -35,44 +29,12 @@ use base64_helpers::{
     decode_base64, decode_base64_optional, decode_cek_base64, decode_key_id_base64,
 };
 
-/// v1 用のダミー `StateNodeClient` 実装。
-/// 実際には何も送信せず、ログ出力だけ行う想定のため、ここでは単に `Ok(())` を返す。
-#[derive(Clone, Default)]
-struct NoopStateNodeClient;
-
-impl StateNodeClient for NoopStateNodeClient {
-    fn send_content_created(
-        &self,
-        _operation: &ContentCreatedOperation,
-    ) -> Result<(), StateNodeClientError> {
-        // TODO: 将来的にHTTPクライアントでstate-nodeのAPIを呼ぶ実装に差し替える。
-        Ok(())
-    }
-
-    fn send_content_updated(
-        &self,
-        _operation: &ContentUpdatedOperation,
-    ) -> Result<(), StateNodeClientError> {
-        // TODO: 将来的にHTTPクライアントでstate-nodeのAPIを呼ぶ実装に差し替える。
-        Ok(())
-    }
-
-    fn send_content_deleted(
-        &self,
-        _operation: &ContentDeletedOperation,
-    ) -> Result<(), StateNodeClientError> {
-        // TODO: 将来的にHTTPクライアントでstate-nodeのAPIを呼ぶ実装に差し替える。
-        Ok(())
-    }
-}
-
 #[derive(Clone)]
 struct AppState {
     pub content_service: Arc<
         ContentService<
             Sha256ContentIdGenerator,
             MultiStorageRepository,
-            NoopStateNodeClient,
             OsRngContentEncryptionKeyGenerator,
             Aes256CtrContentEncryption,
             InMemoryContentEncryptionKeyStore,
@@ -105,7 +67,6 @@ pub fn create_router() -> Router {
     let content_service = ContentService {
         content_id_generator: Sha256ContentIdGenerator,
         content_repository: content_repository.clone(),
-        state_node_client: NoopStateNodeClient,
         key_generator: OsRngContentEncryptionKeyGenerator,
         encryptor: Aes256CtrContentEncryption,
         cek_store: cek_store.clone(),

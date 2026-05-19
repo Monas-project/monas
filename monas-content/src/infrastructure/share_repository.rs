@@ -55,6 +55,14 @@ impl SledShareRepository {
         let db = sled::open(path).map_err(|e| ShareRepositoryError::Storage(e.to_string()))?;
         Ok(Self { db })
     }
+
+    /// 既存の `sled::Db` ハンドルを共有してインスタンスを構築する。
+    ///
+    /// CEK ストアと同じ DB ファイルを共有したい場合に使う
+    /// (`SledContentEncryptionKeyStore::with_db` と同じ `sled::Db` を渡す)。
+    pub fn with_db(db: sled::Db) -> Self {
+        Self { db }
+    }
 }
 
 impl ShareRepository for SledShareRepository {

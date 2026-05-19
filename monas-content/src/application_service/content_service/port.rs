@@ -78,52 +78,33 @@ pub trait ContentEncryptionKeyStore {
     fn delete(&self, content_id: &ContentId) -> Result<(), ContentEncryptionKeyStoreError>;
 }
 
+/// `Arc<dyn ContentEncryptionKeyStore + Send + Sync>` を `ContentService` の
+/// 型パラメータに直接渡せるようにする blanket impl。
+///
+/// SDK 側で persistence backend を実行時に切り替える (in-memory / sled / その他) ために必要。
+impl<T: ContentEncryptionKeyStore + ?Sized> ContentEncryptionKeyStore for std::sync::Arc<T> {
+    fn save(
+        &self,
+        content_id: &ContentId,
+        key: &ContentEncryptionKey,
+    ) -> Result<(), ContentEncryptionKeyStoreError> {
+        (**self).save(content_id, key)
+    }
+
+    fn load(
+        &self,
+        content_id: &ContentId,
+    ) -> Result<Option<ContentEncryptionKey>, ContentEncryptionKeyStoreError> {
+        (**self).load(content_id)
+    }
+
+    fn delete(&self, content_id: &ContentId) -> Result<(), ContentEncryptionKeyStoreError> {
+        (**self).delete(content_id)
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ContentEncryptionKeyStoreError {
     #[error("storage error: {0}")]
     Storage(String),
-}
-
-/// state-node へ Operation を送信するポート。
-pub trait StateNodeClient {
-    fn send_content_created(
-        &self,
-        operation: &ContentCreatedOperation,
-    ) -> Result<(), StateNodeClientError>;
-    fn send_content_updated(
-        &self,
-        operation: &ContentUpdatedOperation,
-    ) -> Result<(), StateNodeClientError>;
-    fn send_content_deleted(
-        &self,
-        operation: &ContentDeletedOperation,
-    ) -> Result<(), StateNodeClientError>;
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum StateNodeClientError {
-    #[error("network error: {0}")]
-    Network(String),
-}
-
-/// state-node に送る「コンテンツ作成」Operation のDTO（アプリケーション層側の表現）。
-pub struct ContentCreatedOperation {
-    pub content_id: ContentId,
-    pub hash: String,
-    pub path: String,
-    pub public_key: String,
-    // TODO: 必要に応じて nodes や license などを追加。
-}
-
-/// state-node に送る「コンテンツ削除」Operation のDTO（アプリケーション層側の表現）。
-pub struct ContentDeletedOperation {
-    pub content_id: ContentId,
-    pub path: String,
-}
-
-/// state-node に送る「コンテンツ更新」Operation のDTO（アプリケーション層側の表現）。
-pub struct ContentUpdatedOperation {
-    pub content_id: ContentId,
-    pub hash: String,
-    pub path: String,
 }

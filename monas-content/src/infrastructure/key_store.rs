@@ -74,6 +74,16 @@ impl SledContentEncryptionKeyStore {
             sled::open(path).map_err(|e| ContentEncryptionKeyStoreError::Storage(e.to_string()))?;
         Ok(Self { db })
     }
+
+    /// 既存の `sled::Db` ハンドルを共有してインスタンスを構築する。
+    ///
+    /// sled は path 単位で排他 flock を取るため、同じプロセスから同一ディレクトリを
+    /// 2 度 `sled::open` することはできない。CEK ストアと Share repository を
+    /// 同じ DB ファイルに同居させたい場合は、外側で 1 度だけ `sled::open` した
+    /// `sled::Db` をこのコンストラクタ経由で渡す。
+    pub fn with_db(db: sled::Db) -> Self {
+        Self { db }
+    }
 }
 
 impl ContentEncryptionKeyStore for SledContentEncryptionKeyStore {

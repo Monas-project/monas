@@ -1,5 +1,5 @@
 [workspace]
-members = ["monas-account", "monas-content", "monas-event-manager", "wasm-module-proto", "monas-filesync", "monas-state-node"]
+members = ["monas-account", "monas-content", "monas-event-manager", "wasm-module-proto", "monas-filesync", "monas-state-node", "monas-sdk", "monas-gateway"]
 resolver = "2"
 
 [workspace.package]
@@ -7,5 +7,3 @@ authors = ["Monas"]
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.79"
-
-[workspace.dependencies]

@@ -1,0 +1,33 @@
+[package]
+name = "monas-sdk"
+authors.workspace = true
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+monas-account = { path = "../monas-account" }
+monas-content = { path = "../monas-content" }
+monas-filesync = { path = "../monas-filesync" }
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0.12"
+uuid = { version = "1.0", features = ["v4"] }
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+ureq = { version = "3.1.4", features = ["json"] }
+url = "2.5"
+dotenv = "0.15"
+sha2 = "0.10"
+hex = "0.4.3"
+# `rt` だけを有効化。SDK 自身はランタイムを起動せず、呼び出し側 (例: gateway) が
+# 用意した tokio runtime 上で `spawn_blocking` を呼ぶためだけに使う。
+tokio = { version = "1.49.0", features = ["rt"] }
+# CEK ストアと Share repository を同一 sled DB で共有させるため、SDK 側で 1 度だけ
+# `sled::open` する。version は monas-content に揃える。
+sled = "0.34"
+
+[dev-dependencies]
+mockito = "1.7.2"
+tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread"] }
