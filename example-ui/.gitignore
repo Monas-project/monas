@@ -1,0 +1,12 @@
+node_modules
+dist
+dist2
+dist-ssr
+*.local
+.env
+.DS_Store
+*.tsbuildinfo
+vite.config.ts.timestamp-*.mjs
+
+# Demo-recording harness — not part of the app (kept locally, not committed).
+recording/
