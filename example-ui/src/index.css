@@ -334,6 +334,10 @@ a {
   background: var(--pink-50);
   color: var(--pink-700);
 }
+.crumbs .crumb.last:hover {
+  background: transparent;
+  color: var(--text);
+}
 .crumbs .crumb.last {
   color: var(--text);
   cursor: default;

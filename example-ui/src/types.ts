@@ -6,6 +6,14 @@ export type Permission = "read" | "write";
 
 export type KeyType = "secp256r1" | "secp256k1";
 
+// What the file browser is showing. "folder" is normal path-based browsing;
+// the others are flat, drive-wide filtered listings driven from the sidebar.
+export type View =
+  | { kind: "folder" }
+  | { kind: "all" } // every file, across all folders
+  | { kind: "synced" } // files registered on a state-node
+  | { kind: "shared" }; // files with at least one share
+
 // A recipient a file has been shared with. We keep the KeyEnvelope material so
 // the demo can later unwrap + decrypt (HPKE round-trip) to prove access.
 export interface ShareGrant {

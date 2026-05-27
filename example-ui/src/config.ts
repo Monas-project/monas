@@ -26,7 +26,6 @@ export const PROXY_DEFAULTS: EndpointConfig = {
 export const GATEWAY_PRESETS: { label: string; value: string }[] = [
   { label: "Local (Vite proxy → Docker)", value: "/api" },
   { label: "Local (direct :3000)", value: "http://127.0.0.1:3000" },
-  { label: "Public API", value: "https://gateway.monas.example" },
 ];
 
 const STORAGE_KEY = "monas.endpoints.v2";

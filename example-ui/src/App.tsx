@@ -34,7 +34,7 @@ import type { RunView, StepSpec } from "./pipeline/types";
 import * as flows from "./pipeline/flows";
 import * as contentApi from "./api/content";
 import * as shareApi from "./api/share";
-import type { Entry } from "./types";
+import type { Entry, View } from "./types";
 
 type Modal =
   | { type: "none" }
@@ -74,6 +74,7 @@ export default function App() {
   const active = getActive();
 
   const [path, setPath] = useState("/");
+  const [view, setView] = useState<View>({ kind: "folder" });
   const [modal, setModal] = useState<Modal>({ type: "none" });
   const [runs, setRuns] = useState<RunView[]>([]);
   const [collapsed, setCollapsed] = useState(false);
@@ -113,7 +114,30 @@ export default function App() {
     [collapsed, upsertRun],
   );
 
-  const current = entriesIn(path);
+  // Changing the folder path always implies normal folder browsing, so this
+  // wrapper also drops any active filter view.
+  const navigateTo = useCallback((p: string) => {
+    setPath(p);
+    setView({ kind: "folder" });
+  }, []);
+
+  // What the browser shows: folder view = direct children of `path`; the filter
+  // views are flat, drive-wide file listings. Derived from the reactive
+  // `entries` so it updates live on create/share/sync/delete.
+  const current =
+    view.kind === "folder"
+      ? entriesIn(path)
+      : entries
+          .filter((e) => e.kind === "file")
+          .filter((e) =>
+            view.kind === "all"
+              ? true
+              : view.kind === "synced"
+                ? e.syncedToStateNode
+                : e.shares.length > 0,
+          )
+          .sort((a, b) => a.name.localeCompare(b.name));
+
   const liveEntry = (id: string) => allEntries().find((e) => e.id === id);
 
   // ---- actions --------------------------------------------------------
@@ -142,6 +166,9 @@ export default function App() {
         versionCount: 1,
         shares: [],
       });
+      // Drop back to folder browsing so the new file is visible at `path`
+      // (it wouldn't match an active filter view yet).
+      setView({ kind: "folder" });
       pushToast(`“${name}” encrypted & created`, "success");
     } else {
       pushToast(`Failed to create “${name}”`, "error");
@@ -184,6 +211,7 @@ export default function App() {
       versionCount: 0,
       shares: [],
     });
+    setView({ kind: "folder" });
     pushToast(`Folder “${name}” created`, "success");
   };
 
@@ -377,7 +405,7 @@ export default function App() {
   const onAction = (action: string, entry: Entry) => {
     switch (action) {
       case "openFolder":
-        return setPath(folderPath(entry.parentPath, entry.name));
+        return navigateTo(folderPath(entry.parentPath, entry.name));
       case "open":
         return handleOpen(entry);
       case "update":
@@ -408,12 +436,15 @@ export default function App() {
       <div className="body">
         <Sidebar
           entries={entries}
+          view={view}
+          onSelectView={setView}
+          onMyDrive={() => navigateTo("/")}
           onNewFile={() => setModal({ type: "newFile" })}
           onNewFolder={() => setModal({ type: "newFolder" })}
           onUpload={() => fileInput.current?.click()}
         />
         <main className="main">
-          <FileBrowser path={path} entries={current} onNavigate={setPath} onAction={onAction} />
+          <FileBrowser path={path} view={view} entries={current} onNavigate={navigateTo} onAction={onAction} />
         </main>
         <PipelinePanel
           runs={runs}

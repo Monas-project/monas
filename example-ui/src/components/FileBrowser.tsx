@@ -1,5 +1,5 @@
 import { useState } from "react";
-import type { Entry } from "../types";
+import type { Entry, View } from "../types";
 import { fmtBytes, fmtTime, crumbsFor } from "../utils";
 import {
   Folder,
@@ -126,35 +126,48 @@ function Row({
   );
 }
 
+const VIEW_TITLES: Record<Exclude<View["kind"], "folder">, string> = {
+  all: "Encrypted files",
+  synced: "On state-node",
+  shared: "Shared",
+};
+
 export function FileBrowser({
   path,
+  view,
   entries,
   onNavigate,
   onAction,
 }: {
   path: string;
+  view: View;
   entries: Entry[];
   onNavigate: (path: string) => void;
   onAction: (action: string, entry: Entry) => void;
 }) {
   const [openMenu, setOpenMenu] = useState<string | null>(null);
   const crumbs = crumbsFor(path);
+  const filtered = view.kind !== "folder";
 
   return (
     <>
       <div className="toolbar">
         <div className="crumbs">
-          {crumbs.map((c, i) => (
-            <span key={c.path} style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
-              {i > 0 && <span className="sep">›</span>}
-              <span
-                className={`crumb ${i === crumbs.length - 1 ? "last" : ""}`}
-                onClick={() => i < crumbs.length - 1 && onNavigate(c.path)}
-              >
-                {c.name}
+          {view.kind !== "folder" ? (
+            <span className="crumb last">{VIEW_TITLES[view.kind]}</span>
+          ) : (
+            crumbs.map((c, i) => (
+              <span key={c.path} style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+                {i > 0 && <span className="sep">›</span>}
+                <span
+                  className={`crumb ${i === crumbs.length - 1 ? "last" : ""}`}
+                  onClick={() => i < crumbs.length - 1 && onNavigate(c.path)}
+                >
+                  {c.name}
+                </span>
               </span>
-            </span>
-          ))}
+            ))
+          )}
         </div>
       </div>
 
@@ -163,10 +176,11 @@ export function FileBrowser({
           <span className="big">
             <Folder size={30} />
           </span>
-          <h3>This folder is empty</h3>
+          <h3>{filtered ? "No matching files" : "This folder is empty"}</h3>
           <p className="muted">
-            Create a file or upload one — it gets encrypted and addressed by CID
-            before anything leaves the client.
+            {filtered
+              ? "Nothing matches this view yet. Files appear here once they're encrypted, synced to a state-node, or shared."
+              : "Create a file or upload one — it gets encrypted and addressed by CID before anything leaves the client."}
           </p>
         </div>
       ) : (

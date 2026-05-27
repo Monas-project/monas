@@ -1,13 +1,49 @@
-import type { Entry } from "../types";
+import type { ReactNode } from "react";
+import type { Entry, View } from "../types";
 import { Folder, Plus, Upload, FileText, Network, Lock } from "./icons";
+
+// A keyboard-accessible, clickable nav row. Reuses the .nav-item styling
+// (which assumes a flex div), so we keep a <div> and add button semantics.
+function NavItem({
+  active,
+  onSelect,
+  children,
+}: {
+  active: boolean;
+  onSelect: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <div
+      className={`nav-item ${active ? "active" : ""}`}
+      role="button"
+      tabIndex={0}
+      onClick={onSelect}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onSelect();
+        }
+      }}
+    >
+      {children}
+    </div>
+  );
+}
 
 export function Sidebar({
   entries,
+  view,
+  onSelectView,
+  onMyDrive,
   onNewFolder,
   onNewFile,
   onUpload,
 }: {
   entries: Entry[];
+  view: View;
+  onSelectView: (view: View) => void;
+  onMyDrive: () => void;
   onNewFolder: () => void;
   onNewFile: () => void;
   onUpload: () => void;
@@ -31,29 +67,29 @@ export function Sidebar({
       </div>
 
       <div className="side-label">Library</div>
-      <div className="nav-item active">
+      <NavItem active={view.kind === "folder"} onSelect={onMyDrive}>
         <Folder size={17} /> My Drive
-      </div>
+      </NavItem>
 
       <div className="side-label">At a glance</div>
-      <div className="nav-item">
+      <NavItem active={view.kind === "all"} onSelect={() => onSelectView({ kind: "all" })}>
         <Lock size={16} /> Encrypted files
         <span style={{ marginLeft: "auto" }} className="mono">
           {files.length}
         </span>
-      </div>
-      <div className="nav-item">
+      </NavItem>
+      <NavItem active={view.kind === "synced"} onSelect={() => onSelectView({ kind: "synced" })}>
         <Network size={16} /> On state-node
         <span style={{ marginLeft: "auto" }} className="mono">
           {synced}
         </span>
-      </div>
-      <div className="nav-item">
+      </NavItem>
+      <NavItem active={view.kind === "shared"} onSelect={() => onSelectView({ kind: "shared" })}>
         <FileText size={16} /> Shared
         <span style={{ marginLeft: "auto" }} className="mono">
           {shared}
         </span>
-      </div>
+      </NavItem>
 
       <div className="side-meta">
         Files are encrypted client-side (AES-256-CTR), addressed by SHA-256 CID,
