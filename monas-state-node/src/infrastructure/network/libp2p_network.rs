@@ -99,6 +99,12 @@ pub struct Libp2pNetworkConfig {
     pub enable_mdns: bool,
     /// Gossipsub topics to subscribe to.
     pub gossipsub_topics: Vec<String>,
+    /// Externally reachable addresses to advertise to peers (e.g. a public
+    /// IP/hostname for production deployments). These are passed to
+    /// `Swarm::add_external_address` and announced via identify so remote nodes
+    /// learn how to dial this node. Empty by default (local/mDNS setups don't
+    /// need it).
+    pub external_addrs: Vec<Multiaddr>,
 }
 
 impl Default for Libp2pNetworkConfig {
@@ -115,6 +121,7 @@ impl Default for Libp2pNetworkConfig {
             bootstrap_nodes: vec![],
             enable_mdns: true,
             gossipsub_topics: vec!["monas-events".to_string()],
+            external_addrs: vec![],
         }
     }
 }
@@ -398,6 +405,15 @@ impl Libp2pNetwork {
             }
         }
 
+        // Advertise externally reachable addresses (e.g. a public IP in
+        // production). identify announces these to peers so remote nodes can
+        // dial us even when our listen addresses are bound to 0.0.0.0 or sit
+        // behind NAT. No-op for local/mDNS setups where this is empty.
+        for addr in &config.external_addrs {
+            swarm.add_external_address(addr.clone());
+            info!("Advertising external address: {}", addr);
+        }
+
         // Subscribe to gossipsub topics
         for topic_name in &config.gossipsub_topics {
             let topic = IdentTopic::new(topic_name);
@@ -414,6 +430,12 @@ impl Libp2pNetwork {
                 .behaviour_mut()
                 .kademlia
                 .add_address(peer_id, addr.clone());
+            // Kademlia alone does not reliably supply addresses to the
+            // request-response behaviours (it only does so while the peer is
+            // `Entry::Present` in a routing bucket). Make the address available
+            // to every behaviour so request-response dials don't fail with
+            // `DialError::NoAddresses`.
+            swarm.add_peer_address(*peer_id, addr.clone());
             info!("Added bootstrap node: {} at {}", peer_id, addr);
         }
 
@@ -1688,12 +1710,16 @@ impl Libp2pNetwork {
                 info.agent_version,
                 info.listen_addrs.len()
             );
-            // Add peer's addresses to Kademlia
+            // Add peer's addresses to Kademlia, and also make them available to
+            // every behaviour (notably request-response) via the swarm's peer
+            // address book. Without this, request-response dials can fail with
+            // `DialError::NoAddresses` even though Kademlia knows the peer.
             for addr in &info.listen_addrs {
                 swarm
                     .behaviour_mut()
                     .kademlia
                     .add_address(&peer_id, addr.clone());
+                swarm.add_peer_address(peer_id, addr.clone());
             }
 
             // Try to bootstrap Kademlia now that we have a peer
@@ -1723,6 +1749,10 @@ impl Libp2pNetwork {
                         .behaviour_mut()
                         .kademlia
                         .add_address(&peer_id, addr.clone());
+                    // Also publish to the swarm-wide peer address book so the
+                    // request-response behaviours can dial this peer (Kademlia
+                    // alone is not a reliable address source for them).
+                    swarm.add_peer_address(peer_id, addr.clone());
                     connected_peers
                         .write()
                         .await
@@ -2126,6 +2156,7 @@ mod tests {
             bootstrap_nodes: vec![],
             enable_mdns: false,
             gossipsub_topics: vec!["test".to_string()],
+            external_addrs: vec![],
         };
 
         // Create a temporary directory for the CRDT repository

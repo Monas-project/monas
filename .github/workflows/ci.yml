@@ -58,3 +58,24 @@ jobs:
           save-if: false # Restore only
       - name: Run tests
         run: cargo test --workspace --profile test
+
+  # End-to-end smoke test: boots a real 4-node libp2p mesh and asserts that
+  # content creation returns HTTP 201 and members hold the data immediately.
+  # This is the regression guard for the request-response DialFailure bug,
+  # which only surfaces over the real HTTP + p2p path (not in `cargo test`).
+  e2e:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: rustup toolchain install stable --profile minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "all-targets-profile-test"
+          save-if: false # Restore only
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+      - name: Run e2e smoke test (4-node mesh)
+        run: ./scripts/ci-e2e.sh
+        working-directory: monas-state-node

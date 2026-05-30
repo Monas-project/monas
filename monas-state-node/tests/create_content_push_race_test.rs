@@ -134,6 +134,7 @@ async fn spawn_test_node() -> TestNode {
         bootstrap_nodes: vec![],
         enable_mdns: false,
         gossipsub_topics: vec!["test-events".to_string()],
+        external_addrs: vec![],
     };
 
     let network = Arc::new(
