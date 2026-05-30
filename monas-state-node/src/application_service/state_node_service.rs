@@ -1549,6 +1549,33 @@ where
                     return Ok(ApplyOutcome::Ignored);
                 }
 
+                // Self-promotion guard: the creator (relay) node intentionally
+                // keeps a local ContentNetwork record in which it is NOT a member
+                // (see create_content). If such a record already exists for this
+                // content and we are not in its member set, we are the creator and
+                // must refuse promotion. Accepting it would later route local-path
+                // writes (invalidate/update/delete) into commit_operation, which
+                // fails with "Genesis not found" because the creator holds no CRDT
+                // genesis. A legitimate new member has no local record yet at this
+                // point (or already lists itself), so it is unaffected. This relies
+                // only on local state — the creator identity is never persisted or
+                // shared with other nodes, owners, or sharees.
+                if let Ok(Some(existing)) = self
+                    .content_repo
+                    .read()
+                    .await
+                    .get_content_network(content_id)
+                    .await
+                {
+                    if !existing.has_member_str(&self.local_node_id) {
+                        tracing::info!(
+                            "Refusing member promotion for content {}: local record marks us as a non-member relay (creator)",
+                            content_id
+                        );
+                        return Ok(ApplyOutcome::Ignored);
+                    }
+                }
+
                 // When handling sync events, we create network with NodeIds directly
                 let content_id_vo = ContentId::new(content_id.clone())?;
 
@@ -2654,6 +2681,61 @@ mod tests {
 
         let outcome = service.handle_sync_event(&event, None).await.unwrap();
         assert_eq!(outcome, ApplyOutcome::Ignored);
+    }
+
+    // Regression: a creator (relay) node keeps a local ContentNetwork record in
+    // which it is NOT a member. When a redundancy check later picks the creator
+    // as a new member and broadcasts ContentNetworkManagerAdded, the creator must
+    // refuse self-promotion — otherwise subsequent local-path writes hit
+    // commit_operation with no genesis and fail ("Genesis not found", HTTP 500).
+    #[tokio::test]
+    async fn test_content_network_manager_added_creator_refuses_self_promotion() {
+        // Seed a local record where node-1 (us) is a non-member relay: the
+        // network it remembers contains only node-2 and node-3.
+        let node_registry = MockNodeRegistry::new();
+        let content_repo = Arc::new(RwLock::new(
+            MockContentNetworkRepository::new()
+                .with_network(create_test_network("content-1", vec!["node-2", "node-3"])),
+        ));
+        let peer_network = Arc::new(MockPeerNetwork::new().with_local_peer_id("node-1"));
+        let event_publisher = MockEventPublisher::new();
+        let crdt_repo = Arc::new(MockContentRepository::new());
+
+        let service: TestService = StateNodeService::new(
+            node_registry,
+            content_repo,
+            peer_network,
+            event_publisher,
+            crdt_repo,
+            "node-1".to_string(),
+        )
+        .with_authentication_service(TestAuthService)
+        .with_authorization_service(AllowAllAuthorizationService);
+
+        // A redundancy check on another node added us (node-1) to the member set.
+        let event = Event::ContentNetworkManagerAdded {
+            content_id: "content-1".to_string(),
+            added_node_id: "node-1".to_string(),
+            member_nodes: vec![
+                "node-1".to_string(),
+                "node-2".to_string(),
+                "node-3".to_string(),
+            ],
+            timestamp: 12345,
+        };
+
+        let outcome = service.handle_sync_event(&event, None).await.unwrap();
+        // Promotion is refused: the creator stays out of the member set.
+        assert_eq!(outcome, ApplyOutcome::Ignored);
+
+        // The local record is unchanged — node-1 is still NOT a member.
+        let network = service
+            .get_content_network_for_test("content-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!network.has_member_str("node-1"));
+        assert_eq!(network.member_count(), 2);
     }
 
     #[tokio::test]
