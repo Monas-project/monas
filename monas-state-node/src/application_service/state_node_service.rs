@@ -342,6 +342,23 @@ where
         self.peer_network.listen_addrs().await
     }
 
+    /// Decide whether a write (update/delete/invalidate) should be committed
+    /// locally or relayed to another node.
+    ///
+    /// The deciding factor is whether **this node holds the CRDT genesis** for
+    /// the content, not whether it appears in the ContentNetwork member set.
+    /// Local commits go through `commit_operation`, which fails with "Genesis
+    /// not found" when the genesis is absent. Two cases legitimately lack the
+    /// genesis and must relay instead: the node that first received
+    /// `create_content` (a non-member relay that intentionally never persisted
+    /// the genesis), and a freshly added member that has not yet synced the
+    /// genesis. Both are transient/structural states keyed purely on local CRDT
+    /// presence — no notion of "who created the content" is stored or
+    /// consulted, so membership and creator identity stay private.
+    async fn can_commit_locally(&self, genesis_cid: &str) -> bool {
+        self.crdt_repo.exists(genesis_cid).await.unwrap_or(false)
+    }
+
     /// Classify a relay error message into the appropriate StateNodeError.
     ///
     /// When a member node returns an error during relay, the error message is
@@ -669,9 +686,10 @@ where
             .map_err(|e| StateNodeError::StorageError(e.to_string()))?
             .ok_or_else(|| StateNodeError::ContentNotFound(content_id_vo.clone()))?;
 
-        // 2. Check if local node is a member
-        if network.has_member_str(&self.local_node_id) {
-            // Local delete path: we are a member node
+        // 2. Decide local commit vs relay by genesis presence (not membership):
+        //    only a node that actually holds the CRDT genesis can delete locally.
+        if self.can_commit_locally(content_id).await {
+            // Local delete path: we hold the genesis
             // Authenticate and authorize locally (we have the up-to-date access policy)
             let auth_service = self.auth_service.as_ref().ok_or_else(|| {
                 StateNodeError::InvalidConfiguration("Authentication not configured".to_string())
@@ -743,8 +761,15 @@ where
 
             Ok(event)
         } else {
-            // Relay path: we are not a member, relay to a member node with failover.
-            let members = network.member_nodes_as_strings();
+            // Relay path: we don't hold the genesis, so relay to a member that
+            // does, with failover. Exclude ourselves: a promoted-but-unsynced
+            // member is in its own member set, and relaying to self would just
+            // waste a failover attempt (mirrors the self-skip on the push path).
+            let members: Vec<String> = network
+                .member_nodes_as_strings()
+                .into_iter()
+                .filter(|m| m != &self.local_node_id)
+                .collect();
             if members.is_empty() {
                 return Err(StateNodeError::NoAvailableMembers);
             }
@@ -807,9 +832,10 @@ where
             .map_err(|e| StateNodeError::StorageError(e.to_string()))?
             .ok_or_else(|| StateNodeError::ContentNotFound(content_id_vo.clone()))?;
 
-        // 2. Check if local node is a member
-        if network.has_member_str(&self.local_node_id) {
-            // Local update path: we are a member node
+        // 2. Decide local commit vs relay by genesis presence (not membership):
+        //    only a node that actually holds the CRDT genesis can update locally.
+        if self.can_commit_locally(content_id).await {
+            // Local update path: we hold the genesis
             // Authenticate and authorize locally (we have the up-to-date access policy)
             let auth_service = self.auth_service.as_ref().ok_or_else(|| {
                 StateNodeError::InvalidConfiguration("Authentication not configured".to_string())
@@ -888,8 +914,15 @@ where
 
             Ok(event)
         } else {
-            // Relay path: we are not a member, relay to a member node with failover.
-            let members = network.member_nodes_as_strings();
+            // Relay path: we don't hold the genesis, so relay to a member that
+            // does, with failover. Exclude ourselves: a promoted-but-unsynced
+            // member is in its own member set, and relaying to self would just
+            // waste a failover attempt (mirrors the self-skip on the push path).
+            let members: Vec<String> = network
+                .member_nodes_as_strings()
+                .into_iter()
+                .filter(|m| m != &self.local_node_id)
+                .collect();
             if members.is_empty() {
                 return Err(StateNodeError::NoAvailableMembers);
             }
@@ -994,8 +1027,10 @@ where
             .map_err(|e| StateNodeError::StorageError(e.to_string()))?
             .ok_or_else(|| StateNodeError::ContentNotFound(content_id_vo.clone()))?;
 
-        if network.has_member_str(&self.local_node_id) {
-            // Local path: we are a member node
+        // Decide local commit vs relay by genesis presence (not membership):
+        // only a node that actually holds the CRDT genesis can invalidate locally.
+        if self.can_commit_locally(content_id).await {
+            // Local path: we hold the genesis
             // 4. Get access policy from CRDT
             let mut policy = self
                 .crdt_repo
@@ -1074,8 +1109,15 @@ where
 
             Ok(new_min)
         } else {
-            // Relay path: we are not a member, relay to a member node
-            let members = network.member_nodes_as_strings();
+            // Relay path: we don't hold the genesis, so relay to a member that
+            // does. Exclude ourselves: a promoted-but-unsynced member is in its
+            // own member set, and relaying to self would just waste a failover
+            // attempt (mirrors the self-skip on the push path above).
+            let members: Vec<String> = network
+                .member_nodes_as_strings()
+                .into_iter()
+                .filter(|m| m != &self.local_node_id)
+                .collect();
             if members.is_empty() {
                 return Err(StateNodeError::NoAvailableMembers);
             }
@@ -1544,7 +1586,16 @@ where
                 member_nodes,
                 ..
             } => {
-                // Only store network metadata if we're a member
+                // Only store network metadata if we're a member.
+                //
+                // Being listed as a member here is always safe to accept: the
+                // local-vs-relay decision for writes is made by genesis
+                // presence (see `can_commit_locally`), not by membership. A
+                // member that has not yet synced the genesis simply relays its
+                // writes until the genesis arrives, so there is no need to
+                // refuse promotion. This also lets the original create_content
+                // relay node become a real member later if it is re-selected
+                // and syncs the genesis.
                 if !member_nodes.contains(&self.local_node_id) {
                     return Ok(ApplyOutcome::Ignored);
                 }
@@ -2654,6 +2705,143 @@ mod tests {
 
         let outcome = service.handle_sync_event(&event, None).await.unwrap();
         assert_eq!(outcome, ApplyOutcome::Ignored);
+    }
+
+    // The node that first handled create_content keeps a local ContentNetwork
+    // record in which it is NOT a member (it is a non-member relay holding no
+    // genesis). If a later redundancy check re-selects it and broadcasts
+    // ContentNetworkManagerAdded with it in the member set, promotion is now
+    // ACCEPTED — membership no longer drives the local-vs-relay write decision
+    // (genesis presence does, see can_commit_locally), so being a member while
+    // lacking the genesis is safe. Writes simply relay until the genesis syncs.
+    #[tokio::test]
+    async fn test_content_network_manager_added_promotes_former_relay_node() {
+        // Seed a local record where node-1 (us) is currently a non-member relay:
+        // the network it remembers contains only node-2 and node-3.
+        let node_registry = MockNodeRegistry::new();
+        let content_repo = Arc::new(RwLock::new(
+            MockContentNetworkRepository::new()
+                .with_network(create_test_network("content-1", vec!["node-2", "node-3"])),
+        ));
+        let peer_network = Arc::new(MockPeerNetwork::new().with_local_peer_id("node-1"));
+        let event_publisher = MockEventPublisher::new();
+        let crdt_repo = Arc::new(MockContentRepository::new());
+
+        let service: TestService = StateNodeService::new(
+            node_registry,
+            content_repo,
+            peer_network,
+            event_publisher,
+            crdt_repo,
+            "node-1".to_string(),
+        )
+        .with_authentication_service(TestAuthService)
+        .with_authorization_service(AllowAllAuthorizationService);
+
+        // A redundancy check on another node added us (node-1) to the member set.
+        let event = Event::ContentNetworkManagerAdded {
+            content_id: "content-1".to_string(),
+            added_node_id: "node-1".to_string(),
+            member_nodes: vec![
+                "node-1".to_string(),
+                "node-2".to_string(),
+                "node-3".to_string(),
+            ],
+            timestamp: 12345,
+        };
+
+        let outcome = service.handle_sync_event(&event, None).await.unwrap();
+        // Promotion is accepted (not Ignored): the former relay becomes a member.
+        assert_eq!(
+            outcome,
+            ApplyOutcome::NeedsSync {
+                content_id: "content-1".to_string(),
+            }
+        );
+
+        // The local record now lists node-1 as a member.
+        let network = service
+            .get_content_network_for_test("content-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(network.has_member_str("node-1"));
+    }
+
+    // The core invariant of the genesis-based routing: a node that IS a member
+    // of the ContentNetwork but does NOT yet hold the CRDT genesis must relay
+    // its writes rather than commit locally. Committing locally without the
+    // genesis is exactly what produced the "Genesis not found" HTTP 500. This
+    // covers both the create_content relay node and a freshly added member that
+    // has not synced the genesis yet.
+    #[tokio::test]
+    async fn test_update_relays_when_member_but_genesis_absent() {
+        let node_registry = MockNodeRegistry::new();
+        // node-1 (us) IS listed as a member alongside node-2.
+        let content_repo = Arc::new(RwLock::new(
+            MockContentNetworkRepository::new()
+                .with_network(create_test_network("content-1", vec!["node-1", "node-2"])),
+        ));
+        // Keep a handle to the peer network so we can assert the relay path was
+        // actually taken (not just that the call returned Ok — the mock CRDT
+        // repo would happily "commit" locally without a genesis, so observing
+        // the relay invocation is the only way to distinguish the two paths).
+        let peer_network = Arc::new(MockPeerNetwork::new().with_local_peer_id("node-1"));
+        let event_publisher = MockEventPublisher::new();
+        // CRDT repo is empty: we hold no genesis for content-1, so a local
+        // commit would (in production) fail with "Genesis not found".
+        let crdt_repo = Arc::new(MockContentRepository::new());
+
+        let service: TestService = StateNodeService::new(
+            node_registry,
+            content_repo,
+            peer_network.clone(),
+            event_publisher,
+            crdt_repo,
+            "node-1".to_string(),
+        )
+        .with_authentication_service(TestAuthService)
+        .with_authorization_service(AllowAllAuthorizationService);
+
+        // Despite being a member, the write must relay (and succeed) because we
+        // lack the genesis — not commit locally.
+        let result = service
+            .update_content(
+                "content-1",
+                b"new data",
+                Some(&test_token()),
+                Some(&test_request_signature()),
+                None,
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "member-without-genesis must relay successfully, got: {:?}",
+            result.err()
+        );
+        // The discriminating assertion: the relay path was taken exactly because
+        // the genesis was absent. If routing reverted to membership-based, this
+        // would be 0 (the node would have committed locally).
+        assert_eq!(
+            *peer_network.relay_update_calls.lock().await,
+            1,
+            "expected the update to be relayed once due to missing genesis",
+        );
+        // And it must never relay to itself: node-1 is in its own member set
+        // (it was promoted) but holds no genesis, so the only valid relay
+        // target is node-2. Relaying to self would waste a failover attempt.
+        let targets = peer_network.relay_update_peers.lock().await.clone();
+        assert!(
+            !targets.contains(&"node-1".to_string()),
+            "must not relay to self (node-1); relayed to: {:?}",
+            targets
+        );
+        assert_eq!(
+            targets,
+            vec!["node-2".to_string()],
+            "relay must target the other member only",
+        );
     }
 
     #[tokio::test]
