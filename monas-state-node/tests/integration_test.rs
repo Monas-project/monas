@@ -140,6 +140,7 @@ async fn create_test_service() -> (Arc<TestService>, Arc<CrslCrdtRepository>, Te
         bootstrap_nodes: vec![],
         enable_mdns: false, // Disable mDNS for isolated tests
         gossipsub_topics: vec!["test-events".to_string()],
+        external_addrs: vec![],
     };
 
     let network = Arc::new(
@@ -529,6 +530,7 @@ async fn create_test_service_with_ac() -> (Arc<TestServiceWithAC>, Arc<CrslCrdtR
         bootstrap_nodes: vec![],
         enable_mdns: false,
         gossipsub_topics: vec!["test-events".to_string()],
+        external_addrs: vec![],
     };
 
     let network = Arc::new(
@@ -1228,6 +1230,7 @@ async fn create_test_service_deny_authz() -> (Arc<TestService>, Arc<CrslCrdtRepo
         bootstrap_nodes: vec![],
         enable_mdns: false,
         gossipsub_topics: vec!["test-events".to_string()],
+        external_addrs: vec![],
     };
 
     let network = Arc::new(
