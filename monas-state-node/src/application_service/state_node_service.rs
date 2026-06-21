@@ -492,19 +492,17 @@ where
                 .fetch_operations(member, content_id, None)
                 .await
             {
-                Ok(ops) if !ops.is_empty() => {
-                    match self.crdt_repo.apply_operations(&ops).await {
-                        Ok(_) => return Ok(()),
-                        Err(e) => {
-                            tracing::warn!(
-                                "ensure_content_local: failed to apply ops from {} for {}: {}",
-                                member,
-                                content_id,
-                                e
-                            );
-                        }
+                Ok(ops) if !ops.is_empty() => match self.crdt_repo.apply_operations(&ops).await {
+                    Ok(_) => return Ok(()),
+                    Err(e) => {
+                        tracing::warn!(
+                            "ensure_content_local: failed to apply ops from {} for {}: {}",
+                            member,
+                            content_id,
+                            e
+                        );
                     }
-                }
+                },
                 Ok(_) => {
                     // Member returned no operations; try the next one.
                 }
@@ -2706,7 +2704,10 @@ mod tests {
 
         assert!(result.is_err());
         assert!(
-            result.unwrap_err().to_string().contains("Content not found"),
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Content not found"),
             "relayed request to a non-member must not re-relay"
         );
     }
@@ -2747,7 +2748,10 @@ mod tests {
         );
 
         let result = service.ensure_content_local("content-1").await;
-        assert!(result.is_ok(), "expected ops pull to succeed, got {result:?}");
+        assert!(
+            result.is_ok(),
+            "expected ops pull to succeed, got {result:?}"
+        );
     }
 
     #[tokio::test]
