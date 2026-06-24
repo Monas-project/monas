@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Monas State Node - 3ノード起動スクリプト
-# このスクリプトは3つのState Nodeを起動し、P2Pネットワークを構築します
+# Monas State Node - 4ノード起動スクリプト
+# このスクリプトは4つのState Nodeを起動し、P2Pネットワークを構築します
 
 set -e
 
@@ -34,11 +34,11 @@ log_info "State Nodeディレクトリ: $STATE_NODE_DIR"
 # データディレクトリのクリーンアップ（オプション）
 if [ "$1" == "--clean" ]; then
     log_warn "既存のデータを削除します..."
-    rm -rf data/node1 data/node2 data/node3
+    rm -rf data/node1 data/node2 data/node3 data/node4
 fi
 
 # データディレクトリの作成
-mkdir -p data/node1 data/node2 data/node3
+mkdir -p data/node1 data/node2 data/node3 data/node4
 
 # PIDを保存するファイル
 PID_FILE="$STATE_NODE_DIR/.local-nodes.pids"
@@ -185,6 +185,32 @@ for i in {1..30}; do
     sleep 1
 done
 
+# ノード4の起動（ノード1に接続）
+log_info "ノード4を起動しています..."
+"$STATE_NODE_BIN" \
+    --data-dir ./data/node4 \
+    -l 127.0.0.1:8083 \
+    -b "$BOOTSTRAP_ADDR" \
+    --log-level info \
+    > "$LOG_DIR/node4.log" 2>&1 &
+NODE4_PID=$!
+echo "$NODE4_PID" >> "$PID_FILE"
+
+# ノード4の起動を待つ
+log_info "ノード4の起動を待っています..."
+for i in {1..30}; do
+    if curl -s http://127.0.0.1:8083/health > /dev/null 2>&1; then
+        log_info "ノード4が起動しました"
+        break
+    fi
+    if [ $i -eq 30 ]; then
+        log_error "ノード4の起動に失敗しました"
+        cleanup
+        exit 1
+    fi
+    sleep 1
+done
+
 # P2P接続が確立されるのを待つ
 log_info "P2P接続が確立されるのを待っています..."
 sleep 3
@@ -192,17 +218,19 @@ sleep 3
 # ステータスの表示
 echo ""
 echo -e "${BLUE}========================================${NC}"
-echo -e "${BLUE}    3つのState Nodeが起動しました！    ${NC}"
+echo -e "${BLUE}    4つのState Nodeが起動しました！    ${NC}"
 echo -e "${BLUE}========================================${NC}"
 echo ""
 echo "ノード1: http://127.0.0.1:8080"
 echo "ノード2: http://127.0.0.1:8081"
 echo "ノード3: http://127.0.0.1:8082"
+echo "ノード4: http://127.0.0.1:8083"
 echo ""
 echo "ログファイル:"
 echo "  - $LOG_DIR/node1.log"
 echo "  - $LOG_DIR/node2.log"
 echo "  - $LOG_DIR/node3.log"
+echo "  - $LOG_DIR/node4.log"
 echo ""
 echo "ログをリアルタイムで確認:"
 echo "  tail -f $LOG_DIR/node1.log"
@@ -224,7 +252,8 @@ else
         # PIDが生きているかチェック
         if ! kill -0 "$NODE1_PID" 2>/dev/null || \
            ! kill -0 "$NODE2_PID" 2>/dev/null || \
-           ! kill -0 "$NODE3_PID" 2>/dev/null; then
+           ! kill -0 "$NODE3_PID" 2>/dev/null || \
+           ! kill -0 "$NODE4_PID" 2>/dev/null; then
             log_error "いずれかのノードが停止しました"
             cleanup
             exit 1

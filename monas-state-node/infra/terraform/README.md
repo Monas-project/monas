@@ -72,6 +72,8 @@ terraform apply \
   -var="efs_filesystem_id=fs-xxx"
 ```
 
+4ノード構成にする場合は、`node2` と同様の手順で `node3` / `node4` も追加します（`node_name` と `domain` のみ変更）。
+
 > `efs_filesystem_id` を指定すると、既存のEFSを共有します（ノードごとに別のアクセスポイントが作成されます）。
 
 ## Local Testing with Docker Compose
@@ -81,10 +83,11 @@ cd monas-state-node/infra
 docker compose up --build
 ```
 
-3ノードが起動します:
+4ノードが起動します:
 - Node 1 (bootstrap): http://localhost:8081
 - Node 2: http://localhost:8082
 - Node 3: http://localhost:8083
+- Node 4: http://localhost:8084
 
 ## Configuration
 

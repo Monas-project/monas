@@ -17,7 +17,7 @@ variable "domain" {
 variable "node_names" {
   description = "List of state node names for subdomain creation"
   type        = list(string)
-  default     = ["node1", "node2", "node3"]
+  default     = ["node1", "node2", "node3", "node4"]
 }
 
 variable "vpc_cidr" {

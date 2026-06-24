@@ -84,10 +84,42 @@ services:
           --log-level info \
           --bootstrap "/ip4/$$(getent hosts node1 | awk '{print $$1}')/tcp/9001/p2p/$$PEER_ID"
 
+  node4:
+    build:
+      context: ../..
+      dockerfile: monas-state-node/infra/docker/Dockerfile
+    environment:
+      - NODE_ROLE=member
+      - HTTP_LISTEN=0.0.0.0:8080
+      - P2P_PORT=9001
+      - DATA_DIR=/data
+      - LOG_LEVEL=info
+    ports:
+      - "8084:8080"
+    volumes:
+      - node4-data:/data
+    networks:
+      - monas-net
+    depends_on:
+      node1:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        PEER_ID=$$(curl -sf http://node1:8080/node/info | grep -o '"peer_id":"[^"]*"' | cut -d'"' -f4)
+        echo "Bootstrap peer ID: $$PEER_ID"
+        exec state-node \
+          --data-dir /data \
+          --listen 0.0.0.0:8080 \
+          --p2p-port 9001 \
+          --log-level info \
+          --bootstrap "/ip4/$$(getent hosts node1 | awk '{print $$1}')/tcp/9001/p2p/$$PEER_ID"
+
 volumes:
   node1-data:
   node2-data:
   node3-data:
+  node4-data:
 
 networks:
   monas-net:
