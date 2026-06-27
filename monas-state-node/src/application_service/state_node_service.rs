@@ -345,18 +345,27 @@ where
     /// Decide whether a write (update/delete/invalidate) should be committed
     /// locally or relayed to another node.
     ///
-    /// The deciding factor is whether **this node holds the CRDT genesis** for
-    /// the content, not whether it appears in the ContentNetwork member set.
+    /// The deciding factor is whether **this node holds the CRDT genesis node**
+    /// for the content, not whether it appears in the ContentNetwork member set.
     /// Local commits go through `commit_operation`, which fails with "Genesis
-    /// not found" when the genesis is absent. Two cases legitimately lack the
-    /// genesis and must relay instead: the node that first received
-    /// `create_content` (a non-member relay that intentionally never persisted
-    /// the genesis), and a freshly added member that has not yet synced the
-    /// genesis. Both are transient/structural states keyed purely on local CRDT
-    /// presence — no notion of "who created the content" is stored or
-    /// consulted, so membership and creator identity stay private.
+    /// not found" when the genesis node is absent. Two cases legitimately lack
+    /// it and must relay instead: the node that first received `create_content`
+    /// (a non-member relay that intentionally never persisted the genesis), and
+    /// a freshly added member that has not yet synced the genesis. Both are
+    /// transient/structural states keyed purely on local CRDT presence — no
+    /// notion of "who created the content" is stored or consulted, so membership
+    /// and creator identity stay private.
+    ///
+    /// We check `has_genesis` (the genesis node is in our DAG), not `exists`
+    /// (any version in the series): a partial sync can leave us with later
+    /// versions but no genesis, where `exists` is `true` yet a local commit
+    /// still fails with "Genesis not found". `has_genesis` matches what a local
+    /// commit can actually do.
     async fn can_commit_locally(&self, genesis_cid: &str) -> bool {
-        self.crdt_repo.exists(genesis_cid).await.unwrap_or(false)
+        self.crdt_repo
+            .has_genesis(genesis_cid)
+            .await
+            .unwrap_or(false)
     }
 
     /// Classify a relay error message into the appropriate StateNodeError.
@@ -1541,11 +1550,22 @@ where
             return Ok(());
         }
 
-        // 2. Query capacity of all member nodes
+        // 2. Query capacity of the *other* member nodes. We must not query our
+        //    own capacity over the network: libp2p does not deliver a node's
+        //    request to itself, so the self-query times out and the result is
+        //    missing — which `unwrap_or(0)` below would then read as 0 bytes,
+        //    wrongly flagging us as low-capacity and triggering spurious member
+        //    additions. We are running and serving this very check, so we count
+        //    ourselves as healthy directly.
         let member_list: Vec<String> = network.member_nodes_as_strings();
+        let peers_to_query: Vec<String> = member_list
+            .iter()
+            .filter(|id| *id != &self.local_node_id)
+            .cloned()
+            .collect();
         let capacities = self
             .peer_network
-            .query_node_capacity_batch(&member_list)
+            .query_node_capacity_batch(&peers_to_query)
             .await
             .map_err(|e| {
                 StateNodeError::NetworkError(NetworkError::ConnectionFailed(e.to_string()))
@@ -1556,6 +1576,12 @@ where
         let mut healthy_count = 0usize;
 
         for node_id in &member_list {
+            // We are healthy from our own perspective (see above) — never flag
+            // ourselves as low-capacity based on a network query we can't make.
+            if node_id == &self.local_node_id {
+                healthy_count += 1;
+                continue;
+            }
             let available = capacities.get(node_id).cloned().unwrap_or(0);
             if available < self.capacity_threshold_bytes {
                 low_capacity_nodes.push(node_id.clone());

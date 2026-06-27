@@ -456,6 +456,12 @@ impl ContentRepository for MockContentRepository {
         Ok(self.contents.lock().await.contains_key(genesis_cid))
     }
 
+    async fn has_genesis(&self, genesis_cid: &str) -> Result<bool> {
+        // The mock has no partial-DAG concept: a content is present with its
+        // genesis or absent entirely, so this mirrors `exists`.
+        Ok(self.contents.lock().await.contains_key(genesis_cid))
+    }
+
     async fn list_contents(&self) -> Result<Vec<String>> {
         Ok(self.contents.lock().await.keys().cloned().collect())
     }
