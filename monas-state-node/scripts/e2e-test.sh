@@ -53,6 +53,7 @@ cd "$STATE_NODE_DIR"
 # テスト結果を記録する変数
 TESTS_PASSED=0
 TESTS_FAILED=0
+NODE_PORTS=(8080 8081 8082 8083)
 
 # test-auth-generator バイナリのビルド
 log_info "test-auth-generatorをビルドしています..."
@@ -92,7 +93,7 @@ check_nodes_running() {
     log_info "ノードの起動状態を確認しています..."
 
     local all_running=true
-    for port in 8080 8081 8082; do
+    for port in "${NODE_PORTS[@]}"; do
         if curl -s "http://127.0.0.1:$port/health" > /dev/null 2>&1; then
             log_success "ノード (ポート $port) は起動しています"
         else
@@ -162,7 +163,7 @@ test_auth_request() {
 # ノード登録
 register_nodes() {
     log_info "ノード登録を行います..."
-    for port in 8080 8081 8082; do
+    for port in "${NODE_PORTS[@]}"; do
         curl -s -X POST "http://127.0.0.1:$port/node/register" \
             -H "Content-Type: application/json" \
             -d '{"total_capacity": 10000000}' > /dev/null 2>&1 || true
@@ -276,7 +277,7 @@ sleep 0.2
 log_step "全ノードから content データを即座に取得できるか確認"
 
 IMMEDIATE_MEMBERS=0
-for port in 8080 8081 8082; do
+for port in "${NODE_PORTS[@]}"; do
     generate_signature "$ACCOUNT1_PRIVATE_KEY" "read" "content"
     DATA_RESPONSE=$(curl -s "http://127.0.0.1:$port/content/$CONTENT_ID/data" \
         -H "Authorization: Bearer $ACCOUNT1_KEY_ID" \
@@ -309,7 +310,7 @@ fi
 # content_networkの形成を確認（各ノードでcontentsリストを確認）
 sleep 2
 log_step "content_networkの形成を確認"
-for port in 8080 8081 8082; do
+for port in "${NODE_PORTS[@]}"; do
     count=$(curl -s "http://127.0.0.1:$port/contents" | jq '. | length' 2>/dev/null || echo "0")
     log_info "  ノード (ポート $port): $count 個のコンテンツを認識"
 done
@@ -397,7 +398,7 @@ log_step "gossipsubによる伝播を待機 (5秒)..."
 sleep 5
 
 log_step "各ノードでcontentデータを取得し、更新が反映されていることを確認"
-for port in 8080 8081 8082; do
+for port in "${NODE_PORTS[@]}"; do
     generate_signature "$ACCOUNT1_PRIVATE_KEY" "read" "content"
     DATA_RESPONSE=$(curl -s "http://127.0.0.1:$port/content/$CONTENT_ID/data" \
         -H "Authorization: Bearer $ACCOUNT1_KEY_ID" \
@@ -414,9 +415,9 @@ for port in 8080 8081 8082; do
 done
 
 # memberノードでデータを検証
-log_test "少なくとも1つのノードで更新データが取得できること"
+log_test "少なくとも1つのノードで更新データが取得できること（4ノード構成）"
 VERIFIED=false
-for port in 8080 8081 8082; do
+for port in "${NODE_PORTS[@]}"; do
     generate_signature "$ACCOUNT1_PRIVATE_KEY" "read" "content"
     DATA_RESPONSE=$(curl -s "http://127.0.0.1:$port/content/$CONTENT_ID/data" \
         -H "Authorization: Bearer $ACCOUNT1_KEY_ID" \
@@ -435,16 +436,132 @@ if [ "$VERIFIED" = true ]; then
     log_success "同期確認: データが取得可能"
     ((TESTS_PASSED++))
 else
-    log_fail "同期確認: どのノードからもデータが取得できませんでした"
+    log_fail "同期確認: 4ノードのいずれからもデータが取得できませんでした"
     ((TESTS_FAILED++))
 fi
 
 # ============================================================================
-# Step 7: トークン無効化 (invalidate_tokens)
+# Step 7: BFT 停止/復帰シナリオ（任意実行）
+# ----------------------------------------------------------------------------
+# RUN_BFT_TEST=1 を指定した場合にのみ実行する。
+# 停止/復帰は環境依存のため、以下のコマンド注入方式で実行する:
+#   BFT_STOP_CMD="..." RUN_BFT_TEST=1 ./scripts/e2e-test.sh
+#   (必要なら BFT_RESTART_CMD を上書き可能)
+# 例（ローカル手動運用）:
+#   BFT_STOP_CMD="kill $(lsof -ti tcp:8083 | awk 'NR==1')" \
+#   RUN_BFT_TEST=1 ./scripts/e2e-test.sh
 # ============================================================================
 
 echo ""
-echo -e "${BLUE}=== Step 7: トークン無効化 (invalidate_tokens) ===${NC}"
+echo -e "${BLUE}=== Step 7: BFT 停止/復帰シナリオ（任意） ===${NC}"
+echo ""
+
+if [ "${RUN_BFT_TEST:-0}" = "1" ]; then
+    if [ -z "${BFT_STOP_CMD:-}" ]; then
+        log_fail "RUN_BFT_TEST=1 の場合は BFT_STOP_CMD が必須です"
+        ((TESTS_FAILED++))
+    else
+        if [ -z "${BFT_RESTART_CMD:-}" ]; then
+            BOOTSTRAP_INFO=$(curl -s "http://127.0.0.1:8080/node/info" 2>/dev/null || true)
+            BOOTSTRAP_PEER_ID=$(echo "$BOOTSTRAP_INFO" | jq -r '.node_id // empty')
+            BOOTSTRAP_LISTEN_ADDR=$(echo "$BOOTSTRAP_INFO" | jq -r '.listen_addrs[]? | select(startswith("/ip4/127.0.0.1/tcp/"))' | head -1)
+            if [ -z "$BOOTSTRAP_LISTEN_ADDR" ]; then
+                BOOTSTRAP_LISTEN_ADDR=$(echo "$BOOTSTRAP_INFO" | jq -r '.listen_addrs[]? | select(startswith("/ip4/0.0.0.0/tcp/"))' | head -1)
+                if [ -n "$BOOTSTRAP_LISTEN_ADDR" ]; then
+                    BOOTSTRAP_LISTEN_ADDR=$(echo "$BOOTSTRAP_LISTEN_ADDR" | sed 's|/ip4/0.0.0.0/|/ip4/127.0.0.1/|')
+                fi
+            fi
+
+            if [ -z "$BOOTSTRAP_PEER_ID" ] || [ -z "$BOOTSTRAP_LISTEN_ADDR" ]; then
+                log_fail "node4復帰用の bootstrap 情報を node1(8080) から取得できませんでした"
+                ((TESTS_FAILED++))
+            else
+                BOOTSTRAP_ADDR="${BOOTSTRAP_LISTEN_ADDR}/p2p/${BOOTSTRAP_PEER_ID}"
+                mkdir -p "./logs-bft"
+                BFT_RESTART_CMD="../target/release/state-node --data-dir ./data/node4 -l 127.0.0.1:8083 -b ${BOOTSTRAP_ADDR} --log-level info > ./logs-bft/node4.log 2>&1 &"
+                log_info "BFT_RESTART_CMD 未指定のため bootstrap付きデフォルト復帰コマンドを使用します"
+            fi
+        fi
+
+        if [ -z "${BFT_RESTART_CMD:-}" ]; then
+            log_fail "node4復帰コマンドの組み立てに失敗しました"
+            ((TESTS_FAILED++))
+        fi
+
+        if [ "$TESTS_FAILED" -gt 0 ]; then
+            :
+        else
+        log_step "ノード停止コマンドを実行します"
+        eval "$BFT_STOP_CMD"
+
+        log_step "node4(8083) 停止確認"
+        if curl -s "http://127.0.0.1:8083/health" > /dev/null 2>&1; then
+            log_fail "node4 が停止していません（8083 が応答しています）"
+            ((TESTS_FAILED++))
+        else
+            log_success "node4 停止を確認"
+            ((TESTS_PASSED++))
+        fi
+
+        BFT_UPDATE_DATA=$(echo -n "BFT update while node4 down" | base64)
+        DECODED_BFT_UPDATE_BODY=$(echo -n "$BFT_UPDATE_DATA" | base64 -d 2>/dev/null | base64)
+        log_step "node4停止中に残りノード経由で更新を実行"
+        test_auth_request \
+            "node4停止中の更新（継続動作確認）" \
+            PUT \
+            "http://127.0.0.1:8080/content/$CONTENT_ID" \
+            "{\"data\": \"$BFT_UPDATE_DATA\"}" \
+            200 \
+            "$ACCOUNT1_KEY_ID" \
+            "$ACCOUNT1_PRIVATE_KEY" \
+            "update" \
+            "$CONTENT_ID" \
+            "$DECODED_BFT_UPDATE_BODY"
+
+        log_step "ノード復帰コマンドを実行します"
+        eval "$BFT_RESTART_CMD"
+
+        log_step "node4(8083) 復帰待ち"
+        NODE4_RECOVERED=false
+        for _ in {1..30}; do
+            if curl -s "http://127.0.0.1:8083/health" > /dev/null 2>&1; then
+                NODE4_RECOVERED=true
+                break
+            fi
+            sleep 1
+        done
+
+        if [ "$NODE4_RECOVERED" = true ]; then
+            log_success "node4 復帰を確認"
+            ((TESTS_PASSED++))
+        else
+            log_fail "node4 が30秒以内に復帰しませんでした"
+            ((TESTS_FAILED++))
+        fi
+
+        if [ "$NODE4_RECOVERED" = true ]; then
+            log_step "復帰後キャッチアップ確認（node4 の contents に対象IDが存在すること）"
+            NODE4_CONTENTS=$(curl -s "http://127.0.0.1:8083/contents" 2>/dev/null || true)
+            if echo "$NODE4_CONTENTS" | grep -q "$CONTENT_ID"; then
+                log_success "node4 で対象コンテンツを確認（キャッチアップ）"
+                ((TESTS_PASSED++))
+            else
+                log_fail "node4 で対象コンテンツを確認できませんでした（キャッチアップ未達の可能性）"
+                ((TESTS_FAILED++))
+            fi
+        fi
+        fi
+    fi
+else
+    log_warn "RUN_BFT_TEST=1 が未指定のため BFT 停止/復帰シナリオをスキップします"
+fi
+
+# ============================================================================
+# Step 8: トークン無効化 (invalidate_tokens)
+# ============================================================================
+
+echo ""
+echo -e "${BLUE}=== Step 8: トークン無効化 (invalidate_tokens) ===${NC}"
 echo ""
 
 log_step "account1 が node A に POST /content/:id/access/invalidate を送信"

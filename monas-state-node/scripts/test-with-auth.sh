@@ -45,6 +45,7 @@ cd "$STATE_NODE_DIR"
 # テスト結果を記録する変数
 TESTS_PASSED=0
 TESTS_FAILED=0
+NODE_PORTS=(8080 8081 8082 8083)
 
 # test-auth-generator バイナリのビルド
 log_info "test-auth-generatorをビルドしています..."
@@ -84,7 +85,7 @@ check_nodes_running() {
     log_info "ノードの起動状態を確認しています..."
 
     local all_running=true
-    for port in 8080 8081 8082; do
+    for port in "${NODE_PORTS[@]}"; do
         if curl -s "http://127.0.0.1:$port/health" > /dev/null 2>&1; then
             log_success "ノード (ポート $port) は起動しています"
         else
@@ -97,7 +98,8 @@ check_nodes_running() {
         log_warn "一部のノードが起動していません。最低1つのノードで動作確認を行います"
         if ! curl -s "http://127.0.0.1:8080/health" > /dev/null 2>&1 && \
            ! curl -s "http://127.0.0.1:8081/health" > /dev/null 2>&1 && \
-           ! curl -s "http://127.0.0.1:8082/health" > /dev/null 2>&1; then
+           ! curl -s "http://127.0.0.1:8082/health" > /dev/null 2>&1 && \
+           ! curl -s "http://127.0.0.1:8083/health" > /dev/null 2>&1; then
             log_error "ノードが1つも起動していません。先に ./scripts/start-local-nodes.sh を実行してください"
             exit 1
         fi
@@ -124,6 +126,8 @@ if ! curl -s "http://127.0.0.1:8080/health" > /dev/null 2>&1; then
         TEST_PORT=8081
     elif curl -s "http://127.0.0.1:8082/health" > /dev/null 2>&1; then
         TEST_PORT=8082
+    elif curl -s "http://127.0.0.1:8083/health" > /dev/null 2>&1; then
+        TEST_PORT=8083
     fi
 fi
 
@@ -334,10 +338,11 @@ echo ""
 echo -e "${BLUE}=== 複数ノード間の同期テスト ===${NC}"
 echo ""
 
-# 3つのノードすべてが起動している場合のみ同期テストを実行
+# 4つのノードすべてが起動している場合のみ同期テストを実行
 if curl -s "http://127.0.0.1:8080/health" > /dev/null 2>&1 && \
    curl -s "http://127.0.0.1:8081/health" > /dev/null 2>&1 && \
-   curl -s "http://127.0.0.1:8082/health" > /dev/null 2>&1; then
+   curl -s "http://127.0.0.1:8082/health" > /dev/null 2>&1 && \
+   curl -s "http://127.0.0.1:8083/health" > /dev/null 2>&1; then
 
     log_test "ノード1でコンテンツを作成"
 
@@ -361,7 +366,7 @@ if curl -s "http://127.0.0.1:8080/health" > /dev/null 2>&1 && \
 
         # 各ノードでコンテンツを確認
         log_test "各ノードでコンテンツリストを確認"
-        for port in 8080 8081 8082; do
+        for port in "${NODE_PORTS[@]}"; do
             count=$(curl -s "http://127.0.0.1:$port/contents" | jq '. | length' 2>/dev/null || echo "0")
             log_info "ノード (ポート $port): $count 個のコンテンツ"
         done
