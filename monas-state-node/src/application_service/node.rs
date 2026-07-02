@@ -356,7 +356,7 @@ impl StateNode {
                                 } => {
                                     let token = AuthToken::new(auth_token);
                                     service_for_relay
-                                        .update_content(
+                                        .update_content_via_relay(
                                             &content_id,
                                             &data,
                                             Some(&token),
@@ -374,7 +374,7 @@ impl StateNode {
                                 } => {
                                     let token = AuthToken::new(auth_token);
                                     service_for_relay
-                                        .delete_content(
+                                        .delete_content_via_relay(
                                             &content_id,
                                             Some(&token),
                                             Some(&request_signature),
@@ -391,7 +391,7 @@ impl StateNode {
                                 } => {
                                     let token = AuthToken::new(auth_token);
                                     service_for_relay
-                                        .invalidate_tokens(
+                                        .invalidate_tokens_via_relay(
                                             &content_id,
                                             &token,
                                             Some(&request_signature),

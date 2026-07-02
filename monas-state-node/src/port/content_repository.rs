@@ -159,6 +159,24 @@ pub trait ContentRepository: Send + Sync {
     /// True if the content exists.
     async fn exists(&self, genesis_cid: &str) -> Result<bool>;
 
+    /// Check whether this node actually holds the **genesis node** for the
+    /// content (not merely some version of it).
+    ///
+    /// This differs from [`exists`](Self::exists): `exists` is satisfied by any
+    /// node in the genesis series (it uses `latest`), so a node that synced
+    /// only later operations — without the genesis itself — still reports
+    /// `true`. A local write, however, must traverse the genesis node and fails
+    /// with "Genesis not found" if it is absent. Routing local-vs-relay
+    /// decisions on `has_genesis` therefore matches what a local commit can
+    /// actually do, whereas `exists` can be "true" yet still fail to commit.
+    ///
+    /// # Arguments
+    /// * `genesis_cid` - The genesis CID to check
+    ///
+    /// # Returns
+    /// True if the genesis node is present in the local DAG.
+    async fn has_genesis(&self, genesis_cid: &str) -> Result<bool>;
+
     /// List all content genesis CIDs.
     ///
     /// # Returns

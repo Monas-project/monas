@@ -342,6 +342,32 @@ where
         self.peer_network.listen_addrs().await
     }
 
+    /// Decide whether a write (update/delete/invalidate) should be committed
+    /// locally or relayed to another node.
+    ///
+    /// The deciding factor is whether **this node holds the CRDT genesis node**
+    /// for the content, not whether it appears in the ContentNetwork member set.
+    /// Local commits go through `commit_operation`, which fails with "Genesis
+    /// not found" when the genesis node is absent. Two cases legitimately lack
+    /// it and must relay instead: the node that first received `create_content`
+    /// (a non-member relay that intentionally never persisted the genesis), and
+    /// a freshly added member that has not yet synced the genesis. Both are
+    /// transient/structural states keyed purely on local CRDT presence — no
+    /// notion of "who created the content" is stored or consulted, so membership
+    /// and creator identity stay private.
+    ///
+    /// We check `has_genesis` (the genesis node is in our DAG), not `exists`
+    /// (any version in the series): a partial sync can leave us with later
+    /// versions but no genesis, where `exists` is `true` yet a local commit
+    /// still fails with "Genesis not found". `has_genesis` matches what a local
+    /// commit can actually do.
+    async fn can_commit_locally(&self, genesis_cid: &str) -> bool {
+        self.crdt_repo
+            .has_genesis(genesis_cid)
+            .await
+            .unwrap_or(false)
+    }
+
     /// Classify a relay error message into the appropriate StateNodeError.
     ///
     /// When a member node returns an error during relay, the error message is
@@ -405,6 +431,119 @@ where
             }
         }
         Err(StateNodeError::NoAvailableMembers)
+    }
+
+    /// Resolve the member nodes that own a content, for relay/sync purposes.
+    ///
+    /// If we hold a local `ContentNetwork` record, return its member set
+    /// (current behaviour). If we do not — e.g. a client sent a request to a
+    /// node that was neither the creator nor a member — fall back to DHT
+    /// discovery using the same key function and replication factor that
+    /// `create_content` used to place the content (`compute_dht_key` +
+    /// `min_replication_factor`). This lets any node relay a request to the
+    /// real members instead of returning `ContentNotFound` (bug #93).
+    ///
+    /// The local node is always excluded from the result. Returns
+    /// `NoAvailableMembers` if no candidate remains.
+    async fn resolve_members(&self, content_id: &str) -> Result<Vec<String>, StateNodeError> {
+        let local_record = self
+            .content_repo
+            .read()
+            .await
+            .get_content_network(content_id)
+            .await
+            .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
+
+        let mut members: Vec<String> = match local_record {
+            Some(network) => network.member_nodes_as_strings(),
+            None => {
+                // No local record: discover the members via the DHT. Request
+                // `k + 1` candidates so that excluding ourselves still leaves
+                // up to `k`, mirroring create_content's placement.
+                let key = compute_dht_key(content_id);
+                self.peer_network
+                    .find_closest_peers(key, self.min_replication_factor + 1)
+                    .await
+                    .map_err(|e| {
+                        StateNodeError::NetworkError(NetworkError::ConnectionFailed(e.to_string()))
+                    })?
+            }
+        };
+
+        members.retain(|peer| peer != &self.local_node_id);
+        if members.is_empty() {
+            return Err(StateNodeError::NoAvailableMembers);
+        }
+        Ok(members)
+    }
+
+    /// Ensure the content's CRDT state is available locally, fetching it from
+    /// member nodes if necessary (bug #93, read side).
+    ///
+    /// Read endpoints (data / history / version) read straight from the local
+    /// `crdt_repo`. A node that holds no local state for a content — e.g. a
+    /// client pointed its gateway at a node that is neither the creator nor a
+    /// member — would otherwise 404. This pulls the operations from a member
+    /// (discovered via `resolve_members`) and applies them locally so the
+    /// existing read path works unchanged. Applying the operations also brings
+    /// in the access policy, so the subsequent `verify_read_access` check is
+    /// evaluated against the real policy rather than an empty one.
+    ///
+    /// No-op when we already have local history. Returns `ContentNotFound` if
+    /// no member could supply the operations.
+    ///
+    /// SECURITY NOTE: this reuses the unauthenticated `fetch_operations` RPC,
+    /// so a non-member can pull any content's operations. Acceptable for the
+    /// single-user demo; a hardened version should add a read-relay RPC with
+    /// member-side authorization. Tracked in bug #93 follow-up.
+    pub async fn ensure_content_local(&self, content_id: &str) -> Result<(), StateNodeError> {
+        // Fast path: we already hold local history for this content.
+        let has_local = self
+            .crdt_repo
+            .get_history(content_id)
+            .await
+            .map(|h| !h.is_empty())
+            .unwrap_or(false);
+        if has_local {
+            return Ok(());
+        }
+
+        // Discover the members (local record, or DHT fallback) and pull ops.
+        let members = self.resolve_members(content_id).await?;
+        let content_id_vo = ContentId::new(content_id.to_string())?;
+
+        for member in &members {
+            match self
+                .peer_network
+                .fetch_operations(member, content_id, None)
+                .await
+            {
+                Ok(ops) if !ops.is_empty() => match self.crdt_repo.apply_operations(&ops).await {
+                    Ok(_) => return Ok(()),
+                    Err(e) => {
+                        tracing::warn!(
+                            "ensure_content_local: failed to apply ops from {} for {}: {}",
+                            member,
+                            content_id,
+                            e
+                        );
+                    }
+                },
+                Ok(_) => {
+                    // Member returned no operations; try the next one.
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "ensure_content_local: failed to fetch ops from {} for {}: {}",
+                        member,
+                        content_id,
+                        e
+                    );
+                }
+            }
+        }
+
+        Err(StateNodeError::ContentNotFound(content_id_vo))
     }
 
     /// Register a new node.
@@ -651,6 +790,32 @@ where
         request_signature: Option<&[u8]>,
         timestamp: Option<u64>,
     ) -> Result<Event, StateNodeError> {
+        self.delete_content_inner(content_id, token, request_signature, timestamp, false)
+            .await
+    }
+
+    /// Entry point for `delete` requests that arrived via relay from another
+    /// node. Identical to [`delete_content`] except that it will not relay
+    /// again — enforcing a 1-hop relay limit to prevent cycles (bug #93).
+    pub async fn delete_content_via_relay(
+        &self,
+        content_id: &str,
+        token: Option<&AuthToken>,
+        request_signature: Option<&[u8]>,
+        timestamp: Option<u64>,
+    ) -> Result<Event, StateNodeError> {
+        self.delete_content_inner(content_id, token, request_signature, timestamp, true)
+            .await
+    }
+
+    async fn delete_content_inner(
+        &self,
+        content_id: &str,
+        token: Option<&AuthToken>,
+        request_signature: Option<&[u8]>,
+        timestamp: Option<u64>,
+        from_relay: bool,
+    ) -> Result<Event, StateNodeError> {
         let token = token.ok_or_else(|| {
             StateNodeError::AuthenticationFailed("Authentication token is required".to_string())
         })?;
@@ -658,20 +823,15 @@ where
             StateNodeError::AuthenticationFailed("Request signature is required".to_string())
         })?;
 
-        // 1. Verify content network exists
+        // 1. A missing local record is not an immediate 404: a node that does
+        //    not hold the content can still relay to the real members
+        //    discovered via the DHT (bug #93).
         let content_id_vo = ContentId::new(content_id.to_string())?;
-        let network = self
-            .content_repo
-            .read()
-            .await
-            .get_content_network(content_id)
-            .await
-            .map_err(|e| StateNodeError::StorageError(e.to_string()))?
-            .ok_or_else(|| StateNodeError::ContentNotFound(content_id_vo.clone()))?;
 
-        // 2. Check if local node is a member
-        if network.has_member_str(&self.local_node_id) {
-            // Local delete path: we are a member node
+        // 2. Decide local commit vs relay by genesis presence (not membership):
+        //    only a node that actually holds the CRDT genesis can delete locally.
+        if self.can_commit_locally(content_id).await {
+            // Local delete path: we hold the genesis
             // Authenticate and authorize locally (we have the up-to-date access policy)
             let auth_service = self.auth_service.as_ref().ok_or_else(|| {
                 StateNodeError::InvalidConfiguration("Authentication not configured".to_string())
@@ -743,11 +903,19 @@ where
 
             Ok(event)
         } else {
-            // Relay path: we are not a member, relay to a member node with failover.
-            let members = network.member_nodes_as_strings();
-            if members.is_empty() {
-                return Err(StateNodeError::NoAvailableMembers);
+            // Relay path: we are not a member.
+            //
+            // 1-hop limit: if this request itself arrived via relay, do not
+            // relay again — the previous hop already resolved members, so a
+            // non-member receiver here means the chosen member was wrong.
+            // Refusing to re-relay prevents relay cycles (bug #93).
+            if from_relay {
+                return Err(StateNodeError::ContentNotFound(content_id_vo.clone()));
             }
+
+            // Resolve members from our local record, or via DHT discovery when
+            // we hold no record (bug #93), then relay with failover.
+            let members = self.resolve_members(content_id).await?;
 
             let token_str = token.as_str().to_string();
             let content_id_owned = content_id.to_string();
@@ -789,6 +957,35 @@ where
         request_signature: Option<&[u8]>,
         timestamp: Option<u64>,
     ) -> Result<Event, StateNodeError> {
+        self.update_content_inner(content_id, data, token, request_signature, timestamp, false)
+            .await
+    }
+
+    /// Entry point for `update` requests that arrived via relay from another
+    /// node. Identical to [`update_content`] except that it will not relay
+    /// again — enforcing a 1-hop relay limit to prevent cycles (bug #93).
+    pub async fn update_content_via_relay(
+        &self,
+        content_id: &str,
+        data: &[u8],
+        token: Option<&AuthToken>,
+        request_signature: Option<&[u8]>,
+        timestamp: Option<u64>,
+    ) -> Result<Event, StateNodeError> {
+        self.update_content_inner(content_id, data, token, request_signature, timestamp, true)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn update_content_inner(
+        &self,
+        content_id: &str,
+        data: &[u8],
+        token: Option<&AuthToken>,
+        request_signature: Option<&[u8]>,
+        timestamp: Option<u64>,
+        from_relay: bool,
+    ) -> Result<Event, StateNodeError> {
         let token = token.ok_or_else(|| {
             StateNodeError::AuthenticationFailed("Authentication token is required".to_string())
         })?;
@@ -796,20 +993,15 @@ where
             StateNodeError::AuthenticationFailed("Request signature is required".to_string())
         })?;
 
-        // 1. Verify content network exists
+        // 1. A missing local record is not an immediate 404: a node that does
+        //    not hold the content can still relay to the real members
+        //    discovered via the DHT (bug #93).
         let content_id_vo = ContentId::new(content_id.to_string())?;
-        let network = self
-            .content_repo
-            .read()
-            .await
-            .get_content_network(content_id)
-            .await
-            .map_err(|e| StateNodeError::StorageError(e.to_string()))?
-            .ok_or_else(|| StateNodeError::ContentNotFound(content_id_vo.clone()))?;
 
-        // 2. Check if local node is a member
-        if network.has_member_str(&self.local_node_id) {
-            // Local update path: we are a member node
+        // 2. Decide local commit vs relay by genesis presence (not membership):
+        //    only a node that actually holds the CRDT genesis can update locally.
+        if self.can_commit_locally(content_id).await {
+            // Local update path: we hold the genesis
             // Authenticate and authorize locally (we have the up-to-date access policy)
             let auth_service = self.auth_service.as_ref().ok_or_else(|| {
                 StateNodeError::InvalidConfiguration("Authentication not configured".to_string())
@@ -888,11 +1080,16 @@ where
 
             Ok(event)
         } else {
-            // Relay path: we are not a member, relay to a member node with failover.
-            let members = network.member_nodes_as_strings();
-            if members.is_empty() {
-                return Err(StateNodeError::NoAvailableMembers);
+            // Relay path: we are not a member.
+            //
+            // 1-hop limit: a relayed request must not be relayed again (bug #93).
+            if from_relay {
+                return Err(StateNodeError::ContentNotFound(content_id_vo.clone()));
             }
+
+            // Resolve members from our local record, or via DHT discovery when
+            // we hold no record (bug #93), then relay with failover.
+            let members = self.resolve_members(content_id).await?;
 
             let token_str = token.as_str().to_string();
             let content_id_owned = content_id.to_string();
@@ -949,6 +1146,32 @@ where
         request_signature: Option<&[u8]>,
         timestamp: Option<u64>,
     ) -> Result<u64, StateNodeError> {
+        self.invalidate_tokens_inner(content_id, token, request_signature, timestamp, false)
+            .await
+    }
+
+    /// Entry point for `invalidate_tokens` requests that arrived via relay from
+    /// another node. Identical to [`invalidate_tokens`] except that it will not
+    /// relay again — enforcing a 1-hop relay limit to prevent cycles (bug #93).
+    pub async fn invalidate_tokens_via_relay(
+        &self,
+        content_id: &str,
+        token: &AuthToken,
+        request_signature: Option<&[u8]>,
+        timestamp: Option<u64>,
+    ) -> Result<u64, StateNodeError> {
+        self.invalidate_tokens_inner(content_id, token, request_signature, timestamp, true)
+            .await
+    }
+
+    async fn invalidate_tokens_inner(
+        &self,
+        content_id: &str,
+        token: &AuthToken,
+        request_signature: Option<&[u8]>,
+        timestamp: Option<u64>,
+        from_relay: bool,
+    ) -> Result<u64, StateNodeError> {
         // 1. Ensure auth services are configured
         let auth_service = self.auth_service.as_ref().ok_or_else(|| {
             StateNodeError::InvalidConfiguration("Authentication not configured".to_string())
@@ -983,7 +1206,9 @@ where
         )
         .await?;
 
-        // 3. Check if this node is a member
+        // 3. Check if this node is a member. A missing record is not an
+        //    immediate 404: a non-member node can still relay to the real
+        //    members discovered via the DHT (bug #93).
         let content_id_vo = ContentId::new(content_id.to_string())?;
         let network = self
             .content_repo
@@ -991,11 +1216,14 @@ where
             .await
             .get_content_network(content_id)
             .await
-            .map_err(|e| StateNodeError::StorageError(e.to_string()))?
-            .ok_or_else(|| StateNodeError::ContentNotFound(content_id_vo.clone()))?;
+            .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
 
-        if network.has_member_str(&self.local_node_id) {
-            // Local path: we are a member node
+        // Decide local commit vs relay by genesis presence (not membership):
+        // only a node that actually holds the CRDT genesis can invalidate
+        // locally. A member that has not yet synced the genesis, or the
+        // create-time relay node, lacks it and must relay instead.
+        if self.can_commit_locally(content_id).await {
+            // Local path: we hold the genesis
             // 4. Get access policy from CRDT
             let mut policy = self
                 .crdt_repo
@@ -1052,8 +1280,15 @@ where
                         StateNodeError::CrdtError(CrdtError::StorageError(e.to_string()))
                     })?;
 
+                // Push to the members we know about. When we hold the genesis
+                // but have no local ContentNetwork record (a rare transient
+                // state under genesis-based routing), there is no member list to
+                // push to here; gossip/sync still propagates the change.
+                let members = network
+                    .as_ref()
+                    .map(|n| n.member_nodes_as_strings())
+                    .unwrap_or_default();
                 if !operations.is_empty() {
-                    let members = network.member_nodes_as_strings();
                     for member_id in &members {
                         if member_id == &self.local_node_id {
                             continue;
@@ -1074,11 +1309,16 @@ where
 
             Ok(new_min)
         } else {
-            // Relay path: we are not a member, relay to a member node
-            let members = network.member_nodes_as_strings();
-            if members.is_empty() {
-                return Err(StateNodeError::NoAvailableMembers);
+            // Relay path: we are not a member.
+            //
+            // 1-hop limit: a relayed request must not be relayed again (bug #93).
+            if from_relay {
+                return Err(StateNodeError::ContentNotFound(content_id_vo.clone()));
             }
+
+            // Resolve members from our local record, or via DHT discovery when
+            // we hold no record (bug #93), then relay with failover.
+            let members = self.resolve_members(content_id).await?;
 
             let token_str = token.as_str().to_string();
             let content_id_owned = content_id.to_string();
@@ -1310,11 +1550,22 @@ where
             return Ok(());
         }
 
-        // 2. Query capacity of all member nodes
+        // 2. Query capacity of the *other* member nodes. We must not query our
+        //    own capacity over the network: libp2p does not deliver a node's
+        //    request to itself, so the self-query times out and the result is
+        //    missing — which `unwrap_or(0)` below would then read as 0 bytes,
+        //    wrongly flagging us as low-capacity and triggering spurious member
+        //    additions. We are running and serving this very check, so we count
+        //    ourselves as healthy directly.
         let member_list: Vec<String> = network.member_nodes_as_strings();
+        let peers_to_query: Vec<String> = member_list
+            .iter()
+            .filter(|id| *id != &self.local_node_id)
+            .cloned()
+            .collect();
         let capacities = self
             .peer_network
-            .query_node_capacity_batch(&member_list)
+            .query_node_capacity_batch(&peers_to_query)
             .await
             .map_err(|e| {
                 StateNodeError::NetworkError(NetworkError::ConnectionFailed(e.to_string()))
@@ -1325,6 +1576,12 @@ where
         let mut healthy_count = 0usize;
 
         for node_id in &member_list {
+            // We are healthy from our own perspective (see above) — never flag
+            // ourselves as low-capacity based on a network query we can't make.
+            if node_id == &self.local_node_id {
+                healthy_count += 1;
+                continue;
+            }
             let available = capacities.get(node_id).cloned().unwrap_or(0);
             if available < self.capacity_threshold_bytes {
                 low_capacity_nodes.push(node_id.clone());
@@ -2366,7 +2623,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_update_content_fails_if_network_not_found() {
+    async fn test_update_content_no_record_no_discoverable_members_errors() {
+        // With bug #93 fixed, a node holding no ContentNetwork record no longer
+        // 404s immediately — it tries to discover the members via the DHT. When
+        // discovery yields no peers (default mock), it reports NoAvailableMembers
+        // rather than ContentNotFound.
         let service = create_test_service("node-1");
 
         let result = service
@@ -2383,7 +2644,158 @@ mod tests {
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("Content not found"));
+            .contains("No available member nodes"));
+    }
+
+    #[tokio::test]
+    async fn test_update_content_no_record_relays_to_discovered_members() {
+        // Bug #93: a node that holds no ContentNetwork record must still relay
+        // the update to members discovered via the DHT, instead of 404ing.
+        let service = create_service_with_peers(
+            "node-1",
+            vec!["node-2".to_string(), "node-3".to_string()],
+            HashMap::new(),
+        );
+
+        let result = service
+            .update_content(
+                "content-1",
+                b"data",
+                Some(&test_token()),
+                Some(&test_request_signature()),
+                None,
+            )
+            .await;
+
+        assert!(result.is_ok(), "expected relay success, got {result:?}");
+        match result.unwrap() {
+            Event::ContentUpdated {
+                content_id,
+                updated_node_id,
+                ..
+            } => {
+                assert_eq!(content_id, "content-1");
+                assert_eq!(updated_node_id, "node-1");
+            }
+            other => panic!("Expected ContentUpdated event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_delete_content_no_record_relays_to_discovered_members() {
+        // Bug #93: delete must also relay to DHT-discovered members.
+        let service = create_service_with_peers(
+            "node-1",
+            vec!["node-2".to_string(), "node-3".to_string()],
+            HashMap::new(),
+        );
+
+        let result = service
+            .delete_content(
+                "content-1",
+                Some(&test_token()),
+                Some(&test_request_signature()),
+                None,
+            )
+            .await;
+
+        assert!(result.is_ok(), "expected relay success, got {result:?}");
+        match result.unwrap() {
+            Event::ContentDeleted {
+                content_id,
+                deleted_by_node_id,
+                ..
+            } => {
+                assert_eq!(content_id, "content-1");
+                assert_eq!(deleted_by_node_id, "node-1");
+            }
+            other => panic!("Expected ContentDeleted event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_via_relay_does_not_re_relay_when_not_member() {
+        // Bug #93 1-hop guard: a request that arrived via relay must NOT be
+        // relayed again. A non-member receiver of a relayed update returns
+        // ContentNotFound instead of forwarding (which would risk a cycle).
+        let service = create_service_with_peers(
+            "node-1",
+            vec!["node-2".to_string(), "node-3".to_string()],
+            HashMap::new(),
+        );
+
+        let result = service
+            .update_content_via_relay(
+                "content-1",
+                b"data",
+                Some(&test_token()),
+                Some(&test_request_signature()),
+                None,
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Content not found"),
+            "relayed request to a non-member must not re-relay"
+        );
+    }
+
+    fn sample_operation(genesis_cid: &str) -> crate::port::content_repository::SerializedOperation {
+        crate::port::content_repository::SerializedOperation {
+            data: vec![0x01, 0x02],
+            genesis_cid: genesis_cid.to_string(),
+            author: "node-2".to_string(),
+            timestamp: 1,
+            node_timestamp: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ensure_content_local_pulls_from_discovered_member() {
+        // Bug #93 (read side): a node with no local state for the content must
+        // pull the operations from a DHT-discovered member and apply them
+        // locally so the read endpoints work instead of 404ing.
+        let node_registry = MockNodeRegistry::new();
+        let content_repo = Arc::new(RwLock::new(MockContentNetworkRepository::new()));
+        let peer_network = Arc::new(
+            MockPeerNetwork::new()
+                .with_local_peer_id("node-1")
+                .with_closest_peers(vec!["node-2".to_string()])
+                .with_fetched_operations(vec![sample_operation("content-1")]),
+        );
+        let event_publisher = MockEventPublisher::new();
+        let crdt_repo = Arc::new(MockContentRepository::new());
+
+        let service: TestService = StateNodeService::new(
+            node_registry,
+            content_repo,
+            peer_network,
+            event_publisher,
+            crdt_repo,
+            "node-1".to_string(),
+        );
+
+        let result = service.ensure_content_local("content-1").await;
+        assert!(
+            result.is_ok(),
+            "expected ops pull to succeed, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ensure_content_local_errors_when_no_member_has_data() {
+        // No discoverable members → cannot pull → ContentNotFound.
+        let service = create_test_service("node-1");
+        let result = service.ensure_content_local("content-1").await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("No available member nodes"));
     }
 
     #[tokio::test]
@@ -2639,6 +3051,137 @@ mod tests {
             .await
             .unwrap();
         assert!(network.is_none());
+    }
+
+    // Writes are routed by genesis presence, not membership, so a node may be a
+    // member yet still relay (until it has synced the genesis). The
+    // ContentNetworkManagerAdded handler therefore accepts promotion of a
+    // former relay node into the member set instead of refusing it.
+    #[tokio::test]
+    async fn test_content_network_manager_added_promotes_former_relay_node() {
+        // Seed a local record where node-1 (us) is currently a non-member relay:
+        // the network it remembers contains only node-2 and node-3.
+        let node_registry = MockNodeRegistry::new();
+        let content_repo = Arc::new(RwLock::new(
+            MockContentNetworkRepository::new()
+                .with_network(create_test_network("content-1", vec!["node-2", "node-3"])),
+        ));
+        let peer_network = Arc::new(MockPeerNetwork::new().with_local_peer_id("node-1"));
+        let event_publisher = MockEventPublisher::new();
+        let crdt_repo = Arc::new(MockContentRepository::new());
+
+        let service: TestService = StateNodeService::new(
+            node_registry,
+            content_repo,
+            peer_network,
+            event_publisher,
+            crdt_repo,
+            "node-1".to_string(),
+        )
+        .with_authentication_service(TestAuthService)
+        .with_authorization_service(AllowAllAuthorizationService);
+
+        // A redundancy check on another node added us (node-1) to the member set.
+        let event = Event::ContentNetworkManagerAdded {
+            content_id: "content-1".to_string(),
+            added_node_id: "node-1".to_string(),
+            member_nodes: vec![
+                "node-1".to_string(),
+                "node-2".to_string(),
+                "node-3".to_string(),
+            ],
+            timestamp: 12345,
+        };
+
+        let outcome = service.handle_sync_event(&event, None).await.unwrap();
+        // Promotion is accepted (not Ignored): the former relay becomes a member.
+        assert_eq!(
+            outcome,
+            ApplyOutcome::NeedsSync {
+                content_id: "content-1".to_string(),
+            }
+        );
+
+        // The local record now lists node-1 as a member.
+        let network = service
+            .get_content_network_for_test("content-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(network.has_member_str("node-1"));
+    }
+
+    // A node that is a member but does not yet hold the genesis must relay its
+    // writes (and never to itself), because local commit would fail with
+    // "Genesis not found". This is the discriminator for genesis-based routing.
+    #[tokio::test]
+    async fn test_update_relays_when_member_but_genesis_absent() {
+        let node_registry = MockNodeRegistry::new();
+        // node-1 (us) IS listed as a member alongside node-2.
+        let content_repo = Arc::new(RwLock::new(
+            MockContentNetworkRepository::new()
+                .with_network(create_test_network("content-1", vec!["node-1", "node-2"])),
+        ));
+        // Keep a handle to the peer network so we can assert the relay path was
+        // actually taken (not just that the call returned Ok — the mock CRDT
+        // repo would happily "commit" locally without a genesis, so observing
+        // the relay invocation is the only way to distinguish the two paths).
+        let peer_network = Arc::new(MockPeerNetwork::new().with_local_peer_id("node-1"));
+        let event_publisher = MockEventPublisher::new();
+        // CRDT repo is empty: we hold no genesis for content-1, so a local
+        // commit would (in production) fail with "Genesis not found".
+        let crdt_repo = Arc::new(MockContentRepository::new());
+
+        let service: TestService = StateNodeService::new(
+            node_registry,
+            content_repo,
+            peer_network.clone(),
+            event_publisher,
+            crdt_repo,
+            "node-1".to_string(),
+        )
+        .with_authentication_service(TestAuthService)
+        .with_authorization_service(AllowAllAuthorizationService);
+
+        // Despite being a member, the write must relay (and succeed) because we
+        // lack the genesis — not commit locally.
+        let result = service
+            .update_content(
+                "content-1",
+                b"new data",
+                Some(&test_token()),
+                Some(&test_request_signature()),
+                None,
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "member-without-genesis must relay successfully, got: {:?}",
+            result.err()
+        );
+        // The discriminating assertion: the relay path was taken exactly because
+        // the genesis was absent. If routing reverted to membership-based, this
+        // would be 0 (the node would have committed locally).
+        assert_eq!(
+            *peer_network.relay_update_calls.lock().await,
+            1,
+            "expected the update to be relayed once due to missing genesis",
+        );
+        // And it must never relay to itself: node-1 is in its own member set
+        // (it was promoted) but holds no genesis, so the only valid relay
+        // target is node-2. Relaying to self would waste a failover attempt.
+        let targets = peer_network.relay_update_peers.lock().await.clone();
+        assert!(
+            !targets.contains(&"node-1".to_string()),
+            "must not relay to self (node-1); relayed to: {:?}",
+            targets
+        );
+        assert_eq!(
+            targets,
+            vec!["node-2".to_string()],
+            "relay must target the other member only",
+        );
     }
 
     #[tokio::test]
