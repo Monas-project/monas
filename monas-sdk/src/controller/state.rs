@@ -24,6 +24,26 @@ impl MonasController {
         None
     }
 
+    /// State Node の読み取り API 用の認証コンテキストを解決する。
+    ///
+    /// 呼び出し元が Authorization を明示していればそのまま透過する。
+    /// 無ければ書き込み系（create/update/delete）と同じく monas-account で
+    /// `read:content:<timestamp>` に署名し、`user:<hex(pubkey)>` トークンを組み立てる。
+    /// State Node 側は読み取り時にこの署名メッセージを検証する
+    /// （`verify_read_access` → `verify_caller_signature("read", "content", ..)`）。
+    fn resolve_state_read_auth<T>(
+        &self,
+        auth: Option<&StateNodeAuthContext>,
+        trace_id: &str,
+    ) -> Result<Option<StateNodeAuthContext>, ApiResponse<T>> {
+        match auth {
+            Some(ctx) if ctx.authorization.is_none() => {
+                self.prepare_state_node_metadata_auth(auth, "read", "content", trace_id)
+            }
+            _ => Ok(auth.cloned()),
+        }
+    }
+
     fn state_node_get_string<T>(
         &self,
         url: &str,
@@ -118,9 +138,13 @@ impl MonasController {
             return response;
         }
 
+        let auth = match self.resolve_state_read_auth::<GetLatestVersionOutput>(auth, &trace_id) {
+            Ok(resolved) => resolved,
+            Err(e) => return e,
+        };
         let history = match self.get_state_node_history::<GetLatestVersionOutput>(
             &input.content_id,
-            auth,
+            auth.as_ref(),
             trace_id.clone(),
         ) {
             Ok(h) => h,
@@ -158,9 +182,13 @@ impl MonasController {
             return response;
         }
 
+        let auth = match self.resolve_state_read_auth::<GetHistoryOutput>(auth, &trace_id) {
+            Ok(resolved) => resolved,
+            Err(e) => return e,
+        };
         let history = match self.get_state_node_history::<GetHistoryOutput>(
             &input.content_id,
-            auth,
+            auth.as_ref(),
             trace_id.clone(),
         ) {
             Ok(h) => h,
@@ -209,6 +237,12 @@ impl MonasController {
                 trace_id,
             );
         }
+
+        let auth = match self.resolve_state_read_auth::<VerifyIntegrityOutput>(auth, &trace_id) {
+            Ok(resolved) => resolved,
+            Err(e) => return e,
+        };
+        let auth = auth.as_ref();
 
         let content_bytes = match URL_SAFE_NO_PAD.decode(&input.content) {
             Ok(b) => b,

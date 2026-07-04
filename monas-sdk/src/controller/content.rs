@@ -217,7 +217,7 @@ impl MonasController {
             .map(Some)
     }
 
-    fn prepare_state_node_metadata_auth<T>(
+    pub(super) fn prepare_state_node_metadata_auth<T>(
         &self,
         auth: Option<&StateNodeAuthContext>,
         operation: &str,
