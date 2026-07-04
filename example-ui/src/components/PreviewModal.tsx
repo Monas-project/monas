@@ -93,7 +93,12 @@ export function PreviewModal({
     if (!cid) return;
     setVerify({ status: "loading" });
     const expectedVersion = latest.status === "ok" ? latest.data.latest_version : undefined;
-    verifyIntegrity({ contentId: cid, contentBase64Url: contentB64Url, expectedVersion })
+    verifyIntegrity({
+      contentId: cid,
+      contentBase64Url: contentB64Url,
+      expectedVersion,
+      localContentId: entry.localContentId,
+    })
       .then((d) => setVerify({ status: "ok", data: d }))
       .catch((e) => setVerify({ status: "error", message: errMsg(e) }));
   };

@@ -52,6 +52,9 @@ export interface RevokeShareOutput {
 
 export function revokeShare(input: {
   contentId: string;
+  /** State-node series id — the state node only knows this, not the SDK-local
+   *  version id, so the post-revoke re-encryption sync must address it. */
+  remoteContentId?: string;
   senderPublicKeyB64Url: string;
   recipientPublicKeyB64Url: string;
 }) {
@@ -60,6 +63,7 @@ export function revokeShare(input: {
     timestamp: true,
     body: {
       content_id: input.contentId,
+      remote_content_id: input.remoteContentId,
       sender_public_key: input.senderPublicKeyB64Url,
       recipient_public_key: input.recipientPublicKeyB64Url,
     },

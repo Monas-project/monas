@@ -38,6 +38,10 @@ export function verifyIntegrity(input: {
   contentId: string;
   contentBase64Url: string;
   expectedVersion?: string;
+  /** SDK-local version id — lets the SDK compare the state-node ciphertext
+   *  against its locally stored ciphertext (the state node never sees
+   *  plaintext, so a plaintext comparison can never match). */
+  localContentId?: string;
 }) {
   return gateway<VerifyIntegrityOutput>("/state/verify-integrity", {
     method: "POST",
@@ -46,6 +50,7 @@ export function verifyIntegrity(input: {
       content_id: input.contentId,
       content: input.contentBase64Url,
       expected_version: input.expectedVersion,
+      local_content_id: input.localContentId,
     },
   });
 }

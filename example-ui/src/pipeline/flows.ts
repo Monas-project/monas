@@ -283,6 +283,7 @@ export function revokeFlow(input: {
       exec: async (ctx) => {
         const r = await shareApi.revokeShare({
           contentId: entry.localContentId!,
+          remoteContentId: entry.remoteContentId,
           senderPublicKeyB64Url: identity.publicKeyB64Url,
           recipientPublicKeyB64Url: input.recipientPublicKeyB64Url,
         });
