@@ -265,6 +265,29 @@ impl PeerNetwork for MockPeerNetwork {
             .unwrap_or(true))
     }
 
+    async fn relay_read_content(
+        &self,
+        _peer_id: &str,
+        content_id: &str,
+        _version: Option<&str>,
+        _auth_token: &str,
+        _request_signature: &[u8],
+        _timestamp: Option<u64>,
+    ) -> Result<(Vec<u8>, String)> {
+        Err(anyhow::anyhow!("Content not found: {}", content_id))
+    }
+
+    async fn relay_read_history(
+        &self,
+        _peer_id: &str,
+        content_id: &str,
+        _auth_token: &str,
+        _request_signature: &[u8],
+        _timestamp: Option<u64>,
+    ) -> Result<Vec<String>> {
+        Err(anyhow::anyhow!("Content not found: {}", content_id))
+    }
+
     async fn connected_peer_count(&self) -> usize {
         0
     }
