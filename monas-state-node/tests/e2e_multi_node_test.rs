@@ -30,6 +30,7 @@ async fn create_test_node() -> (StateNode, TempDir) {
             bootstrap_nodes: vec![],
             enable_mdns: false, // Disable mDNS to avoid interference between tests
             gossipsub_topics: vec![EVENTS_TOPIC.to_string()],
+            external_addrs: vec![],
         },
         node_id: None,
         sync_interval_secs: 30,

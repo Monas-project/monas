@@ -37,6 +37,16 @@ pub struct MockPeerNetwork {
     pub relay_update_result: Arc<Mutex<Option<bool>>>,
     pub relay_delete_result: Arc<Mutex<Option<bool>>>,
     pub relay_invalidate_tokens_result: Arc<Mutex<Option<bool>>>,
+    /// Number of times each relay method was invoked. Lets tests assert that a
+    /// write actually took the relay path (vs committing locally).
+    pub relay_update_calls: Arc<Mutex<usize>>,
+    pub relay_delete_calls: Arc<Mutex<usize>>,
+    pub relay_invalidate_tokens_calls: Arc<Mutex<usize>>,
+    /// Target peer ids each relay method was invoked with, in order. Lets tests
+    /// assert which members a write was relayed to (e.g. never to self).
+    pub relay_update_peers: Arc<Mutex<Vec<String>>>,
+    pub relay_delete_peers: Arc<Mutex<Vec<String>>>,
+    pub relay_invalidate_tokens_peers: Arc<Mutex<Vec<String>>>,
 }
 
 impl MockPeerNetwork {
@@ -52,6 +62,12 @@ impl MockPeerNetwork {
             relay_update_result: Arc::new(Mutex::new(Some(true))),
             relay_delete_result: Arc::new(Mutex::new(Some(true))),
             relay_invalidate_tokens_result: Arc::new(Mutex::new(Some(true))),
+            relay_update_calls: Arc::new(Mutex::new(0)),
+            relay_delete_calls: Arc::new(Mutex::new(0)),
+            relay_invalidate_tokens_calls: Arc::new(Mutex::new(0)),
+            relay_update_peers: Arc::new(Mutex::new(Vec::new())),
+            relay_delete_peers: Arc::new(Mutex::new(Vec::new())),
+            relay_invalidate_tokens_peers: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -198,35 +214,50 @@ impl PeerNetwork for MockPeerNetwork {
 
     async fn relay_update_content(
         &self,
-        _peer_id: &str,
+        peer_id: &str,
         _content_id: &str,
         _data: &[u8],
         _auth_token: &str,
         _request_signature: &[u8],
         _timestamp: Option<u64>,
     ) -> Result<bool> {
+        *self.relay_update_calls.lock().await += 1;
+        self.relay_update_peers
+            .lock()
+            .await
+            .push(peer_id.to_string());
         Ok(self.relay_update_result.lock().await.unwrap_or(true))
     }
 
     async fn relay_delete_content(
         &self,
-        _peer_id: &str,
+        peer_id: &str,
         _content_id: &str,
         _auth_token: &str,
         _request_signature: &[u8],
         _timestamp: Option<u64>,
     ) -> Result<bool> {
+        *self.relay_delete_calls.lock().await += 1;
+        self.relay_delete_peers
+            .lock()
+            .await
+            .push(peer_id.to_string());
         Ok(self.relay_delete_result.lock().await.unwrap_or(true))
     }
 
     async fn relay_invalidate_tokens(
         &self,
-        _peer_id: &str,
+        peer_id: &str,
         _content_id: &str,
         _auth_token: &str,
         _request_signature: &[u8],
         _timestamp: Option<u64>,
     ) -> Result<bool> {
+        *self.relay_invalidate_tokens_calls.lock().await += 1;
+        self.relay_invalidate_tokens_peers
+            .lock()
+            .await
+            .push(peer_id.to_string());
         Ok(self
             .relay_invalidate_tokens_result
             .lock()
@@ -422,6 +453,12 @@ impl ContentRepository for MockContentRepository {
     }
 
     async fn exists(&self, genesis_cid: &str) -> Result<bool> {
+        Ok(self.contents.lock().await.contains_key(genesis_cid))
+    }
+
+    async fn has_genesis(&self, genesis_cid: &str) -> Result<bool> {
+        // The mock has no partial-DAG concept: a content is present with its
+        // genesis or absent entirely, so this mirrors `exists`.
         Ok(self.contents.lock().await.contains_key(genesis_cid))
     }
 

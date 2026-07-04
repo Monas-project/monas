@@ -451,6 +451,20 @@ impl ContentRepository for CrslCrdtRepository {
         Ok(repo.latest(&genesis).is_some())
     }
 
+    async fn has_genesis(&self, genesis_cid: &str) -> Result<bool> {
+        let genesis = match Self::parse_cid(genesis_cid) {
+            Ok(cid) => cid,
+            Err(_) => return Ok(false),
+        };
+
+        let repo = self.repo.lock();
+
+        // The genesis CID *is* a node CID, so look it up directly. Unlike
+        // `latest`, this is only true when the genesis node itself is present —
+        // not when we hold only later versions from a partial sync.
+        Ok(matches!(repo.dag.get_node(&genesis), Ok(Some(_))))
+    }
+
     async fn list_contents(&self) -> Result<Vec<String>> {
         let repo = self.repo.lock();
 

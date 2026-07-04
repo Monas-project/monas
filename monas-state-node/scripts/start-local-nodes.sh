@@ -79,9 +79,12 @@ fi
 
 # ノード1（ブートストラップノード）の起動
 log_info "ノード1（ブートストラップノード）を起動しています..."
+# The state-node defaults to a fixed P2P port (9090); give each node on this
+# host a distinct --p2p-port to avoid a bind collision.
 "$STATE_NODE_BIN" \
     --data-dir ./data/node1 \
     -l 127.0.0.1:8080 \
+    --p2p-port 9091 \
     --log-level info \
     > "$LOG_DIR/node1.log" 2>&1 &
 NODE1_PID=$!
@@ -138,6 +141,7 @@ log_info "ノード2を起動しています..."
 "$STATE_NODE_BIN" \
     --data-dir ./data/node2 \
     -l 127.0.0.1:8081 \
+    --p2p-port 9092 \
     -b "$BOOTSTRAP_ADDR" \
     --log-level info \
     > "$LOG_DIR/node2.log" 2>&1 &
@@ -164,6 +168,7 @@ log_info "ノード3を起動しています..."
 "$STATE_NODE_BIN" \
     --data-dir ./data/node3 \
     -l 127.0.0.1:8082 \
+    --p2p-port 9093 \
     -b "$BOOTSTRAP_ADDR" \
     --log-level info \
     > "$LOG_DIR/node3.log" 2>&1 &

@@ -112,6 +112,7 @@ mod tests {
             bootstrap_nodes: vec![],
             enable_mdns: false,
             gossipsub_topics: vec!["test".to_string()],
+            external_addrs: vec![],
         };
 
         let config2 = Libp2pNetworkConfig {
@@ -119,6 +120,7 @@ mod tests {
             bootstrap_nodes: vec![],
             enable_mdns: false,
             gossipsub_topics: vec!["test".to_string()],
+            external_addrs: vec![],
         };
 
         let network1 = Libp2pNetwork::new(config1, crdt_repo1, tmp_dir1.path().to_path_buf())

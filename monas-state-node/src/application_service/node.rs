@@ -356,7 +356,7 @@ impl StateNode {
                                 } => {
                                     let token = AuthToken::new(auth_token);
                                     service_for_relay
-                                        .update_content(
+                                        .update_content_via_relay(
                                             &content_id,
                                             &data,
                                             Some(&token),
@@ -374,7 +374,7 @@ impl StateNode {
                                 } => {
                                     let token = AuthToken::new(auth_token);
                                     service_for_relay
-                                        .delete_content(
+                                        .delete_content_via_relay(
                                             &content_id,
                                             Some(&token),
                                             Some(&request_signature),
@@ -391,7 +391,7 @@ impl StateNode {
                                 } => {
                                     let token = AuthToken::new(auth_token);
                                     service_for_relay
-                                        .invalidate_tokens(
+                                        .invalidate_tokens_via_relay(
                                             &content_id,
                                             &token,
                                             Some(&request_signature),
@@ -656,6 +656,7 @@ mod tests {
                 bootstrap_nodes: vec![],
                 enable_mdns: false,
                 gossipsub_topics: vec!["test".to_string()],
+                external_addrs: vec![],
             },
             node_id: Some("test-node-id".to_string()),
             sync_interval_secs: 30,
@@ -684,6 +685,7 @@ mod tests {
                 bootstrap_nodes: vec![],
                 enable_mdns: false,
                 gossipsub_topics: vec!["test".to_string()],
+                external_addrs: vec![],
             },
             node_id: None,
             sync_interval_secs: 30,
@@ -713,6 +715,7 @@ mod tests {
                 bootstrap_nodes: vec![],
                 enable_mdns: false,
                 gossipsub_topics: vec!["test".to_string()],
+                external_addrs: vec![],
             },
             node_id: None, // Will be auto-generated from libp2p PeerId
             sync_interval_secs: 30,
@@ -743,6 +746,7 @@ mod tests {
                 bootstrap_nodes: vec![],
                 enable_mdns: false,
                 gossipsub_topics: vec!["test".to_string()],
+                external_addrs: vec![],
             },
             node_id: None,
             sync_interval_secs: 30,

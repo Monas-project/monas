@@ -684,6 +684,12 @@ async fn get_content_data(
     headers: HeaderMap,
     Query(query): Query<VersionQuery>,
 ) -> impl IntoResponse {
+    // Bug #93: if this node holds no local state for the content (it is neither
+    // the creator nor a member), pull it from a member first so the read below
+    // and the access-policy check both see the real data. Best-effort: on
+    // failure we fall through to the normal local read (which 404s as before).
+    let _ = state.ensure_content_local(&content_id).await;
+
     if let Err(response) = verify_read_access(&state, &headers, &content_id).await {
         return response;
     }
@@ -735,6 +741,9 @@ async fn get_content_history(
     Path(content_id): Path<String>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    // Bug #93: pull content from a member if we hold none locally (best-effort).
+    let _ = state.ensure_content_local(&content_id).await;
+
     if let Err(response) = verify_read_access(&state, &headers, &content_id).await {
         return response;
     }
@@ -768,6 +777,9 @@ async fn get_content_version(
     Path((content_id, version)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    // Bug #93: pull content from a member if we hold none locally (best-effort).
+    let _ = state.ensure_content_local(&content_id).await;
+
     if let Err(response) = verify_read_access(&state, &headers, &content_id).await {
         return response;
     }

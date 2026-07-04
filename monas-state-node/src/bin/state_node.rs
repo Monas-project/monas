@@ -32,8 +32,16 @@ struct Args {
     #[arg(short, long)]
     bootstrap: Vec<String>,
 
-    /// P2P listen port (0 for random).
-    #[arg(long, default_value = "0")]
+    /// Externally reachable addresses to advertise to peers (multiaddr format).
+    /// Use in production to announce a public IP/hostname so remote nodes can
+    /// dial this node, e.g. `/ip4/203.0.113.5/tcp/9090`. May be repeated.
+    #[arg(long)]
+    external_address: Vec<String>,
+
+    /// P2P listen port. Defaults to a fixed port so the advertised address is
+    /// stable across restarts (important for production). Pass `0` for a random
+    /// port (e.g. when running multiple nodes on one host).
+    #[arg(long, default_value = "9090")]
     p2p_port: u16,
 
     /// Log level (trace, debug, info, warn, error).
@@ -86,6 +94,17 @@ async fn main() -> Result<()> {
             }
         } else {
             tracing::warn!("Failed to parse bootstrap address: {}", addr_str);
+        }
+    }
+
+    // Parse and add externally reachable addresses to advertise.
+    for addr_str in &args.external_address {
+        match Multiaddr::from_str(addr_str) {
+            Ok(addr) => {
+                tracing::info!("External address: {}", addr);
+                network_config.external_addrs.push(addr);
+            }
+            Err(e) => tracing::warn!("Failed to parse external address {}: {}", addr_str, e),
         }
     }
 

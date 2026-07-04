@@ -489,6 +489,9 @@ mod tests {
         async fn exists(&self, _genesis_cid: &str) -> Result<bool> {
             unimplemented!()
         }
+        async fn has_genesis(&self, _genesis_cid: &str) -> Result<bool> {
+            unimplemented!()
+        }
         async fn list_contents(&self) -> Result<Vec<String>> {
             unimplemented!()
         }
