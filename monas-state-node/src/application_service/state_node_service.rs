@@ -497,12 +497,14 @@ where
     /// single-user demo; a hardened version should add a read-relay RPC with
     /// member-side authorization. Tracked in bug #93 follow-up.
     pub async fn ensure_content_local(&self, content_id: &str) -> Result<(), StateNodeError> {
-        // Fast path: we already hold local history for this content.
+        // Fast path: we already hold this content's genesis node locally.
+        // NOTE: `get_history` cannot be used here — crsl-lib's `linear_history`
+        // returns `[genesis]` even when no node exists (phantom history), which
+        // would make this check always pass and skip the pull.
         let has_local = self
             .crdt_repo
-            .get_history(content_id)
+            .has_genesis(content_id)
             .await
-            .map(|h| !h.is_empty())
             .unwrap_or(false);
         if has_local {
             return Ok(());

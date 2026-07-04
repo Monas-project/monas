@@ -101,13 +101,25 @@ where
             }
         };
 
-        // 2. Get local version to request only newer operations
-        let local_version = self
+        // 2. Get local version to request only newer operations.
+        // Only trust the local history if we actually hold the genesis node:
+        // crsl-lib's `linear_history` returns `[genesis]` even for content we
+        // hold nothing of (phantom history). Passing that as `since` makes
+        // providers skip the Create operation and we would never converge.
+        let has_genesis = self
             .crdt_repo
-            .get_history(genesis_cid)
+            .has_genesis(genesis_cid)
             .await
-            .ok()
-            .and_then(|h| h.last().cloned());
+            .unwrap_or(false);
+        let local_version = if has_genesis {
+            self.crdt_repo
+                .get_history(genesis_cid)
+                .await
+                .ok()
+                .and_then(|h| h.last().cloned())
+        } else {
+            None
+        };
 
         // 3. Fetch operations from each member node
         for node_id in network.member_nodes() {
