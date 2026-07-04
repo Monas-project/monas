@@ -75,7 +75,13 @@ pub struct DelegatedAccessToken {
 /// 共有取り消しリクエスト
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RevokeShareInput {
+    /// SDK ローカルの版ID（ACL・CEK・再暗号化はローカルIDで処理される）
     pub content_id: String,
+    /// State Node へ送る系列ID。未指定の場合は `content_id` を使う（後方互換）。
+    /// State Node はローカル版IDを知らないため、State Node に登録済みの
+    /// コンテンツでは必ず指定すること（`UpdateContentInput` と同じ区別）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_content_id: Option<String>,
     /// 送信者の公開鍵（base64url） - sender_key_idを計算するために使用
     pub sender_public_key: String,
     pub recipient_public_key: String,

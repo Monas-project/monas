@@ -298,13 +298,44 @@ impl MonasController {
             }
         };
 
-        let valid = content_bytes == state_bytes;
-        let reason = if valid {
-            None
+        // State Node が保持するのは SDK が送信した「暗号文」なので、
+        // local_content_id があればローカルに保存された暗号文とバイト比較する。
+        // （平文 `content` と State Node のバイト列は一致し得ない。）
+        let (valid, reason) = if let Some(local_id) = input.local_content_id.as_deref() {
+            match self.content_service.fetch_encrypted(
+                monas_content::domain::content_id::ContentId::new(local_id.to_string()),
+            ) {
+                Ok(local_cipher) => {
+                    if local_cipher == state_bytes {
+                        (true, None)
+                    } else {
+                        (
+                            false,
+                            Some(format!(
+                                "state node ciphertext differs from local ciphertext (version={version_to_check})"
+                            )),
+                        )
+                    }
+                }
+                Err(e) => (
+                    false,
+                    Some(format!(
+                        "failed to load local ciphertext for {local_id}: {e}"
+                    )),
+                ),
+            }
         } else {
-            Some(format!(
-                "content mismatch with state node (version={version_to_check})"
-            ))
+            let valid = content_bytes == state_bytes;
+            (
+                valid,
+                if valid {
+                    None
+                } else {
+                    Some(format!(
+                        "content mismatch with state node (version={version_to_check})"
+                    ))
+                },
+            )
         };
 
         ApiResponse::success(

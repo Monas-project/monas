@@ -517,8 +517,14 @@ impl MonasController {
             }
         };
 
+        // State Node は系列ID（remote_content_id）でコンテンツを管理する。
+        // ローカル版IDしか送らないと State Node 側で未知のコンテンツ扱いになる。
+        let state_node_content_id = input
+            .remote_content_id
+            .as_deref()
+            .unwrap_or(&input.content_id);
         if let Some(response) = self.send_update_to_state_node(
-            &input.content_id,
+            state_node_content_id,
             &reencryption.encrypted_content,
             auth,
             trace_id.clone(),

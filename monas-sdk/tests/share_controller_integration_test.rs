@@ -186,6 +186,7 @@ async fn revoke_share_updates_state_node_version() {
     let revoke_response = controller.revoke_share(
         RevokeShareInput {
             content_id: created.content_id,
+            remote_content_id: None,
             sender_public_key: sender.public_key,
             recipient_public_key: recipient.public_key,
         },
@@ -280,6 +281,7 @@ async fn revoke_share_rolls_back_local_state_when_state_node_sync_fails() {
     let revoke_response = controller.revoke_share(
         RevokeShareInput {
             content_id: created.content_id.clone(),
+            remote_content_id: None,
             sender_public_key: sender.public_key.clone(),
             recipient_public_key: recipient.public_key.clone(),
         },
@@ -317,6 +319,7 @@ async fn revoke_share_rolls_back_local_state_when_state_node_sync_fails() {
     let second_revoke_response = controller.revoke_share(
         RevokeShareInput {
             content_id: created.content_id,
+            remote_content_id: None,
             sender_public_key: sender.public_key,
             recipient_public_key: recipient.public_key,
         },
@@ -414,6 +417,7 @@ async fn revoke_share_rollback_fires_on_inner_share_service_error() {
     let first = controller.revoke_share(
         RevokeShareInput {
             content_id: created.content_id.clone(),
+            remote_content_id: None,
             sender_public_key: sender.public_key.clone(),
             recipient_public_key: recipient.public_key.clone(),
         },
@@ -432,6 +436,7 @@ async fn revoke_share_rollback_fires_on_inner_share_service_error() {
     let second = controller.revoke_share(
         RevokeShareInput {
             content_id: created.content_id,
+            remote_content_id: None,
             sender_public_key: sender.public_key,
             recipient_public_key: recipient.public_key,
         },

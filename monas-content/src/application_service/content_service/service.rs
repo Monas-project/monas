@@ -237,6 +237,29 @@ where
         })
     }
 
+    /// ローカルに保存された「暗号化済み」バイト列を取得する。
+    ///
+    /// State Node 整合性検証用途：State Node が保持するのは SDK が送信した
+    /// 暗号文なので、復号せずローカル暗号文とバイト比較することで
+    /// 「State Node が改ざんされていない同一の暗号文を保持しているか」を
+    /// 確認できる。
+    pub fn fetch_encrypted(&self, content_id: ContentId) -> Result<Vec<u8>, FetchError> {
+        let content = self
+            .content_repository
+            .find_by_id(&content_id)
+            .map_err(FetchError::Repository)?
+            .ok_or(FetchError::NotFound)?;
+
+        if content.is_deleted() {
+            return Err(FetchError::Deleted);
+        }
+
+        content
+            .encrypted_content()
+            .cloned()
+            .ok_or(FetchError::NotFound)
+    }
+
     /// 外部でアンラップされた CEK と暗号化済みコンテンツを用いて復号するユースケース。
     ///
     /// - 共有フロー（Share）で KeyEnvelope から CEK を取り出した後の復号処理を想定。
