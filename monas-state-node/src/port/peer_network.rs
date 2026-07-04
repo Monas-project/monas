@@ -171,6 +171,34 @@ pub trait PeerNetwork: Send + Sync {
         timestamp: Option<u64>,
     ) -> Result<bool>;
 
+    /// Relay a content-data read to a member node.
+    ///
+    /// Used when a node that does not replicate the content receives a read
+    /// request. The member re-authenticates the original caller (token +
+    /// request signature) and enforces the access policy before serving.
+    /// `version: None` reads the latest version. Returns `(data, version)`.
+    async fn relay_read_content(
+        &self,
+        peer_id: &str,
+        content_id: &str,
+        version: Option<&str>,
+        auth_token: &str,
+        request_signature: &[u8],
+        timestamp: Option<u64>,
+    ) -> Result<(Vec<u8>, String)>;
+
+    /// Relay a version-history read to a member node.
+    ///
+    /// Same authentication contract as [`PeerNetwork::relay_read_content`].
+    async fn relay_read_history(
+        &self,
+        peer_id: &str,
+        content_id: &str,
+        auth_token: &str,
+        request_signature: &[u8],
+        timestamp: Option<u64>,
+    ) -> Result<Vec<String>>;
+
     // ========== Monitoring Methods ==========
 
     /// Get the number of currently connected peers.

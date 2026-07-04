@@ -477,75 +477,221 @@ where
         Ok(members)
     }
 
-    /// Ensure the content's CRDT state is available locally, fetching it from
-    /// member nodes if necessary (bug #93, read side).
+    /// Whether this node actually replicates the content (holds its genesis
+    /// node in the local DAG).
     ///
-    /// Read endpoints (data / history / version) read straight from the local
-    /// `crdt_repo`. A node that holds no local state for a content — e.g. a
-    /// client pointed its gateway at a node that is neither the creator nor a
-    /// member — would otherwise 404. This pulls the operations from a member
-    /// (discovered via `resolve_members`) and applies them locally so the
-    /// existing read path works unchanged. Applying the operations also brings
-    /// in the access policy, so the subsequent `verify_read_access` check is
-    /// evaluated against the real policy rather than an empty one.
-    ///
-    /// No-op when we already have local history. Returns `ContentNotFound` if
-    /// no member could supply the operations.
-    ///
-    /// SECURITY NOTE: this reuses the unauthenticated `fetch_operations` RPC,
-    /// so a non-member can pull any content's operations. Acceptable for the
-    /// single-user demo; a hardened version should add a read-relay RPC with
-    /// member-side authorization. Tracked in bug #93 follow-up.
-    pub async fn ensure_content_local(&self, content_id: &str) -> Result<(), StateNodeError> {
-        // Fast path: we already hold this content's genesis node locally.
-        // NOTE: `get_history` cannot be used here — crsl-lib's `linear_history`
-        // returns `[genesis]` even when no node exists (phantom history), which
-        // would make this check always pass and skip the pull.
-        let has_local = self
-            .crdt_repo
+    /// NOTE: `get_history` cannot be used for this — crsl-lib's
+    /// `linear_history` returns `[genesis]` even when no node exists (phantom
+    /// history), which would make such a check always pass.
+    pub async fn has_local_content(&self, content_id: &str) -> bool {
+        self.crdt_repo
             .has_genesis(content_id)
             .await
-            .unwrap_or(false);
-        if has_local {
-            return Ok(());
+            .unwrap_or(false)
+    }
+
+    /// Authorize a read against the content's access policy (bug #93 hardened
+    /// read path).
+    ///
+    /// Authenticates the caller (token + request signature) and grants access
+    /// when the caller is the content owner or the authorization service
+    /// grants `ReadContent`. Content without a policy is readable (it may not
+    /// have a policy yet) — same semantics as the HTTP read path.
+    pub async fn authorize_read(
+        &self,
+        token: &AuthToken,
+        request_signature: Option<&[u8]>,
+        timestamp: Option<u64>,
+        content_id: &str,
+    ) -> Result<(), StateNodeError> {
+        let identity = self
+            .authenticate_for_read(token, request_signature, timestamp)
+            .await?;
+
+        if let Ok(Some(policy)) = self.crdt_repo.get_access_policy(content_id).await {
+            if policy.is_owner(&identity) {
+                return Ok(());
+            }
+
+            let authz_request = crate::port::authorization_service::AuthorizationRequest {
+                identity,
+                resource: ContentId::new(content_id.to_string())?,
+                capability: crate::domain::auth_capability::AuthCapability::ReadContent,
+                token: Some(token.clone()),
+                request_signature: request_signature.map(|s| s.to_vec()),
+            };
+            if let Some(authz_service) = self.authz_service.as_ref() {
+                if let Ok(result) = authz_service.authorize(&authz_request).await {
+                    if result.is_granted() {
+                        return Ok(());
+                    }
+                }
+            }
+
+            return Err(StateNodeError::AuthorizationFailed(
+                "Insufficient permissions: read access required".to_string(),
+            ));
         }
 
-        // Discover the members (local record, or DHT fallback) and pull ops.
-        let members = self.resolve_members(content_id).await?;
-        let content_id_vo = ContentId::new(content_id.to_string())?;
+        // No policy exists yet — allow, matching the HTTP read path.
+        Ok(())
+    }
 
+    /// Serve a relayed data read on a member node (bug #93 hardened read path).
+    ///
+    /// Called by the relay handler when a non-member node forwards a read.
+    /// Re-authenticates the original caller before touching the repository.
+    /// `version: None` serves the latest version. Returns `(data, version)`.
+    pub async fn read_content_via_relay(
+        &self,
+        content_id: &str,
+        version: Option<&str>,
+        token: &AuthToken,
+        request_signature: Option<&[u8]>,
+        timestamp: Option<u64>,
+    ) -> Result<(Vec<u8>, String), StateNodeError> {
+        self.authorize_read(token, request_signature, timestamp, content_id)
+            .await?;
+
+        let content_id_vo = ContentId::new(content_id.to_string())?;
+        match version {
+            Some(v) => {
+                let data = self
+                    .crdt_repo
+                    .get_version(v)
+                    .await
+                    .map_err(|e| StateNodeError::StorageError(e.to_string()))?
+                    .ok_or(StateNodeError::ContentNotFound(content_id_vo))?;
+                Ok((data, v.to_string()))
+            }
+            None => self
+                .crdt_repo
+                .get_latest_with_version(content_id)
+                .await
+                .map_err(|e| StateNodeError::StorageError(e.to_string()))?
+                .ok_or(StateNodeError::ContentNotFound(content_id_vo)),
+        }
+    }
+
+    /// Serve a relayed history read on a member node (bug #93 hardened read
+    /// path). Same authentication contract as `read_content_via_relay`.
+    pub async fn read_history_via_relay(
+        &self,
+        content_id: &str,
+        token: &AuthToken,
+        request_signature: Option<&[u8]>,
+        timestamp: Option<u64>,
+    ) -> Result<Vec<String>, StateNodeError> {
+        self.authorize_read(token, request_signature, timestamp, content_id)
+            .await?;
+
+        // Guard against crsl-lib's phantom `[genesis]` history for content we
+        // don't actually hold.
+        if !self.has_local_content(content_id).await {
+            return Err(StateNodeError::ContentNotFound(ContentId::new(
+                content_id.to_string(),
+            )?));
+        }
+
+        self.crdt_repo
+            .get_history(content_id)
+            .await
+            .map_err(|e| StateNodeError::StorageError(e.to_string()))
+    }
+
+    /// Relay a data read to the content's members (bug #93 hardened read path,
+    /// caller side).
+    ///
+    /// Used by read endpoints on a node that does not replicate the content.
+    /// The caller's auth material is forwarded verbatim so the member can
+    /// re-authenticate; operations are never pulled to this node.
+    pub async fn relay_read_data(
+        &self,
+        content_id: &str,
+        version: Option<&str>,
+        token: &AuthToken,
+        request_signature: Option<&[u8]>,
+        timestamp: Option<u64>,
+    ) -> Result<(Vec<u8>, String), StateNodeError> {
+        let members = self.resolve_members(content_id).await?;
+        let sig: &[u8] = request_signature.unwrap_or(&[]);
+
+        let mut last_err: Option<String> = None;
         for member in &members {
             match self
                 .peer_network
-                .fetch_operations(member, content_id, None)
+                .relay_read_content(member, content_id, version, token.as_str(), sig, timestamp)
                 .await
             {
-                Ok(ops) if !ops.is_empty() => match self.crdt_repo.apply_operations(&ops).await {
-                    Ok(_) => return Ok(()),
-                    Err(e) => {
-                        tracing::warn!(
-                            "ensure_content_local: failed to apply ops from {} for {}: {}",
-                            member,
-                            content_id,
-                            e
-                        );
-                    }
-                },
-                Ok(_) => {
-                    // Member returned no operations; try the next one.
-                }
+                Ok(result) => return Ok(result),
                 Err(e) => {
                     tracing::warn!(
-                        "ensure_content_local: failed to fetch ops from {} for {}: {}",
+                        "relay_read_data: member {} failed for {}: {}",
                         member,
                         content_id,
                         e
                     );
+                    last_err = Some(e.to_string());
                 }
             }
         }
 
-        Err(StateNodeError::ContentNotFound(content_id_vo))
+        Err(Self::map_relay_read_error(content_id, last_err))
+    }
+
+    /// Relay a history read to the content's members (bug #93 hardened read
+    /// path, caller side).
+    pub async fn relay_read_history(
+        &self,
+        content_id: &str,
+        token: &AuthToken,
+        request_signature: Option<&[u8]>,
+        timestamp: Option<u64>,
+    ) -> Result<Vec<String>, StateNodeError> {
+        let members = self.resolve_members(content_id).await?;
+        let sig: &[u8] = request_signature.unwrap_or(&[]);
+
+        let mut last_err: Option<String> = None;
+        for member in &members {
+            match self
+                .peer_network
+                .relay_read_history(member, content_id, token.as_str(), sig, timestamp)
+                .await
+            {
+                Ok(versions) => return Ok(versions),
+                Err(e) => {
+                    tracing::warn!(
+                        "relay_read_history: member {} failed for {}: {}",
+                        member,
+                        content_id,
+                        e
+                    );
+                    last_err = Some(e.to_string());
+                }
+            }
+        }
+
+        Err(Self::map_relay_read_error(content_id, last_err))
+    }
+
+    /// Map the last member error of a relayed read back to a typed error so
+    /// the HTTP layer returns the status the member decided on (the relay
+    /// transport only carries strings).
+    fn map_relay_read_error(content_id: &str, last_err: Option<String>) -> StateNodeError {
+        let msg = last_err.unwrap_or_else(|| "no members responded".to_string());
+        let lower = msg.to_lowercase();
+        if lower.contains("not found") {
+            match ContentId::new(content_id.to_string()) {
+                Ok(cid) => StateNodeError::ContentNotFound(cid),
+                Err(_) => StateNodeError::StorageError(msg),
+            }
+        } else if lower.contains("authentication failed") {
+            StateNodeError::AuthenticationFailed(msg)
+        } else if lower.contains("insufficient permissions") || lower.contains("authorization") {
+            StateNodeError::AuthorizationFailed(msg)
+        } else {
+            StateNodeError::NetworkError(NetworkError::ConnectionFailed(msg))
+        }
     }
 
     /// Register a new node.
@@ -2746,28 +2892,17 @@ mod tests {
         );
     }
 
-    fn sample_operation(genesis_cid: &str) -> crate::port::content_repository::SerializedOperation {
-        crate::port::content_repository::SerializedOperation {
-            data: vec![0x01, 0x02],
-            genesis_cid: genesis_cid.to_string(),
-            author: "node-2".to_string(),
-            timestamp: 1,
-            node_timestamp: 1,
-        }
-    }
-
     #[tokio::test]
-    async fn test_ensure_content_local_pulls_from_discovered_member() {
-        // Bug #93 (read side): a node with no local state for the content must
-        // pull the operations from a DHT-discovered member and apply them
-        // locally so the read endpoints work instead of 404ing.
+    async fn test_relay_read_data_maps_member_not_found() {
+        // Bug #93 (hardened read side): a node with no local state relays the
+        // read to a DHT-discovered member. When every member reports the
+        // content missing, the caller gets a typed ContentNotFound back.
         let node_registry = MockNodeRegistry::new();
         let content_repo = Arc::new(RwLock::new(MockContentNetworkRepository::new()));
         let peer_network = Arc::new(
             MockPeerNetwork::new()
                 .with_local_peer_id("node-1")
-                .with_closest_peers(vec!["node-2".to_string()])
-                .with_fetched_operations(vec![sample_operation("content-1")]),
+                .with_closest_peers(vec!["node-2".to_string()]),
         );
         let event_publisher = MockEventPublisher::new();
         let crdt_repo = Arc::new(MockContentRepository::new());
@@ -2781,18 +2916,31 @@ mod tests {
             "node-1".to_string(),
         );
 
-        let result = service.ensure_content_local("content-1").await;
-        assert!(
-            result.is_ok(),
-            "expected ops pull to succeed, got {result:?}"
-        );
+        let result = service
+            .relay_read_data(
+                "content-1",
+                None,
+                &test_token(),
+                Some(&test_request_signature()),
+                None,
+            )
+            .await;
+        assert!(matches!(result, Err(StateNodeError::ContentNotFound(_))));
     }
 
     #[tokio::test]
-    async fn test_ensure_content_local_errors_when_no_member_has_data() {
-        // No discoverable members → cannot pull → ContentNotFound.
+    async fn test_relay_read_data_errors_when_no_members() {
+        // No discoverable members → nothing to relay to → NoAvailableMembers.
         let service = create_test_service("node-1");
-        let result = service.ensure_content_local("content-1").await;
+        let result = service
+            .relay_read_data(
+                "content-1",
+                None,
+                &test_token(),
+                Some(&test_request_signature()),
+                None,
+            )
+            .await;
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
