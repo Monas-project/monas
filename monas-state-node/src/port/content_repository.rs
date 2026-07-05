@@ -109,14 +109,19 @@ pub trait ContentRepository: Send + Sync {
     async fn get_latest_with_version(&self, genesis_cid: &str)
         -> Result<Option<(Vec<u8>, String)>>;
 
-    /// Get content at a specific version.
+    /// Get content at a specific version, scoped to one content series.
     ///
     /// # Arguments
+    /// * `genesis_cid` - The genesis CID of the content the caller is
+    ///   authorized for. The version MUST belong to this series — a raw CID
+    ///   lookup would let a caller authorized for one content read any other
+    ///   content's versions.
     /// * `version_cid` - The specific version CID
     ///
     /// # Returns
-    /// The content data at that version, or None if not found.
-    async fn get_version(&self, version_cid: &str) -> Result<Option<Vec<u8>>>;
+    /// The content data at that version, or None if the version does not
+    /// exist or belongs to a different content series.
+    async fn get_version(&self, genesis_cid: &str, version_cid: &str) -> Result<Option<Vec<u8>>>;
 
     /// Get the version history of content.
     ///

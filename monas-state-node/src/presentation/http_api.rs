@@ -719,7 +719,7 @@ async fn get_content_data(
 
     // Get data based on version parameter
     let data_result = if let Some(version) = &query.version {
-        crdt_repo.get_version(version).await
+        crdt_repo.get_version(&content_id, version).await
     } else {
         crdt_repo.get_latest(&content_id).await
     };
@@ -811,7 +811,7 @@ async fn get_content_version(
 
     let crdt_repo = state.crdt_repo();
 
-    match crdt_repo.get_version(&version).await {
+    match crdt_repo.get_version(&content_id, &version).await {
         Ok(Some(data)) => {
             let encoded = base64::engine::general_purpose::STANDARD.encode(&data);
             Json(ContentDataResponse {

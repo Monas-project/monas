@@ -17,11 +17,12 @@ use crate::port::authentication_service::AuthenticationService;
 use crate::port::authorization_service::{AuthorizationRequest, AuthorizationService};
 use crate::port::content_repository::ContentRepository;
 use crate::port::event_publisher::EventPublisher;
-use crate::port::peer_network::PeerNetwork;
+use crate::port::peer_network::{PeerNetwork, RelayReadError, RelayReadErrorKind};
 use crate::port::persistence::{
     PersistentAccessControlRepository, PersistentContentRepository, PersistentNodeRegistry,
 };
 use anyhow::Result;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 
 /// Result of applying an event.
@@ -508,7 +509,20 @@ where
             .authenticate_for_read(token, request_signature, timestamp)
             .await?;
 
-        if let Ok(Some(policy)) = self.crdt_repo.get_access_policy(content_id).await {
+        // Fail closed: an error loading the policy must deny, not fall through
+        // to the "no policy" allow below.
+        let policy = self
+            .crdt_repo
+            .get_access_policy(content_id)
+            .await
+            .map_err(|e| {
+                StateNodeError::StorageError(format!(
+                    "failed to load access policy for {}: {}",
+                    content_id, e
+                ))
+            })?;
+
+        if let Some(policy) = policy {
             if policy.is_owner(&identity) {
                 return Ok(());
             }
@@ -558,7 +572,7 @@ where
             Some(v) => {
                 let data = self
                     .crdt_repo
-                    .get_version(v)
+                    .get_version(content_id, v)
                     .await
                     .map_err(|e| StateNodeError::StorageError(e.to_string()))?
                     .ok_or(StateNodeError::ContentNotFound(content_id_vo))?;
@@ -616,7 +630,7 @@ where
         let members = self.resolve_members(content_id).await?;
         let sig: &[u8] = request_signature.unwrap_or(&[]);
 
-        let mut last_err: Option<String> = None;
+        let mut best: Option<RelayReadError> = None;
         for member in &members {
             match self
                 .peer_network
@@ -631,12 +645,25 @@ where
                         content_id,
                         e
                     );
-                    last_err = Some(e.to_string());
+                    match Self::record_relay_read_error(&mut best, e) {
+                        // An auth verdict is authoritative — the member DID
+                        // evaluate the request. Do not let a later member's
+                        // transport failure overwrite it.
+                        ControlFlow::Break(final_err) => {
+                            return Err(Self::relay_read_error_to_state_error(
+                                content_id, final_err,
+                            ))
+                        }
+                        ControlFlow::Continue(()) => {}
+                    }
                 }
             }
         }
 
-        Err(Self::map_relay_read_error(content_id, last_err))
+        Err(Self::relay_read_error_to_state_error(
+            content_id,
+            best.unwrap_or_else(|| RelayReadError::other("no members responded")),
+        ))
     }
 
     /// Relay a history read to the content's members (bug #93 hardened read
@@ -651,7 +678,7 @@ where
         let members = self.resolve_members(content_id).await?;
         let sig: &[u8] = request_signature.unwrap_or(&[]);
 
-        let mut last_err: Option<String> = None;
+        let mut best: Option<RelayReadError> = None;
         for member in &members {
             match self
                 .peer_network
@@ -666,31 +693,69 @@ where
                         content_id,
                         e
                     );
-                    last_err = Some(e.to_string());
+                    match Self::record_relay_read_error(&mut best, e) {
+                        ControlFlow::Break(final_err) => {
+                            return Err(Self::relay_read_error_to_state_error(
+                                content_id, final_err,
+                            ))
+                        }
+                        ControlFlow::Continue(()) => {}
+                    }
                 }
             }
         }
 
-        Err(Self::map_relay_read_error(content_id, last_err))
+        Err(Self::relay_read_error_to_state_error(
+            content_id,
+            best.unwrap_or_else(|| RelayReadError::other("no members responded")),
+        ))
     }
 
-    /// Map the last member error of a relayed read back to a typed error so
-    /// the HTTP layer returns the status the member decided on (the relay
-    /// transport only carries strings).
-    fn map_relay_read_error(content_id: &str, last_err: Option<String>) -> StateNodeError {
-        let msg = last_err.unwrap_or_else(|| "no members responded".to_string());
-        let lower = msg.to_lowercase();
-        if lower.contains("not found") {
-            match ContentId::new(content_id.to_string()) {
-                Ok(cid) => StateNodeError::ContentNotFound(cid),
-                Err(_) => StateNodeError::StorageError(msg),
+    /// Fold one member's relayed-read failure into the running best error.
+    ///
+    /// Auth verdicts (401/403) short-circuit the member loop: the member
+    /// evaluated the caller against the real policy, so asking further
+    /// members cannot change the answer. NotFound is kept over transport
+    /// errors but the loop continues — a lagging member may miss a version
+    /// another member can still serve.
+    fn record_relay_read_error(
+        best: &mut Option<RelayReadError>,
+        err: RelayReadError,
+    ) -> ControlFlow<RelayReadError> {
+        match err.kind {
+            RelayReadErrorKind::AuthenticationFailed | RelayReadErrorKind::AuthorizationFailed => {
+                ControlFlow::Break(err)
             }
-        } else if lower.contains("authentication failed") {
-            StateNodeError::AuthenticationFailed(msg)
-        } else if lower.contains("insufficient permissions") || lower.contains("authorization") {
-            StateNodeError::AuthorizationFailed(msg)
-        } else {
-            StateNodeError::NetworkError(NetworkError::ConnectionFailed(msg))
+            RelayReadErrorKind::NotFound => {
+                *best = Some(err);
+                ControlFlow::Continue(())
+            }
+            RelayReadErrorKind::Other => {
+                if best.is_none() {
+                    *best = Some(err);
+                }
+                ControlFlow::Continue(())
+            }
+        }
+    }
+
+    /// Convert a member's typed relayed-read verdict into the service error
+    /// the HTTP layer maps to a status code.
+    fn relay_read_error_to_state_error(content_id: &str, err: RelayReadError) -> StateNodeError {
+        match err.kind {
+            RelayReadErrorKind::NotFound => match ContentId::new(content_id.to_string()) {
+                Ok(cid) => StateNodeError::ContentNotFound(cid),
+                Err(_) => StateNodeError::StorageError(err.message),
+            },
+            RelayReadErrorKind::AuthenticationFailed => {
+                StateNodeError::AuthenticationFailed(err.message)
+            }
+            RelayReadErrorKind::AuthorizationFailed => {
+                StateNodeError::AuthorizationFailed(err.message)
+            }
+            RelayReadErrorKind::Other => {
+                StateNodeError::NetworkError(NetworkError::ConnectionFailed(err.message))
+            }
         }
     }
 
@@ -2926,6 +2991,202 @@ mod tests {
             )
             .await;
         assert!(matches!(result, Err(StateNodeError::ContentNotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn test_relay_read_data_returns_member_payload() {
+        // Happy path: the member serves the read and the payload comes back.
+        let node_registry = MockNodeRegistry::new();
+        let content_repo = Arc::new(RwLock::new(MockContentNetworkRepository::new()));
+        let peer_network = Arc::new(
+            MockPeerNetwork::new()
+                .with_local_peer_id("node-1")
+                .with_closest_peers(vec!["node-2".to_string()])
+                .with_relay_read_data(b"cipher".to_vec(), "v1"),
+        );
+        let event_publisher = MockEventPublisher::new();
+        let crdt_repo = Arc::new(MockContentRepository::new());
+
+        let service: TestService = StateNodeService::new(
+            node_registry,
+            content_repo,
+            peer_network,
+            event_publisher,
+            crdt_repo,
+            "node-1".to_string(),
+        );
+
+        let result = service
+            .relay_read_data(
+                "content-1",
+                None,
+                &test_token(),
+                Some(&test_request_signature()),
+                None,
+            )
+            .await
+            .expect("relayed read should succeed");
+        assert_eq!(result, (b"cipher".to_vec(), "v1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_relay_read_data_returns_member_auth_verdict() {
+        // A member's 403 verdict must come back typed (not as a generic
+        // network error), so the HTTP layer returns the member's decision.
+        use crate::port::peer_network::{RelayReadError, RelayReadErrorKind};
+        let node_registry = MockNodeRegistry::new();
+        let content_repo = Arc::new(RwLock::new(MockContentNetworkRepository::new()));
+        let peer_network = Arc::new(
+            MockPeerNetwork::new()
+                .with_local_peer_id("node-1")
+                .with_closest_peers(vec!["node-2".to_string(), "node-3".to_string()])
+                .with_relay_read_error(RelayReadError {
+                    kind: RelayReadErrorKind::AuthorizationFailed,
+                    message: "Insufficient permissions: read access required".to_string(),
+                }),
+        );
+        let event_publisher = MockEventPublisher::new();
+        let crdt_repo = Arc::new(MockContentRepository::new());
+
+        let service: TestService = StateNodeService::new(
+            node_registry,
+            content_repo,
+            peer_network,
+            event_publisher,
+            crdt_repo,
+            "node-1".to_string(),
+        );
+
+        let result = service
+            .relay_read_data(
+                "content-1",
+                None,
+                &test_token(),
+                Some(&test_request_signature()),
+                None,
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(StateNodeError::AuthorizationFailed(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_authorize_read_allows_owner() {
+        let service = create_test_service("node-1");
+        let owner = Identity::user("test-user".to_string()).unwrap();
+        let policy = crate::domain::access_policy::AccessPolicy::new(
+            ContentId::new("content-1".to_string()).unwrap(),
+            owner,
+        );
+        service
+            .crdt_repo
+            .access_policies
+            .lock()
+            .await
+            .insert("content-1".to_string(), policy);
+
+        let result = service
+            .authorize_read(
+                &test_token(),
+                Some(&test_request_signature()),
+                None,
+                "content-1",
+            )
+            .await;
+        assert!(result.is_ok(), "owner must be allowed: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn test_authorize_read_allows_when_no_policy() {
+        // Documented semantics: content without a policy is readable.
+        let service = create_test_service("node-1");
+        let result = service
+            .authorize_read(
+                &test_token(),
+                Some(&test_request_signature()),
+                None,
+                "content-1",
+            )
+            .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_authorize_read_denies_non_owner_when_authz_denies() {
+        struct DenyAllAuthorizationService;
+        #[async_trait::async_trait]
+        impl AuthorizationService for DenyAllAuthorizationService {
+            async fn authorize(
+                &self,
+                _request: &AuthorizationRequest,
+            ) -> Result<AuthorizationResult> {
+                Ok(AuthorizationResult::Denied {
+                    reason: "no".to_string(),
+                })
+            }
+        }
+
+        let node_registry = MockNodeRegistry::new();
+        let content_repo = Arc::new(RwLock::new(MockContentNetworkRepository::new()));
+        let peer_network = Arc::new(MockPeerNetwork::new().with_local_peer_id("node-1"));
+        let event_publisher = MockEventPublisher::new();
+        let crdt_repo = Arc::new(MockContentRepository::new());
+
+        let service: TestService = StateNodeService::new(
+            node_registry,
+            content_repo,
+            peer_network,
+            event_publisher,
+            crdt_repo,
+            "node-1".to_string(),
+        )
+        .with_authentication_service(TestAuthService)
+        .with_authorization_service(DenyAllAuthorizationService);
+
+        let owner = Identity::user("someone-else".to_string()).unwrap();
+        let policy = crate::domain::access_policy::AccessPolicy::new(
+            ContentId::new("content-1".to_string()).unwrap(),
+            owner,
+        );
+        service
+            .crdt_repo
+            .access_policies
+            .lock()
+            .await
+            .insert("content-1".to_string(), policy);
+
+        let result = service
+            .authorize_read(
+                &test_token(),
+                Some(&test_request_signature()),
+                None,
+                "content-1",
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(StateNodeError::AuthorizationFailed(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_authorize_read_fails_closed_on_policy_error() {
+        // A policy-store failure must deny, not fall through to the
+        // "no policy -> allow" branch.
+        let service = create_test_service("node-1");
+        *service.crdt_repo.access_policy_error.lock().await = true;
+
+        let result = service
+            .authorize_read(
+                &test_token(),
+                Some(&test_request_signature()),
+                None,
+                "content-1",
+            )
+            .await;
+        assert!(matches!(result, Err(StateNodeError::StorageError(_))));
     }
 
     #[tokio::test]

@@ -203,6 +203,96 @@ async fn revoke_share_updates_state_node_version() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn revoke_share_syncs_state_node_by_remote_content_id() {
+    // The state node only knows the series id (remote_content_id), never the
+    // SDK-local version id. The post-revoke re-encryption PUT must therefore
+    // address the remote id when it is provided.
+    let _guard = acquire_test_lock();
+    let mut server = Server::new_async().await;
+    let create_mock = server
+        .mock("POST", "/content")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"content_id":"remote-series-id"}"#)
+        .create_async()
+        .await;
+    let delegate_mock = server
+        .mock("POST", "/issuer/delegate")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"delegated_token":"dummy.jwt.token","issued_at":1700000000,"expires_at":1700003600,"jti":"jti-3"}"#,
+        )
+        .create_async()
+        .await;
+    // Only the remote id path is mocked: a PUT to any other path (e.g. the
+    // local content id) would fail the request and the assertion below.
+    let update_mock = server
+        .mock("PUT", "/content/remote-series-id")
+        .with_status(200)
+        .create_async()
+        .await;
+
+    let controller = MonasController::with_urls(server.url(), server.url());
+
+    let sender = controller
+        .generate_keypair(GenerateKeypairInput {
+            key_type: KeyType::Secp256r1,
+        })
+        .data
+        .expect("sender keypair should be generated");
+    let recipient = controller
+        .generate_keypair(GenerateKeypairInput {
+            key_type: KeyType::Secp256r1,
+        })
+        .data
+        .expect("recipient keypair should be generated");
+
+    let create_response = controller.create_content(
+        CreateContentInput {
+            content: URL_SAFE_NO_PAD.encode(b"revoke-remote-id-content"),
+            metadata: Some(ContentMetadata {
+                name: Some("revoke-remote.txt".to_string()),
+                content_type: Some("text/plain".to_string()),
+                created_at: None,
+                updated_at: None,
+            }),
+        },
+        None,
+    );
+    assert!(create_response.success, "create_content should succeed");
+    let created = create_response.data.expect("create should return data");
+    create_mock.assert();
+
+    let share_response = controller.share_content(ShareContentInput {
+        content_id: created.content_id.clone(),
+        sender_public_key: sender.public_key.clone(),
+        recipient_public_key: recipient.public_key.clone(),
+        permissions: vec![Permission::Write],
+    });
+    assert!(share_response.success, "share_content should succeed");
+    delegate_mock.assert();
+
+    let revoke_response = controller.revoke_share(
+        RevokeShareInput {
+            content_id: created.content_id,
+            remote_content_id: Some("remote-series-id".to_string()),
+            sender_public_key: sender.public_key,
+            recipient_public_key: recipient.public_key,
+        },
+        None,
+    );
+    assert!(
+        revoke_response.success,
+        "revoke_share should succeed: {:?}",
+        revoke_response.error
+    );
+    update_mock.assert();
+
+    cleanup_content_artifacts();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn revoke_share_rolls_back_local_state_when_state_node_sync_fails() {
     let _guard = acquire_test_lock();
     let mut server = Server::new_async().await;
