@@ -15,6 +15,7 @@ use crate::domain::events::Event;
 use crate::infrastructure::disk_capacity;
 use crate::port::content_repository::{ContentRepository, SerializedOperation};
 use crate::port::peer_network::PeerNetwork;
+use crate::port::peer_network::{RelayReadError, RelayReadErrorKind};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -42,7 +43,8 @@ const PEER_NETWORK_TIMEOUT: Duration = Duration::from_secs(30);
 /// which processes them using StateNodeService.
 pub struct RelayRequest {
     pub kind: RelayRequestKind,
-    pub reply: oneshot::Sender<Result<RelayOutcome>>,
+    pub reply:
+        oneshot::Sender<std::result::Result<RelayOutcome, crate::domain::errors::StateNodeError>>,
 }
 
 /// Result payload of a processed relay request.
@@ -249,7 +251,7 @@ enum SwarmCommand {
         auth_token: String,
         request_signature: Vec<u8>,
         timestamp: Option<u64>,
-        reply: oneshot::Sender<Result<Vec<String>>>,
+        reply: RelayHistoryReply,
     },
     /// Send a response back through a ResponseChannel.
     /// Used by spawned relay tasks to send responses without blocking the swarm loop.
@@ -263,7 +265,24 @@ enum SwarmCommand {
 const PENDING_REQUEST_TTL: Duration = Duration::from_secs(120);
 
 /// Reply payload of a relayed data read: `(data, served_version)`.
-type RelayReadReply = oneshot::Sender<Result<(Vec<u8>, String)>>;
+type RelayReadReply = oneshot::Sender<std::result::Result<(Vec<u8>, String), RelayReadError>>;
+/// Reply payload of a relayed history read.
+type RelayHistoryReply = oneshot::Sender<std::result::Result<Vec<String>, RelayReadError>>;
+
+/// Map a member-side service error to the wire verdict for relayed reads.
+fn relay_read_error_kind(e: &crate::domain::errors::StateNodeError) -> RelayReadErrorKind {
+    use crate::domain::errors::StateNodeError as E;
+    match e {
+        E::ContentNotFound(_) => RelayReadErrorKind::NotFound,
+        E::AuthenticationFailed(_) | E::InvalidUcanToken(_) => {
+            RelayReadErrorKind::AuthenticationFailed
+        }
+        E::AuthorizationFailed(_) | E::PermissionDenied(_) => {
+            RelayReadErrorKind::AuthorizationFailed
+        }
+        _ => RelayReadErrorKind::Other,
+    }
+}
 
 /// Pending requests tracking with TTL support.
 ///
@@ -283,7 +302,7 @@ struct PendingRequests {
     relay_delete_queries: HashMap<OutboundRequestId, oneshot::Sender<Result<bool>>>,
     relay_invalidate_tokens_queries: HashMap<OutboundRequestId, oneshot::Sender<Result<bool>>>,
     relay_read_queries: HashMap<OutboundRequestId, RelayReadReply>,
-    relay_history_queries: HashMap<OutboundRequestId, oneshot::Sender<Result<Vec<String>>>>,
+    relay_history_queries: HashMap<OutboundRequestId, RelayHistoryReply>,
     /// Timestamps for all pending request IDs, used for TTL-based cleanup.
     timestamps: HashMap<u64, tokio::time::Instant>,
 }
@@ -1102,10 +1121,10 @@ impl Libp2pNetwork {
                     let _ = reply.send(Err(anyhow::anyhow!("{}", err_msg)));
                 }
                 if let Some(reply) = pending.relay_read_queries.remove(&request_id) {
-                    let _ = reply.send(Err(anyhow::anyhow!("{}", err_msg)));
+                    let _ = reply.send(Err(RelayReadError::other(&err_msg)));
                 }
                 if let Some(reply) = pending.relay_history_queries.remove(&request_id) {
-                    let _ = reply.send(Err(anyhow::anyhow!("{}", err_msg)));
+                    let _ = reply.send(Err(RelayReadError::other(&err_msg)));
                 }
             }
             _ => {}
@@ -1395,16 +1414,11 @@ impl Libp2pNetwork {
                             Ok(Ok(_)) => ContentResponse::Error {
                                 message: "Unexpected relay outcome for ReadContent".to_string(),
                             },
-                            Ok(Err(e)) => {
-                                let msg = e.to_string();
-                                if msg.to_lowercase().contains("not found") {
-                                    ContentResponse::NotFound { content_id }
-                                } else {
-                                    ContentResponse::Error {
-                                        message: format!("Relay read failed: {}", msg),
-                                    }
-                                }
-                            }
+                            Ok(Err(e)) => ContentResponse::ReadFailed {
+                                content_id,
+                                kind: relay_read_error_kind(&e),
+                                message: e.to_string(),
+                            },
                             Err(_) => ContentResponse::Error {
                                 message: "Relay handler dropped".to_string(),
                             },
@@ -1454,16 +1468,11 @@ impl Libp2pNetwork {
                             Ok(Ok(_)) => ContentResponse::Error {
                                 message: "Unexpected relay outcome for ReadHistory".to_string(),
                             },
-                            Ok(Err(e)) => {
-                                let msg = e.to_string();
-                                if msg.to_lowercase().contains("not found") {
-                                    ContentResponse::NotFound { content_id }
-                                } else {
-                                    ContentResponse::Error {
-                                        message: format!("Relay read failed: {}", msg),
-                                    }
-                                }
-                            }
+                            Ok(Err(e)) => ContentResponse::ReadFailed {
+                                content_id,
+                                kind: relay_read_error_kind(&e),
+                                message: e.to_string(),
+                            },
                             Err(_) => ContentResponse::Error {
                                 message: "Relay handler dropped".to_string(),
                             },
@@ -1819,14 +1828,23 @@ impl Libp2pNetwork {
                 ContentResponse::ContentData { data, version, .. } => {
                     let _ = reply.send(Ok((data, version)));
                 }
+                ContentResponse::ReadFailed { kind, message, .. } => {
+                    let _ = reply.send(Err(RelayReadError { kind, message }));
+                }
                 ContentResponse::NotFound { content_id } => {
-                    let _ = reply.send(Err(anyhow::anyhow!("Content not found: {}", content_id)));
+                    let _ = reply.send(Err(RelayReadError {
+                        kind: RelayReadErrorKind::NotFound,
+                        message: format!("Content not found: {}", content_id),
+                    }));
                 }
                 ContentResponse::Error { message } => {
-                    let _ = reply.send(Err(anyhow::anyhow!("Relay read error: {}", message)));
+                    let _ = reply.send(Err(RelayReadError::other(format!(
+                        "Relay read error: {}",
+                        message
+                    ))));
                 }
                 _ => {
-                    let _ = reply.send(Err(anyhow::anyhow!("Unexpected response type")));
+                    let _ = reply.send(Err(RelayReadError::other("Unexpected response type")));
                 }
             }
             return;
@@ -1838,14 +1856,23 @@ impl Libp2pNetwork {
                 ContentResponse::HistoryData { versions, .. } => {
                     let _ = reply.send(Ok(versions));
                 }
+                ContentResponse::ReadFailed { kind, message, .. } => {
+                    let _ = reply.send(Err(RelayReadError { kind, message }));
+                }
                 ContentResponse::NotFound { content_id } => {
-                    let _ = reply.send(Err(anyhow::anyhow!("Content not found: {}", content_id)));
+                    let _ = reply.send(Err(RelayReadError {
+                        kind: RelayReadErrorKind::NotFound,
+                        message: format!("Content not found: {}", content_id),
+                    }));
                 }
                 ContentResponse::Error { message } => {
-                    let _ = reply.send(Err(anyhow::anyhow!("Relay read error: {}", message)));
+                    let _ = reply.send(Err(RelayReadError::other(format!(
+                        "Relay read error: {}",
+                        message
+                    ))));
                 }
                 _ => {
-                    let _ = reply.send(Err(anyhow::anyhow!("Unexpected response type")));
+                    let _ = reply.send(Err(RelayReadError::other("Unexpected response type")));
                 }
             }
         }
@@ -2401,9 +2428,9 @@ impl PeerNetwork for Libp2pNetwork {
         auth_token: &str,
         request_signature: &[u8],
         timestamp: Option<u64>,
-    ) -> Result<(Vec<u8>, String)> {
+    ) -> std::result::Result<(Vec<u8>, String), RelayReadError> {
         let peer_id = PeerId::from_str(peer_id)
-            .map_err(|_| anyhow::anyhow!("Invalid peer ID: {}", peer_id))?;
+            .map_err(|_| RelayReadError::other(format!("Invalid peer ID: {}", peer_id)))?;
 
         let (tx, rx) = oneshot::channel();
         self.command_tx
@@ -2417,12 +2444,12 @@ impl PeerNetwork for Libp2pNetwork {
                 reply: tx,
             })
             .await
-            .map_err(|_| anyhow::anyhow!("Failed to send command"))?;
+            .map_err(|_| RelayReadError::other("Failed to send command"))?;
 
         tokio::time::timeout(PEER_NETWORK_TIMEOUT, rx)
             .await
-            .map_err(|_| anyhow::anyhow!("relay_read_content timed out"))?
-            .map_err(|_| anyhow::anyhow!("Failed to receive response"))?
+            .map_err(|_| RelayReadError::other("relay_read_content timed out"))?
+            .map_err(|_| RelayReadError::other("Failed to receive response"))?
     }
 
     async fn relay_read_history(
@@ -2432,9 +2459,9 @@ impl PeerNetwork for Libp2pNetwork {
         auth_token: &str,
         request_signature: &[u8],
         timestamp: Option<u64>,
-    ) -> Result<Vec<String>> {
+    ) -> std::result::Result<Vec<String>, RelayReadError> {
         let peer_id = PeerId::from_str(peer_id)
-            .map_err(|_| anyhow::anyhow!("Invalid peer ID: {}", peer_id))?;
+            .map_err(|_| RelayReadError::other(format!("Invalid peer ID: {}", peer_id)))?;
 
         let (tx, rx) = oneshot::channel();
         self.command_tx
@@ -2447,12 +2474,12 @@ impl PeerNetwork for Libp2pNetwork {
                 reply: tx,
             })
             .await
-            .map_err(|_| anyhow::anyhow!("Failed to send command"))?;
+            .map_err(|_| RelayReadError::other("Failed to send command"))?;
 
         tokio::time::timeout(PEER_NETWORK_TIMEOUT, rx)
             .await
-            .map_err(|_| anyhow::anyhow!("relay_read_history timed out"))?
-            .map_err(|_| anyhow::anyhow!("Failed to receive response"))?
+            .map_err(|_| RelayReadError::other("relay_read_history timed out"))?
+            .map_err(|_| RelayReadError::other("Failed to receive response"))?
     }
 
     async fn connected_peer_count(&self) -> usize {

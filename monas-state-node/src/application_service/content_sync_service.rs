@@ -378,6 +378,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_sync_requests_full_history_when_genesis_missing() {
+        // Phantom-history guard: when we do not actually hold the genesis
+        // node, the sync must request the FULL operation history
+        // (since=None). Passing the phantom [genesis] as `since` makes
+        // providers skip the Create operation and the node never converges.
+        let service = create_service_with_members("node-1", "content-1", vec!["node-2"], vec![]);
+        // MockContentRepository is empty -> has_genesis("content-1") == false.
+
+        let _ = service.sync_from_peers("content-1").await.unwrap();
+
+        let since = service.peer_network.fetch_operations_since.lock().await;
+        assert_eq!(since.as_slice(), &[None]);
+    }
+
+    #[tokio::test]
+    async fn test_sync_requests_incremental_when_genesis_present() {
+        let service = create_service_with_members("node-1", "content-1", vec!["node-2"], vec![]);
+        // Materialize the content locally so has_genesis == true.
+        service
+            .crdt_repo
+            .contents
+            .lock()
+            .await
+            .insert("content-1".to_string(), b"data".to_vec());
+        service.crdt_repo.history.lock().await.insert(
+            "content-1".to_string(),
+            vec!["v1".to_string(), "v2".to_string()],
+        );
+
+        let _ = service.sync_from_peers("content-1").await.unwrap();
+
+        let since = service.peer_network.fetch_operations_since.lock().await;
+        assert_eq!(since.as_slice(), &[Some("v2".to_string())]);
+    }
+
+    #[tokio::test]
     async fn test_sync_from_peers_no_network() {
         let service = create_test_service("node-1");
 

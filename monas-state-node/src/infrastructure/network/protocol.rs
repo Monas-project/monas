@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub use crate::port::peer_network::PushBootstrap;
+pub use crate::port::peer_network::{PushBootstrap, RelayReadErrorKind};
 
 /// Protocol name for capacity queries.
 pub const CAPACITY_PROTOCOL: &str = "/monas/capacity/1.0.0";
@@ -129,6 +129,14 @@ pub enum ContentResponse {
     HistoryData {
         content_id: String,
         versions: Vec<String>,
+    },
+    /// Failure of a relayed read, carrying the member's typed verdict so the
+    /// relaying node can map it back to 401/403/404 without parsing message
+    /// text.
+    ReadFailed {
+        content_id: String,
+        kind: RelayReadErrorKind,
+        message: String,
     },
     /// Content not found.
     NotFound { content_id: String },

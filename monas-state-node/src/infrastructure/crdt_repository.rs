@@ -214,10 +214,19 @@ impl ContentRepository for CrslCrdtRepository {
         }
     }
 
-    async fn get_version(&self, version_cid: &str) -> Result<Option<Vec<u8>>> {
+    async fn get_version(&self, genesis_cid: &str, version_cid: &str) -> Result<Option<Vec<u8>>> {
+        let genesis = Self::parse_cid(genesis_cid)?;
         let cid = Self::parse_cid(version_cid)?;
 
         let repo = self.repo.lock();
+
+        // Scope the lookup to this content's DAG: read authorization is
+        // granted per content, so serving a version from a different series
+        // would be a cross-content read. Unknown nodes resolve to None.
+        match repo.get_genesis(&cid) {
+            Ok(g) if g == genesis => {}
+            _ => return Ok(None),
+        }
 
         match repo.dag.get_node(&cid) {
             Ok(Some(node)) => Ok(Some(node.payload().data.clone())),
@@ -703,6 +712,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_version_rejects_cross_content_lookup() {
+        // Read authorization is granted per content, so a version CID from a
+        // different series must not be readable through another genesis.
+        let tmp = tempdir().unwrap();
+        let repo = CrslCrdtRepository::open(tmp.path()).unwrap();
+
+        let a = repo
+            .create_content(b"content A", "author", None)
+            .await
+            .unwrap();
+        let b = repo
+            .create_content(b"content B", "author", None)
+            .await
+            .unwrap();
+
+        // Sanity: within the right series the version resolves.
+        assert!(repo
+            .get_version(&a.genesis_cid, &a.version_cid)
+            .await
+            .unwrap()
+            .is_some());
+
+        // Cross-content: B's version through A's genesis must be None.
+        assert!(repo
+            .get_version(&a.genesis_cid, &b.version_cid)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
     async fn test_get_history() {
         let tmp = tempdir().unwrap();
         let repo = CrslCrdtRepository::open(tmp.path()).unwrap();
@@ -730,7 +770,10 @@ mod tests {
         let data = b"Test content";
         let result = repo.create_content(data, "author", None).await.unwrap();
 
-        let retrieved = repo.get_version(&result.version_cid).await.unwrap();
+        let retrieved = repo
+            .get_version(&result.genesis_cid, &result.version_cid)
+            .await
+            .unwrap();
         assert_eq!(retrieved, Some(data.to_vec()));
     }
 

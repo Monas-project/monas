@@ -442,9 +442,7 @@ impl StateNode {
                                         .map(|versions| RelayOutcome::History { versions })
                                 }
                             };
-                            let _ = req
-                                .reply
-                                .send(result.map_err(|e| anyhow::anyhow!(e.to_string())));
+                            let _ = req.reply.send(result);
                         }
                     }
                 }
