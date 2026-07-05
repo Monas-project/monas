@@ -241,7 +241,7 @@ enum SwarmCommand {
         auth_token: String,
         request_signature: Vec<u8>,
         timestamp: Option<u64>,
-        reply: oneshot::Sender<Result<(Vec<u8>, String)>>,
+        reply: RelayReadReply,
     },
     RelayReadHistory {
         peer_id: PeerId,
@@ -262,6 +262,9 @@ enum SwarmCommand {
 /// TTL for pending requests. Entries older than this are cleaned up to prevent memory leaks.
 const PENDING_REQUEST_TTL: Duration = Duration::from_secs(120);
 
+/// Reply payload of a relayed data read: `(data, served_version)`.
+type RelayReadReply = oneshot::Sender<Result<(Vec<u8>, String)>>;
+
 /// Pending requests tracking with TTL support.
 ///
 /// Each request tracks its creation time. A periodic sweep removes entries
@@ -279,7 +282,7 @@ struct PendingRequests {
     relay_update_queries: HashMap<OutboundRequestId, oneshot::Sender<Result<bool>>>,
     relay_delete_queries: HashMap<OutboundRequestId, oneshot::Sender<Result<bool>>>,
     relay_invalidate_tokens_queries: HashMap<OutboundRequestId, oneshot::Sender<Result<bool>>>,
-    relay_read_queries: HashMap<OutboundRequestId, oneshot::Sender<Result<(Vec<u8>, String)>>>,
+    relay_read_queries: HashMap<OutboundRequestId, RelayReadReply>,
     relay_history_queries: HashMap<OutboundRequestId, oneshot::Sender<Result<Vec<String>>>>,
     /// Timestamps for all pending request IDs, used for TTL-based cleanup.
     timestamps: HashMap<u64, tokio::time::Instant>,
