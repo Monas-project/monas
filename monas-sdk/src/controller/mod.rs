@@ -262,14 +262,14 @@ impl MonasController {
         use monas_content::application_service::content_service::ContentService;
         use monas_content::infrastructure::{
             content_id::Sha256ContentIdGenerator,
-            encryption::{Aes256CtrContentEncryption, OsRngContentEncryptionKeyGenerator},
+            encryption::{Aes256GcmContentEncryption, OsRngContentEncryptionKeyGenerator},
         };
 
         ContentService {
             content_id_generator: Sha256ContentIdGenerator,
             content_repository,
             key_generator: OsRngContentEncryptionKeyGenerator,
-            encryptor: Aes256CtrContentEncryption,
+            encryptor: Aes256GcmContentEncryption,
             cek_store,
         }
     }

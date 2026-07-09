@@ -3111,12 +3111,10 @@ dependencies = [
 name = "monas-content"
 version = "0.1.0"
 dependencies = [
- "aes",
  "aes-gcm",
  "axum 0.8.8",
  "base64 0.22.1",
  "chrono",
- "ctr",
  "dyn-clone",
  "hex",
  "hkdf",

@@ -28,17 +28,20 @@ impl MonasController {
     ///
     /// 呼び出し元が Authorization を明示していればそのまま透過する。
     /// 無ければ書き込み系（create/update/delete）と同じく monas-account で
-    /// `read:content:<timestamp>` に署名し、`user:<hex(pubkey)>` トークンを組み立てる。
+    /// `read:<content_id>:<timestamp>` に署名し、`user:<hex(pubkey)>` トークンを組み立てる。
     /// State Node 側は読み取り時にこの署名メッセージを検証する
-    /// （`verify_read_access` → `verify_caller_signature("read", "content", ..)`）。
+    /// （`verify_read_access` → `verify_caller_signature("read", content_id, ..)`）。
+    /// 署名を content_id にバインドすることで、relay 先ノード等に渡った署名を
+    /// 他コンテンツの読み取りに再利用されることを防ぐ。
     fn resolve_state_read_auth<T>(
         &self,
         auth: Option<&StateNodeAuthContext>,
+        content_id: &str,
         trace_id: &str,
     ) -> Result<Option<StateNodeAuthContext>, ApiResponse<T>> {
         match auth {
             Some(ctx) if ctx.authorization.is_none() => {
-                self.prepare_state_node_metadata_auth(auth, "read", "content", trace_id)
+                self.prepare_state_node_metadata_auth(auth, "read", content_id, trace_id)
             }
             _ => Ok(auth.cloned()),
         }
@@ -138,7 +141,11 @@ impl MonasController {
             return response;
         }
 
-        let auth = match self.resolve_state_read_auth::<GetLatestVersionOutput>(auth, &trace_id) {
+        let auth = match self.resolve_state_read_auth::<GetLatestVersionOutput>(
+            auth,
+            &input.content_id,
+            &trace_id,
+        ) {
             Ok(resolved) => resolved,
             Err(e) => return e,
         };
@@ -182,7 +189,11 @@ impl MonasController {
             return response;
         }
 
-        let auth = match self.resolve_state_read_auth::<GetHistoryOutput>(auth, &trace_id) {
+        let auth = match self.resolve_state_read_auth::<GetHistoryOutput>(
+            auth,
+            &input.content_id,
+            &trace_id,
+        ) {
             Ok(resolved) => resolved,
             Err(e) => return e,
         };
@@ -238,7 +249,11 @@ impl MonasController {
             );
         }
 
-        let auth = match self.resolve_state_read_auth::<VerifyIntegrityOutput>(auth, &trace_id) {
+        let auth = match self.resolve_state_read_auth::<VerifyIntegrityOutput>(
+            auth,
+            &input.content_id,
+            &trace_id,
+        ) {
             Ok(resolved) => resolved,
             Err(e) => return e,
         };

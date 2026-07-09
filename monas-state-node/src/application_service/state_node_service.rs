@@ -222,12 +222,18 @@ where
 
     /// Authenticate a caller for read operations.
     ///
+    /// The request signature is bound to the specific `content_id` (message
+    /// `read:{content_id}:{timestamp}`), so a signature captured by one node
+    /// cannot be replayed to read other content. Mirrors the delete path,
+    /// which already signs over the content id.
+    ///
     /// Returns the authenticated identity on success.
     pub async fn authenticate_for_read(
         &self,
         token: &AuthToken,
         request_signature: Option<&[u8]>,
         timestamp: Option<u64>,
+        content_id: &str,
     ) -> Result<Identity, StateNodeError> {
         let auth_service = self.auth_service.as_ref().ok_or_else(|| {
             StateNodeError::InvalidConfiguration("Authentication not configured".to_string())
@@ -256,7 +262,7 @@ where
             token,
             sig,
             "read",
-            "content",
+            content_id,
             timestamp,
             None,
         )
@@ -506,7 +512,7 @@ where
         content_id: &str,
     ) -> Result<(), StateNodeError> {
         let identity = self
-            .authenticate_for_read(token, request_signature, timestamp)
+            .authenticate_for_read(token, request_signature, timestamp, content_id)
             .await?;
 
         // Fail closed: an error loading the policy must deny, not fall through
@@ -3111,6 +3117,91 @@ mod tests {
             )
             .await;
         assert!(result.is_ok());
+    }
+
+    /// The read request signature must be verified against a message bound to
+    /// the specific content id (`read:{content_id}:{timestamp}`), not a
+    /// generic `read:content:{timestamp}`. This keeps a signature forwarded to
+    /// relay members (or leaked to a non-member node) from being replayed to
+    /// read other content (PR #54 review).
+    #[tokio::test]
+    async fn test_read_signature_message_is_bound_to_content_id() {
+        struct CapturingAuthService {
+            messages: Arc<std::sync::Mutex<Vec<String>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl AuthenticationService for CapturingAuthService {
+            async fn authenticate(
+                &self,
+                token: &AuthToken,
+                _context: Option<&crate::port::auth_token::AuthContext>,
+            ) -> Result<Identity> {
+                Identity::user(token.as_str().to_string())
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))
+            }
+
+            async fn is_valid(&self, token: &AuthToken) -> Result<bool> {
+                Ok(!token.is_empty())
+            }
+
+            async fn verify_request_signature(
+                &self,
+                _token: &AuthToken,
+                _signature: &[u8],
+                message: &str,
+                _timestamp: Option<u64>,
+            ) -> Result<()> {
+                self.messages.lock().unwrap().push(message.to_string());
+                Ok(())
+            }
+
+            async fn verify_jwt_signature(&self, _token: &AuthToken) -> Result<()> {
+                Ok(())
+            }
+
+            async fn get_issuer(&self, token: &AuthToken) -> Result<Option<Identity>> {
+                Ok(Some(
+                    Identity::user(token.as_str().to_string())
+                        .map_err(|e| anyhow::anyhow!(e.to_string()))?,
+                ))
+            }
+        }
+
+        let messages = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let node_registry = MockNodeRegistry::new();
+        let content_repo = Arc::new(RwLock::new(MockContentNetworkRepository::new()));
+        let peer_network = Arc::new(MockPeerNetwork::new().with_local_peer_id("node-1"));
+        let event_publisher = MockEventPublisher::new();
+        let crdt_repo = Arc::new(MockContentRepository::new());
+        let service: TestService = StateNodeService::new(
+            node_registry,
+            content_repo,
+            peer_network,
+            event_publisher,
+            crdt_repo,
+            "node-1".to_string(),
+        )
+        .with_authentication_service(CapturingAuthService {
+            messages: Arc::clone(&messages),
+        });
+
+        service
+            .authenticate_for_read(
+                &test_token(),
+                Some(&test_request_signature()),
+                Some(1234),
+                "content-abc",
+            )
+            .await
+            .expect("authentication should succeed");
+
+        let captured = messages.lock().unwrap();
+        assert_eq!(
+            captured.as_slice(),
+            ["read:content-abc:1234"],
+            "read signature message must include the content id"
+        );
     }
 
     #[tokio::test]

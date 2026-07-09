@@ -24,7 +24,7 @@ use monas_content::domain::content::{Content, ContentEncryptionKey, StorageProvi
 use monas_content::domain::content_id::ContentId;
 use monas_content::infrastructure::{
     content_id::Sha256ContentIdGenerator,
-    encryption::{Aes256CtrContentEncryption, OsRngContentEncryptionKeyGenerator},
+    encryption::{Aes256GcmContentEncryption, OsRngContentEncryptionKeyGenerator},
     MultiStorageRepository,
 };
 
@@ -38,7 +38,7 @@ pub(super) type ContentServiceInstance = ContentService<
     Sha256ContentIdGenerator,
     MultiStorageRepository,
     OsRngContentEncryptionKeyGenerator,
-    Aes256CtrContentEncryption,
+    Aes256GcmContentEncryption,
     DynCekStore,
 >;
 
