@@ -116,6 +116,32 @@ read 応答は2区間で異なるシリアライズを経る:
 
 ## 5. 設計方針(たたき台 / 要レビュー)
 
+### 5.0 鍵レイヤーの整理(調査で確定)
+
+設計に関わる鍵は**別レイヤーの2種類**で、混同しないこと。
+
+| 鍵 | 実体 | 管理 | 用途 |
+|---|---|---|---|
+| **ユーザー鍵**(owner) | `AccessPolicy.owner` = `Identity{id: hex(P-256 pubkey), type: User}`(`identity.rs:15`, `access_policy.rs:21`) | monas-account | 誰がコンテンツの所有者か。read 認証もこの鍵の署名 |
+| **node 鍵**(member) | `member_nodes` の NodeId = P-256 node_key 由来(`content_network.rs:24`) | 各 state node(`node_key.pem`) | 誰がコンテンツを複製保持する node か |
+
+→ **メンバーシップ(誰が member か)の権威はユーザー鍵(owner)、応答の発言者は node 鍵(member)**。§5.3 のメンバーシップ署名は owner のユーザー鍵で、§5.1 の応答署名は member の node 鍵で行う。
+
+### 5.0.1 重要な発見: Node 全体を返せば、データ真正性と系列は署名なしで検証できる
+
+crsl-lib の `Node` は `to_bytes()`(CBOR)/`from_bytes()` が公開されており(`node.rs:90/104`)、`content_id()` はその CBOR バイト列の SHA-256(`node.rs:76`)。したがって:
+
+- member が生 `data` ではなく **シリアライズした `Node` 全体**(payload + parents + genesis + timestamp + metadata)を返せば、クライアントは:
+  1. **`from_bytes` → `content_id()` を再計算 → 要求した version CID と一致するか**でデータ本文と親参照の改ざんを検知できる(**署名不要**。CID = 内容ハッシュなので、CID が正しければ中身は正しい)
+  2. Node に含まれる `parents` / `genesis` で系列を辿れる
+
+- つまり **署名が本質的に必要なのは「これが最新である」という否定的事実**(=より新しい版が存在しないこと)だけに絞り込める。データの真正性・系列は content-addressing で足りる。
+
+この発見により設計を2つに分離できる:
+
+- **(A) 版指定 read**(`version` を指定):署名不要。member は Node を返し、クライアントは CID 再計算で検証。改ざん・偽データは弾ける。
+- **(B) 最新 read / 履歴**(`version: None`):member の「これが最新」「これが履歴」という主張は content-addressing では検証できない(否定的事実のため)。ここに member の node 鍵署名 + 単調性チェックが要る。
+
 ### 5.1 何に署名するか
 
 member は応答ごとに、以下を含むメッセージへ node_key(P-256)で署名する:
@@ -142,14 +168,27 @@ sign( content_id || version_cid || sha256(data) || timestamp )
 
 `ContentNetwork` レコード(member リスト)に owner / genesis authority の署名を付け、gossip 受信時・DHT フォールバック時の両方で検証。§4.1 の弱点(PeerID 文字列 vs P-256 NodeId)もここで整合を取る。
 
-## 6. 未解決の論点(設計で詰める)
+## 6. 論点への推奨(§5.0 の発見を踏まえた現時点の案)
 
-1. **member 公開鍵の配布**: クライアントは `signer_node_id` の P-256 公開鍵をどう入手するか。`NodePublicKey` 交換(`libp2p_network.rs:1907`)は node 間のもの。クライアント(SDK)への配布経路が要る。ContentNetwork レコードに member の公開鍵を含める案が有力。
-2. **メンバーシップ署名の権威**: 誰が member リストに署名する権利を持つか。owner か、genesis authority か。member 追加/削除のたびに再署名が必要。
-3. **系列検証のコスト**: クライアントが毎回 genesis まで parents を辿るのは高コスト。どこまで検証するか(直近のみ / チェックポイント / 全チェーン)。
-4. **単調性の状態管理**: 「前回見た版」をクライアントのどこに、どう永続化するか。複数デバイス間で不整合が出ないか。
-5. **鍵ローテーション**: node_key / member 鍵のローテーション時に過去の署名をどう扱うか。
-6. **段階導入**: 署名を `Option` にする以上、「署名を検証しないと拒否する」モードへの移行タイミング(新旧ノード混在期間の扱い)。
+1. **member 公開鍵の配布** → **ContentNetwork レコードに member の P-256 公開鍵を含める**。member リスト自体が owner 署名で保護される(§5.3)ので、そこに公開鍵を同梱すれば「正規 member の鍵一覧」が owner 権威で配布される。クライアントは応答署名をこの鍵で検証。`NodePublicKey` 交換(node 間)とは別に、SDK 向けにこのレコードを返す口が要る。既存の `PublicKeyRegistry` は node ローカルの検証用なので流用しない。
+
+2. **メンバーシップ署名の権威** → **owner のユーザー鍵**(§5.0)。`AccessPolicy.owner` が既に `Identity`(P-256 pubkey)なので、owner が member リスト + 各 member の公開鍵に署名する。member 追加/削除のたびに owner が再署名(単調増加する version 番号付きで、古い member リストへの差し替えを防ぐ)。genesis authority 案は owner と一致するので別概念にしない。**残論点**: owner がオフラインのとき member 変更できない問題 → owner が委任トークン(既存 JWT/UCAN, `jwt_signer.rs`)で member 管理権限を委譲する形を検討。
+
+3. **系列検証のコスト** → **通常は単調性チェックのみ(直近版の親子1ホップ)、全チェーン検証はオンデマンド**。§5.0.1 で版指定 read は CID 再計算だけで足りるため、毎回 genesis まで辿る必要はない。ロールバック検出には「前回見た版が今回の版の祖先か」だけ確認できればよく、これは差分の parents を辿る短いパスで済む。監査目的の全チェーン検証は明示要求時のみ。
+
+4. **単調性の状態管理** → **SDK のローカル永続化に「content_id → 最後に見た version CID + timestamp」を記録**。SDK は既に `SledContentEncryptionKeyStore`(`controller/mod.rs:246`)で sled 永続化を持つので、同じ DB に version 追跡ストアを足す。**複数デバイス問題**: デバイス A が v5、デバイス B が v3 までしか知らない場合、B が v3→v5 に進むのは正常(巻き戻しではない)。TOFU の単調性は「自分が一度見た版より古い版を最新と主張されたら警告」であり、デバイス間で状態共有は不要(各デバイスが自分の観測履歴を持てばよい)。ただし正規の履歴改変(owner による rebase 等)がある設計なら誤検知しうる → Monas の CRDT は追記のみ(版は不変)なので問題にならない見込み。要確認。
+
+5. **鍵ローテーション** → **member リストの version 番号 + timestamp で世代管理**。node 鍵ローテーション時は owner が新しい公開鍵を含む member リストに再署名。過去の署名は「その時点で有効だった member リストの世代」に対して検証する必要があるため、クライアントは応答の timestamp とレコード世代を突き合わせる。詳細は実装フェーズで詰める(初版はローテーション非対応でも可)。
+
+6. **段階導入** → **3 モードで移行**: (i) `Option` 署名を付けるが**検証しない**(観測のみ、ログ) → (ii) 署名があれば**検証する**が、無くても通す(warn) → (iii) 署名必須(無い/検証失敗は**拒否**)。オープン参加型ネットワーク移行前に (iii) へ。新旧ノード混在期は (ii) で吸収。gossip の member レコード署名も同様の 3 モード。
+
+### 6.1 ユーザーに確認したい設計判断
+
+以下は技術だけで決められない、プロダクト方針が絡む点:
+
+- **owner オフライン時の member 管理**(論点2): 委任トークンで管理権限を移譲する仕組みを入れるか、初版は「owner online 必須」で割り切るか。
+- **段階導入の (iii) 強制タイミング**(論点6): このPR系列で (i)/(ii) まで入れ、(iii) はオープン化のマイルストーンに紐付けるか。
+- **実装の分割単位**: §7 の (a)(b)(c) を別 PR にするか、まとめるか。
 
 ## 7. スコープと優先度
 
