@@ -235,11 +235,11 @@ member リストの取得・検証は**フローに現れない**(晒さない�
 - **方式**: §5.1.b(owner 発行の単体 member 証明 + member 応答)+ §5.1.a(単調性)+ (A) CID 再計算、の組み合わせで確定。owner は発行時のみ介在し read 経路には入らない。
 - **鮮度の限界の受容**: 正規 member 自身によるロールバック/stale は原理的に防げないことを「既知の限界」として脅威モデルに明記する(§5.1.b)。
 
-**実装フェーズで確定する残論点**:
-- **member 証明の添付方式**: 常時添付 or 要求時のみ。および中継に `iss`(owner)を見せないための読み手宛暗号化の要否(§5.1.b「owner 公開鍵の可視性」)。
-- **owner オフライン時の member 追加**: 管理権限の委任を入れるか、初版は owner online 必須で割り切るか。
-- **単調性の強制タイミング**: §5.1.a を先行して拒否モードまで入れるか(機密性影響ゼロ・依存なしのため技術的には即可)。
-- **実装の分割単位**: §7 の段階を別 PR にするか。
+**実装前提の確定(2026-07-18)**: production 利用ゼロ(テストのみ)のため、**後方互換は一切考慮しない。破壊的変更 OK。1 PR で全実装**。これに伴い:
+- **段階導入(3 モード)は廃止** — 最初から検証必須(検証失敗 = 拒否)で実装する。`Option` フィールドでの共存も不要、ワイヤ型は直接置き換える。
+- **member 証明の添付方式**: **常時添付**で開始(シンプル優先)。`iss` の読み手宛暗号化は初版では入れず、§5.1.b の緩和策として TODO 記録に留める(クローズド環境のうちは露出リスクが実質ない)。
+- **owner オフライン時の member 追加**: 初版は **owner online 必須**で割り切る(委任は将来)。
+- **単調性**: 最初から拒否モード。
 
 ### 6.2 検討して却下した案(再検討防止の記録)
 
@@ -249,11 +249,87 @@ member リストの取得・検証は**フローに現れない**(晒さない�
 4. **認証付き可変「最新ポインタ」**(JWT の未使用 `fct` フィールド等に最新 CID を載せる案を含む) — ポインタ自体が「最新性を保証すべき可変状態」になり、同じ問題が再帰する(そのポインタは最新か?)。同期・更新コストも生む。却下。
 5. **CEK による member 証明** — CEK は読み手・書き手・(設計次第で)member 全員が持つため「member だけ」を区別できない。却下。
 
-## 7. スコープと優先度
+## 7. スコープと前提
 
-- すべて「攻撃者が read relay の経路に入れること」が前提。**クローズドな 4 ノード構成の現状では成立しない**。オープン参加型ネットワークにする前までに対応(Kademlia への Sybil/eclipse 攻撃が現実的になるため)。
-- **機密性制約 §5.0.0 は全段階で不変の前提**。完全性を足す各段が member 集合を晒していないか、各 PR でチェックする。
-- 実装の段階分割(依存順):
-  1. **版の真正性(A)** — member が Node 全体を返す + クライアント CID 再計算。署名不要・機密性影響ゼロ。最優先で独立に入る。
-  2. **単調性チェック(§5.1.a)** — SDK ローカル記録 + 祖先判定。機密性影響ゼロ・依存なし。1 と並行可。
-  3. **owner 発行 member 証明(§5.1.b / §5.3)** — owner 署名トークン発行 + 応答添付 + クライアント検証。段階導入 (i)→(iii)。オープン化前に必須化。
+- すべて「攻撃者が read relay の経路に入れること」が前提。**クローズドな 4 ノード構成の現状では成立しない**が、オープン参加型移行前に必要なので今のうちに入れる(Kademlia への Sybil/eclipse 攻撃が現実的になるため)。
+- **機密性制約 §5.0.0 は不変の前提**。完全性を足す実装が member 集合を晒していないかを実装中チェックする。
+- **後方互換なし・破壊的変更 OK・1 PR**(§6.1)。
+
+## 8. 実装計画(1 PR)
+
+3 コンポーネントを 1 PR で実装する。依存順に記載するが同一 PR。すべて既存コードの file:line は §4 の調査に基づく。
+
+### 8.1 コンポーネント A: 版真正性(Node 全体を返して CID 再計算)
+
+**目的**: member の read 応答が「生 payload」ではなく `Node` 全体(CBOR)を返すようにし、クライアントが CID を再計算して改ざん検知する。
+
+**state-node 側**:
+1. `crdt_repository.rs` の `get_version` / `get_latest_with_version`(`:184, :207, :232`)が現状 `node.payload().data.clone()` を返すのを、**`node.to_bytes()`(CBOR 全体)を返す**ように変更。戻り値型を「payload バイト列」から「Node CBOR バイト列」へ。※ port trait `content_repository.rs` のシグネチャも変更。
+2. `read_content_via_relay`(`state_node_service.rs:565`)の戻り値 `(Vec<u8>, String)` の `Vec<u8>` を Node CBOR に。
+3. ワイヤ: `ContentResponse::ContentData { content_id, data, version }`(`protocol.rs:106`)の `data` を Node CBOR に(意味を変えるだけで型は `Vec<u8>` のまま。フィールド名を `node_bytes` にリネームして意図を明示)。内部 `RelayOutcome::Data`(`libp2p_network.rs:55`)も同様。
+4. HTTP `ContentDataResponse`(`http_api.rs:225`)/ SDK `StateNodeContentDataResponse`(`models/state_node.rs:51`)の `data` も Node CBOR(base64)に。
+
+**SDK 側(クライアント検証)**:
+5. Node CBOR を受け取ったら、crsl-lib の `Node::from_bytes`(`node.rs:104`)→ `content_id()`(`node.rs:76`)で CID 再計算し、要求 version(または応答の主張 version)と一致を検証。不一致は**拒否**。
+6. 検証後、`Node.payload().data`(暗号文)を取り出して既存の復号(AES-GCM)に渡す。
+   - ※ crsl-lib はワイヤ型の依存に入る。SDK が crsl-lib の `Node` 型を使えるか要確認(既に依存にあるか、追加が要るか)。無理なら Node のパース + CID 再計算だけを行う軽量ヘルパを用意。
+
+### 8.2 コンポーネント B: 単調性チェック(ロールバック検出)
+
+**目的**: SDK が「content ごとに最後に見た version CID」を記録し、後退した応答を拒否。
+
+1. SDK ローカルストア: 既存 `SledContentEncryptionKeyStore`(`controller/mod.rs:246`)と同じ sled DB に **`content_id → last_seen_version_cid` ストア**を新設(新しい tree/prefix)。in-memory 実装も対で用意(`controller/mod.rs:230` に倣う)。
+2. 祖先判定: 応答の Node から `parents`(`node.rs:144`)を辿り、「記録済みの last_seen が今回版の祖先に含まれるか」を確認。含まれない(= 後退 or 分岐)なら**拒否/警告**。
+   - 辿るために親版の取得が要る場合がある → 版指定 read(A)で親を順次取得。深さは実装で bound(全チェーンは監査時のみ、§6 論点3)。
+3. 検証通過後、last_seen を今回版に更新。初回(記録なし)は TOFU で受理 + 記録。
+
+### 8.3 コンポーネント C: owner 発行 member 証明
+
+**目的**: 応答ノードが正規 member であることを、リストを晒さず単体で証明。
+
+**owner(monas-account)側 — 証明発行**:
+1. 既存の委任トークン発行(`service.rs:98-133`、`DelegationClaims { iss, aud, exp, iat, jti, att }` を ES256 署名)を転用し、**member 証明トークン**を発行する口を追加。`aud = member の node 公開鍵 key_id`、`att = [{ with: "monas://content/{cid}", can: "host" }]`(`can` に `host` を追加、`DelegatedCapability` / `CapabilityAction` に enum 追加)。
+2. member 追加フロー(`add_member_to_content` 系、`state_node_service.rs:1564` 周辺)で、owner がこのトークンを発行し、対象 member node に配布する経路を追加。member node はトークンを永続化。
+
+**member node 側 — 応答に添付**:
+3. `read_content_via_relay`(`state_node_service.rs:565`)/ `read_history_via_relay`(`:598`)の応答に、自ノードの member 証明トークンを載せる。ワイヤ `ContentResponse::ContentData` / `HistoryData` に `member_proof: String`(必須)を追加。内部 `RelayOutcome`・HTTP・SDK 型も同様に追加(§4.4 の経路表の全型)。
+4. caller の分解 `libp2p_network.rs:1828`(現状 `..` で余剰を捨てている)を修正し、`member_proof` を通す。
+
+**SDK 側 — 検証**:
+5. 応答の `member_proof` を **owner 公開鍵**(= `AccessPolicy.owner`、read 認可時に既知)で ES256 検証。`att.with` が要求 content と一致、`exp` 未失効を確認。無効/欠落は**拒否**。
+6. owner 公開鍵の入手: read 認可経路で既に owner を知っているはず(要確認 — SDK が `AccessPolicy.owner` を保持しているか、別途取得が要るか)。
+
+### 8.4 検証フロー統合(SDK, §5.2)
+
+最新 read で以下を順に。1つでも失敗したら拒否:
+1. A: Node CBOR → CID 再計算 = 主張 version か
+2. C: member_proof を owner 鍵で検証(member か)
+3. B: last_seen が今回版の祖先か(後退でないか)
+4. 全通過 → 復号して返す + last_seen 更新
+
+### 8.5 テスト計画
+
+- A: 改ざん Node(payload 書き換え)→ CID 不一致 → 拒否を検証。
+- B: v5 を見た後に v3 を返す → 後退拒否。初回 v3 は受理。
+- C: 非 member(証明なし/他 content の証明)→ 拒否。正規 member の証明 → 受理。owner 鍵違い → 拒否。
+- 統合: 既存の relay read e2e(`e2e-test.sh`)を Node 返却 + 証明必須に更新。
+- **§5.0.0 チェック**: 応答・ログに member 集合が現れないことをテスト/レビューで確認。
+
+### 8.6 実装前に確定した事項(調査済み 2026-07-18)
+
+**(1) SDK は crsl-lib に依存していない**(`monas-sdk/Cargo.toml` に無し)。→ 選択肢:
+- (a) crsl-lib を SDK 依存に追加し `Node::from_bytes`/`content_id()` を直接使う。確実だが SDK に DAG ライブラリ全体(leveldb 等含む)を持ち込みビルド肥大。
+- (b) **【推奨】SDK に軽量 CID 検証ヘルパを自前実装**: Node の CBOR を最小限デコード(`payload`/`parents`/`genesis` を取り出す)+ 受信 CBOR バイト列全体を SHA-256 → CIDv1(RAW/SHA2-256、`node.rs:76-81` と同一手順)で version 突合。crsl-lib 全体は要らず、`serde_cbor` + `sha2` + `cid` クレートで足りる。Node の CBOR スキーマ(フィールド順・型)を crsl-lib と厳密に一致させる必要があるのでテストで固定。
+- → **(b) を採用**。ただし CBOR スキーマ一致の検証テスト(state-node が出す Node CBOR を SDK が再計算して一致)を必須にする。
+
+**(2) SDK は owner / AccessPolicy を知らない**(`AccessPolicy` は state-node ドメイン、SDK には無い)。→ member 証明を owner 鍵で検証するには owner 公開鍵の入手経路が新規に要る:
+- read 認可のために SDK は既に「自分の権限(委任トークン)」を持つ。そのトークンの `iss` が owner なので、**owner 公開鍵は委任トークンの `iss` から得られる**可能性が高い(要確認: `iss` が pubkey そのものか、key_id か)。
+- 委任経由で得られないなら、content の owner 公開鍵を返す軽量な取得口を state-node/account に新設。
+- → 実装первый手: SDK が持つ委任トークンの `iss` から owner 公開鍵を導出できるか確認。可能なら追加 API 不要。
+
+### 8.7 実装中に判定する TODO
+
+- 単調性の祖先探索の深さ bound の既定値。8.2-2。
+- member 証明の配布経路(owner→member node)の具体。8.3-2。
+- member 証明トークンの永続化先(member node 側)。8.3-2。
+- `member_proof` の `iss` 露出緩和(読み手宛暗号化)は初版スコープ外・TODO 記録のみ(§6.1)。
