@@ -259,6 +259,14 @@ member リストの取得・検証は**フローに現れない**(晒さない�
 
 3 コンポーネントを 1 PR で実装する。依存順に記載するが同一 PR。すべて既存コードの file:line は §4 の調査に基づく。
 
+### 8.0 検証ロジックの置き場所 = `monas-content`(2026-07-18 修正)
+
+**検証は `monas-sdk` ではなく `monas-content` に置く。** 理由:
+- `monas-sdk` は `monas-content` に依存する薄い API 層(`monas-sdk/Cargo.toml:10`)。コンテンツの暗号処理(復号 `domain/content/encryption.rs`、CID 計算 `infrastructure/content_id.rs`、CEK 管理、share/envelope)は**すべて既に `monas-content` に集約**されている。read の完全性検証もコンテンツドメインの責務なのでここに属する。
+- SDK は「検証する `monas-content` の口を呼ぶだけ」に留め、JWT 検証・CID 再計算などの暗号ロジックを SDK に持ち込まない。
+
+**CID 再計算の重要な差異**: `monas-content` 既存の `Sha256ContentIdGenerator`(`content_id.rs:9`)は `SHA-256(raw_content)` を hex 化するだけで、**crsl-lib の Node CID(`SHA-256(CBOR(Node全体))` → CIDv1 RAW/SHA2-256、`node.rs:76`)とはアルゴリズムもエンコードも別物**。version CID の再計算には crsl-lib 準拠の実装が要る。`content_id.rs:6` に `todo: crslのcid生成を使用する` とある通り元々 crsl 準拠にしたい意図があるので、**`monas-content` に crsl-lib 準拠の Node CID 計算を新設**(既存 generator とは別関数)してこの TODO を回収する。crsl-lib を `monas-content` 依存に足すか、CBOR+SHA-256+CID の軽量実装を `monas-content` 内に持つかは 8.6 で判断。
+
 ### 8.1 コンポーネント A: 版真正性(Node 全体を返して CID 再計算)
 
 **目的**: member の read 応答が「生 payload」ではなく `Node` 全体(CBOR)を返すようにし、クライアントが CID を再計算して改ざん検知する。
@@ -269,10 +277,9 @@ member リストの取得・検証は**フローに現れない**(晒さない�
 3. ワイヤ: `ContentResponse::ContentData { content_id, data, version }`(`protocol.rs:106`)の `data` を Node CBOR に(意味を変えるだけで型は `Vec<u8>` のまま。フィールド名を `node_bytes` にリネームして意図を明示)。内部 `RelayOutcome::Data`(`libp2p_network.rs:55`)も同様。
 4. HTTP `ContentDataResponse`(`http_api.rs:225`)/ SDK `StateNodeContentDataResponse`(`models/state_node.rs:51`)の `data` も Node CBOR(base64)に。
 
-**SDK 側(クライアント検証)**:
-5. Node CBOR を受け取ったら、crsl-lib の `Node::from_bytes`(`node.rs:104`)→ `content_id()`(`node.rs:76`)で CID 再計算し、要求 version(または応答の主張 version)と一致を検証。不一致は**拒否**。
-6. 検証後、`Node.payload().data`(暗号文)を取り出して既存の復号(AES-GCM)に渡す。
-   - ※ crsl-lib はワイヤ型の依存に入る。SDK が crsl-lib の `Node` 型を使えるか要確認(既に依存にあるか、追加が要るか)。無理なら Node のパース + CID 再計算だけを行う軽量ヘルパを用意。
+**クライアント検証(`monas-content` に実装、SDK はそれを呼ぶ)**:
+5. `monas-content` に crsl-lib 準拠の Node CID 再計算 + 検証関数を新設(§8.0)。Node CBOR を受け取ったら CID 再計算 → 要求 version と一致を検証。不一致は**拒否**。
+6. 検証後、Node の `payload.data`(暗号文)を取り出して既存の復号(`domain/content/encryption.rs`、AES-GCM)に渡す。復号・CID 検証とも `monas-content` 内で完結し、SDK は結果を受け取るだけ。
 
 ### 8.2 コンポーネント B: 単調性チェック(ロールバック検出)
 
@@ -295,9 +302,9 @@ member リストの取得・検証は**フローに現れない**(晒さない�
 3. `read_content_via_relay`(`state_node_service.rs:565`)/ `read_history_via_relay`(`:598`)の応答に、自ノードの member 証明トークンを載せる。ワイヤ `ContentResponse::ContentData` / `HistoryData` に `member_proof: String`(必須)を追加。内部 `RelayOutcome`・HTTP・SDK 型も同様に追加(§4.4 の経路表の全型)。
 4. caller の分解 `libp2p_network.rs:1828`(現状 `..` で余剰を捨てている)を修正し、`member_proof` を通す。
 
-**SDK 側 — 検証**:
-5. 応答の `member_proof` を **owner 公開鍵**(= `AccessPolicy.owner`、read 認可時に既知)で ES256 検証。`att.with` が要求 content と一致、`exp` 未失効を確認。無効/欠落は**拒否**。
-6. owner 公開鍵の入手: read 認可経路で既に owner を知っているはず(要確認 — SDK が `AccessPolicy.owner` を保持しているか、別途取得が要るか)。
+**クライアント検証(`monas-content` に実装)**:
+5. 応答の `member_proof` を **owner 公開鍵**で ES256 検証(`monas-content` に検証関数を新設。既存の署名検証/鍵管理と同居)。`att.with` が要求 content と一致、`exp` 未失効を確認。無効/欠落は**拒否**。
+6. owner 公開鍵の入手(§8.6 参照): SDK/content が持つ委任トークンの `iss` から導出できるか確認。導出できれば追加 API 不要。
 
 ### 8.4 検証フロー統合(SDK, §5.2)
 
@@ -317,15 +324,14 @@ member リストの取得・検証は**フローに現れない**(晒さない�
 
 ### 8.6 実装前に確定した事項(調査済み 2026-07-18)
 
-**(1) SDK は crsl-lib に依存していない**(`monas-sdk/Cargo.toml` に無し)。→ 選択肢:
-- (a) crsl-lib を SDK 依存に追加し `Node::from_bytes`/`content_id()` を直接使う。確実だが SDK に DAG ライブラリ全体(leveldb 等含む)を持ち込みビルド肥大。
-- (b) **【推奨】SDK に軽量 CID 検証ヘルパを自前実装**: Node の CBOR を最小限デコード(`payload`/`parents`/`genesis` を取り出す)+ 受信 CBOR バイト列全体を SHA-256 → CIDv1(RAW/SHA2-256、`node.rs:76-81` と同一手順)で version 突合。crsl-lib 全体は要らず、`serde_cbor` + `sha2` + `cid` クレートで足りる。Node の CBOR スキーマ(フィールド順・型)を crsl-lib と厳密に一致させる必要があるのでテストで固定。
-- → **(b) を採用**。ただし CBOR スキーマ一致の検証テスト(state-node が出す Node CBOR を SDK が再計算して一致)を必須にする。
+**(1) CID 再計算は `monas-content` に crsl-lib 準拠で新設**(§8.0)。`monas-content` は現状 crsl-lib 非依存。選択肢:
+- (a) crsl-lib を `monas-content` 依存に追加し `Node::from_bytes`/`content_id()` を直接使う。確実だが DAG ライブラリ全体(leveldb 等)を持ち込む。
+- (b) **【推奨】`monas-content` に軽量 Node CID 計算を自前実装**: Node の CBOR を最小限デコード(`payload`/`parents`/`genesis`)+ 受信 CBOR 全体を SHA-256 → CIDv1(RAW/SHA2-256、`node.rs:76-81` と同一手順)。`serde_cbor` + `sha2` + `cid` で足りる。`content_id.rs:6` の TODO 回収も兼ねる。
+- → **(b) を採用**。CBOR スキーマ一致テスト(state-node が出す Node CBOR を `monas-content` が再計算して一致)を必須にする。crsl-lib のバージョンは rev pin(`Cargo.toml:51`)なのでスキーマ固定でよい。
 
-**(2) SDK は owner / AccessPolicy を知らない**(`AccessPolicy` は state-node ドメイン、SDK には無い)。→ member 証明を owner 鍵で検証するには owner 公開鍵の入手経路が新規に要る:
-- read 認可のために SDK は既に「自分の権限(委任トークン)」を持つ。そのトークンの `iss` が owner なので、**owner 公開鍵は委任トークンの `iss` から得られる**可能性が高い(要確認: `iss` が pubkey そのものか、key_id か)。
-- 委任経由で得られないなら、content の owner 公開鍵を返す軽量な取得口を state-node/account に新設。
-- → 実装первый手: SDK が持つ委任トークンの `iss` から owner 公開鍵を導出できるか確認。可能なら追加 API 不要。
+**(2) owner 公開鍵の入手経路**: `AccessPolicy` は state-node ドメインで content/SDK には無い。member 証明を owner 鍵で検証するには入手経路が要る:
+- read 認可のために content/SDK は既に「自分の権限(委任トークン)」を持つ。そのトークンの `iss` が owner なので、**owner 公開鍵は委任トークンの `iss` から得られる**可能性が高い(要確認: `iss` が pubkey そのものか key_id か。`service.rs` の `owner_key_id = key_id_from_public_key(...)` を見る限り key_id。key_id から pubkey を復元できる形式か確認)。
+- **確認済み(2026-07-18)**: owner key_id は `user:{hex(public_key)}`(`service.rs:160-161` `key_id_from_public_key`)で**公開鍵そのものを内包する自己完結型**。委任トークンの `iss` から hex デコードするだけで owner 公開鍵が復元でき、**追加の取得 API・通信は不要**。member 証明の検証に必要な鍵は読み手が既に持つ委任トークンから取れる。
 
 ### 8.7 実装中に判定する TODO
 
