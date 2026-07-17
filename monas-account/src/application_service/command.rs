@@ -30,17 +30,3 @@ pub struct IssueDelegatedTokenResult {
     pub expires_at: u64,
     pub jti: String,
 }
-
-/// Request to issue a membership proof: an owner-signed token attesting that a
-/// specific state node (`member_node_id`) is a legitimate member/host of a
-/// content. Used by the verified read path so a responding node can prove it is
-/// a real member without exposing the member list
-/// (`docs/design/read-response-integrity.md` §5.1.b).
-#[derive(Debug, Clone)]
-pub struct IssueMemberProofRequest {
-    /// Identity of the member state node this proof is issued to (the token's
-    /// `aud`). This is the node's self-identifier (e.g. `node:<node_id>`).
-    pub member_node_id: String,
-    pub content_id: String,
-    pub ttl_secs: u64,
-}

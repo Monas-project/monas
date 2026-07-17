@@ -3123,7 +3123,6 @@ dependencies = [
  "hmac",
  "hpke-rs",
  "hpke-rs-rust-crypto",
- "monas-account",
  "monas-filesync",
  "multihash",
  "p256",
