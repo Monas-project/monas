@@ -1,5 +1,5 @@
 use crate::application_service::command::{
-    IssueDelegatedTokenRequest, IssueDelegatedTokenResult, KeyTypeMapper,
+    IssueDelegatedTokenRequest, IssueDelegatedTokenResult, IssueMemberProofRequest, KeyTypeMapper,
 };
 use crate::application_service::error::{AccountServiceError, IssueDelegatedTokenError, SignError};
 use crate::application_service::port::AccountKeyStore;
@@ -120,6 +120,90 @@ impl AccountService {
             iat: now,
             jti: jti.clone(),
             att,
+        };
+
+        let key_pair = KeyPairGenerateFactory::from_key_bytes(
+            stored.algorithm,
+            &stored.public_key,
+            &stored.secret_key,
+        )
+        .map_err(IssueDelegatedTokenError::InvalidKey)?;
+        let account = Account::new(key_pair);
+        let delegated_token = sign_es256_jwt_payload(&payload, |signing_input| {
+            let (signature, _recovery_id) = account.sign(signing_input);
+            Ok(signature)
+        })
+        .map_err(IssueDelegatedTokenError::JwtSigning)?;
+
+        Ok(IssueDelegatedTokenResult {
+            delegated_token,
+            issued_at: now,
+            expires_at,
+            jti,
+        })
+    }
+
+    /// Issue an owner-signed membership proof for a state node.
+    ///
+    /// The proof is an ES256 JWT (`iss = owner key_id`, `aud = member_node_id`,
+    /// `att = [{ with: "monas://content/{cid}", can: "host" }]`). A member node
+    /// attaches it to read responses; a reader verifies it against the owner
+    /// public key (recoverable from the owner key_id) to confirm the responder
+    /// is a legitimate member — without ever seeing the member list
+    /// (`docs/design/read-response-integrity.md` §5.1.b).
+    pub fn issue_member_proof<S: AccountKeyStore>(
+        store: &S,
+        req: IssueMemberProofRequest,
+    ) -> Result<IssueDelegatedTokenResult, IssueDelegatedTokenError> {
+        if req.content_id.trim().is_empty() {
+            return Err(IssueDelegatedTokenError::Validation(
+                "content_id must not be empty".to_string(),
+            ));
+        }
+        if req.member_node_id.trim().is_empty() {
+            return Err(IssueDelegatedTokenError::Validation(
+                "member_node_id must not be empty".to_string(),
+            ));
+        }
+        if req.ttl_secs == 0 {
+            return Err(IssueDelegatedTokenError::Validation(
+                "ttl_secs must be greater than 0".to_string(),
+            ));
+        }
+        const MAX_TTL_SECS: u64 = 24 * 60 * 60;
+        if req.ttl_secs > MAX_TTL_SECS {
+            return Err(IssueDelegatedTokenError::Validation(format!(
+                "ttl_secs must be <= {MAX_TTL_SECS}"
+            )));
+        }
+
+        let stored = store
+            .load()
+            .map_err(IssueDelegatedTokenError::KeyStore)?
+            .ok_or(IssueDelegatedTokenError::NotFound)?;
+
+        if stored.algorithm != KeyAlgorithm::P256 {
+            return Err(IssueDelegatedTokenError::UnsupportedAlgorithm(format!(
+                "{:?}",
+                stored.algorithm
+            )));
+        }
+
+        let owner_key_id = key_id_from_public_key(&stored.public_key);
+        let now = unix_now_secs()?;
+        let expires_at = now.saturating_add(req.ttl_secs);
+        let jti = generate_jti();
+
+        let payload = DelegationClaims {
+            iss: owner_key_id,
+            aud: req.member_node_id,
+            exp: expires_at,
+            iat: now,
+            jti: jti.clone(),
+            att: vec![DelegationCapabilityClaim {
+                with: format!("monas://content/{}", req.content_id),
+                can: "host".to_string(),
+            }],
         };
 
         let key_pair = KeyPairGenerateFactory::from_key_bytes(
