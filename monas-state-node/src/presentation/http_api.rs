@@ -717,20 +717,28 @@ async fn get_content_data(
 
     let crdt_repo = state.crdt_repo();
 
-    // Get data based on version parameter
-    let data_result = if let Some(version) = &query.version {
-        crdt_repo.get_version(&content_id, version).await
+    // Return the whole Node (CBOR), matching the relay branch above, so the
+    // client always verifies the same format (recompute CID) regardless of
+    // whether this node held the content locally or relayed the read.
+    // (docs/design/read-response-integrity.md §8.1)
+    let data_result: Result<Option<(Vec<u8>, String)>, _> = if let Some(version) = &query.version {
+        crdt_repo
+            .get_version_node_bytes(&content_id, version)
+            .await
+            .map(|opt| opt.map(|bytes| (bytes, version.clone())))
     } else {
-        crdt_repo.get_latest(&content_id).await
+        crdt_repo
+            .get_latest_node_bytes_with_version(&content_id)
+            .await
     };
 
     match data_result {
-        Ok(Some(data)) => {
+        Ok(Some((data, served_version))) => {
             let encoded = base64::engine::general_purpose::STANDARD.encode(&data);
             Json(ContentDataResponse {
                 content_id,
                 data: encoded,
-                version: query.version,
+                version: Some(served_version),
             })
             .into_response()
         }
@@ -811,7 +819,12 @@ async fn get_content_version(
 
     let crdt_repo = state.crdt_repo();
 
-    match crdt_repo.get_version(&content_id, &version).await {
+    // Return the whole Node (CBOR), matching the relay branch, so the client
+    // verifies the same format everywhere (§8.1).
+    match crdt_repo
+        .get_version_node_bytes(&content_id, &version)
+        .await
+    {
         Ok(Some(data)) => {
             let encoded = base64::engine::general_purpose::STANDARD.encode(&data);
             Json(ContentDataResponse {

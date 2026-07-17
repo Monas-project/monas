@@ -303,11 +303,34 @@ impl MonasController {
             Err(e) => return e,
         };
 
-        let state_bytes = match BASE64_STANDARD.decode(&state_node_data.data) {
+        let node_bytes = match BASE64_STANDARD.decode(&state_node_data.data) {
             Ok(b) => b,
             Err(e) => {
                 return ApiResponse::error(
                     ApiError::Internal(format!("invalid base64 data from state node: {e}")),
+                    trace_id,
+                );
+            }
+        };
+
+        // State Node は read 応答として「Node 全体(CBOR)」を返す。まず CID を
+        // 再計算して version と一致することを検証し(改ざん検知)、その上で
+        // payload の暗号文を取り出す(§8.1)。
+        let state_bytes = match monas_content::infrastructure::node_verification::verify_and_extract(
+            &node_bytes,
+            &state_node_data
+                .version
+                .clone()
+                .unwrap_or(version_to_check.clone()),
+        ) {
+            Ok(verified) => verified.ciphertext,
+            Err(e) => {
+                return ApiResponse::success(
+                    VerifyIntegrityOutput {
+                        valid: false,
+                        computed_hash,
+                        reason: Some(format!("state node response failed CID verification: {e}")),
+                    },
                     trace_id,
                 );
             }

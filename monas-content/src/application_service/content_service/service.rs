@@ -289,6 +289,49 @@ where
         Ok(plaintext)
     }
 
+    /// Verify and decrypt a relay-read response fetched from a state node.
+    ///
+    /// The state node returns the whole crsl-lib `Node` (CBOR). This:
+    /// 1. Recomputes the Node CID and confirms it equals `expected_version_cid`
+    ///    (tamper detection — a relay peer cannot fabricate the payload).
+    /// 2. Extracts the ciphertext from the Node payload.
+    /// 3. Loads the CEK for `local_content_id` and AES-GCM-decrypts.
+    ///
+    /// This is the client-side core of the verified read path
+    /// (`docs/design/read-response-integrity.md` §5.2 / §8). It does NOT do the
+    /// membership-proof or monotonicity checks — those are layered by the
+    /// caller (SDK) around this call, which owns the proof and last-seen state.
+    ///
+    /// Returns the plaintext, and the verified node's parent CIDs (for the
+    /// caller's monotonicity check).
+    pub fn verify_and_decrypt_relay_read(
+        &self,
+        node_bytes: &[u8],
+        expected_version_cid: &str,
+        local_content_id: ContentId,
+    ) -> Result<VerifiedRead, VerifiedReadError> {
+        let verified = crate::infrastructure::node_verification::verify_and_extract(
+            node_bytes,
+            expected_version_cid,
+        )
+        .map_err(VerifiedReadError::NodeVerification)?;
+
+        let key = self
+            .cek_store
+            .load(&local_content_id)
+            .map_err(VerifiedReadError::KeyStore)?
+            .ok_or(VerifiedReadError::MissingKey)?;
+
+        let plaintext = self
+            .decrypt_with_cek(local_content_id, key, verified.ciphertext)
+            .map_err(VerifiedReadError::Decrypt)?;
+
+        Ok(VerifiedRead {
+            plaintext,
+            parents: verified.parents,
+        })
+    }
+
     /// コンテンツ削除ユースケース。
     ///
     /// - 物理削除ではなく、ドメインオブジェクト上で `is_deleted` フラグとバッファをクリアして保存する「論理削除」
@@ -631,6 +674,26 @@ pub enum DecryptWithCekError {
     ContentIdMismatch { expected: String, actual: String },
     #[error("domain error: {0:?}")]
     Domain(ContentError),
+}
+
+/// Result of a verified relay read: the plaintext plus the verified node's
+/// parent version CIDs (used by the caller for the monotonicity check).
+#[derive(Debug)]
+pub struct VerifiedRead {
+    pub plaintext: Vec<u8>,
+    pub parents: Vec<String>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum VerifiedReadError {
+    #[error("node verification failed: {0}")]
+    NodeVerification(crate::infrastructure::node_verification::NodeVerificationError),
+    #[error("key store error: {0:?}")]
+    KeyStore(ContentEncryptionKeyStoreError),
+    #[error("no content encryption key for this content")]
+    MissingKey,
+    #[error("decrypt failed: {0}")]
+    Decrypt(DecryptWithCekError),
 }
 
 #[derive(Debug, thiserror::Error)]
