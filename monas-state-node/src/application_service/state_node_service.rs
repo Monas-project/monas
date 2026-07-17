@@ -574,19 +574,22 @@ where
             .await?;
 
         let content_id_vo = ContentId::new(content_id.to_string())?;
+        // Return the whole crsl-lib Node (CBOR), not just the payload, so the
+        // client can recompute the CID and verify the response was not
+        // tampered with (docs/design/read-response-integrity.md §8.1).
         match version {
             Some(v) => {
-                let data = self
+                let node_bytes = self
                     .crdt_repo
-                    .get_version(content_id, v)
+                    .get_version_node_bytes(content_id, v)
                     .await
                     .map_err(|e| StateNodeError::StorageError(e.to_string()))?
                     .ok_or(StateNodeError::ContentNotFound(content_id_vo))?;
-                Ok((data, v.to_string()))
+                Ok((node_bytes, v.to_string()))
             }
             None => self
                 .crdt_repo
-                .get_latest_with_version(content_id)
+                .get_latest_node_bytes_with_version(content_id)
                 .await
                 .map_err(|e| StateNodeError::StorageError(e.to_string()))?
                 .ok_or(StateNodeError::ContentNotFound(content_id_vo)),

@@ -235,6 +235,58 @@ impl ContentRepository for CrslCrdtRepository {
         }
     }
 
+    async fn get_latest_node_bytes_with_version(
+        &self,
+        genesis_cid: &str,
+    ) -> Result<Option<(Vec<u8>, String)>> {
+        let genesis = Self::parse_cid(genesis_cid)?;
+
+        let repo = self.repo.lock();
+
+        match repo.latest(&genesis) {
+            Some(latest_cid) => match repo.dag.get_node(&latest_cid) {
+                Ok(Some(node)) => {
+                    let bytes = node
+                        .to_bytes()
+                        .map_err(|e| anyhow::anyhow!("Failed to serialize node: {}", e))?;
+                    Ok(Some((bytes, latest_cid.to_string())))
+                }
+                Ok(None) => Ok(None),
+                Err(e) => Err(anyhow::anyhow!("Failed to get node: {}", e)),
+            },
+            None => Ok(None),
+        }
+    }
+
+    async fn get_version_node_bytes(
+        &self,
+        genesis_cid: &str,
+        version_cid: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        let genesis = Self::parse_cid(genesis_cid)?;
+        let cid = Self::parse_cid(version_cid)?;
+
+        let repo = self.repo.lock();
+
+        // Same series-scoping guarantee as get_version: refuse to serve a
+        // version that belongs to a different content series.
+        match repo.get_genesis(&cid) {
+            Ok(g) if g == genesis => {}
+            _ => return Ok(None),
+        }
+
+        match repo.dag.get_node(&cid) {
+            Ok(Some(node)) => {
+                let bytes = node
+                    .to_bytes()
+                    .map_err(|e| anyhow::anyhow!("Failed to serialize node: {}", e))?;
+                Ok(Some(bytes))
+            }
+            Ok(None) => Ok(None),
+            Err(e) => Err(anyhow::anyhow!("Failed to get node: {}", e)),
+        }
+    }
+
     async fn get_access_policy(&self, genesis_cid: &str) -> Result<Option<AccessPolicy>> {
         let genesis = Self::parse_cid(genesis_cid)?;
 

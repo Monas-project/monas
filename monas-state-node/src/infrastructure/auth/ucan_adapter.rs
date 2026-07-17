@@ -477,6 +477,19 @@ mod tests {
         ) -> Result<Option<Vec<u8>>> {
             unimplemented!()
         }
+        async fn get_latest_node_bytes_with_version(
+            &self,
+            _genesis_cid: &str,
+        ) -> Result<Option<(Vec<u8>, String)>> {
+            unimplemented!()
+        }
+        async fn get_version_node_bytes(
+            &self,
+            _genesis_cid: &str,
+            _version_cid: &str,
+        ) -> Result<Option<Vec<u8>>> {
+            unimplemented!()
+        }
         async fn get_history(&self, _genesis_cid: &str) -> Result<Vec<String>> {
             unimplemented!()
         }
