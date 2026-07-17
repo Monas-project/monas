@@ -121,6 +121,34 @@ PR #54(read relay)に対するセキュリティ指摘(issue #55)への対応。
 3. 実 read エンドポイント(§5.2)→ 単調性(§5.1)の順で実装。
 4. テスト → PR(§5.3)。
 
+## 6.1 タスクリスト全体(チェックリスト)
+
+前セッションの TaskCreate は引き継がれないので、ここに残す。
+
+- [x] **A サーバ**: state-node が Node CBOR を返す(`ec26c00`)
+- [x] **A クライアント**: monas-content で CID 再計算・検証 + crsl-lib パリティ(`ec26c00`)
+- [x] **read 形式統一 + E2E verify-decrypt コア + verify_integrity 修正**(`7970b35`)
+- [x] **設計訂正 + ハンドオフ doc**(`b41f454`)
+- [ ] **C を revert**: `git revert 3a64a5a`(member 証明は設計上不要)
+- [ ] **B 単調性チェック**: SDK sled に last_seen 記録 + parents 祖先判定(§5.1)
+- [ ] **実 read エンドポイント**: SDK 新メソッド + gateway auth 転送 + CEK 入手(§5.2)。**これが無いと「実際に使えない」**
+- [ ] **テスト**: A 改ざん拒否 / B 後退拒否・初回受理 / e2e-test.sh 更新(§5.3)
+- [ ] **build/test/clippy/fmt green**(Rust 1.97 の clippy で確認、§5.3)
+- [ ] **PR 作成**: base = `fix/state-node-read-relay`(#54)。本文に「A+B のみ、member 証明は不採用」明記
+
+## 6.2 ユーザーからの確定事項(セッション履歴より)
+
+- **1 PR のみ**で実装する。
+- **後方互換は一切考慮しない。破壊的変更 OK**(production 利用ゼロ、テストのみ)。
+- **PR 向き先は `fix/state-node-read-relay`(#54)**。
+- **「実際に使えないと意味がない」** → 検証機構だけでなく、state node から読んで復号する**実 read 経路まで**作ること(§5.2 は必須、切り出し不可)。
+- **member 証明は不要**(§2。owner は membership を知り得ない)。
+- Fable 5 モデルを使い続ける。
+
+## 6.3 実 read 経路で残っている設計判断(§5.2 の CEK 問題)
+
+share で受け取った content は、unwrap した CEK が現状どこにも保存されない(`decrypt_shared_content` は即復号のみ)。実 read 経路で share 済み content も読めるようにするなら、unwrap 済み CEK を `cek_store.save` する経路が別途要る。**自分が作成者の content なら `cek_store.load(local_id)` で足りる**ので、初版は「作成者による自 content の read」に絞り、share 経由 read は別途、という切り分けも可(実装時にユーザー判断を仰ぐ)。
+
 ---
 
 ## 7. 主要な file:line リファレンス(調査済み)
