@@ -3193,6 +3193,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
+ "cid",
  "dotenv",
  "hex",
  "mockito",
@@ -3200,6 +3201,7 @@ dependencies = [
  "monas-content",
  "monas-filesync",
  "serde",
+ "serde_cbor",
  "serde_json",
  "sha2",
  "sled",
