@@ -9,7 +9,8 @@ use crate::common::{
 };
 use crate::models::share::{
     DecryptSharedContentInput, DecryptSharedContentOutput, DelegatedAccessToken, KeyEnvelope,
-    Permission, RevokeShareInput, RevokeShareOutput, ShareContentInput, ShareContentOutput,
+    Permission, ReissuedKeyEnvelope, RevokeShareInput, RevokeShareOutput, ShareContentInput,
+    ShareContentOutput,
 };
 
 use monas_content::application_service::content_service::{
@@ -456,45 +457,18 @@ impl MonasController {
 
         let recipient_key_id = Self::compute_key_id_from_public_key(&recipient_public_key_bytes);
 
-        // 4. ShareService::revoke_shareを呼び出し
-        let cmd = RevokeShareCommand {
-            content_id,
-            sender_key_id,
-            recipient_key_id,
-        };
-
-        let result = match self.share_service.revoke_share(cmd) {
-            Ok(result) => result,
-            Err(e) => {
-                // ShareService::revoke_share は share_repository を先に save してから envelope を
-                // 生成するため、途中で失敗した場合も ACL は既に変更されている可能性がある。
-                // snapshot から share/content/cek を復元する。
-                let primary = Self::map_share_error(e);
-                if let Err(restore_err) = self.restore_revoke_share_snapshot(&snapshot) {
-                    return ApiResponse::error(
-                        super::combine_rollback_failure(
-                            primary,
-                            restore_err,
-                            "Revoke",
-                            "revoke",
-                            "restore",
-                        ),
-                        trace_id,
-                    );
-                }
-                return ApiResponse::error(primary, trace_id);
-            }
-        };
-
-        // revoke後に再暗号し、State Nodeのバージョンを進める
+        // 4. まず CEK をローテーションして再暗号化する。
+        //    ShareService::revoke_share は「その時点の CEK・ciphertext」で残存受信者向け
+        //    KeyEnvelope を再発行するため、**reencrypt が先**でないと旧 CEK の envelope を
+        //    配ってしまい、ローテーションの意味がなくなる
+        //    (service 側 step 2 の「再暗号化後はここが新しい CEK になっている想定」に一致させる)。
         let reencryption = match self.content_service.reencrypt(ReencryptContentCommand {
             content_id: ContentId::new(input.content_id.clone()),
         }) {
             Ok(result) => result,
             Err(e) => {
-                // reencrypt に失敗した時点で ACL は既に変更済み。
-                // snapshot 復元をせずに return すると ACL だけが剥がれた中途半端な状態が残るため、
-                // ここでロールバックする。
+                // reencrypt は途中失敗時に旧 CEK を書き戻すが、content repo 側の状態も
+                // 含めて確実に pre-revoke へ戻すため snapshot 復元も行う。
                 //
                 // TODO(pr29-followup): この経路は SDK 公開 API だけでは安定して再現できないため
                 // integration test が存在しない。test-hook feature を導入してから
@@ -508,6 +482,37 @@ impl MonasController {
                             restore_err,
                             "Reencrypt",
                             "reencrypt",
+                            "restore",
+                        ),
+                        trace_id,
+                    );
+                }
+                return ApiResponse::error(primary, trace_id);
+            }
+        };
+
+        // 5. ShareService::revoke_shareを呼び出し(ACL 更新 + 残存受信者向けに
+        //    新 CEK・新 ciphertext で KeyEnvelope を再発行)
+        let cmd = RevokeShareCommand {
+            content_id,
+            sender_key_id,
+            recipient_key_id,
+        };
+
+        let result = match self.share_service.revoke_share(cmd) {
+            Ok(result) => result,
+            Err(e) => {
+                // ShareService::revoke_share は share_repository を先に save してから envelope を
+                // 生成するため、途中で失敗した場合も ACL は既に変更されている可能性がある。
+                // 直前の reencrypt の巻き戻しも含め、snapshot から share/content/cek を復元する。
+                let primary = Self::map_share_error(e);
+                if let Err(restore_err) = self.restore_revoke_share_snapshot(&snapshot) {
+                    return ApiResponse::error(
+                        super::combine_rollback_failure(
+                            primary,
+                            restore_err,
+                            "Revoke",
+                            "revoke",
                             "restore",
                         ),
                         trace_id,
@@ -547,11 +552,24 @@ impl MonasController {
             return response;
         }
 
+        // 残存受信者向けの再発行 envelope(新 CEK・新 ciphertext)を出力に載せる。
+        // owner はこれを各受信者へ配布し、受信者が decrypt_shared_content で処理すると
+        // ローカル保存済み CEK がローテーション後のものへ更新される。
+        let reissued_envelopes = result
+            .envelopes
+            .iter()
+            .map(|env| ReissuedKeyEnvelope {
+                recipient_key_id: encode_base64url(env.recipient().key_id().as_bytes()),
+                key_envelope: Self::to_key_envelope(env),
+            })
+            .collect();
+
         let output = RevokeShareOutput {
             content_id: result.content_id.as_str().to_string(),
             recipient_public_key: input.recipient_public_key,
             revoked: true,
             revoked_at: Some(Utc::now().to_rfc3339()),
+            reissued_envelopes,
         };
 
         ApiResponse::success(output, trace_id)
@@ -666,7 +684,7 @@ impl MonasController {
         let raw_content: Vec<u8> =
             match self
                 .content_service
-                .decrypt_with_cek(content_id.clone(), cek, ciphertext)
+                .decrypt_with_cek(content_id.clone(), cek.clone(), ciphertext)
             {
                 Ok(content) => content,
                 Err(e) => {
@@ -682,6 +700,21 @@ impl MonasController {
                     return ApiResponse::error(ApiError::Internal(error_msg), trace_id);
                 }
             };
+
+        // 9. 復号成功 = この CEK が本物であることの確認になるので、受信者ローカルの
+        //    cek_store に保存する。これで share 受信者も後から state node 経由の
+        //    検証付き read(read_content_from_state_node)で同じ content を復号できる。
+        //    同一 content_id への保存は上書きなので、CEK ローテーション後に再発行された
+        //    KeyEnvelope を処理すれば保存済み CEK も新しいものへ追従する。
+        //    CEK が出るのは受信者デバイスのローカルストアまでで、ネットワークには出ない。
+        if let Err(e) = self.content_service.cek_store.save(&content_id, &cek) {
+            // 復号自体は成功しているので致命ではないが、後続の state node read が
+            // MissingKey で失敗する原因になるため警告は残す。
+            eprintln!(
+                "monas-sdk: failed to persist unwrapped CEK for {} (state-node reads of this shared content will fail until a KeyEnvelope is processed again): {e}",
+                content_id.as_str()
+            );
+        }
 
         let content_base64url = encode_base64url(&raw_content);
 

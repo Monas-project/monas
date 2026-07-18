@@ -95,6 +95,20 @@ pub struct RevokeShareOutput {
     pub revoked: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub revoked_at: Option<String>,
+    /// 取り消し後も共有が残っている受信者向けに、ローテーション後の CEK で
+    /// 再発行された KeyEnvelope。呼び出し側(owner)はこれを各受信者へ配布し、
+    /// 受信者は `decrypt_shared_content` で処理することでローカル保存済み CEK が
+    /// 新しいものへ更新される(state node 経由の read が引き続き復号できる)。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reissued_envelopes: Vec<ReissuedKeyEnvelope>,
+}
+
+/// revoke 後に残存受信者向けへ再発行された KeyEnvelope。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReissuedKeyEnvelope {
+    /// 再発行先の受信者 key id(base64url)
+    pub recipient_key_id: String,
+    pub key_envelope: KeyEnvelope,
 }
 
 // ============================================
@@ -205,9 +219,33 @@ mod tests {
             recipient_public_key: "recipient_key".into(),
             revoked: true,
             revoked_at: Some("2025-12-05T12:34:56Z".into()),
+            reissued_envelopes: vec![],
         };
         let json = serde_json::to_string(&output).unwrap();
         assert!(json.contains("\"revoked\":true"));
+        // 空の envelope リストは serialize されない(後方互換)
+        assert!(!json.contains("reissued_envelopes"));
+    }
+
+    #[test]
+    fn test_revoke_share_output_with_reissued_envelopes() {
+        let output = RevokeShareOutput {
+            content_id: "test_id".into(),
+            recipient_public_key: "recipient_key".into(),
+            revoked: true,
+            revoked_at: None,
+            reissued_envelopes: vec![ReissuedKeyEnvelope {
+                recipient_key_id: "surviving-recipient".into(),
+                key_envelope: KeyEnvelope {
+                    enc: "enc".into(),
+                    wrapped_cek: "wrapped".into(),
+                    ciphertext: "cipher".into(),
+                },
+            }],
+        };
+        let json = serde_json::to_string(&output).unwrap();
+        assert!(json.contains("\"reissued_envelopes\""));
+        assert!(json.contains("\"recipient_key_id\":\"surviving-recipient\""));
     }
 
     #[test]
