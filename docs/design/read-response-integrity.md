@@ -1,6 +1,6 @@
 # read 経路の完全性: 応答データの E2E 検証
 
-- ステータス: **【2026-07-18 重要訂正】member 証明(C)を廃止。A(版真正性)+ B(単調性)に縮小。実装途中。**
+- ステータス: **【2026-07-18】実装完了。member 証明(C)は廃止し、A(版真正性)+ B(単調性)+ 実 read 経路(share 受信者の CEK 永続化・rotation 追従含む)を実装。**
 - 関連: PR #54、issue #55
 - 前提ブランチ: `feature/read-response-signing`(#54 の上に積む)
 - **再開手順は `docs/design/read-response-integrity-HANDOFF.md` を参照。**

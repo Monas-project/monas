@@ -1,6 +1,11 @@
 # read-response-integrity 実装ハンドオフ(別セッション再開用)
 
-最終更新: 2026-07-18。このファイルだけ読めば、別セッションで作業を再開できるように書いた。
+最終更新: 2026-07-18(実装完了)。このファイルだけ読めば、別セッションで作業を再開できるように書いた。
+
+> **【2026-07-18 更新】実装は完了した。** C の revert・実 read エンドポイント・単調性チェック(B)・
+> share 受信者の CEK 永続化・revoke 順序修正(reencrypt を先に)+ 再発行 envelope の返却まで実装済み。
+> ユーザー決定により §6.3 の切り分け案は採らず、**share 経由 read も含めて本 PR で実装**した。
+> 残りは PR 作成のみ。詳細は git log と `docs/design/read-response-integrity.md` を参照。
 
 ---
 
@@ -129,11 +134,13 @@ PR #54(read relay)に対するセキュリティ指摘(issue #55)への対応。
 - [x] **A クライアント**: monas-content で CID 再計算・検証 + crsl-lib パリティ(`ec26c00`)
 - [x] **read 形式統一 + E2E verify-decrypt コア + verify_integrity 修正**(`7970b35`)
 - [x] **設計訂正 + ハンドオフ doc**(`b41f454`)
-- [ ] **C を revert**: `git revert 3a64a5a`(member 証明は設計上不要)
-- [ ] **B 単調性チェック**: SDK sled に last_seen 記録 + parents 祖先判定(§5.1)
-- [ ] **実 read エンドポイント**: SDK 新メソッド + gateway auth 転送 + CEK 入手(§5.2)。**これが無いと「実際に使えない」**
-- [ ] **テスト**: A 改ざん拒否 / B 後退拒否・初回受理 / e2e-test.sh 更新(§5.3)
-- [ ] **build/test/clippy/fmt green**(Rust 1.97 の clippy で確認、§5.3)
+- [x] **C を revert**: `git revert 3a64a5a`(member 証明は設計上不要)
+- [x] **B 単調性チェック**: last_seen ストア(sled/in-memory)+ CID 検証済み parents の祖先探索(fail-closed、上限 256 fetch)。最新読みのみ適用、明示版指定 read は A のみ
+- [x] **実 read エンドポイント**: SDK `read_content_from_state_node` + gateway `POST /state/read`(auth 転送)
+- [x] **share 受信者の CEK 永続化**: `decrypt_shared_content` 成功時に unwrap 済み CEK を受信者ローカル cek_store へ保存(rotation 時は新 envelope 処理で上書き追従)
+- [x] **revoke 順序修正**: SDK が revoke → reencrypt の順で呼んでいた(service の想定と逆で、旧 CEK の envelope を生成していた)のを reencrypt → revoke に修正。再発行 envelope を `RevokeShareOutput.reissued_envelopes` で返すようにした(残存受信者への新 CEK 配布経路)
+- [x] **テスト**: A 改ざん拒否 / B TOFU・前進・後退・明示版 / 受信者 read / rotation 追従 / walk 単体(SDK 統合 5 + 単体 7)。旧形式前提だった verify_integrity テストも Node CBOR に更新。e2e-test.sh は `.data` 有無のみ見る形式非依存 assert のため変更不要
+- [x] **build/test/clippy/fmt green**(workspace 全テスト + Rust 1.97 clippy --deny warnings)
 - [ ] **PR 作成**: base = `fix/state-node-read-relay`(#54)。本文に「A+B のみ、member 証明は不採用」明記
 
 ## 6.2 ユーザーからの確定事項(セッション履歴より)
@@ -145,9 +152,13 @@ PR #54(read relay)に対するセキュリティ指摘(issue #55)への対応。
 - **member 証明は不要**(§2。owner は membership を知り得ない)。
 - Fable 5 モデルを使い続ける。
 
-## 6.3 実 read 経路で残っている設計判断(§5.2 の CEK 問題)
+## 6.3 実 read 経路の CEK 問題(→ 解決済み)
 
-share で受け取った content は、unwrap した CEK が現状どこにも保存されない(`decrypt_shared_content` は即復号のみ)。実 read 経路で share 済み content も読めるようにするなら、unwrap 済み CEK を `cek_store.save` する経路が別途要る。**自分が作成者の content なら `cek_store.load(local_id)` で足りる**ので、初版は「作成者による自 content の read」に絞り、share 経由 read は別途、という切り分けも可(実装時にユーザー判断を仰ぐ)。
+share で受け取った content は、unwrap した CEK がどこにも保存されなかった(`decrypt_shared_content` は即復号のみ)。**ユーザー判断(2026-07-18)で「share 経由 read も含めて本 PR で production レベル実装」に決定**し、以下で解決した:
+
+- `decrypt_shared_content` 成功時(= CEK の正しさが復号で証明された後)に、unwrap 済み CEK を**受信者デバイスのローカル cek_store** へ保存。CEK も平文もネットワーク・state node には一切出ない(E2E 暗号化の思想は不変。state node は終始 ciphertext-only)。
+- CEK ローテーション(revoke 時の reencrypt)への追従: revoke で再発行された KeyEnvelope(`RevokeShareOutput.reissued_envelopes`)を受信者が再処理すると、保存済み CEK が上書き更新される。旧 CEK のまま新 ciphertext を読むと `Forbidden`(鍵が古い/revoke の可能性を示すメッセージ)で誘導される。
+- 「即時破棄」は意図的なセキュリティ前提ではないことを確認済み: revoke の安全性は受信者の鍵破棄ではなく **CEK ローテーション**(reencrypt + 残存者への再発行)に依存する設計。
 
 ---
 
