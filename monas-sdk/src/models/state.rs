@@ -43,6 +43,39 @@ pub struct GetHistoryOutput {
 }
 
 // ============================================
+// read_content_from_state_node
+// ============================================
+
+/// State Node からの検証付き read リクエスト。
+///
+/// - `content_id`: State Node 側の content id（remote id）。履歴・版データの取得と
+///   読み取り署名（`read:{content_id}:{timestamp}`）のバインドに使う。
+/// - `local_content_id`: SDK ローカルの content id（plain CID）。CEK の引き当てと
+///   復号後の整合性チェック（平文から再計算した plain CID との一致）に使う。
+///   local↔remote の対応表は存在しないため、呼び出し側が両方を渡す
+///   （`VerifyIntegrityInput` と同じ設計）。
+/// - `version`: 読む版 CID。省略時は State Node の履歴から最新版を読む。
+///   最新読みのときのみ単調性チェック（ロールバック検出）が働く。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadContentFromStateNodeInput {
+    pub content_id: String,
+    pub local_content_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
+/// State Node からの検証付き read レスポンス。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadContentFromStateNodeOutput {
+    pub content_id: String,
+    pub local_content_id: String,
+    /// 実際に読まれた版 CID（CID 再計算で検証済み）
+    pub version: String,
+    /// 復号済みの平文（base64url）
+    pub content: String,
+}
+
+// ============================================
 // verify_integrity
 // ============================================
 

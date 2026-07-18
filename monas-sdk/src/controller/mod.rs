@@ -8,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use content::{ContentServiceInstance, DynCekStore};
 use share::{DynPublicKeyDirectory, DynShareRepository, ShareServiceInstance};
+use state::DynLastSeenStore;
 
 use crate::common::{ApiError, ApiResponse, MonasConfig, PersistenceConfig, StateNodeAuthContext};
 
@@ -67,6 +68,9 @@ pub struct MonasController {
     content_service: ContentServiceInstance,
     /// ShareService
     share_service: ShareServiceInstance,
+    /// content ごとに最後に受理した State Node 版 CID の記録
+    /// (read 単調性チェック、`docs/design/read-response-integrity.md` コンポーネント B)
+    last_seen_store: DynLastSeenStore,
 }
 
 impl MonasController {
@@ -159,7 +163,7 @@ impl MonasController {
         // stateless thin client and push CEK / share ownership to State Node,
         // or (b) define an explicit pluggable port for CEK ownership semantics.
         let content_repository = Self::create_content_repository();
-        let (cek_store, share_repository, public_key_directory) =
+        let (cek_store, share_repository, public_key_directory, last_seen_store) =
             Self::create_persistence(&config.persistence)?;
         let agent = Self::build_agent(&config);
 
@@ -178,6 +182,7 @@ impl MonasController {
                 share_repository,
                 public_key_directory,
             ),
+            last_seen_store,
         })
     }
 
@@ -210,12 +215,21 @@ impl MonasController {
     /// CEK / Share / Public key directory の 3 ストアに共有させる。sled は path 単位で
     /// 排他 flock を取るため、同じディレクトリを 2 度 open すると 2 個目が
     /// 失敗する (`MONAS_PERSISTENCE_DIR` 設定時の本番経路で必ず再現)。
-    /// キー空間は `cek:` / `share:` / `pubkey:` プレフィックスで分離されている。
+    /// キー空間は `cek:` / `share:` / `pubkey:` / `last_seen:` プレフィックスで分離されている。
     fn create_persistence(
         persistence: &PersistenceConfig,
-    ) -> Result<(DynCekStore, DynShareRepository, DynPublicKeyDirectory), ApiError> {
+    ) -> Result<
+        (
+            DynCekStore,
+            DynShareRepository,
+            DynPublicKeyDirectory,
+            DynLastSeenStore,
+        ),
+        ApiError,
+    > {
         use monas_content::infrastructure::{
             key_store::{InMemoryContentEncryptionKeyStore, SledContentEncryptionKeyStore},
+            last_seen_version_store::{InMemoryLastSeenVersionStore, SledLastSeenVersionStore},
             public_key_directory::{InMemoryPublicKeyDirectory, SledPublicKeyDirectory},
             share_repository::{InMemoryShareRepository, SledShareRepository},
         };
@@ -224,13 +238,14 @@ impl MonasController {
             PersistenceConfig::InMemory => {
                 eprintln!(
                     "monas-sdk: PersistenceConfig::InMemory is in use. \
-                     CEK / share / public-key data are kept in memory only and will be lost on restart. \
+                     CEK / share / public-key / last-seen-version data are kept in memory only and will be lost on restart. \
                      Use MonasConfig::with_persistence_dir(<path>) for production gateways."
                 );
                 let cek: DynCekStore = Arc::new(InMemoryContentEncryptionKeyStore::default());
                 let share: DynShareRepository = Arc::new(InMemoryShareRepository::default());
                 let pkd: DynPublicKeyDirectory = Arc::new(InMemoryPublicKeyDirectory::default());
-                Ok((cek, share, pkd))
+                let last_seen: DynLastSeenStore = Arc::new(InMemoryLastSeenVersionStore::default());
+                Ok((cek, share, pkd, last_seen))
             }
             PersistenceConfig::Sled { dir } => {
                 if let Err(e) = std::fs::create_dir_all(dir) {
@@ -239,17 +254,19 @@ impl MonasController {
                     )));
                 }
                 // sled は path 単位で flock を取るので 1 度だけ開く。
-                // `sled::Db` は Arc ベースで Clone 可能なので、3 つのストアに同じ Db を渡す。
+                // `sled::Db` は Arc ベースで Clone 可能なので、4 つのストアに同じ Db を渡す。
                 let db = sled::open(dir).map_err(|e| {
                     ApiError::Internal(format!("failed to open sled DB at {dir:?}: {e}"))
                 })?;
                 let cek = SledContentEncryptionKeyStore::with_db(db.clone());
                 let share = SledShareRepository::with_db(db.clone());
-                let pkd = SledPublicKeyDirectory::with_db(db);
+                let pkd = SledPublicKeyDirectory::with_db(db.clone());
+                let last_seen = SledLastSeenVersionStore::with_db(db);
                 let cek: DynCekStore = Arc::new(cek);
                 let share: DynShareRepository = Arc::new(share);
                 let pkd: DynPublicKeyDirectory = Arc::new(pkd);
-                Ok((cek, share, pkd))
+                let last_seen: DynLastSeenStore = Arc::new(last_seen);
+                Ok((cek, share, pkd, last_seen))
             }
         }
     }

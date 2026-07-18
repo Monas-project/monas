@@ -4,14 +4,84 @@ use base64::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::common::{generate_trace_id, ApiError, ApiResponse, StateNodeAuthContext};
+use crate::common::{
+    encode_base64url, generate_trace_id, ApiError, ApiResponse, StateNodeAuthContext,
+};
 use crate::models::state::{
     GetHistoryInput, GetHistoryOutput, GetLatestVersionInput, GetLatestVersionOutput,
-    VerifyIntegrityInput, VerifyIntegrityOutput,
+    ReadContentFromStateNodeInput, ReadContentFromStateNodeOutput, VerifyIntegrityInput,
+    VerifyIntegrityOutput,
 };
 use crate::models::state_node::{StateNodeContentDataResponse, StateNodeContentHistoryResponse};
 
 use super::MonasController;
+
+/// read 単調性チェックの記録先
+/// (`docs/design/read-response-integrity.md` コンポーネント B)。
+pub(super) type DynLastSeenStore = std::sync::Arc<
+    dyn monas_content::infrastructure::last_seen_version_store::LastSeenVersionStore,
+>;
+
+/// 単調性チェックの祖先探索で fetch する Node 数の上限。
+///
+/// 前回 read から `MAX_MONOTONICITY_FETCHES` 版を超えて履歴が進んでいた場合、
+/// 探索は fail-closed で中断される(`AncestorWalkOutcome::BoundExceeded`)。
+/// 攻撃者が偽の深い DAG を返してクライアントに際限なく fetch させる DoS を防ぐ。
+const MAX_MONOTONICITY_FETCHES: usize = 256;
+
+/// `walk_ancestors_for` の結果。
+#[derive(Debug, PartialEq, Eq)]
+enum AncestorWalkOutcome {
+    /// `target` が祖先に見つかった = 今回の版は前回受理した版の子孫(単調)。
+    FoundTarget,
+    /// DAG を(bound 内で)出し尽くしたが `target` が祖先にいない
+    /// = 後退(ロールバック/stale relay の固定)。
+    Exhausted,
+    /// fetch 上限に達した。fail-closed で拒否する。
+    BoundExceeded,
+}
+
+/// 今回読んだ版の親 CID 群から祖先 DAG を辿り、`target`(前回受理した版)が
+/// 祖先に含まれるかを判定する。
+///
+/// `fetch_parents(cid)` は「その CID の Node を取得し、**CID 再計算で検証した上で**
+/// parents を返す」こと。検証済みの親のみを辿ることで、攻撃者が偽の親リンクで
+/// `target` を「祖先に見せかける」ことはできない(偽 Node は CID が一致しない)。
+fn walk_ancestors_for(
+    start_parents: &[String],
+    target: &str,
+    max_fetches: usize,
+    mut fetch_parents: impl FnMut(&str) -> Result<Vec<String>, String>,
+) -> Result<AncestorWalkOutcome, String> {
+    use std::collections::{HashSet, VecDeque};
+
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut frontier: VecDeque<String> = VecDeque::new();
+    for p in start_parents {
+        if visited.insert(p.clone()) {
+            frontier.push_back(p.clone());
+        }
+    }
+
+    let mut fetches = 0usize;
+    while let Some(cid) = frontier.pop_front() {
+        if cid == target {
+            return Ok(AncestorWalkOutcome::FoundTarget);
+        }
+        if fetches >= max_fetches {
+            return Ok(AncestorWalkOutcome::BoundExceeded);
+        }
+        fetches += 1;
+        let parents = fetch_parents(&cid)?;
+        for p in parents {
+            if visited.insert(p.clone()) {
+                frontier.push_back(p);
+            }
+        }
+    }
+
+    Ok(AncestorWalkOutcome::Exhausted)
+}
 
 impl MonasController {
     fn validate_state_content_id<T>(content_id: &str, trace_id: String) -> Option<ApiResponse<T>> {
@@ -222,6 +292,291 @@ impl MonasController {
         )
     }
 
+    /// State Node の Node CBOR を取得し、CID 検証済みの親 CID リストを返す。
+    /// 単調性チェックの祖先探索用フェッチャ。
+    fn fetch_verified_parents(
+        &self,
+        remote_content_id: &str,
+        version_cid: &str,
+        auth: Option<&StateNodeAuthContext>,
+        trace_id: &str,
+    ) -> Result<Vec<String>, String> {
+        let data = self
+            .get_state_node_version_data::<()>(
+                remote_content_id,
+                version_cid,
+                auth,
+                trace_id.to_string(),
+            )
+            .map_err(|e| format!("failed to fetch ancestor node {version_cid}: {:?}", e.error))?;
+
+        let node_bytes = BASE64_STANDARD
+            .decode(&data.data)
+            .map_err(|e| format!("invalid base64 data for ancestor node {version_cid}: {e}"))?;
+
+        let verified = monas_content::infrastructure::node_verification::verify_and_extract(
+            &node_bytes,
+            version_cid,
+        )
+        .map_err(|e| format!("ancestor node {version_cid} failed CID verification: {e}"))?;
+
+        Ok(verified.parents)
+    }
+
+    /// State Node から content を読み、検証・復号して平文を返す(検証付き read)。
+    ///
+    /// `docs/design/read-response-integrity.md` の実 read 経路。処理フロー:
+    /// 1. `read:{content_id}:{timestamp}` 署名の認証コンテキストを解決
+    /// 2. 版を決定(`input.version` 指定があればその版、無ければ履歴の最新)
+    /// 3. Node CBOR を取得し、CID 再計算で改ざん検証(コンポーネント A)
+    /// 4. 最新読みの場合のみ、単調性チェック(コンポーネント B):
+    ///    前回受理した版が今回の版の祖先でなければ後退として拒否
+    /// 5. ローカル cek_store から CEK を引き、AES-GCM 復号 + plain CID 照合
+    ///
+    /// CEK は「自分が作成した content」または「share の KeyEnvelope を処理済みの
+    /// content」(`decrypt_shared_content` が保存する)についてローカルに存在する。
+    ///
+    /// 既知の限界(設計 §2): 正規 member 自身による stale/ロールバックのうち、
+    /// クライアントが一度も見ていない範囲は検出できない(否定的事実は証明不能)。
+    pub fn read_content_from_state_node(
+        &self,
+        input: ReadContentFromStateNodeInput,
+        auth: Option<&StateNodeAuthContext>,
+    ) -> ApiResponse<ReadContentFromStateNodeOutput> {
+        let trace_id = generate_trace_id();
+
+        if let Some(response) = Self::validate_state_content_id(&input.content_id, trace_id.clone())
+        {
+            return response;
+        }
+        if input.local_content_id.is_empty() {
+            return ApiResponse::error(
+                ApiError::Validation("local_content_id must not be empty".into()),
+                trace_id,
+            );
+        }
+
+        let auth = match self.resolve_state_read_auth::<ReadContentFromStateNodeOutput>(
+            auth,
+            &input.content_id,
+            &trace_id,
+        ) {
+            Ok(resolved) => resolved,
+            Err(e) => return e,
+        };
+        let auth = auth.as_ref();
+
+        // 版の決定。明示指定が無ければ履歴の最新を読む。
+        // 履歴は署名も系列検証も無い(信頼できない)が、ここで版を「選ぶ」だけで、
+        // 選ばれた版の中身は CID 検証(A)、新しさは単調性チェック(B)が守る。
+        let (version, is_latest_read) = match input.version.clone() {
+            Some(v) => (v, false),
+            None => {
+                let history = match self.get_state_node_history::<ReadContentFromStateNodeOutput>(
+                    &input.content_id,
+                    auth,
+                    trace_id.clone(),
+                ) {
+                    Ok(h) => h,
+                    Err(e) => return e,
+                };
+                let latest = history
+                    .versions
+                    .last()
+                    .cloned()
+                    .unwrap_or_else(|| input.content_id.clone());
+                (latest, true)
+            }
+        };
+
+        // Node CBOR の取得 + CID 検証(A)
+        let state_node_data = match self
+            .get_state_node_version_data::<ReadContentFromStateNodeOutput>(
+                &input.content_id,
+                &version,
+                auth,
+                trace_id.clone(),
+            ) {
+            Ok(d) => d,
+            Err(e) => return e,
+        };
+
+        let node_bytes = match BASE64_STANDARD.decode(&state_node_data.data) {
+            Ok(b) => b,
+            Err(e) => {
+                return ApiResponse::error(
+                    ApiError::Internal(format!("invalid base64 data from state node: {e}")),
+                    trace_id,
+                );
+            }
+        };
+
+        let verified = match monas_content::infrastructure::node_verification::verify_and_extract(
+            &node_bytes,
+            &version,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                return ApiResponse::error(
+                    ApiError::Internal(format!(
+                        "state node response failed CID verification (tampered response?): {e}"
+                    )),
+                    trace_id,
+                );
+            }
+        };
+
+        // 単調性チェック(B)。最新読みのときだけ働く。版を明示指定した read は
+        // 「過去の版を意図的に読む」正当な操作なので、A(CID 検証)のみ。
+        if is_latest_read {
+            if let Err(e) = self.enforce_read_monotonicity(
+                &input.content_id,
+                &version,
+                &verified.parents,
+                auth,
+                &trace_id,
+            ) {
+                return *e;
+            }
+        }
+
+        // CEK ロード + AES-GCM 復号 + plain CID 照合
+        let local_content_id =
+            monas_content::domain::content_id::ContentId::new(input.local_content_id.clone());
+        let plaintext = match self.content_service.verify_and_decrypt_relay_read(
+            &node_bytes,
+            &version,
+            local_content_id,
+        ) {
+            Ok(read) => read.plaintext,
+            Err(e) => {
+                return ApiResponse::error(
+                    Self::map_verified_read_error(e, &input.local_content_id),
+                    trace_id,
+                );
+            }
+        };
+
+        ApiResponse::success(
+            ReadContentFromStateNodeOutput {
+                content_id: input.content_id,
+                local_content_id: input.local_content_id,
+                version,
+                content: encode_base64url(&plaintext),
+            },
+            trace_id,
+        )
+    }
+
+    /// 最新読みの単調性チェック本体。前回受理した版(`last_seen`)が今回の版の
+    /// 祖先(または同一)であることを、CID 検証済みの親リンクを辿って確認する。
+    /// 通過したら `last_seen` を今回の版へ更新する。
+    fn enforce_read_monotonicity(
+        &self,
+        remote_content_id: &str,
+        version: &str,
+        parents: &[String],
+        auth: Option<&StateNodeAuthContext>,
+        trace_id: &str,
+    ) -> Result<(), Box<ApiResponse<ReadContentFromStateNodeOutput>>> {
+        let last_seen = self.last_seen_store.load(remote_content_id).map_err(|e| {
+            Box::new(ApiResponse::error(
+                ApiError::Internal(format!("failed to load last-seen version: {e}")),
+                trace_id.to_string(),
+            ))
+        })?;
+
+        match last_seen.as_deref() {
+            // 初回(記録なし)は TOFU で受理し、下で記録する。
+            None => {}
+            // 同じ版を読み直しただけ。
+            Some(l) if l == version => return Ok(()),
+            Some(l) => {
+                let outcome = walk_ancestors_for(parents, l, MAX_MONOTONICITY_FETCHES, |cid| {
+                    self.fetch_verified_parents(remote_content_id, cid, auth, trace_id)
+                })
+                .map_err(|e| {
+                    Box::new(ApiResponse::error(
+                        ApiError::Internal(format!("monotonicity ancestor walk failed: {e}")),
+                        trace_id.to_string(),
+                    ))
+                })?;
+
+                match outcome {
+                    AncestorWalkOutcome::FoundTarget => {}
+                    AncestorWalkOutcome::Exhausted => {
+                        return Err(Box::new(ApiResponse::error(
+                            ApiError::Conflict(format!(
+                                "version regression detected: state node returned {version} as latest, \
+                                 but previously accepted version {l} is not among its ancestors \
+                                 (possible rollback attack or stale relay)"
+                            )),
+                            trace_id.to_string(),
+                        )));
+                    }
+                    AncestorWalkOutcome::BoundExceeded => {
+                        return Err(Box::new(ApiResponse::error(
+                            ApiError::Conflict(format!(
+                                "monotonicity check aborted: ancestor walk exceeded \
+                                 {MAX_MONOTONICITY_FETCHES} fetches without reaching previously \
+                                 accepted version {l}; rejecting read (fail-closed)"
+                            )),
+                            trace_id.to_string(),
+                        )));
+                    }
+                }
+            }
+        }
+
+        self.last_seen_store
+            .save(remote_content_id, version)
+            .map_err(|e| {
+                Box::new(ApiResponse::error(
+                    ApiError::Internal(format!("failed to record last-seen version: {e}")),
+                    trace_id.to_string(),
+                ))
+            })
+    }
+
+    /// `verify_and_decrypt_relay_read` のエラーを、呼び出し側が対処を判断できる
+    /// `ApiError` へ写像する。特に「CEK が無い」「CEK が合わない」は
+    /// share / rotation / revoke のどの状況かをメッセージで区別する。
+    fn map_verified_read_error(
+        e: monas_content::application_service::content_service::VerifiedReadError,
+        local_content_id: &str,
+    ) -> ApiError {
+        use monas_content::application_service::content_service::{
+            DecryptWithCekError, VerifiedReadError,
+        };
+        match e {
+            VerifiedReadError::NodeVerification(err) => ApiError::Internal(format!(
+                "state node response failed CID verification (tampered response?): {err}"
+            )),
+            VerifiedReadError::KeyStore(err) => {
+                ApiError::Internal(format!("CEK store error: {err:?}"))
+            }
+            VerifiedReadError::MissingKey => ApiError::NotFound(format!(
+                "no content encryption key for local content {local_content_id} on this device: \
+                 the content was neither created here nor received via share on this device. \
+                 Process its share KeyEnvelope (POST /share/decrypt) first."
+            )),
+            VerifiedReadError::Decrypt(DecryptWithCekError::Domain(_)) => ApiError::Forbidden(
+                "decryption failed with the locally stored CEK: the key may be stale after a CEK \
+                 rotation, or your access may have been revoked. If you still have access, \
+                 re-process the latest share KeyEnvelope to refresh the stored CEK."
+                    .to_string(),
+            ),
+            VerifiedReadError::Decrypt(DecryptWithCekError::ContentIdMismatch {
+                expected,
+                actual,
+            }) => ApiError::Conflict(format!(
+                "decrypted content does not match local_content_id (expected {expected}, got \
+                 {actual}): the content has likely been updated — pass the local content id that \
+                 corresponds to the version being read"
+            )),
+        }
+    }
+
     /// 取得したコンテンツの整合性を検証する。
     ///
     /// `auth` は State Node の履歴・バージ取得 API に転送する認証ヘッダ。本番では `Some` が必要。
@@ -384,5 +739,124 @@ impl MonasController {
             },
             trace_id,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{walk_ancestors_for, AncestorWalkOutcome};
+    use std::collections::HashMap;
+
+    /// cid -> parents のテーブルからフェッチャを作る。
+    fn table_fetcher(
+        table: HashMap<&'static str, Vec<&'static str>>,
+    ) -> impl FnMut(&str) -> Result<Vec<String>, String> {
+        move |cid: &str| {
+            table
+                .get(cid)
+                .map(|ps| ps.iter().map(|s| s.to_string()).collect())
+                .ok_or_else(|| format!("unknown cid {cid}"))
+        }
+    }
+
+    #[test]
+    fn finds_target_in_direct_parents_without_fetching() {
+        // 直接の親に target がいれば fetch は 1 度も要らない
+        let mut fetch_count = 0;
+        let outcome = walk_ancestors_for(
+            &["target".to_string(), "other".to_string()],
+            "target",
+            10,
+            |_| {
+                fetch_count += 1;
+                Ok(vec![])
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome, AncestorWalkOutcome::FoundTarget);
+        assert_eq!(fetch_count, 0);
+    }
+
+    #[test]
+    fn finds_target_deeper_in_chain() {
+        // v3 -> v2 -> v1(target) -> genesis
+        let outcome = walk_ancestors_for(
+            &["v2".to_string()],
+            "v1",
+            10,
+            table_fetcher(HashMap::from([
+                ("v2", vec!["v1"]),
+                ("v1", vec!["genesis"]),
+                ("genesis", vec![]),
+            ])),
+        )
+        .unwrap();
+        assert_eq!(outcome, AncestorWalkOutcome::FoundTarget);
+    }
+
+    #[test]
+    fn exhausted_when_target_not_ancestor() {
+        // 後退シナリオ: 古い版の祖先には新しい target がいない
+        let outcome = walk_ancestors_for(
+            &["genesis".to_string()],
+            "newer-version",
+            10,
+            table_fetcher(HashMap::from([("genesis", vec![])])),
+        )
+        .unwrap();
+        assert_eq!(outcome, AncestorWalkOutcome::Exhausted);
+    }
+
+    #[test]
+    fn exhausted_immediately_for_genesis_read() {
+        // genesis(親なし)を「最新」と偽られたケース: 探索なしで後退確定
+        let outcome =
+            walk_ancestors_for(&[], "newer-version", 10, |_| panic!("must not fetch")).unwrap();
+        assert_eq!(outcome, AncestorWalkOutcome::Exhausted);
+    }
+
+    #[test]
+    fn bound_exceeded_is_fail_closed() {
+        // 際限なく親が続く偽 DAG は上限で打ち切る
+        let mut i = 0;
+        let outcome = walk_ancestors_for(&["n0".to_string()], "never-found", 5, |_| {
+            i += 1;
+            Ok(vec![format!("n{i}")])
+        })
+        .unwrap();
+        assert_eq!(outcome, AncestorWalkOutcome::BoundExceeded);
+    }
+
+    #[test]
+    fn diamond_dag_is_deduplicated() {
+        // merge を含む DAG(v3 の親 v2a, v2b が共通祖先 v1 を持つ)でも
+        // 同じノードを二度 fetch しない
+        let mut fetched: Vec<String> = vec![];
+        let outcome = walk_ancestors_for(
+            &["v2a".to_string(), "v2b".to_string()],
+            "genesis",
+            10,
+            |cid: &str| {
+                fetched.push(cid.to_string());
+                Ok(match cid {
+                    "v2a" | "v2b" => vec!["v1".to_string()],
+                    "v1" => vec!["genesis".to_string()],
+                    _ => vec![],
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome, AncestorWalkOutcome::FoundTarget);
+        // v1 は 1 度だけ fetch される
+        assert_eq!(fetched.iter().filter(|c| c.as_str() == "v1").count(), 1);
+    }
+
+    #[test]
+    fn fetch_error_propagates() {
+        let err = walk_ancestors_for(&["v2".to_string()], "v1", 10, |_| {
+            Err("network down".to_string())
+        })
+        .unwrap_err();
+        assert!(err.contains("network down"));
     }
 }
