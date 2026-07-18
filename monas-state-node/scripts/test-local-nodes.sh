@@ -83,7 +83,7 @@ check_nodes_running() {
     log_info "ノードの起動状態を確認しています..."
 
     local all_running=true
-    for port in 8080 8081 8082; do
+    for port in 8080 8081 8082 8083; do
         if curl -s "http://127.0.0.1:$port/health" > /dev/null 2>&1; then
             log_success "ノード (ポート $port) は起動しています"
         else
@@ -116,6 +116,7 @@ echo ""
 test_request "ノード1のヘルスチェック" GET "http://127.0.0.1:8080/health"
 test_request "ノード2のヘルスチェック" GET "http://127.0.0.1:8081/health"
 test_request "ノード3のヘルスチェック" GET "http://127.0.0.1:8082/health"
+test_request "ノード4のヘルスチェック" GET "http://127.0.0.1:8083/health"
 
 echo ""
 echo -e "${BLUE}=== ノード登録テスト ===${NC}"
@@ -132,6 +133,9 @@ NODE2_ID=$(echo "$NODE2_INFO" | jq -r '.node_id')
 
 test_request "ノード3の情報取得" GET "http://127.0.0.1:8082/node/info"
 NODE3_INFO=$(curl -s http://127.0.0.1:8082/node/info)
+
+test_request "ノード4の情報取得" GET "http://127.0.0.1:8083/node/info"
+NODE4_INFO=$(curl -s http://127.0.0.1:8083/node/info)
 NODE3_ID=$(echo "$NODE3_INFO" | jq -r '.node_id')
 
 # ノード登録
@@ -220,7 +224,7 @@ echo "  - 'CRDT merge completed'"
 # ディスク容量の確認
 echo ""
 log_test "ディスク容量の確認"
-for port in 8080 8081 8082; do
+for port in 8080 8081 8082 8083; do
     node_info=$(curl -s "http://127.0.0.1:$port/node/info")
     if [ $? -eq 0 ]; then
         total_capacity=$(echo "$node_info" | jq -r '.total_capacity // "不明"')
