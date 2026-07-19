@@ -63,11 +63,17 @@ pub struct Capability {
 /// アクション種別（AuthToken用）
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CapabilityAction {
+    #[serde(rename = "read")]
     Read,
+    #[serde(rename = "write")]
     Write,
+    #[serde(rename = "delete")]
     Delete,
+    #[serde(rename = "share")]
     Share,
+    #[serde(rename = "revoke")]
     Revoke,
+    #[serde(rename = "reencrypt")]
     Reencrypt,
 }
 

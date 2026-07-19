@@ -65,16 +65,14 @@ impl UcanAdapter {
     /// * `identity` - The Identity to convert
     ///
     /// # Returns
-    /// Key ID string in format "monas:type:id"
-    /// For self-contained key IDs, id is the hex-encoded public key,
-    /// e.g., "monas:user:04abcd..."
+    /// Key ID string in format "type:id".
     fn identity_to_key_id(identity: &Identity) -> String {
         let identity_type = match identity.identity_type() {
             IdentityType::User => "user",
             IdentityType::Node => "node",
             IdentityType::Service => "service",
         };
-        format!("monas:{}:{}", identity_type, identity.id())
+        format!("{}:{}", identity_type, identity.id())
     }
 
     /// Extract public key bytes from a self-contained key ID.
