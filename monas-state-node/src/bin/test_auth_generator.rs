@@ -219,9 +219,7 @@ struct DelegatedPayload {
 fn build_delegated_request_message(jwt: &str) -> String {
     let parts: Vec<&str> = jwt.split('.').collect();
     if parts.len() != 3 {
-        eprintln!(
-            "Error: Invalid --auth-token format (expected header.payload.signature)"
-        );
+        eprintln!("Error: Invalid --auth-token format (expected header.payload.signature)");
         std::process::exit(1);
     }
 
