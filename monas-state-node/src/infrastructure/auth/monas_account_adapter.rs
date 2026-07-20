@@ -163,6 +163,14 @@ impl MonasAccountAdapter {
         Self::extract_public_key_from_key_id(&parsed.payload.aud)?;
         Identity::new(id, identity_type).context("Failed to create Identity from JWT audience")
     }
+
+    fn redact_token_for_log(token: &str) -> String {
+        if !token.contains('.') {
+            return token.to_string();
+        }
+        let prefix: String = token.chars().take(12).collect();
+        format!("jwt:{}...(len={})", prefix, token.len())
+    }
 }
 
 impl Default for MonasAccountAdapter {
@@ -187,7 +195,7 @@ impl AuthenticationService for MonasAccountAdapter {
         if let Some(ctx) = context {
             tracing::debug!(
                 "Authentication for {} (operation: {}, content_id: {})",
-                raw,
+                Self::redact_token_for_log(raw),
                 ctx.operation,
                 ctx.content_id
             );
