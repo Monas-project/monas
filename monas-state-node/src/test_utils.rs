@@ -418,7 +418,7 @@ impl ContentRepository for MockContentRepository {
     async fn get_version(&self, version_cid: &str) -> Result<Option<Vec<u8>>> {
         // For simplicity, return the first content that matches
         let contents = self.contents.lock().await;
-        for (genesis_cid, _) in contents.iter() {
+        for genesis_cid in contents.keys() {
             if let Some(history) = self.history.lock().await.get(genesis_cid) {
                 if history.contains(&version_cid.to_string()) {
                     return Ok(contents.get(genesis_cid).cloned());

@@ -90,8 +90,8 @@ fn generate_test_auth_data() {
 
     // Machine-readable output for script consumption
     println!("PRIVATE_KEY={}", hex::encode(private_key_bytes));
-    println!("PUBLIC_KEY={}", &public_key_hex);
-    println!("KEY_ID=user:{}", &public_key_hex);
+    println!("PUBLIC_KEY={}", public_key_hex);
+    println!("KEY_ID=user:{}", public_key_hex);
 }
 
 /// Sign a request with the correct message format.
