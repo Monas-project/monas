@@ -65,16 +65,14 @@ impl UcanAdapter {
     /// * `identity` - The Identity to convert
     ///
     /// # Returns
-    /// Key ID string in format "monas:type:id"
-    /// For self-contained key IDs, id is the hex-encoded public key,
-    /// e.g., "monas:user:04abcd..."
+    /// Key ID string in format "type:id".
     fn identity_to_key_id(identity: &Identity) -> String {
         let identity_type = match identity.identity_type() {
             IdentityType::User => "user",
             IdentityType::Node => "node",
             IdentityType::Service => "service",
         };
-        format!("monas:{}:{}", identity_type, identity.id())
+        format!("{}:{}", identity_type, identity.id())
     }
 
     /// Extract public key bytes from a self-contained key ID.
@@ -237,6 +235,7 @@ impl UcanAdapter {
         token: &InfraAuthToken,
         request: &AuthorizationRequest,
         min_valid_issued_at: u64,
+        owner_identity: &Identity,
     ) -> Result<()> {
         // 1. Check expiration
         if token.is_expired() {
@@ -281,7 +280,17 @@ impl UcanAdapter {
             );
         }
 
-        // 4. Check JTI uniqueness (adapter layer - replay attack prevention)
+        // 4. Ensure issuer is the content owner.
+        let owner_key_id = Self::identity_to_key_id(owner_identity);
+        if token.payload.iss != owner_key_id {
+            anyhow::bail!(
+                "AuthToken issuer mismatch: expected owner {}, got {}",
+                owner_key_id,
+                token.payload.iss
+            );
+        }
+
+        // 5. Check JTI uniqueness (adapter layer - replay attack prevention)
         if let Some(nonce_store) = &self.nonce_store {
             if !nonce_store
                 .check_and_record_nonce(&token.payload.jti)
@@ -291,13 +300,13 @@ impl UcanAdapter {
             }
         }
 
-        // 5. Extract owner's public key from key ID and verify AuthToken signature
+        // 6. Extract owner's public key from key ID and verify AuthToken signature
         let owner_public_key = Self::get_public_key_from_key_id(&token.payload.iss)?;
 
         SignatureVerifier::verify_auth_token_signature(token, &owner_public_key)
             .context("AuthToken signature verification failed")?;
 
-        // 6. Verify request signature (adapter layer - mandatory)
+        // 7. Verify request signature (adapter layer - mandatory)
         let request_signature = request.request_signature.as_ref().ok_or_else(|| {
             anyhow::anyhow!("Request signature is required for AuthToken-based authorization")
         })?;
@@ -318,7 +327,7 @@ impl UcanAdapter {
         )
         .context("Request signature verification failed")?;
 
-        // 7. Check capability (domain-level check, using infra token's capability format)
+        // 8. Check capability (domain-level check, using infra token's capability format)
         let required_action =
             crate::infrastructure::auth::auth_token::CapabilityAction::from_auth_capability(
                 &request.capability,
@@ -341,13 +350,14 @@ impl UcanAdapter {
         token: &AuthToken,
         request: &AuthorizationRequest,
         min_valid_issued_at: u64,
+        owner_identity: &Identity,
     ) -> Result<bool> {
         // 1. Parse AuthToken
         let auth_token = self.parse_auth_token(token.as_str())?;
 
         // 2. Verify AuthToken (domain verifier checks signature, expiration, audience,
         //    capability, and access control; adapter checks JTI and request signature)
-        self.verify_auth_token(&auth_token, request, min_valid_issued_at)
+        self.verify_auth_token(&auth_token, request, min_valid_issued_at, owner_identity)
             .await?;
 
         Ok(true)
@@ -385,7 +395,12 @@ impl AuthorizationService for UcanAdapter {
 
         // 4. Check AuthToken (delegated access) with min_valid_issued_at
         match self
-            .check_auth_token_authorization(token, request, policy.min_valid_issued_at())
+            .check_auth_token_authorization(
+                token,
+                request,
+                policy.min_valid_issued_at(),
+                policy.owner(),
+            )
             .await
         {
             Ok(true) => Ok(AuthorizationResult::Granted),
@@ -788,6 +803,59 @@ mod tests {
         assert!(
             result.is_denied(),
             "AuthToken authorization should be denied for wrong capability"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_auth_token_authorization_denied_when_issuer_is_not_owner() {
+        use crate::infrastructure::auth::test_helpers::TestKeyPair;
+        use crate::port::auth_token::AuthToken;
+
+        // Setup
+        let alice_owner = TestKeyPair::generate("user", "alice");
+        let mallory_attacker = TestKeyPair::generate("user", "mallory");
+        let bob_recipient = TestKeyPair::generate("user", "bob");
+        let repo = Arc::new(MockContentRepo::new());
+        let adapter = UcanAdapter::new(repo.clone());
+
+        let content_id = ContentId::new("test-content-owner-bound".to_string()).unwrap();
+        let owner_identity = identity_from_key(&alice_owner);
+        let policy = AccessPolicy::new(content_id.clone(), owner_identity);
+        repo.policies
+            .write()
+            .await
+            .insert("test-content-owner-bound".to_string(), policy);
+
+        // Mallory (non-owner) self-issues a token for Bob.
+        let forged_token = mallory_attacker.create_auth_token(
+            &bob_recipient,
+            "monas://content/test-content-owner-bound",
+            vec![crate::infrastructure::auth::auth_token::CapabilityAction::Write],
+            Some(3600),
+        );
+        let request_sig = bob_recipient.sign_request(&forged_token);
+        let token = AuthToken::new(forged_token.to_jwt().unwrap());
+
+        let request = AuthorizationRequest {
+            identity: identity_from_key(&bob_recipient),
+            resource: content_id,
+            capability: AuthCapability::WriteContent,
+            token: Some(token),
+            request_signature: Some(request_sig),
+        };
+
+        let result = adapter.authorize(&request).await.unwrap();
+        assert!(
+            result.is_denied(),
+            "Authorization must be denied when token issuer is not owner"
+        );
+        assert!(
+            result
+                .denial_reason()
+                .unwrap_or_default()
+                .contains("issuer mismatch"),
+            "Expected issuer mismatch denial, got: {:?}",
+            result
         );
     }
 

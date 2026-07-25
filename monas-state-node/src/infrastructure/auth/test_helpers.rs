@@ -31,7 +31,7 @@ impl TestKeyPair {
     /// * `_name` - Unused (kept for API compatibility). Key ID is derived from public key.
     ///
     /// # Returns
-    /// A new TestKeyPair with self-contained key ID format: "monas:type:{public_key_hex}"
+    /// A new TestKeyPair with self-contained key ID format: "type:{public_key_hex}"
     pub fn generate(identity_type: &str, _name: &str) -> Self {
         let secret = SecretKey::random(&mut OsRng);
         let signing_key = SigningKey::from(secret);
@@ -40,7 +40,7 @@ impl TestKeyPair {
         // Get uncompressed public key (65 bytes: 0x04 + X + Y)
         let public_key_bytes = verifying_key.to_encoded_point(false).as_bytes().to_vec();
 
-        let key_id = format!("monas:{}:{}", identity_type, hex::encode(&public_key_bytes));
+        let key_id = format!("{}:{}", identity_type, hex::encode(&public_key_bytes));
 
         Self {
             secret_key: signing_key,
@@ -161,7 +161,7 @@ impl TestPublicKeyRepository {
     /// Register a public key for a key ID
     ///
     /// # Arguments
-    /// * `key_id` - The key ID to register (format: "monas:type:id")
+    /// * `key_id` - The key ID to register (format: "type:id")
     /// * `public_key` - The public key bytes (uncompressed format)
     pub fn register(&mut self, key_id: &str, public_key: Vec<u8>) {
         self.keys.insert(key_id.to_string(), public_key);
@@ -208,11 +208,11 @@ mod tests {
     #[test]
     fn test_generate_key_pair() {
         let alice = TestKeyPair::generate("user", "alice");
-        assert!(alice.key_id().starts_with("monas:user:04"));
+        assert!(alice.key_id().starts_with("user:04"));
         assert_eq!(alice.public_key().len(), 65); // Uncompressed P256 key
         assert_eq!(alice.public_key()[0], 0x04); // Uncompressed format marker
                                                  // key_id should contain the full hex-encoded public key
-        let expected_key_id = format!("monas:user:{}", hex::encode(alice.public_key()));
+        let expected_key_id = format!("user:{}", hex::encode(alice.public_key()));
         assert_eq!(alice.key_id(), expected_key_id);
     }
 

@@ -10,6 +10,7 @@ use crate::domain::events::{current_timestamp, Event};
 use crate::domain::identity::Identity;
 use crate::domain::state_node::{self, NodeSnapshot};
 use crate::domain::value_objects::ContentId;
+use crate::infrastructure::auth::auth_token::AuthToken as InfraAuthToken;
 use crate::infrastructure::crypto::verify_p256_signature;
 use crate::infrastructure::placement::compute_dht_key;
 use crate::port::auth_token::{AuthToken, RequestMetadata};
@@ -244,19 +245,12 @@ where
             .await
             .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))?;
 
-        // Verify caller signature:
-        // - JWT tokens: verify JWT's own P-256 signature
-        // - type:id tokens: verify request signature (mandatory)
-        let sig = if token.as_str().contains('.') {
-            // JWT: signature is inside the token itself, pass empty slice
-            &[] as &[u8]
-        } else {
-            request_signature.ok_or_else(|| {
-                StateNodeError::AuthenticationFailed(
-                    "Request signature is required for non-JWT tokens".to_string(),
-                )
-            })?
-        };
+        // Verify caller signature for all token types.
+        // JWT: proof-of-possession via "{iss}:{aud}:{jti}" request signature
+        // type:id: metadata/body based request signature
+        let sig = request_signature.ok_or_else(|| {
+            StateNodeError::AuthenticationFailed("Request signature is required".to_string())
+        })?;
         self.verify_caller_signature(
             auth_service.as_ref(),
             token,
@@ -274,9 +268,9 @@ where
     /// Verify the caller's request signature.
     ///
     /// For JWT tokens (containing `.`), verifies the JWT's own P-256 signature
-    /// via `AuthenticationService::verify_jwt_signature`. JWT tokens contain
-    /// operation/resource/timestamp in their payload, so no separate request
-    /// body signature is needed.
+    /// via `AuthenticationService::verify_jwt_signature`, and enforces
+    /// caller proof-of-possession by verifying request signature over
+    /// "{iss}:{aud}:{jti}" using the audience key.
     ///
     /// For `type:id` tokens (e.g., `user:alice`), constructs a signing message
     /// and delegates to `AuthenticationService::verify_request_signature`:
@@ -293,14 +287,40 @@ where
         timestamp: Option<u64>,
         request_body: Option<&[u8]>,
     ) -> Result<(), StateNodeError> {
-        // JWT tokens: verify the JWT's own signature
+        // JWT tokens: verify JWT signature + request proof-of-possession.
         if token.as_str().contains('.') {
-            return auth_service.verify_jwt_signature(token).await.map_err(|e| {
+            auth_service
+                .verify_jwt_signature(token)
+                .await
+                .map_err(|e| {
+                    StateNodeError::AuthenticationFailed(format!(
+                        "JWT signature verification failed: {}",
+                        e
+                    ))
+                })?;
+
+            let parsed = InfraAuthToken::from_jwt(token.as_str()).map_err(|e| {
                 StateNodeError::AuthenticationFailed(format!(
-                    "JWT signature verification failed: {}",
+                    "Failed to parse JWT for request signature verification: {}",
                     e
                 ))
-            });
+            })?;
+
+            let pop_message = format!(
+                "{}:{}:{}",
+                parsed.payload.iss, parsed.payload.aud, parsed.payload.jti
+            );
+            auth_service
+                .verify_request_signature(token, signature, &pop_message, timestamp)
+                .await
+                .map_err(|e| {
+                    StateNodeError::AuthenticationFailed(format!(
+                        "JWT request signature verification failed: {}",
+                        e
+                    ))
+                })?;
+
+            return Ok(());
         }
 
         // non-JWT tokens: verify request signature
@@ -1402,18 +1422,10 @@ where
             .await
             .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))?;
 
-        // 2.5. Verify request signature (mandatory)
-        // JWT tokens: signature is inside the token itself, pass empty slice
-        // type:id tokens: require request signature
-        let sig = if token.as_str().contains('.') {
-            &[] as &[u8]
-        } else {
-            request_signature.ok_or_else(|| {
-                StateNodeError::AuthenticationFailed(
-                    "Request signature is required for non-JWT tokens".to_string(),
-                )
-            })?
-        };
+        // 2.5. Verify request signature (mandatory for all token types)
+        let sig = request_signature.ok_or_else(|| {
+            StateNodeError::AuthenticationFailed("Request signature is required".to_string())
+        })?;
         self.verify_caller_signature(
             auth_service.as_ref(),
             token,
