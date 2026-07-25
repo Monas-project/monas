@@ -155,6 +155,22 @@ impl MonasAccountAdapter {
     ) -> Result<()> {
         self.verify_signature(key_id, context).await
     }
+
+    /// Parse a delegated JWT and extract requester identity from `aud`.
+    fn parse_jwt_identity(&self, jwt: &str) -> Result<Identity> {
+        let parsed = InfraAuthToken::from_jwt(jwt).context("Failed to parse JWT token")?;
+        let (identity_type, id) = self.parse_key_id(&parsed.payload.aud)?;
+        Self::extract_public_key_from_key_id(&parsed.payload.aud)?;
+        Identity::new(id, identity_type).context("Failed to create Identity from JWT audience")
+    }
+
+    fn redact_token_for_log(token: &str) -> String {
+        if !token.contains('.') {
+            return token.to_string();
+        }
+        let prefix: String = token.chars().take(12).collect();
+        format!("jwt:{}...(len={})", prefix, token.len())
+    }
 }
 
 impl Default for MonasAccountAdapter {
@@ -174,21 +190,25 @@ impl AuthenticationService for MonasAccountAdapter {
         token: &AuthToken,
         context: Option<&AuthContext>,
     ) -> Result<Identity> {
-        let key_id = token.as_str();
-        let (identity_type, id) = self.parse_key_id(key_id)?;
+        let raw = token.as_str();
 
         if let Some(ctx) = context {
             tracing::debug!(
                 "Authentication for {} (operation: {}, content_id: {})",
-                key_id,
+                Self::redact_token_for_log(raw),
                 ctx.operation,
                 ctx.content_id
             );
         }
 
-        // Validate the embedded public key format
-        Self::extract_public_key_from_key_id(key_id)?;
+        if raw.contains('.') {
+            // Delegated access path: token is JWT, caller identity is the audience.
+            return self.parse_jwt_identity(raw);
+        }
 
+        let (identity_type, id) = self.parse_key_id(raw)?;
+        // Validate the embedded public key format
+        Self::extract_public_key_from_key_id(raw)?;
         Identity::new(id, identity_type).context("Failed to create Identity from key ID")
     }
 
@@ -219,17 +239,27 @@ impl AuthenticationService for MonasAccountAdapter {
         message: &str,
         timestamp: Option<u64>,
     ) -> Result<()> {
-        let key_id = token.as_str();
+        let key_id = if token.as_str().contains('.') {
+            let parsed =
+                InfraAuthToken::from_jwt(token.as_str()).context("Failed to parse JWT token")?;
+            parsed.payload.aud
+        } else {
+            token.as_str().to_string()
+        };
         let context = SignatureContext::new(message.to_string(), signature.to_vec());
         let context = if let Some(ts) = timestamp {
             context.with_timestamp(ts)
         } else {
             context
         };
-        self.verify_signature(key_id, &context).await
+        self.verify_signature(&key_id, &context).await
     }
 
     async fn is_valid(&self, token: &AuthToken) -> Result<bool> {
+        if token.as_str().contains('.') {
+            return Ok(self.verify_jwt_signature(token).await.is_ok());
+        }
+
         let key_id = token.as_str();
         match Self::extract_public_key_from_key_id(key_id) {
             Ok(_) => Ok(self.parse_key_id(key_id).is_ok()),
@@ -238,6 +268,14 @@ impl AuthenticationService for MonasAccountAdapter {
     }
 
     async fn get_issuer(&self, token: &AuthToken) -> Result<Option<Identity>> {
+        if token.as_str().contains('.') {
+            let parsed = InfraAuthToken::from_jwt(token.as_str()).context("Failed to parse JWT")?;
+            let (identity_type, id) = self.parse_key_id(&parsed.payload.iss)?;
+            Self::extract_public_key_from_key_id(&parsed.payload.iss)?;
+            let identity =
+                Identity::new(id, identity_type).context("Failed to create issuer identity")?;
+            return Ok(Some(identity));
+        }
         let identity = self.authenticate(token, None).await?;
         Ok(Some(identity))
     }
