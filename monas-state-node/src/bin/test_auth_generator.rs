@@ -216,6 +216,29 @@ struct DelegatedPayload {
     jti: String,
 }
 
+/// Delegated-JWT payload with the SAME field order as monas-account's
+/// `DelegationClaims` and the state node's `AuthTokenPayload`.
+///
+/// The state node verifies JWT signatures by re-serializing the parsed
+/// payload struct, so the signing input is only reproducible when the
+/// issuer serializes fields in this exact order. `serde_json::json!` maps
+/// are alphabetical and produce tokens the state node cannot verify.
+#[derive(serde::Serialize)]
+struct ShareTokenPayload {
+    iss: String,
+    aud: String,
+    exp: u64,
+    iat: u64,
+    jti: String,
+    att: Vec<ShareTokenCapability>,
+}
+
+#[derive(serde::Serialize)]
+struct ShareTokenCapability {
+    with: String,
+    can: String,
+}
+
 fn build_delegated_request_message(jwt: &str) -> String {
     let parts: Vec<&str> = jwt.split('.').collect();
     if parts.len() != 3 {
@@ -360,14 +383,11 @@ fn generate_share_token(args: &[String]) {
 
     let recipient_key_id = format!("user:{}", hex::encode(&recipient_public_key_bytes));
 
-    let caps: Vec<serde_json::Value> = capabilities_str
+    let caps: Vec<ShareTokenCapability> = capabilities_str
         .split(',')
-        .map(|c| {
-            let action = c.trim();
-            json!({
-                "with": format!("monas://content/{}", content_id),
-                "can": action
-            })
+        .map(|c| ShareTokenCapability {
+            with: format!("monas://content/{}", content_id),
+            can: c.trim().to_string(),
         })
         .collect();
 
@@ -384,17 +404,18 @@ fn generate_share_token(args: &[String]) {
 
     let jti = Uuid::new_v4().to_string();
 
-    let payload = json!({
-        "iss": owner_key_id,
-        "aud": recipient_key_id,
-        "exp": now + expiry,
-        "iat": now,
-        "jti": jti,
-        "att": caps
-    });
+    let payload = ShareTokenPayload {
+        iss: owner_key_id.clone(),
+        aud: recipient_key_id.clone(),
+        exp: now + expiry,
+        iat: now,
+        jti: jti.clone(),
+        att: caps,
+    };
 
     let header_b64 = URL_SAFE_NO_PAD.encode(header.to_string());
-    let payload_b64 = URL_SAFE_NO_PAD.encode(payload.to_string());
+    let payload_b64 =
+        URL_SAFE_NO_PAD.encode(serde_json::to_string(&payload).expect("payload serialization"));
 
     let signing_input = format!("{}.{}", header_b64, payload_b64);
 
