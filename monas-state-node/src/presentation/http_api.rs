@@ -193,7 +193,10 @@ impl IntoResponse for StateNodeError {
             StateNodeError::NotAMember { .. } => self.to_string(),
             StateNodeError::PermissionDenied(_) => "Permission denied".to_string(),
             StateNodeError::InvalidUcanToken(_) => "Invalid authentication token".to_string(),
-            StateNodeError::AuthenticationFailed(_) => "Authentication failed".to_string(),
+            StateNodeError::AuthenticationFailed(detail) => {
+                tracing::warn!("authentication failed: {detail}");
+                "Authentication failed".to_string()
+            }
             StateNodeError::AuthorizationFailed(_) => "Authorization failed".to_string(),
             StateNodeError::InvalidCid(_) => "Invalid content identifier".to_string(),
             StateNodeError::InvalidConfiguration(_) => "Invalid request".to_string(),
