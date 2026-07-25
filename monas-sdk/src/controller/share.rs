@@ -708,11 +708,16 @@ impl MonasController {
         //    KeyEnvelope を処理すれば保存済み CEK も新しいものへ追従する。
         //    CEK が出るのは受信者デバイスのローカルストアまでで、ネットワークには出ない。
         if let Err(e) = self.content_service.cek_store.save(&content_id, &cek) {
-            // 復号自体は成功しているので致命ではないが、後続の state node read が
-            // MissingKey で失敗する原因になるため警告は残す。
-            eprintln!(
-                "monas-sdk: failed to persist unwrapped CEK for {} (state-node reads of this shared content will fail until a KeyEnvelope is processed again): {e}",
-                content_id.as_str()
+            // 保存に失敗したまま成功を返すと、呼び出し側は「以後この端末で
+            // 検証付き read ができる」と信じるのに実際は MissingKey で失敗する。
+            // silent degradation を避けるためエラーとして返す(再処理可能)。
+            return ApiResponse::error(
+                ApiError::Internal(format!(
+                    "decrypted the shared content but failed to persist its CEK for {}: {e}. \
+                     Re-process the KeyEnvelope to enable state-node reads on this device.",
+                    content_id.as_str()
+                )),
+                trace_id,
             );
         }
 

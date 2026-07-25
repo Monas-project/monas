@@ -494,6 +494,81 @@ async fn read_rejects_tampered_node() {
     cleanup_content_artifacts();
 }
 
+/// last_seen は「復号まで含む全検証が成功した read」でしか進んではならない。
+/// CID 検証は通るが復号できない偽 Node を 1 回受けただけで pin が偽版に
+/// 汚染されると、以後の正規 read が恒久的に Conflict になる(自壊 DoS)。
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_decrypt_does_not_poison_last_seen_pin() {
+    let _guard = acquire_test_lock();
+    let mut server = Server::new_async().await;
+    let controller = MonasController::with_urls(server.url(), server.url());
+
+    let plaintext = b"pin-poison-target";
+    let created = create_and_share(&mut server, &controller, plaintext).await;
+
+    let genesis_bytes = make_node_bytes(&created.ciphertext, vec![], None);
+    let genesis_cid = recompute_node_cid(&genesis_bytes).unwrap();
+
+    // 攻撃者が鋳造した「CID は正しいが CEK で復号できない」偽 Node。
+    // parents に正規 genesis を入れて単調性チェックも通す。
+    let forged_bytes = make_node_bytes(
+        b"garbage-not-encrypted-with-cek",
+        vec![&genesis_cid],
+        Some(&genesis_cid),
+    );
+    let forged_cid = recompute_node_cid(&forged_bytes).unwrap();
+
+    // 正規の次版 v2(genesis の子、正規 ciphertext)。
+    let v2_bytes = make_node_bytes(&created.ciphertext, vec![&genesis_cid], Some(&genesis_cid));
+    let v2_cid = recompute_node_cid(&v2_bytes).unwrap();
+
+    let _g_data = mock_version_data(&mut server, &genesis_cid, &genesis_bytes).await;
+    let _forged_data = mock_version_data(&mut server, &forged_cid, &forged_bytes).await;
+    let _v2_data = mock_version_data(&mut server, &v2_cid, &v2_bytes).await;
+
+    let read_latest = || {
+        controller.read_content_from_state_node(
+            ReadContentFromStateNodeInput {
+                content_id: REMOTE_ID.into(),
+                local_content_id: created.local_content_id.clone(),
+                version: None,
+            },
+            None,
+        )
+    };
+
+    // 1. 初回(TOFU): latest = g を受理、last_seen = g
+    let history_g = mock_history(&mut server, &[&genesis_cid]).await;
+    let first = read_latest();
+    assert!(first.success, "TOFU read should succeed: {:?}", first.error);
+    history_g.remove_async().await;
+
+    // 2. 偽 Node を latest として受ける: CID 検証・単調性は通るが復号で失敗する
+    let history_forged = mock_history(&mut server, &[&genesis_cid, &forged_cid]).await;
+    let poisoned = read_latest();
+    assert!(!poisoned.success, "undecryptable forged node must fail");
+    assert!(
+        matches!(poisoned.error, Some(ApiError::Forbidden(_))),
+        "expected Forbidden(decrypt failure), got: {:?}",
+        poisoned.error
+    );
+    history_forged.remove_async().await;
+
+    // 3. 正規の latest = v2 は引き続き受理される。
+    //    (pin が forged_cid に汚染されていれば、v2 の祖先に forged が居ないため
+    //    Conflict になってしまう — それが修正前のバグ)
+    let _history_v2 = mock_history(&mut server, &[&genesis_cid, &v2_cid]).await;
+    let legit = read_latest();
+    assert!(
+        legit.success,
+        "legitimate read after failed decrypt must still succeed (pin must not be poisoned): {:?}",
+        legit.error
+    );
+    assert_eq!(legit.data.unwrap().version, v2_cid);
+
+    cleanup_content_artifacts();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn read_monotonicity_accepts_forward_and_rejects_regression() {
     let _guard = acquire_test_lock();

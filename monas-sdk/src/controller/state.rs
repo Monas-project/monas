@@ -17,7 +17,7 @@ use crate::models::state_node::{StateNodeContentDataResponse, StateNodeContentHi
 use super::MonasController;
 
 /// read 単調性チェックの記録先
-/// (`docs/design/read-response-integrity.md` コンポーネント B)。
+/// (`docs/design.md` §10「read応答の完全性検証」の単調性)。
 pub(super) type DynLastSeenStore = std::sync::Arc<
     dyn monas_content::infrastructure::last_seen_version_store::LastSeenVersionStore,
 >;
@@ -325,7 +325,7 @@ impl MonasController {
 
     /// State Node から content を読み、検証・復号して平文を返す(検証付き read)。
     ///
-    /// `docs/design/read-response-integrity.md` の実 read 経路。処理フロー:
+    /// `docs/design.md` §10「read応答の完全性検証」の実 read 経路。処理フロー:
     /// 1. `read:{content_id}:{timestamp}` 署名の認証コンテキストを解決
     /// 2. 版を決定(`input.version` 指定があればその版、無ければ履歴の最新)
     /// 3. Node CBOR を取得し、CID 再計算で改ざん検証(コンポーネント A)
@@ -428,17 +428,24 @@ impl MonasController {
 
         // 単調性チェック(B)。最新読みのときだけ働く。版を明示指定した read は
         // 「過去の版を意図的に読む」正当な操作なので、A(CID 検証)のみ。
-        if is_latest_read {
-            if let Err(e) = self.enforce_read_monotonicity(
+        // ここではチェックのみ行い、last_seen の記録は復号まで含む全検証が
+        // 成功した後に行う。チェック通過直後に記録すると、CID は通るが復号
+        // できない偽 Node を 1 回受けるだけで pin が汚染され、以後の正規 read
+        // が恒久的に Conflict になる(単調性チェックの自壊 DoS)。
+        let checked_last_seen = if is_latest_read {
+            match self.check_read_monotonicity(
                 &input.content_id,
                 &version,
                 &verified.parents,
                 auth,
                 &trace_id,
             ) {
-                return *e;
+                Ok(last_seen) => Some(last_seen),
+                Err(e) => return *e,
             }
-        }
+        } else {
+            None
+        };
 
         // CEK ロード + AES-GCM 復号 + plain CID 照合
         let local_content_id =
@@ -457,6 +464,24 @@ impl MonasController {
             }
         };
 
+        // 全検証成功。last_seen を compare-and-advance で記録する。
+        // チェック時に観測した値から動いていた場合(並行 read が先に進めた)は
+        // 上書きせずスキップする — 古い版で pin を巻き戻さないため。
+        if let Some(expected) = checked_last_seen {
+            if expected.as_deref() != Some(version.as_str()) {
+                if let Err(e) = self.last_seen_store.compare_and_save(
+                    &input.content_id,
+                    expected.as_deref(),
+                    &version,
+                ) {
+                    return ApiResponse::error(
+                        ApiError::Internal(format!("failed to record last-seen version: {e}")),
+                        trace_id,
+                    );
+                }
+            }
+        }
+
         ApiResponse::success(
             ReadContentFromStateNodeOutput {
                 content_id: input.content_id,
@@ -470,15 +495,16 @@ impl MonasController {
 
     /// 最新読みの単調性チェック本体。前回受理した版(`last_seen`)が今回の版の
     /// 祖先(または同一)であることを、CID 検証済みの親リンクを辿って確認する。
-    /// 通過したら `last_seen` を今回の版へ更新する。
-    fn enforce_read_monotonicity(
+    /// チェックのみ行い、記録はしない(記録は復号成功後に呼び出し側が
+    /// compare-and-advance で行う)。戻り値はチェック時に観測した `last_seen`。
+    fn check_read_monotonicity(
         &self,
         remote_content_id: &str,
         version: &str,
         parents: &[String],
         auth: Option<&StateNodeAuthContext>,
         trace_id: &str,
-    ) -> Result<(), Box<ApiResponse<ReadContentFromStateNodeOutput>>> {
+    ) -> Result<Option<String>, Box<ApiResponse<ReadContentFromStateNodeOutput>>> {
         let last_seen = self.last_seen_store.load(remote_content_id).map_err(|e| {
             Box::new(ApiResponse::error(
                 ApiError::Internal(format!("failed to load last-seen version: {e}")),
@@ -487,10 +513,10 @@ impl MonasController {
         })?;
 
         match last_seen.as_deref() {
-            // 初回(記録なし)は TOFU で受理し、下で記録する。
+            // 初回(記録なし)は TOFU で受理する(記録は復号成功後)。
             None => {}
             // 同じ版を読み直しただけ。
-            Some(l) if l == version => return Ok(()),
+            Some(l) if l == version => {}
             Some(l) => {
                 let outcome = walk_ancestors_for(parents, l, MAX_MONOTONICITY_FETCHES, |cid| {
                     self.fetch_verified_parents(remote_content_id, cid, auth, trace_id)
@@ -528,14 +554,7 @@ impl MonasController {
             }
         }
 
-        self.last_seen_store
-            .save(remote_content_id, version)
-            .map_err(|e| {
-                Box::new(ApiResponse::error(
-                    ApiError::Internal(format!("failed to record last-seen version: {e}")),
-                    trace_id.to_string(),
-                ))
-            })
+        Ok(last_seen)
     }
 
     /// `verify_and_decrypt_relay_read` のエラーを、呼び出し側が対処を判断できる
@@ -670,13 +689,12 @@ impl MonasController {
 
         // State Node は read 応答として「Node 全体(CBOR)」を返す。まず CID を
         // 再計算して version と一致することを検証し(改ざん検知)、その上で
-        // payload の暗号文を取り出す(§8.1)。
+        // payload の暗号文を取り出す(§8.1)。照合先はクライアントが選択した
+        // version に固定する。応答内の version は自己申告なので、それに対して
+        // 照合すると任意の Node + その CID を返すだけで検証が通ってしまう。
         let state_bytes = match monas_content::infrastructure::node_verification::verify_and_extract(
             &node_bytes,
-            &state_node_data
-                .version
-                .clone()
-                .unwrap_or(version_to_check.clone()),
+            &version_to_check,
         ) {
             Ok(verified) => verified.ciphertext,
             Err(e) => {
