@@ -129,7 +129,7 @@ pub trait ContentRepository: Send + Sync {
     /// Unlike [`get_latest_with_version`], this returns the whole Node (CBOR)
     /// rather than just the payload bytes, so a client can recompute the CID
     /// and verify the response was not tampered with — no signature needed.
-    /// See `docs/design/read-response-integrity.md` §8.1.
+    /// See `docs/design.md` §10「read応答の完全性検証」.
     async fn get_latest_node_bytes_with_version(
         &self,
         genesis_cid: &str,

@@ -576,7 +576,7 @@ where
         let content_id_vo = ContentId::new(content_id.to_string())?;
         // Return the whole crsl-lib Node (CBOR), not just the payload, so the
         // client can recompute the CID and verify the response was not
-        // tampered with (docs/design/read-response-integrity.md §8.1).
+        // tampered with (docs/design.md §10「read応答の完全性検証」).
         match version {
             Some(v) => {
                 let node_bytes = self

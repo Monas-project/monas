@@ -6,7 +6,7 @@
 //! is the SHA-256 of the exact CBOR bytes, so a matching CID proves the bytes
 //! (payload + parents + genesis + timestamp + metadata) are authentic. No
 //! signature is needed for this check. See
-//! `docs/design/read-response-integrity.md` §5.0.1 / §8.
+//! `docs/design.md` §10「read応答の完全性検証」.
 //!
 //! This mirrors crsl-lib's `Node::content_id()`:
 //! `CIDv1(codec=RAW=0x55, multihash=SHA2-256(sha256(serde_cbor(node))))`.

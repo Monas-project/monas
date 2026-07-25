@@ -298,9 +298,9 @@ where
     /// 3. Loads the CEK for `local_content_id` and AES-GCM-decrypts.
     ///
     /// This is the client-side core of the verified read path
-    /// (`docs/design/read-response-integrity.md` §5.2 / §8). It does NOT do the
-    /// membership-proof or monotonicity checks — those are layered by the
-    /// caller (SDK) around this call, which owns the proof and last-seen state.
+    /// (`docs/design.md` §10「read応答の完全性検証」). It does NOT do the
+    /// monotonicity check — that is layered by the caller (SDK) around this
+    /// call, which owns the last-seen state.
     ///
     /// Returns the plaintext, and the verified node's parent CIDs (for the
     /// caller's monotonicity check).

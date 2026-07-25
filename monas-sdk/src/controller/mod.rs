@@ -69,7 +69,7 @@ pub struct MonasController {
     /// ShareService
     share_service: ShareServiceInstance,
     /// content ごとに最後に受理した State Node 版 CID の記録
-    /// (read 単調性チェック、`docs/design/read-response-integrity.md` コンポーネント B)
+    /// (read 単調性チェック、`docs/design.md` §10「read応答の完全性検証」の単調性)
     last_seen_store: DynLastSeenStore,
 }
 
