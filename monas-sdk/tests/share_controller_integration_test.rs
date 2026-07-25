@@ -68,6 +68,7 @@ async fn share_content_succeeds_after_content_creation() {
     let share_response = controller.share_content(ShareContentInput {
         content_id: created.content_id.clone(),
         sender_public_key: sender.public_key.clone(),
+        sender_private_key: sender.private_key.clone(),
         recipient_public_key: recipient.public_key.clone(),
         permissions: vec![Permission::Read],
     });
@@ -177,6 +178,7 @@ async fn revoke_share_updates_state_node_version() {
     let share_response = controller.share_content(ShareContentInput {
         content_id: created.content_id.clone(),
         sender_public_key: sender.public_key.clone(),
+        sender_private_key: sender.private_key.clone(),
         recipient_public_key: recipient.public_key.clone(),
         permissions: vec![Permission::Write],
     });
@@ -187,7 +189,8 @@ async fn revoke_share_updates_state_node_version() {
         RevokeShareInput {
             content_id: created.content_id,
             remote_content_id: None,
-            sender_public_key: sender.public_key,
+            sender_public_key: sender.public_key.clone(),
+            sender_private_key: sender.private_key.clone(),
             recipient_public_key: recipient.public_key,
         },
         None,
@@ -267,6 +270,7 @@ async fn revoke_share_syncs_state_node_by_remote_content_id() {
     let share_response = controller.share_content(ShareContentInput {
         content_id: created.content_id.clone(),
         sender_public_key: sender.public_key.clone(),
+        sender_private_key: sender.private_key.clone(),
         recipient_public_key: recipient.public_key.clone(),
         permissions: vec![Permission::Write],
     });
@@ -277,7 +281,8 @@ async fn revoke_share_syncs_state_node_by_remote_content_id() {
         RevokeShareInput {
             content_id: created.content_id,
             remote_content_id: Some("remote-series-id".to_string()),
-            sender_public_key: sender.public_key,
+            sender_public_key: sender.public_key.clone(),
+            sender_private_key: sender.private_key.clone(),
             recipient_public_key: recipient.public_key,
         },
         None,
@@ -361,6 +366,7 @@ async fn revoke_share_rolls_back_local_state_when_state_node_sync_fails() {
     let share_response = controller.share_content(ShareContentInput {
         content_id: created.content_id.clone(),
         sender_public_key: sender.public_key.clone(),
+        sender_private_key: sender.private_key.clone(),
         recipient_public_key: recipient.public_key.clone(),
         permissions: vec![Permission::Read],
     });
@@ -373,6 +379,7 @@ async fn revoke_share_rolls_back_local_state_when_state_node_sync_fails() {
             content_id: created.content_id.clone(),
             remote_content_id: None,
             sender_public_key: sender.public_key.clone(),
+            sender_private_key: sender.private_key.clone(),
             recipient_public_key: recipient.public_key.clone(),
         },
         None,
@@ -386,7 +393,7 @@ async fn revoke_share_rolls_back_local_state_when_state_node_sync_fails() {
     let get_shared_response = controller.decrypt_shared_content(DecryptSharedContentInput {
         content_id: created.content_id.clone(),
         private_key: recipient.private_key.clone(),
-        sender_key_id: shared.sender_key_id.clone(),
+        sender_public_key: shared.sender_public_key.clone(),
         recipient_key_id: shared.recipient_key_id.clone(),
         key_envelope: shared.key_envelope.clone(),
         version: None,
@@ -410,7 +417,8 @@ async fn revoke_share_rolls_back_local_state_when_state_node_sync_fails() {
         RevokeShareInput {
             content_id: created.content_id,
             remote_content_id: None,
-            sender_public_key: sender.public_key,
+            sender_public_key: sender.public_key.clone(),
+            sender_private_key: sender.private_key.clone(),
             recipient_public_key: recipient.public_key,
         },
         None,
@@ -496,6 +504,7 @@ async fn revoke_share_rollback_fires_on_inner_share_service_error() {
         .share_content(ShareContentInput {
             content_id: created.content_id.clone(),
             sender_public_key: sender.public_key.clone(),
+            sender_private_key: sender.private_key.clone(),
             recipient_public_key: recipient.public_key.clone(),
             permissions: vec![Permission::Read],
         })
@@ -509,6 +518,7 @@ async fn revoke_share_rollback_fires_on_inner_share_service_error() {
             content_id: created.content_id.clone(),
             remote_content_id: None,
             sender_public_key: sender.public_key.clone(),
+            sender_private_key: sender.private_key.clone(),
             recipient_public_key: recipient.public_key.clone(),
         },
         None,
@@ -527,7 +537,8 @@ async fn revoke_share_rollback_fires_on_inner_share_service_error() {
         RevokeShareInput {
             content_id: created.content_id,
             remote_content_id: None,
-            sender_public_key: sender.public_key,
+            sender_public_key: sender.public_key.clone(),
+            sender_private_key: sender.private_key.clone(),
             recipient_public_key: recipient.public_key,
         },
         None,

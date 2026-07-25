@@ -55,6 +55,10 @@ pub struct KeyEnvelope {
     sender_key_id: KeyId,
     recipient: WrappedRecipientKey,
     ciphertext: Vec<u8>,
+    /// CEK の鍵世代。rotation(revoke による再暗号化)のたびに +1 される。
+    /// wrap の AAD に束縛されるため改ざんできず、受信者は記録済み世代より
+    /// 古い envelope を拒否することで旧 CEK への巻き戻し(replay)を防ぐ。
+    key_epoch: u64,
 }
 
 impl KeyEnvelope {
@@ -64,6 +68,7 @@ impl KeyEnvelope {
         sender_key_id: KeyId,
         recipient: WrappedRecipientKey,
         ciphertext: Vec<u8>,
+        key_epoch: u64,
     ) -> Self {
         Self {
             content_id,
@@ -71,6 +76,7 @@ impl KeyEnvelope {
             sender_key_id,
             recipient,
             ciphertext,
+            key_epoch,
         }
     }
 
@@ -92,6 +98,10 @@ impl KeyEnvelope {
 
     pub fn ciphertext(&self) -> &[u8] {
         &self.ciphertext
+    }
+
+    pub fn key_epoch(&self) -> u64 {
+        self.key_epoch
     }
 }
 
@@ -117,10 +127,12 @@ mod tests {
             key_id(&[1, 2, 3]),
             recipient,
             vec![0xAA, 0xBB],
+            3,
         );
 
         assert!(matches!(env.key_wrap_algorithm(), KeyWrapAlgorithm::HpkeV1));
         assert_eq!(env.recipient().key_id().as_bytes(), &[4, 5, 6]);
         assert_eq!(env.ciphertext(), &[0xAA, 0xBB]);
+        assert_eq!(env.key_epoch(), 3);
     }
 }

@@ -71,7 +71,14 @@ pub struct MonasController {
     /// content ごとに最後に受理した State Node 版 CID の記録
     /// (read 単調性チェック、`docs/design.md` §10「read応答の完全性検証」の単調性)
     last_seen_store: DynLastSeenStore,
+    /// share 受信者側の送信者公開鍵ピン(TOFU)と受理済み CEK 鍵世代の記録
+    /// (KeyEnvelope の送信者認証と rotation 巻き戻し replay 防止)
+    sender_pin_store: DynSenderPinStore,
 }
+
+/// SDK が使う送信者鍵ピンストアの動的型。
+pub(super) type DynSenderPinStore =
+    std::sync::Arc<dyn monas_content::infrastructure::sender_key_pin_store::SenderKeyPinStore>;
 
 impl MonasController {
     pub(super) fn current_unix_timestamp() -> u64 {
@@ -163,7 +170,7 @@ impl MonasController {
         // stateless thin client and push CEK / share ownership to State Node,
         // or (b) define an explicit pluggable port for CEK ownership semantics.
         let content_repository = Self::create_content_repository();
-        let (cek_store, share_repository, public_key_directory, last_seen_store) =
+        let (cek_store, share_repository, public_key_directory, last_seen_store, sender_pin_store) =
             Self::create_persistence(&config.persistence)?;
         let agent = Self::build_agent(&config);
 
@@ -183,6 +190,7 @@ impl MonasController {
                 public_key_directory,
             ),
             last_seen_store,
+            sender_pin_store,
         })
     }
 
@@ -215,7 +223,7 @@ impl MonasController {
     /// CEK / Share / Public key directory の 3 ストアに共有させる。sled は path 単位で
     /// 排他 flock を取るため、同じディレクトリを 2 度 open すると 2 個目が
     /// 失敗する (`MONAS_PERSISTENCE_DIR` 設定時の本番経路で必ず再現)。
-    /// キー空間は `cek:` / `share:` / `pubkey:` / `last_seen:` プレフィックスで分離されている。
+    /// キー空間は `cek:` / `share:` / `pubkey:` / `last_seen:` / `sender_pin:` プレフィックスで分離されている。
     fn create_persistence(
         persistence: &PersistenceConfig,
     ) -> Result<
@@ -224,6 +232,7 @@ impl MonasController {
             DynShareRepository,
             DynPublicKeyDirectory,
             DynLastSeenStore,
+            DynSenderPinStore,
         ),
         ApiError,
     > {
@@ -231,6 +240,7 @@ impl MonasController {
             key_store::{InMemoryContentEncryptionKeyStore, SledContentEncryptionKeyStore},
             last_seen_version_store::{InMemoryLastSeenVersionStore, SledLastSeenVersionStore},
             public_key_directory::{InMemoryPublicKeyDirectory, SledPublicKeyDirectory},
+            sender_key_pin_store::{InMemorySenderKeyPinStore, SledSenderKeyPinStore},
             share_repository::{InMemoryShareRepository, SledShareRepository},
         };
 
@@ -245,7 +255,8 @@ impl MonasController {
                 let share: DynShareRepository = Arc::new(InMemoryShareRepository::default());
                 let pkd: DynPublicKeyDirectory = Arc::new(InMemoryPublicKeyDirectory::default());
                 let last_seen: DynLastSeenStore = Arc::new(InMemoryLastSeenVersionStore::default());
-                Ok((cek, share, pkd, last_seen))
+                let sender_pin: DynSenderPinStore = Arc::new(InMemorySenderKeyPinStore::default());
+                Ok((cek, share, pkd, last_seen, sender_pin))
             }
             PersistenceConfig::Sled { dir } => {
                 if let Err(e) = std::fs::create_dir_all(dir) {
@@ -261,12 +272,14 @@ impl MonasController {
                 let cek = SledContentEncryptionKeyStore::with_db(db.clone());
                 let share = SledShareRepository::with_db(db.clone());
                 let pkd = SledPublicKeyDirectory::with_db(db.clone());
-                let last_seen = SledLastSeenVersionStore::with_db(db);
+                let last_seen = SledLastSeenVersionStore::with_db(db.clone());
+                let sender_pin = SledSenderKeyPinStore::with_db(db);
                 let cek: DynCekStore = Arc::new(cek);
                 let share: DynShareRepository = Arc::new(share);
                 let pkd: DynPublicKeyDirectory = Arc::new(pkd);
                 let last_seen: DynLastSeenStore = Arc::new(last_seen);
-                Ok((cek, share, pkd, last_seen))
+                let sender_pin: DynSenderPinStore = Arc::new(sender_pin);
+                Ok((cek, share, pkd, last_seen, sender_pin))
             }
         }
     }

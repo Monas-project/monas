@@ -23,6 +23,11 @@ pub struct KeyEnvelope {
     pub wrapped_cek: String,
     /// 暗号化されたコンテンツ（base64url）
     pub ciphertext: String,
+    /// CEK の鍵世代。rotation(revoke)のたびに +1 される。wrap の AAD に
+    /// 束縛されているため書き換えると復号自体が失敗する。受信者は記録済み
+    /// 世代より古い envelope を拒否する(旧 CEK への巻き戻し replay 防止)。
+    #[serde(default)]
+    pub key_epoch: u64,
 }
 
 // ============================================
@@ -35,6 +40,9 @@ pub struct ShareContentInput {
     pub content_id: String,
     /// 送信者の公開鍵（base64url） - sender_key_idを計算するために使用
     pub sender_public_key: String,
+    /// 送信者の秘密鍵（base64url）。KeyEnvelope の HPKE Auth モード wrap
+    /// (送信者認証)に用いる。SDK には保存されない。
+    pub sender_private_key: String,
     /// 共有先の公開鍵（base64url）
     pub recipient_public_key: String,
     #[serde(default = "default_permissions")]
@@ -50,6 +58,9 @@ fn default_permissions() -> Vec<Permission> {
 pub struct ShareContentOutput {
     pub content_id: String,
     pub recipient_public_key: String,
+    /// 送信者の公開鍵（base64url）。受信者はこれを `decrypt_shared_content` に
+    /// 渡し、初回処理時に TOFU でピン留めする(以後の envelope 検証の根になる)。
+    pub sender_public_key: String,
     pub sender_key_id: String,
     pub recipient_key_id: String,
     pub key_envelope: KeyEnvelope,
@@ -84,6 +95,9 @@ pub struct RevokeShareInput {
     pub remote_content_id: Option<String>,
     /// 送信者の公開鍵（base64url） - sender_key_idを計算するために使用
     pub sender_public_key: String,
+    /// 送信者の秘密鍵（base64url）。残存受信者向け KeyEnvelope 再発行の
+    /// HPKE Auth モード wrap に用いる。SDK には保存されない。
+    pub sender_private_key: String,
     pub recipient_public_key: String,
 }
 
@@ -120,7 +134,10 @@ pub struct ReissuedKeyEnvelope {
 pub struct DecryptSharedContentInput {
     pub content_id: String,
     pub private_key: String,
-    pub sender_key_id: String,
+    /// 送信者の公開鍵（base64url）。HPKE Auth モードの unwrap に用いる。
+    /// この content で初めての envelope 処理なら TOFU でピン留めされ、
+    /// 以後はピン済みの鍵と一致しない場合は拒否される。
+    pub sender_public_key: String,
     pub recipient_key_id: String,
     pub key_envelope: KeyEnvelope,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -157,6 +174,7 @@ mod tests {
             enc: "enc_data".into(),
             wrapped_cek: "wrapped_cek_data".into(),
             ciphertext: "ciphertext_data".into(),
+            key_epoch: 0,
         };
         let json = serde_json::to_string(&envelope).unwrap();
         assert!(json.contains("\"enc\":\"enc_data\""));
@@ -169,6 +187,7 @@ mod tests {
         let json = r#"{
             "content_id": "test_id",
             "sender_public_key": "sender_pub",
+            "sender_private_key": "sender_priv",
             "recipient_public_key": "recipient_key"
         }"#;
         let input: ShareContentInput = serde_json::from_str(json).unwrap();
@@ -180,6 +199,7 @@ mod tests {
         let json = r#"{
             "content_id": "test_id",
             "sender_public_key": "sender_pub",
+            "sender_private_key": "sender_priv",
             "recipient_public_key": "recipient_key",
             "permissions": ["read", "write"]
         }"#;
@@ -192,12 +212,14 @@ mod tests {
         let output = ShareContentOutput {
             content_id: "test_id".into(),
             recipient_public_key: "recipient_key".into(),
+            sender_public_key: "sender_public_key".into(),
             sender_key_id: "sender_key_id".into(),
             recipient_key_id: "recipient_key_id".into(),
             key_envelope: KeyEnvelope {
                 enc: "enc".into(),
                 wrapped_cek: "cek".into(),
                 ciphertext: "ct".into(),
+                key_epoch: 0,
             },
             delegated_access: Some(DelegatedAccessToken {
                 delegated_token: "jwt".into(),
@@ -240,6 +262,7 @@ mod tests {
                     enc: "enc".into(),
                     wrapped_cek: "wrapped".into(),
                     ciphertext: "cipher".into(),
+                    key_epoch: 1,
                 },
             }],
         };
@@ -253,12 +276,13 @@ mod tests {
         let input = DecryptSharedContentInput {
             content_id: "test_id".into(),
             private_key: "test_key".into(),
-            sender_key_id: "sender_key_id".into(),
+            sender_public_key: "sender_public_key".into(),
             recipient_key_id: "recipient_key_id".into(),
             key_envelope: KeyEnvelope {
                 enc: "enc".into(),
                 wrapped_cek: "cek".into(),
                 ciphertext: "ct".into(),
+                key_epoch: 0,
             },
             version: None,
         };

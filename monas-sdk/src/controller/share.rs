@@ -138,6 +138,7 @@ impl MonasController {
             enc: encode_base64url(recipient.enc()),
             wrapped_cek: encode_base64url(recipient.wrapped_cek()),
             ciphertext: encode_base64url(domain_envelope.ciphertext()),
+            key_epoch: domain_envelope.key_epoch(),
         }
     }
 
@@ -298,6 +299,7 @@ impl MonasController {
         for (field, value) in [
             ("content_id", input.content_id.as_str()),
             ("sender_public_key", input.sender_public_key.as_str()),
+            ("sender_private_key", input.sender_private_key.as_str()),
             ("recipient_public_key", input.recipient_public_key.as_str()),
         ] {
             if let Err(e) = Self::validate_non_empty(field, value) {
@@ -316,6 +318,13 @@ impl MonasController {
             };
 
         let sender_key_id = Self::compute_key_id_from_public_key(&sender_public_key_bytes);
+
+        // 送信者の秘密鍵(HPKE Auth モード wrap の送信者認証に使用。保存はしない)
+        let sender_private_key_bytes =
+            match Self::decode_base64url_field("sender_private_key", &input.sender_private_key) {
+                Ok(v) => v,
+                Err(e) => return ApiResponse::error(e, trace_id),
+            };
 
         // 4. 共有先の公開鍵をデコード
         let recipient_public_key_bytes =
@@ -341,6 +350,7 @@ impl MonasController {
         let cmd = GrantShareCommand {
             content_id: content_id.clone(),
             sender_key_id,
+            sender_private_key: sender_private_key_bytes.clone(),
             recipient_public_key: recipient_public_key_bytes.clone(),
             permission: permission.clone(),
         };
@@ -362,6 +372,7 @@ impl MonasController {
                 let rollback_cmd = RevokeShareCommand {
                     content_id: content_id.clone(),
                     sender_key_id: sender_key_id_for_output.clone(),
+                    sender_private_key: sender_private_key_bytes.clone(),
                     recipient_key_id: result.recipient_key_id.clone(),
                 };
                 if let Err(rb) = self.share_service.revoke_share(rollback_cmd) {
@@ -393,6 +404,7 @@ impl MonasController {
         let output = ShareContentOutput {
             content_id: input.content_id,
             recipient_public_key: input.recipient_public_key,
+            sender_public_key: input.sender_public_key,
             sender_key_id: sender_key_id_b64,
             recipient_key_id: recipient_key_id_b64,
             key_envelope,
@@ -425,6 +437,7 @@ impl MonasController {
         for (field, value) in [
             ("content_id", input.content_id.as_str()),
             ("sender_public_key", input.sender_public_key.as_str()),
+            ("sender_private_key", input.sender_private_key.as_str()),
             ("recipient_public_key", input.recipient_public_key.as_str()),
         ] {
             if let Err(e) = Self::validate_non_empty(field, value) {
@@ -446,6 +459,13 @@ impl MonasController {
                 Err(e) => return ApiResponse::error(e, trace_id),
             };
         let sender_key_id = Self::compute_key_id_from_public_key(&sender_public_key_bytes);
+
+        // 送信者の秘密鍵(再発行 envelope の HPKE Auth モード wrap に使用。保存はしない)
+        let sender_private_key_bytes =
+            match Self::decode_base64url_field("sender_private_key", &input.sender_private_key) {
+                Ok(v) => v,
+                Err(e) => return ApiResponse::error(e, trace_id),
+            };
 
         // 3. 共有先の公開鍵をデコードしてrecipient_key_idを計算
         let recipient_public_key_bytes =
@@ -496,6 +516,7 @@ impl MonasController {
         let cmd = RevokeShareCommand {
             content_id,
             sender_key_id,
+            sender_private_key: sender_private_key_bytes,
             recipient_key_id,
         };
 
@@ -580,13 +601,17 @@ impl MonasController {
     /// 処理フロー:
     /// 1. 入力のバリデーション
     /// 2. ContentIdに変換
-    /// 3. sender_key_idとrecipient_key_idをデコード
-    /// 4. 秘密鍵をデコード
+    /// 3. sender_public_keyとrecipient_key_idをデコード
+    /// 4. 送信者鍵ピン(TOFU)と鍵世代(key_epoch)の検証:
+    ///    - 初回はこの content の送信者公開鍵候補として受け入れ、復号成功時にピン留め
+    ///    - 2回目以降はピン済み公開鍵と一致しない送信者を拒否し、
+    ///      記録済みの鍵世代より古い envelope を拒否する(rotation 巻き戻し replay 防止)
     /// 5. KeyEnvelopeの各フィールドをデコード
     /// 6. KeyEnvelopeをmonas-content形式に変換
     /// 7. ShareService::unwrap_cek_from_envelopeを呼び出してCEKを取得
+    ///    (HPKE Auth モード: unwrap 成功 = ピン留め鍵の持ち主が作った envelope の証明)
     /// 8. ContentService::decrypt_with_cekを呼び出してコンテンツを復号
-    /// 9. 結果を返却
+    /// 9. CEK と送信者鍵ピン・鍵世代を保存し、結果を返却
     pub fn decrypt_shared_content(
         &self,
         input: DecryptSharedContentInput,
@@ -596,7 +621,7 @@ impl MonasController {
         // 1. 入力のバリデーション
         for (field, value) in [
             ("content_id", input.content_id.as_str()),
-            ("sender_key_id", input.sender_key_id.as_str()),
+            ("sender_public_key", input.sender_public_key.as_str()),
             ("recipient_key_id", input.recipient_key_id.as_str()),
             ("private_key", input.private_key.as_str()),
             ("key_envelope.enc", input.key_envelope.enc.as_str()),
@@ -617,13 +642,13 @@ impl MonasController {
         // 2. ContentIdに変換
         let content_id = ContentId::new(input.content_id.clone());
 
-        // 3. sender_key_idとrecipient_key_idをデコード
-        let sender_key_id_bytes =
-            match Self::decode_base64url_field("sender_key_id", &input.sender_key_id) {
+        // 3. sender_public_keyとrecipient_key_idをデコード
+        let sender_public_key_bytes =
+            match Self::decode_base64url_field("sender_public_key", &input.sender_public_key) {
                 Ok(v) => v,
                 Err(e) => return ApiResponse::error(e, trace_id),
             };
-        let sender_key_id = KeyId::new(sender_key_id_bytes);
+        let sender_key_id = Self::compute_key_id_from_public_key(&sender_public_key_bytes);
 
         let recipient_key_id_bytes =
             match Self::decode_base64url_field("recipient_key_id", &input.recipient_key_id) {
@@ -632,7 +657,46 @@ impl MonasController {
             };
         let recipient_key_id = KeyId::new(recipient_key_id_bytes);
 
-        // 4. 秘密鍵をデコード
+        // 4. 送信者鍵ピン(TOFU)と鍵世代の検証。
+        //    unwrap に使う鍵は「入力された鍵」ではなく「ピン済みの鍵」を優先する:
+        //    ピンがある限り、呼び出し側が違う鍵を渡しても検証の根は動かない。
+        let pinned = match self.sender_pin_store.load(content_id.as_str()) {
+            Ok(p) => p,
+            Err(e) => {
+                return ApiResponse::error(
+                    ApiError::Internal(format!("sender key pin store error: {e}")),
+                    trace_id,
+                );
+            }
+        };
+        let effective_sender_public_key = match &pinned {
+            None => sender_public_key_bytes.clone(),
+            Some(pin) => {
+                if pin.sender_public_key != sender_public_key_bytes {
+                    return ApiResponse::error(
+                        ApiError::Forbidden(format!(
+                            "sender public key does not match the key pinned for content {} on                              first share. Rejecting the envelope: a different sender cannot                              replace the content encryption key.",
+                            content_id.as_str()
+                        )),
+                        trace_id,
+                    );
+                }
+                if input.key_envelope.key_epoch < pin.key_epoch {
+                    return ApiResponse::error(
+                        ApiError::Conflict(format!(
+                            "stale key envelope: its key_epoch {} is older than the last accepted                              epoch {} for content {} (possible replay of a pre-rotation envelope).                              Ask the owner for the latest KeyEnvelope.",
+                            input.key_envelope.key_epoch,
+                            pin.key_epoch,
+                            content_id.as_str()
+                        )),
+                        trace_id,
+                    );
+                }
+                pin.sender_public_key.clone()
+            }
+        };
+
+        // 秘密鍵をデコード
         let private_key_bytes =
             match Self::decode_base64url_field("private_key", &input.private_key) {
                 Ok(v) => v,
@@ -667,14 +731,30 @@ impl MonasController {
             sender_key_id,
             wrapped_recipient,
             ciphertext.clone(),
+            input.key_envelope.key_epoch,
         );
 
-        // 7. ShareService::unwrap_cek_from_envelopeを呼び出してCEKを取得
-        let cek = match self
-            .share_service
-            .unwrap_cek_from_envelope(&domain_envelope, &private_key_bytes)
-        {
+        // 7. ShareService::unwrap_cek_from_envelopeを呼び出してCEKを取得。
+        //    HPKE Auth モードのため、unwrap 成功 = effective_sender_public_key の
+        //    持ち主がこの envelope を作った証明になる(偽送信者の envelope はここで失敗する)。
+        let cek = match self.share_service.unwrap_cek_from_envelope(
+            &domain_envelope,
+            &private_key_bytes,
+            &effective_sender_public_key,
+        ) {
             Ok(cek) => cek,
+            // HPKE Auth モードでは unwrap 失敗が「送信者検証の失敗」を意味し得る
+            // (偽送信者の envelope / AAD 改ざん / 鍵不一致はすべてここで落ちる)。
+            Err(ShareApplicationError::KeyWrapping(msg)) => {
+                return ApiResponse::error(
+                    ApiError::Forbidden(format!(
+                        "failed to unwrap the CEK with the expected sender public key: the \
+                         envelope was not created by the pinned sender, or its fields \
+                         (content_id / recipient / key_epoch) were tampered with: {msg}"
+                    )),
+                    trace_id,
+                );
+            }
             Err(e) => {
                 return ApiResponse::error(Self::map_share_error(e), trace_id);
             }
@@ -719,6 +799,29 @@ impl MonasController {
                 )),
                 trace_id,
             );
+        }
+
+        // 10. unwrap + 復号の成功 = 送信者と鍵世代の正しさが暗号学的に確認できた
+        //     時点なので、送信者公開鍵をピン留めし(TOFU)、受理した鍵世代を記録する。
+        let new_pin = monas_content::infrastructure::sender_key_pin_store::SenderKeyPin {
+            sender_public_key: effective_sender_public_key,
+            key_epoch: input.key_envelope.key_epoch,
+        };
+        let should_save_pin = match &pinned {
+            None => true,
+            Some(pin) => input.key_envelope.key_epoch > pin.key_epoch,
+        };
+        if should_save_pin {
+            if let Err(e) = self.sender_pin_store.save(content_id.as_str(), &new_pin) {
+                return ApiResponse::error(
+                    ApiError::Internal(format!(
+                        "decrypted the shared content but failed to persist the sender key pin \
+                         for {}: {e}. Re-process the KeyEnvelope.",
+                        content_id.as_str()
+                    )),
+                    trace_id,
+                );
+            }
         }
 
         let content_base64url = encode_base64url(&raw_content);

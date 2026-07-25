@@ -129,6 +129,7 @@ async fn create_and_share(
     let share_response = controller.share_content(ShareContentInput {
         content_id: created.content_id.clone(),
         sender_public_key: sender.public_key.clone(),
+        sender_private_key: sender.private_key.clone(),
         recipient_public_key: recipient.public_key.clone(),
         permissions: vec![Permission::Read],
     });
@@ -236,7 +237,7 @@ async fn share_recipient_reads_content_after_processing_envelope() {
     let decrypt_response = recipient_controller.decrypt_shared_content(DecryptSharedContentInput {
         content_id: created.local_content_id.clone(),
         private_key: created.recipient_private_key.clone(),
-        sender_key_id: created.shared.sender_key_id.clone(),
+        sender_public_key: created.shared.sender_public_key.clone(),
         recipient_key_id: created.shared.recipient_key_id.clone(),
         key_envelope: created.shared.key_envelope.clone(),
         version: None,
@@ -339,6 +340,7 @@ async fn cek_rotation_after_revoke_updates_recipient_and_read() {
         creator.share_content(ShareContentInput {
             content_id: created.content_id.clone(),
             sender_public_key: sender.public_key.clone(),
+            sender_private_key: sender.private_key.clone(),
             recipient_public_key: recipient_pub.to_string(),
             permissions: vec![Permission::Read],
         })
@@ -354,7 +356,7 @@ async fn cek_rotation_after_revoke_updates_recipient_and_read() {
     let decrypt_v1 = recipient_controller.decrypt_shared_content(DecryptSharedContentInput {
         content_id: created.content_id.clone(),
         private_key: surviving_recipient.private_key.clone(),
-        sender_key_id: shared_surviving.sender_key_id.clone(),
+        sender_public_key: shared_surviving.sender_public_key.clone(),
         recipient_key_id: shared_surviving.recipient_key_id.clone(),
         key_envelope: shared_surviving.key_envelope.clone(),
         version: None,
@@ -374,6 +376,7 @@ async fn cek_rotation_after_revoke_updates_recipient_and_read() {
             content_id: created.content_id.clone(),
             remote_content_id: Some(REMOTE_ID.into()),
             sender_public_key: sender.public_key.clone(),
+            sender_private_key: sender.private_key.clone(),
             recipient_public_key: revoked_recipient.public_key.clone(),
         },
         None,
@@ -438,7 +441,7 @@ async fn cek_rotation_after_revoke_updates_recipient_and_read() {
     let decrypt_v2 = recipient_controller.decrypt_shared_content(DecryptSharedContentInput {
         content_id: created.content_id.clone(),
         private_key: surviving_recipient.private_key.clone(),
-        sender_key_id: shared_surviving.sender_key_id.clone(),
+        sender_public_key: shared_surviving.sender_public_key.clone(),
         recipient_key_id: reissued.recipient_key_id.clone(),
         key_envelope: reissued.key_envelope.clone(),
         version: None,
@@ -453,6 +456,36 @@ async fn cek_rotation_after_revoke_updates_recipient_and_read() {
             .decode(fresh_read.data.unwrap().content)
             .unwrap(),
         plaintext
+    );
+
+    // rotation 前の旧 envelope(key_epoch が古い)を再送しても、保存済み CEK は
+    // 巻き戻らない(replay 防止)。攻撃者が保存しておいた正規の旧 envelope で
+    // 受信者の CEK を旧世代へ戻し、read を壊すことはできない。
+    assert!(
+        reissued.key_envelope.key_epoch > shared_surviving.key_envelope.key_epoch,
+        "rotation must advance the envelope key_epoch"
+    );
+    let replay = recipient_controller.decrypt_shared_content(DecryptSharedContentInput {
+        content_id: created.content_id.clone(),
+        private_key: surviving_recipient.private_key.clone(),
+        sender_public_key: shared_surviving.sender_public_key.clone(),
+        recipient_key_id: shared_surviving.recipient_key_id.clone(),
+        key_envelope: shared_surviving.key_envelope.clone(),
+        version: None,
+    });
+    assert!(!replay.success, "pre-rotation envelope replay must fail");
+    match replay.error {
+        Some(ApiError::Conflict(msg)) => {
+            assert!(msg.contains("stale key envelope"), "msg={msg}")
+        }
+        other => panic!("expected Conflict(stale envelope), got: {other:?}"),
+    }
+    // read は引き続き新 CEK で成功する(巻き戻っていない証明)
+    let read_after_replay = read_latest();
+    assert!(
+        read_after_replay.success,
+        "read must still succeed after rejected replay: {:?}",
+        read_after_replay.error
     );
 
     cleanup_content_artifacts();
@@ -489,6 +522,64 @@ async fn read_rejects_tampered_node() {
             assert!(msg.contains("CID verification"), "msg={msg}")
         }
         other => panic!("expected Internal(CID verification), got: {other:?}"),
+    }
+
+    cleanup_content_artifacts();
+}
+
+/// KeyEnvelope は HPKE Auth モードでラップされており、受信者は送信者公開鍵で
+/// unwrap する(成功 = その鍵の持ち主が作った証明)。
+/// - 間違った送信者鍵での処理は復号自体が失敗する
+/// - 一度正しい鍵で処理すると TOFU でピン留めされ、以後別の鍵を渡しても拒否される
+#[tokio::test(flavor = "multi_thread")]
+async fn envelope_sender_auth_rejects_wrong_sender_key() {
+    let _guard = acquire_test_lock();
+    let mut server = Server::new_async().await;
+    let creator = MonasController::with_urls(server.url(), server.url());
+
+    let created = create_and_share(&mut server, &creator, b"sender-auth-target").await;
+
+    let recipient_controller = MonasController::with_urls(server.url(), server.url());
+    let attacker = recipient_controller
+        .generate_keypair(GenerateKeypairInput {
+            key_type: KeyType::Secp256r1,
+        })
+        .data
+        .expect("attacker keypair");
+
+    let decrypt_with_sender = |sender_public_key: String| {
+        recipient_controller.decrypt_shared_content(DecryptSharedContentInput {
+            content_id: created.local_content_id.clone(),
+            private_key: created.recipient_private_key.clone(),
+            sender_public_key,
+            recipient_key_id: created.shared.recipient_key_id.clone(),
+            key_envelope: created.shared.key_envelope.clone(),
+            version: None,
+        })
+    };
+
+    // 1. 間違った送信者鍵(攻撃者の鍵)を渡して処理 → unwrap が失敗する
+    let wrong_key = decrypt_with_sender(attacker.public_key.clone());
+    assert!(!wrong_key.success, "wrong sender key must fail to unwrap");
+    match wrong_key.error {
+        Some(ApiError::Forbidden(msg)) => {
+            assert!(msg.contains("unwrap"), "msg={msg}")
+        }
+        other => panic!("expected Forbidden(unwrap failure), got: {other:?}"),
+    }
+
+    // 2. 正しい送信者鍵で処理 → 成功し、TOFU でピン留めされる
+    let correct = decrypt_with_sender(created.shared.sender_public_key.clone());
+    assert!(correct.success, "{:?}", correct.error);
+
+    // 3. ピン留め後に別の鍵を渡す → unwrap 以前にピン不一致で拒否される
+    let after_pin = decrypt_with_sender(attacker.public_key.clone());
+    assert!(!after_pin.success, "non-pinned sender key must be rejected");
+    match after_pin.error {
+        Some(ApiError::Forbidden(msg)) => {
+            assert!(msg.contains("pinned"), "msg={msg}")
+        }
+        other => panic!("expected Forbidden(pin mismatch), got: {other:?}"),
     }
 
     cleanup_content_artifacts();

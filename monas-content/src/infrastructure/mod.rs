@@ -5,6 +5,7 @@ pub mod key_wrapping;
 pub mod last_seen_version_store;
 pub mod node_verification;
 pub mod public_key_directory;
+pub mod sender_key_pin_store;
 pub mod share_repository;
 
 #[cfg(feature = "filesync")]
