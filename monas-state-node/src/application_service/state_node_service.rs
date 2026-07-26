@@ -10,7 +10,6 @@ use crate::domain::events::{current_timestamp, Event};
 use crate::domain::identity::Identity;
 use crate::domain::state_node::{self, NodeSnapshot};
 use crate::domain::value_objects::ContentId;
-use crate::infrastructure::auth::auth_token::AuthToken as InfraAuthToken;
 use crate::infrastructure::crypto::verify_p256_signature;
 use crate::infrastructure::placement::compute_dht_key;
 use crate::port::auth_token::{AuthToken, RequestMetadata};
@@ -245,9 +244,9 @@ where
             .await
             .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))?;
 
-        // Verify caller signature for all token types.
-        // JWT: proof-of-possession via "{iss}:{aud}:{jti}" request signature
-        // type:id: metadata/body based request signature
+        // Verify caller signature for all token types. The signed message is
+        // `read:{content_id}:{timestamp}` regardless of token kind; JWT tokens
+        // additionally have their own owner signature verified.
         let sig = request_signature.ok_or_else(|| {
             StateNodeError::AuthenticationFailed("Request signature is required".to_string())
         })?;
@@ -267,15 +266,20 @@ where
 
     /// Verify the caller's request signature.
     ///
-    /// For JWT tokens (containing `.`), verifies the JWT's own P-256 signature
-    /// via `AuthenticationService::verify_jwt_signature`, and enforces
-    /// caller proof-of-possession by verifying request signature over
-    /// "{iss}:{aud}:{jti}" using the audience key.
-    ///
-    /// For `type:id` tokens (e.g., `user:alice`), constructs a signing message
-    /// and delegates to `AuthenticationService::verify_request_signature`:
+    /// The signed message is identical for every token type (issue #61):
     /// - If `request_body` is `Some(body)`: signs `hex(sha256(body + timestamp_be_bytes))`
     /// - If `request_body` is `None`: signs `{operation}:{resource}:{timestamp}`
+    ///
+    /// Replay protection comes from the timestamp *inside* the signed message
+    /// (freshness window checked by the auth service), so `timestamp` is
+    /// mandatory — there is no server-clock fallback. A token can therefore be
+    /// reused for many requests within its TTL; a stolen signature only allows
+    /// repeating the same operation on the same resource within the window.
+    ///
+    /// For JWT tokens (containing `.`), the JWT's own P-256 signature is
+    /// verified first via `AuthenticationService::verify_jwt_signature`
+    /// (over the received wire bytes), and the request signature is then
+    /// verified against the audience (`aud`) key.
     #[allow(clippy::too_many_arguments)]
     async fn verify_caller_signature(
         &self,
@@ -287,7 +291,8 @@ where
         timestamp: Option<u64>,
         request_body: Option<&[u8]>,
     ) -> Result<(), StateNodeError> {
-        // JWT tokens: verify JWT signature + request proof-of-possession.
+        // JWT tokens: the token itself is a signed capability — verify the
+        // owner's signature before trusting any of its claims.
         if token.as_str().contains('.') {
             auth_service
                 .verify_jwt_signature(token)
@@ -298,38 +303,16 @@ where
                         e
                     ))
                 })?;
-
-            let parsed = InfraAuthToken::from_jwt(token.as_str()).map_err(|e| {
-                StateNodeError::AuthenticationFailed(format!(
-                    "Failed to parse JWT for request signature verification: {}",
-                    e
-                ))
-            })?;
-
-            let pop_message = format!(
-                "{}:{}:{}",
-                parsed.payload.iss, parsed.payload.aud, parsed.payload.jti
-            );
-            auth_service
-                .verify_request_signature(token, signature, &pop_message, timestamp)
-                .await
-                .map_err(|e| {
-                    StateNodeError::AuthenticationFailed(format!(
-                        "JWT request signature verification failed: {}",
-                        e
-                    ))
-                })?;
-
-            return Ok(());
         }
 
-        // non-JWT tokens: verify request signature
-        let ts = timestamp.unwrap_or_else(|| {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
-        });
+        // Freshness is part of the signed message. Falling back to the server
+        // clock would let a caller omit the timestamp and bypass the max-age
+        // check entirely, so a missing timestamp is an authentication error.
+        let ts = timestamp.ok_or_else(|| {
+            StateNodeError::AuthenticationFailed(
+                "X-Request-Timestamp is required for request signature verification".to_string(),
+            )
+        })?;
 
         let message = if let Some(body) = request_body {
             // Body-based signing: hex(sha256(body + timestamp_be_bytes))
@@ -2518,6 +2501,17 @@ mod tests {
         vec![0x01]
     }
 
+    /// timestamp は署名検証で構造的に必須(issue #61)。mock 認証でも
+    /// 存在チェックは実コードを通るため、現在時刻を渡す。
+    fn test_timestamp() -> Option<u64> {
+        Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+    }
+
     type TestService = StateNodeService<
         MockNodeRegistry,
         MockContentNetworkRepository,
@@ -2619,6 +2613,32 @@ mod tests {
         }
     }
 
+    /// timestamp が無いリクエストは署名検証に到達する前に拒否される
+    /// (issue #61: freshness は署名内 timestamp が担うため、欠如は
+    /// サーバ時刻へのフォールバックではなく認証エラー)。
+    #[tokio::test]
+    async fn test_create_content_requires_timestamp() {
+        let mut capacities = HashMap::new();
+        capacities.insert("peer-1".to_string(), 500);
+        let service = create_service_with_peers("node-1", vec!["peer-1".to_string()], capacities);
+
+        let result = service
+            .create_content(
+                b"test data",
+                Some(&test_token()),
+                Some(&test_request_signature()),
+                None,
+            )
+            .await;
+
+        match result {
+            Err(StateNodeError::AuthenticationFailed(msg)) => {
+                assert!(msg.contains("X-Request-Timestamp"), "msg={msg}");
+            }
+            other => panic!("expected AuthenticationFailed, got: {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn test_create_content_with_peers() {
         let mut capacities = HashMap::new();
@@ -2641,7 +2661,7 @@ mod tests {
                 b"test data",
                 Some(&test_token()),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
             )
             .await
             .unwrap();
@@ -2687,7 +2707,7 @@ mod tests {
                 b"test data",
                 Some(&test_token()),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
             )
             .await
             .unwrap();
@@ -2724,7 +2744,7 @@ mod tests {
                 b"test data",
                 Some(&test_token()),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
             )
             .await;
 
@@ -2744,7 +2764,7 @@ mod tests {
                 b"test data",
                 Some(&test_token()),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
             )
             .await;
 
@@ -2790,7 +2810,7 @@ mod tests {
                 b"new data",
                 Some(&test_token()),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
             )
             .await
             .unwrap();
@@ -2837,7 +2857,7 @@ mod tests {
                 b"new data",
                 Some(&test_token()),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
             )
             .await;
 
@@ -2870,7 +2890,7 @@ mod tests {
                 b"data",
                 Some(&test_token()),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
             )
             .await;
 
@@ -2897,7 +2917,7 @@ mod tests {
                 b"data",
                 Some(&test_token()),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
             )
             .await;
 
@@ -2929,7 +2949,7 @@ mod tests {
                 "content-1",
                 Some(&test_token()),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
             )
             .await;
 
@@ -2964,7 +2984,7 @@ mod tests {
                 b"data",
                 Some(&test_token()),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
             )
             .await;
 
@@ -3668,7 +3688,7 @@ mod tests {
                 b"new data",
                 Some(&test_token()),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
             )
             .await;
 

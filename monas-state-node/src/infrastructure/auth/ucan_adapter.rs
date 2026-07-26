@@ -14,7 +14,6 @@ use crate::domain::auth_capability::AuthCapability;
 use crate::domain::identity::{Identity, IdentityType};
 use crate::infrastructure::auth::auth_token::AuthToken as InfraAuthToken;
 use crate::infrastructure::auth::signature_verifier::SignatureVerifier;
-use crate::infrastructure::persistence::SledPublicKeyRepository;
 use crate::port::auth_token::AuthToken;
 use crate::port::authorization_service::{
     AuthorizationRequest, AuthorizationResult, AuthorizationService,
@@ -40,23 +39,12 @@ use std::sync::Arc;
 /// ```
 pub struct UcanAdapter {
     content_repo: Arc<dyn ContentRepository>,
-    /// Nonce store for replay attack prevention (JTI uniqueness check)
-    nonce_store: Option<Arc<SledPublicKeyRepository>>,
 }
 
 impl UcanAdapter {
     /// Create a new UcanAdapter with a ContentRepository
     pub fn new(content_repo: Arc<dyn ContentRepository>) -> Self {
-        Self {
-            content_repo,
-            nonce_store: None,
-        }
-    }
-
-    /// Set the nonce store for replay attack prevention (builder pattern)
-    pub fn with_nonce_store(mut self, nonce_store: Arc<SledPublicKeyRepository>) -> Self {
-        self.nonce_store = Some(nonce_store);
-        self
+        Self { content_repo }
     }
 
     /// Convert Identity to key ID format
@@ -217,21 +205,27 @@ impl UcanAdapter {
         })
     }
 
-    /// Verify AuthToken with domain-level checks delegated to domain verifier components,
-    /// plus adapter-specific checks (JTI uniqueness, request signature).
+    /// Verify AuthToken with domain-level checks delegated to domain verifier components.
     ///
     /// Domain-level verification (signature, expiration, TTL, access control, audience,
     /// capability) uses the same logic as domain::auth_token_verifier::AuthTokenVerifier.
-    /// Adapter-level checks (JTI nonce, request signature) remain here as they depend
-    /// on infrastructure concerns (nonce store, request context).
+    ///
+    /// Request proof-of-possession(リクエスト署名の中身)の検証はここでは行わない。
+    /// 全経路が authorize より前に通る認証層(`verify_caller_signature`)が、
+    /// トークン種別によらず `{operation}:{resource}:{timestamp}` 形式で検証する。
+    /// リプレイ防御は署名内 timestamp の鮮度チェック(5 分窓)に一本化されている。
     ///
     /// Note: We cannot directly call AuthTokenVerifier::verify() because the infra and
     /// domain AuthToken use different JWT serialization formats for iss/aud fields
     /// (string key IDs vs byte-array KeyId). Instead, we use the domain's
     /// ContentAccessControl for access control checks and delegate signature verification
     /// to the shared crypto layer.
+    ///
+    /// `token_str` は受信したままの JWT 文字列。署名検証はワイヤ上のバイト列に
+    /// 対して行う(再シリアライズ形とフィールド順序が異なっても正しく検証できる)。
     async fn verify_auth_token(
         &self,
+        token_str: &str,
         token: &InfraAuthToken,
         request: &AuthorizationRequest,
         min_valid_issued_at: u64,
@@ -290,44 +284,29 @@ impl UcanAdapter {
             );
         }
 
-        // 5. Check JTI uniqueness (adapter layer - replay attack prevention)
-        if let Some(nonce_store) = &self.nonce_store {
-            if !nonce_store
-                .check_and_record_nonce(&token.payload.jti)
-                .await?
-            {
-                anyhow::bail!("AuthToken JTI already used (replay attack prevented)");
-            }
-        }
-
-        // 6. Extract owner's public key from key ID and verify AuthToken signature
+        // 5. Extract owner's public key from key ID and verify AuthToken signature
+        //    over the received wire bytes (issue #60: re-serialization must not
+        //    participate in signature verification).
         let owner_public_key = Self::get_public_key_from_key_id(&token.payload.iss)?;
 
-        SignatureVerifier::verify_auth_token_signature(token, &owner_public_key)
+        SignatureVerifier::verify_jwt_signature_wire(token_str, &owner_public_key)
             .context("AuthToken signature verification failed")?;
 
-        // 7. Verify request signature (adapter layer - mandatory)
-        let request_signature = request.request_signature.as_ref().ok_or_else(|| {
-            anyhow::anyhow!("Request signature is required for AuthToken-based authorization")
-        })?;
+        // 6. Require a request signature to be present.
+        //
+        // Proof-of-possession 自体は認証層(`verify_caller_signature`)が
+        // `{operation}:{resource}:{timestamp}` 形式で検証済みである(全経路が
+        // authorize より前に必ず通る)。リプレイ防御は署名内 timestamp の
+        // 鮮度チェックに一本化されており、旧実装の jti 単回消費
+        // (ノードごとに独立で、SDK の「委譲トークンを 1 個渡して TTL 内で
+        // 再利用する」設計と矛盾していた)は廃止した(issue #61)。
+        // ここでは「署名なしで authorize が呼ばれる」経路の混入を防ぐ
+        // 存在チェックのみを行う。
+        if request.request_signature.is_none() {
+            anyhow::bail!("Request signature is required for AuthToken-based authorization");
+        }
 
-        // Extract requester's public key from key ID
-        let requester_public_key = Self::get_public_key_from_key_id(&token.payload.aud)?;
-
-        // Construct request message: "{iss}:{aud}:{jti}"
-        let request_message = format!(
-            "{}:{}:{}",
-            token.payload.iss, token.payload.aud, token.payload.jti
-        );
-
-        SignatureVerifier::verify_request_signature(
-            request_message.as_bytes(),
-            request_signature,
-            &requester_public_key,
-        )
-        .context("Request signature verification failed")?;
-
-        // 8. Check capability (domain-level check, using infra token's capability format)
+        // 7. Check capability (domain-level check, using infra token's capability format)
         let required_action =
             crate::infrastructure::auth::auth_token::CapabilityAction::from_auth_capability(
                 &request.capability,
@@ -356,9 +335,16 @@ impl UcanAdapter {
         let auth_token = self.parse_auth_token(token.as_str())?;
 
         // 2. Verify AuthToken (domain verifier checks signature, expiration, audience,
-        //    capability, and access control; adapter checks JTI and request signature)
-        self.verify_auth_token(&auth_token, request, min_valid_issued_at, owner_identity)
-            .await?;
+        //    capability, and access control; request PoP is enforced upstream in
+        //    the authentication layer)
+        self.verify_auth_token(
+            token.as_str(),
+            &auth_token,
+            request,
+            min_valid_issued_at,
+            owner_identity,
+        )
+        .await?;
 
         Ok(true)
     }
@@ -749,7 +735,14 @@ mod tests {
         );
 
         // 6. Bob creates request signature
-        let request_sig = bob.sign_request(&auth_token);
+        let request_sig = bob.sign_request(
+            "read",
+            content_id.as_str(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        );
 
         // 7. Create authorization request from Bob using AuthToken
         let bob_identity = identity_from_key(&bob);
@@ -798,7 +791,14 @@ mod tests {
             Some(3600),
         );
 
-        let request_sig = bob.sign_request(&auth_token);
+        let request_sig = bob.sign_request(
+            "read",
+            content_id.as_str(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        );
 
         // Bob tries to use Write capability (not granted)
         let bob_identity = identity_from_key(&bob);
@@ -846,7 +846,14 @@ mod tests {
             vec![crate::infrastructure::auth::auth_token::CapabilityAction::Write],
             Some(3600),
         );
-        let request_sig = bob_recipient.sign_request(&forged_token);
+        let request_sig = bob_recipient.sign_request(
+            "write",
+            content_id.as_str(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        );
         let token = AuthToken::new(forged_token.to_jwt().unwrap());
 
         let request = AuthorizationRequest {
@@ -872,64 +879,105 @@ mod tests {
         );
     }
 
+    /// 委譲トークンは TTL 内で何度でも使える(issue #61)。
+    /// リプレイ防御は認証層の署名内 timestamp(鮮度窓)が担い、
+    /// 旧 jti 単回消費(1 トークン 1 リクエストになり、履歴取得 → データ取得
+    /// という通常の read すら成立しなかった)は廃止された。
     #[tokio::test]
-    async fn test_auth_token_authorization_denied_replay() {
+    async fn test_auth_token_reusable_across_requests() {
         use crate::infrastructure::auth::test_helpers::TestKeyPair;
-        use crate::infrastructure::persistence::SledPublicKeyRepository;
         use crate::port::auth_token::AuthToken;
 
         // Setup
         let alice = TestKeyPair::generate("user", "alice");
         let bob = TestKeyPair::generate("user", "bob");
         let repo = Arc::new(MockContentRepo::new());
-        let temp_dir = tempfile::TempDir::new().unwrap();
-        let nonce_store = Arc::new(SledPublicKeyRepository::open(temp_dir.path()).unwrap());
-        let adapter = UcanAdapter::new(repo.clone()).with_nonce_store(nonce_store);
+        let adapter = UcanAdapter::new(repo.clone());
 
-        let content_id = ContentId::new("test-content-replay".to_string()).unwrap();
+        let content_id = ContentId::new("test-content-reuse".to_string()).unwrap();
         let alice_identity = identity_from_key(&alice);
         let policy = AccessPolicy::new(content_id.clone(), alice_identity.clone());
         repo.policies
             .write()
             .await
-            .insert("test-content-replay".to_string(), policy);
+            .insert("test-content-reuse".to_string(), policy);
 
         // Create a valid token
         let auth_token = alice.create_auth_token(
             &bob,
-            "monas://content/test-content-replay",
+            "monas://content/test-content-reuse",
             vec![crate::infrastructure::auth::auth_token::CapabilityAction::Read],
             Some(3600),
         );
 
-        let request_sig = bob.sign_request(&auth_token);
+        let request_sig = bob.sign_request(
+            "read",
+            content_id.as_str(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        );
         let bob_identity = identity_from_key(&bob);
         let token = AuthToken::new(auth_token.to_jwt().unwrap());
 
-        // First request should succeed
-        let request = AuthorizationRequest {
-            identity: bob_identity.clone(),
-            resource: content_id.clone(),
-            capability: AuthCapability::ReadContent,
-            token: Some(token.clone()),
-            request_signature: Some(request_sig.clone()),
-        };
-        let result = adapter.authorize(&request).await.unwrap();
-        assert!(result.is_granted(), "First use should be granted");
+        // 同じトークンで複数リクエスト(履歴取得 → データ取得を模す)が全部通る
+        for i in 0..3 {
+            let request = AuthorizationRequest {
+                identity: bob_identity.clone(),
+                resource: content_id.clone(),
+                capability: AuthCapability::ReadContent,
+                token: Some(token.clone()),
+                request_signature: Some(request_sig.clone()),
+            };
+            let result = adapter.authorize(&request).await.unwrap();
+            assert!(
+                result.is_granted(),
+                "request {} with the same token should be granted, got: {:?}",
+                i,
+                result
+            );
+        }
+    }
 
-        // Second request with same token (same JTI) should be denied (replay)
-        let request2 = AuthorizationRequest {
-            identity: bob_identity,
+    /// authorize は request_signature の存在を要求する(検証自体は認証層で
+    /// 済んでいる前提だが、署名なしで authorize が呼ばれる経路の混入を防ぐ)。
+    #[tokio::test]
+    async fn test_auth_token_authorization_requires_request_signature() {
+        use crate::infrastructure::auth::test_helpers::TestKeyPair;
+        use crate::port::auth_token::AuthToken;
+
+        let alice = TestKeyPair::generate("user", "alice");
+        let bob = TestKeyPair::generate("user", "bob");
+        let repo = Arc::new(MockContentRepo::new());
+        let adapter = UcanAdapter::new(repo.clone());
+
+        let content_id = ContentId::new("test-content-no-sig".to_string()).unwrap();
+        let alice_identity = identity_from_key(&alice);
+        let policy = AccessPolicy::new(content_id.clone(), alice_identity.clone());
+        repo.policies
+            .write()
+            .await
+            .insert("test-content-no-sig".to_string(), policy);
+
+        let auth_token = alice.create_auth_token(
+            &bob,
+            "monas://content/test-content-no-sig",
+            vec![crate::infrastructure::auth::auth_token::CapabilityAction::Read],
+            Some(3600),
+        );
+
+        let request = AuthorizationRequest {
+            identity: identity_from_key(&bob),
             resource: content_id,
             capability: AuthCapability::ReadContent,
-            token: Some(token),
-            request_signature: Some(request_sig),
+            token: Some(AuthToken::new(auth_token.to_jwt().unwrap())),
+            request_signature: None,
         };
-        let result2 = adapter.authorize(&request2).await.unwrap();
+        let result = adapter.authorize(&request).await.unwrap();
         assert!(
-            result2.is_denied(),
-            "Replay should be denied, but got: {:?}",
-            result2
+            result.is_denied(),
+            "authorize without a request signature must be denied"
         );
     }
 
@@ -963,7 +1011,14 @@ mod tests {
         // Wait a moment to ensure expiration
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
-        let request_sig = bob.sign_request(&auth_token);
+        let request_sig = bob.sign_request(
+            "read",
+            content_id.as_str(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        );
 
         let bob_identity = identity_from_key(&bob);
         let token = AuthToken::new(auth_token.to_jwt().unwrap());
@@ -1016,7 +1071,14 @@ mod tests {
             .await
             .insert("test-content-inv".to_string(), policy);
 
-        let request_sig = bob.sign_request(&auth_token);
+        let request_sig = bob.sign_request(
+            "read",
+            content_id.as_str(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        );
         let bob_identity = identity_from_key(&bob);
         let token = AuthToken::new(auth_token.to_jwt().unwrap());
         let request = AuthorizationRequest {

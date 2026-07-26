@@ -127,18 +127,14 @@ impl TestKeyPair {
 
     /// Sign a request using this key pair
     ///
-    /// The request signature format is: "{iss}:{aud}:{jti}"
-    ///
-    /// # Arguments
-    /// * `auth_token` - The AuthToken being used for the request
+    /// The request signature format is `{operation}:{resource}:{timestamp}` —
+    /// identical for every token type (issue #61). The old "{iss}:{aud}:{jti}"
+    /// fixed string is gone: freshness lives inside the signed message.
     ///
     /// # Returns
     /// The request signature bytes
-    pub fn sign_request(&self, auth_token: &AuthToken) -> Vec<u8> {
-        let message = format!(
-            "{}:{}:{}",
-            auth_token.payload.iss, auth_token.payload.aud, auth_token.payload.jti
-        );
+    pub fn sign_request(&self, operation: &str, resource: &str, timestamp: u64) -> Vec<u8> {
+        let message = format!("{operation}:{resource}:{timestamp}");
         self.sign(message.as_bytes())
     }
 }
@@ -247,18 +243,21 @@ mod tests {
 
     #[test]
     fn test_sign_request() {
-        let alice = TestKeyPair::generate("user", "alice");
         let bob = TestKeyPair::generate("user", "bob");
 
-        let token = alice.create_auth_token(
-            &bob,
-            "monas://content/test123",
-            vec![CapabilityAction::Read],
-            None,
-        );
-
-        let request_sig = bob.sign_request(&token);
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let request_sig = bob.sign_request("read", "content-1", ts);
         assert!(!request_sig.is_empty());
+
+        // 統一形式 `{operation}:{resource}:{timestamp}` に対する署名として検証できる
+        let message = format!("read:content-1:{ts}");
+        use p256::ecdsa::signature::Verifier;
+        let vk = bob.secret_key.verifying_key();
+        let sig = p256::ecdsa::Signature::from_slice(&request_sig).unwrap();
+        assert!(vk.verify(message.as_bytes(), &sig).is_ok());
     }
 
     #[test]

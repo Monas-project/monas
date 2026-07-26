@@ -235,7 +235,12 @@ async fn create_content_delivers_crdt_ops_to_members_without_gossipsub_sync() {
             &data,
             Some(&test_token()),
             Some(&test_request_signature()),
-            None,
+            Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+            ),
         )
         .await
         .expect("create_content on A should succeed");
