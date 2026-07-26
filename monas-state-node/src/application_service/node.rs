@@ -211,16 +211,12 @@ impl StateNode {
             node_id.clone(),
         ));
 
-        // Create auth services with public key registry for identity verification
-        let auth_public_key_repo = Arc::new(
-            crate::infrastructure::persistence::SledPublicKeyRepository::open(
-                config.data_dir.join("auth_public_keys"),
-            )
-            .context("Failed to open auth public key repository")?,
-        );
+        // Create auth services.
+        // NOTE: リプレイ防御は署名内 timestamp の鮮度チェックに一本化されており、
+        // 旧 jti nonce ストア(ノードごとに独立で、委譲トークンの TTL 内再利用と
+        // 矛盾していた)は廃止した(issue #61)。
         let auth_service = MonasAccountAdapter::new();
-        let authz_service =
-            UcanAdapter::new(crdt_repo_dyn.clone()).with_nonce_store(auth_public_key_repo.clone());
+        let authz_service = UcanAdapter::new(crdt_repo_dyn.clone());
 
         // Create service with CRDT repository
         let service = Arc::new(

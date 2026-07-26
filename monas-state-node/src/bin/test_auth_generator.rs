@@ -4,7 +4,6 @@ use base64::{
 };
 use p256::ecdsa::{signature::Signer, SigningKey};
 use p256::elliptic_curve::rand_core::OsRng;
-use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest as Sha2Digest, Sha256};
 use std::env;
@@ -62,7 +61,7 @@ fn print_usage(program: &str) {
     eprintln!("    --resource <res>                     Resource (content_id or 'content')");
     eprintln!("    --timestamp <ts>                     Unix timestamp");
     eprintln!("    [--body <base64>]                    Request body (base64, for create/update)");
-    eprintln!("    [--auth-token <jwt>]                 Delegated token (signs \"iss:aud:jti\")");
+    eprintln!("    (delegated JWT requests sign the same message with the recipient key)");
     eprintln!("  generate-token [content_id]           - Generate an auth token (JWT)");
     eprintln!("  generate-share-token                  - Generate a share token for another user");
 }
@@ -107,7 +106,6 @@ fn sign_request(args: &[String]) {
     let mut resource = String::new();
     let mut timestamp_str = String::new();
     let mut body_b64 = String::new();
-    let mut auth_token = String::new();
 
     let mut i = 0;
     while i < args.len() {
@@ -140,12 +138,6 @@ fn sign_request(args: &[String]) {
                 i += 1;
                 if i < args.len() {
                     body_b64 = args[i].clone();
-                }
-            }
-            "--auth-token" => {
-                i += 1;
-                if i < args.len() {
-                    auth_token = args[i].clone();
                 }
             }
             _ => {}
@@ -181,10 +173,11 @@ fn sign_request(args: &[String]) {
     });
 
     // Construct the signing message.
-    // Delegated JWT requests use "{iss}:{aud}:{jti}".
-    let message = if !auth_token.is_empty() {
-        build_delegated_request_message(&auth_token)
-    } else if !body_b64.is_empty() {
+    // The message format is identical for every token type (issue #61):
+    // body-based for writes, `{operation}:{resource}:{timestamp}` otherwise.
+    // Delegated JWT requests are signed with the recipient (aud) key over the
+    // same message — the old "{iss}:{aud}:{jti}" fixed string is gone.
+    let message = if !body_b64.is_empty() {
         // Body-based signing: hex(sha256(body_bytes + timestamp_be_bytes))
         let body_bytes = STANDARD.decode(&body_b64).unwrap_or_else(|e| {
             eprintln!("Error: Invalid body base64: {}", e);
@@ -207,31 +200,6 @@ fn sign_request(args: &[String]) {
     println!("SIGNATURE={}", signature_base64);
     println!("TIMESTAMP={}", timestamp);
     println!("MESSAGE={}", message);
-}
-
-#[derive(Debug, Deserialize)]
-struct DelegatedPayload {
-    iss: String,
-    aud: String,
-    jti: String,
-}
-
-fn build_delegated_request_message(jwt: &str) -> String {
-    let parts: Vec<&str> = jwt.split('.').collect();
-    if parts.len() != 3 {
-        eprintln!("Error: Invalid --auth-token format (expected header.payload.signature)");
-        std::process::exit(1);
-    }
-
-    let payload_bytes = URL_SAFE_NO_PAD.decode(parts[1]).unwrap_or_else(|e| {
-        eprintln!("Error: Invalid JWT payload encoding: {}", e);
-        std::process::exit(1);
-    });
-    let payload: DelegatedPayload = serde_json::from_slice(&payload_bytes).unwrap_or_else(|e| {
-        eprintln!("Error: Invalid JWT payload JSON: {}", e);
-        std::process::exit(1);
-    });
-    format!("{}:{}:{}", payload.iss, payload.aud, payload.jti)
 }
 
 fn generate_auth_token(content_id: Option<String>) {

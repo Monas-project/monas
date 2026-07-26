@@ -227,8 +227,10 @@ impl AuthenticationService for MonasAccountAdapter {
         let issuer_key_id = &parsed.payload.iss;
         let public_key = Self::extract_public_key_from_key_id(issuer_key_id)?;
 
-        // Verify P-256 signature
-        SignatureVerifier::verify_auth_token_signature(&parsed, &public_key)
+        // Verify P-256 signature over the received wire bytes (never over a
+        // re-serialized form, which would reject tokens whose issuer used a
+        // different JSON field order).
+        SignatureVerifier::verify_jwt_signature_wire(jwt_str, &public_key)
             .context("JWT signature verification failed")
     }
 
@@ -493,6 +495,51 @@ mod tests {
             .verify_request_signature(&token, &invalid_signature, message, Some(0))
             .await;
         assert!(result.is_err());
+    }
+
+    /// issue #61: 委譲 JWT の PoP も非 JWT と同じ `{op}:{resource}:{timestamp}`
+    /// 形式で、宛先(aud)の鍵に対して検証される。同じトークンを別の
+    /// リクエスト(新しい timestamp・新しい署名)で再利用できる。
+    #[tokio::test]
+    async fn test_verify_request_signature_jwt_unified_message() {
+        use crate::infrastructure::auth::test_helpers::TestKeyPair;
+
+        let owner = TestKeyPair::generate("user", "owner");
+        let recipient = TestKeyPair::generate("user", "recipient");
+        let auth_token = owner.create_auth_token(
+            &recipient,
+            "monas://content/content-1",
+            vec![crate::infrastructure::auth::auth_token::CapabilityAction::Read],
+            Some(3600),
+        );
+        let token = AuthToken::new(auth_token.to_jwt().unwrap());
+        let adapter = MonasAccountAdapter::new();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // 同じトークンで 2 リクエスト(履歴取得 → データ取得を模す)。
+        // それぞれ新しい timestamp を署名の中に入れる。
+        for i in 0..2u64 {
+            let ts = now + i;
+            let message = format!("read:content-1:{ts}");
+            let sig = recipient.sign(message.as_bytes());
+            let result = adapter
+                .verify_request_signature(&token, &sig, &message, Some(ts))
+                .await;
+            assert!(result.is_ok(), "request {i} should verify: {result:?}");
+        }
+
+        // 宛先(aud)以外の鍵で署名したものは拒否される
+        let ts = now;
+        let message = format!("read:content-1:{ts}");
+        let forged = owner.sign(message.as_bytes());
+        assert!(adapter
+            .verify_request_signature(&token, &forged, &message, Some(ts))
+            .await
+            .is_err());
     }
 
     #[tokio::test]

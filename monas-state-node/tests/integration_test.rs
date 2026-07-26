@@ -106,6 +106,17 @@ fn test_request_signature() -> Vec<u8> {
     vec![0x01]
 }
 
+/// timestamp は署名検証で構造的に必須(issue #61)。mock 認証でも
+/// 存在チェックは実コードを通るため、現在時刻を渡す。
+fn test_timestamp() -> Option<u64> {
+    Some(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    )
+}
+
 fn sign_access_control_update(update: &AccessControlUpdate) -> (Vec<u8>, Vec<u8>) {
     use p256::ecdsa::signature::DigestSigner;
     use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
@@ -202,7 +213,7 @@ async fn test_create_content() {
             data,
             Some(&test_token()),
             Some(&test_request_signature()),
-            None,
+            test_timestamp(),
         )
         .await;
 
@@ -606,7 +617,7 @@ async fn test_access_control_update_and_verify() {
             &update,
             Some(&test_token()),
             Some(&test_request_signature()),
-            None,
+            test_timestamp(),
         )
         .await
         .unwrap();
@@ -657,7 +668,7 @@ async fn test_access_control_update_missing_signature() {
             &update,
             Some(&test_token()),
             Some(&test_request_signature()),
-            None,
+            test_timestamp(),
         )
         .await;
     assert!(result.is_err());
@@ -1095,7 +1106,7 @@ async fn test_update_content_requires_authentication() {
             data,
             None,
             Some(&test_request_signature()),
-            None,
+            test_timestamp(),
         )
         .await;
     assert!(result.is_err());
@@ -1277,7 +1288,7 @@ async fn test_authorization_denied_prevents_create_content() {
             data,
             Some(&test_token()),
             Some(&test_request_signature()),
-            None,
+            test_timestamp(),
         )
         .await;
 
@@ -1347,7 +1358,7 @@ async fn test_access_control_update_signature_verification() {
             &update,
             Some(&test_token()),
             Some(&test_request_signature()),
-            None,
+            test_timestamp(),
         )
         .await;
 

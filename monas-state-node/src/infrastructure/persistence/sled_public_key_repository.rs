@@ -20,8 +20,6 @@ pub struct SledPublicKeyRepository {
     key_id_tree: sled::Tree,
     /// Tree for NodeId -> KeyId mapping
     node_to_key_tree: sled::Tree,
-    /// Tree for nonce tracking (replay attack prevention)
-    nonce_tree: sled::Tree,
 }
 
 impl SledPublicKeyRepository {
@@ -36,16 +34,11 @@ impl SledPublicKeyRepository {
         let node_to_key_tree = db
             .open_tree("node_to_key_mapping")
             .context("Failed to open node_to_key_tree")?;
-        let nonce_tree = db
-            .open_tree("used_nonces")
-            .context("Failed to open nonce_tree")?;
-
         Ok(Self {
             db,
             node_key_tree,
             key_id_tree,
             node_to_key_tree,
-            nonce_tree,
         })
     }
 
@@ -53,81 +46,6 @@ impl SledPublicKeyRepository {
     pub fn open<P: AsRef<std::path::Path>>(path: P) -> Result<Self> {
         let db = sled::open(path)?;
         Self::new(Arc::new(db))
-    }
-
-    /// Maximum number of nonce entries before forced cleanup.
-    const MAX_NONCE_ENTRIES: usize = 1_000_000;
-
-    /// Check and record a nonce to prevent replay attacks.
-    ///
-    /// Uses sled's compare-and-swap to atomically check and insert,
-    /// preventing TOCTOU race conditions between concurrent requests.
-    ///
-    /// # Returns
-    /// Ok(true) if the nonce is new and was recorded
-    /// Ok(false) if the nonce was already used
-    pub async fn check_and_record_nonce(&self, nonce: &str) -> Result<bool> {
-        let nonce_bytes = nonce.as_bytes();
-
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs();
-
-        let timestamp_bytes = timestamp.to_le_bytes();
-
-        // Size limit: clean up aggressively if approaching capacity
-        if self.nonce_tree.len() >= Self::MAX_NONCE_ENTRIES {
-            tracing::warn!(
-                "Nonce store at capacity ({} entries), running cleanup",
-                self.nonce_tree.len()
-            );
-            self.cleanup_old_nonces(timestamp.saturating_sub(3600))?;
-            // If still over capacity after 1-hour cleanup, be more aggressive
-            if self.nonce_tree.len() >= Self::MAX_NONCE_ENTRIES {
-                self.cleanup_old_nonces(timestamp.saturating_sub(300))?;
-            }
-        }
-
-        // Atomic compare-and-swap: only insert if key does not exist (None -> Some)
-        match self.nonce_tree.compare_and_swap(
-            nonce_bytes,
-            None::<&[u8]>,
-            Some(&timestamp_bytes),
-        )? {
-            Ok(()) => {
-                // Successfully recorded — nonce was new
-                // Periodically clean up old nonces (older than 1 hour)
-                if timestamp % 60 == 0 {
-                    self.cleanup_old_nonces(timestamp.saturating_sub(3600))?;
-                }
-                Ok(true)
-            }
-            Err(_) => {
-                // Nonce already existed
-                Ok(false)
-            }
-        }
-    }
-
-    /// Clean up nonces older than the given timestamp
-    fn cleanup_old_nonces(&self, cutoff_timestamp: u64) -> Result<()> {
-        let mut keys_to_remove = Vec::new();
-
-        for result in self.nonce_tree.iter() {
-            let (key, value) = result?;
-            if value.len() == 8 {
-                let timestamp = u64::from_le_bytes(value.as_ref().try_into()?);
-                if timestamp < cutoff_timestamp {
-                    keys_to_remove.push(key.to_vec());
-                }
-            }
-        }
-
-        for key in keys_to_remove {
-            self.nonce_tree.remove(key)?;
-        }
-
-        Ok(())
     }
 
     /// Flush all pending writes to disk
@@ -268,25 +186,6 @@ mod tests {
         // Should no longer exist
         let retrieved = repo.get_public_key(&node_id).await.unwrap();
         assert!(retrieved.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_nonce_tracking() {
-        let (repo, _temp_dir) = create_test_repository().await;
-
-        let nonce = "test-nonce-123";
-
-        // First use should succeed
-        assert!(repo.check_and_record_nonce(nonce).await.unwrap());
-
-        // Second use should fail (replay attack prevention)
-        assert!(!repo.check_and_record_nonce(nonce).await.unwrap());
-
-        // Different nonce should succeed
-        assert!(repo
-            .check_and_record_nonce("different-nonce")
-            .await
-            .unwrap());
     }
 
     #[tokio::test]
