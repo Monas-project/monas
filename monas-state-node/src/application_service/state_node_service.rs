@@ -3028,7 +3028,7 @@ mod tests {
                 None,
                 &test_token(),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
             )
             .await;
         assert!(matches!(result, Err(StateNodeError::ContentNotFound(_))));
@@ -3063,7 +3063,7 @@ mod tests {
                 None,
                 &test_token(),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
             )
             .await
             .expect("relayed read should succeed");
@@ -3104,7 +3104,7 @@ mod tests {
                 None,
                 &test_token(),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
             )
             .await;
         assert!(matches!(
@@ -3132,7 +3132,7 @@ mod tests {
             .authorize_read(
                 &test_token(),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
                 "content-1",
             )
             .await;
@@ -3147,7 +3147,7 @@ mod tests {
             .authorize_read(
                 &test_token(),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
                 "content-1",
             )
             .await;
@@ -3287,7 +3287,7 @@ mod tests {
             .authorize_read(
                 &test_token(),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
                 "content-1",
             )
             .await;
@@ -3308,7 +3308,7 @@ mod tests {
             .authorize_read(
                 &test_token(),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
                 "content-1",
             )
             .await;
@@ -3325,7 +3325,7 @@ mod tests {
                 None,
                 &test_token(),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
             )
             .await;
         assert!(result.is_err());
