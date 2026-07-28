@@ -298,12 +298,20 @@ where
     /// 3. Loads the CEK for `local_content_id` and AES-GCM-decrypts.
     ///
     /// This is the client-side core of the verified read path
-    /// (`docs/design.md` §10「read応答の完全性検証」). It does NOT do the
-    /// monotonicity check — that is layered by the caller (SDK) around this
-    /// call, which owns the last-seen state.
+    /// (`docs/design.md` §10「read応答の完全性検証」). It verifies **payload
+    /// authenticity only**: that these bytes are the ones named by
+    /// `expected_version_cid`. It does not establish that the version is the
+    /// canonical head, the latest, or the work of an authorized writer.
     ///
-    /// Returns the plaintext, and the verified node's parent CIDs (for the
-    /// caller's monotonicity check).
+    /// There is **no monotonicity check anywhere** — neither here nor in the
+    /// SDK above. One existed and was removed: forged `parents` bypass it, and
+    /// it could not tell a legitimate sync lag from an attack, so it broke
+    /// honest reads without stopping dishonest ones. Version authenticity needs
+    /// an owner/writer-signed trust anchor, tracked in issue #59.
+    ///
+    /// Returns the plaintext and the verified node's parent CIDs. The parents
+    /// are returned for callers that want to inspect the DAG; nothing in the
+    /// SDK currently consumes them.
     /// `cek` を渡した場合はそれを使い、`None` の場合だけローカルの CEK ストアを
     /// 引く。呼び出し側が「どの CEK が正しいか」をより確実に知っている場合
     /// (share 受信者は送信者ピンの権威レコードに CEK を持つ)、ストアより

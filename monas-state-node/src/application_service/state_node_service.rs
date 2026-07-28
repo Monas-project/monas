@@ -140,6 +140,10 @@ enum MemberProvenance {
 /// Relay candidates plus the provenance of the list.
 struct ResolvedMembers {
     members: Vec<String>,
+    /// Kept for diagnostics and for #63: once membership is owner-signed,
+    /// `auth_verdict_is_authoritative` reads this again to restore the early
+    /// exit on a denial. Nothing branches on it today — see that method.
+    #[allow(dead_code)]
     provenance: MemberProvenance,
 }
 
@@ -164,15 +168,32 @@ impl ResolvedMembers {
     }
 
     /// Whether a negative authorization verdict from these peers may be treated
-    /// as final.
+    /// as final — i.e. may end the failover loop early.
     ///
-    /// For unproven peers it must not be: a single hostile node squatting near
-    /// the DHT key could otherwise deny every read by answering 403 first, and
-    /// even an honest but partially-synced replica can answer 403 from a policy
-    /// it has not finished replicating. In both cases the right move is to keep
-    /// asking the remaining candidates.
+    /// **Currently always false.** A denial is still kept and returned if no
+    /// candidate produces anything better; what this disables is *stopping* at
+    /// the first one.
+    ///
+    /// For [`MemberProvenance::DhtGuess`] the reason is direct: a single
+    /// hostile node squatting near the DHT key could otherwise deny every read
+    /// by answering 403 first, and even an honest but partially-synced replica
+    /// can answer 403 from a policy it has not finished replicating.
+    ///
+    /// [`MemberProvenance::LocalRecord`] used to return true here, on the
+    /// grounds that a listed member evaluated the caller against the real
+    /// policy. That does not hold while the record itself can be planted: the
+    /// first record for a content is accepted with no prior membership to check
+    /// against, so an attacker who wins that race lands in the list and its 403
+    /// would end the loop — a permanent denial of service against a legitimate
+    /// caller, which is exactly what the DhtGuess case is guarding against.
+    ///
+    /// Restoring the early exit needs owner-signed membership (#63). Until
+    /// then, the cost of always continuing is bounded: one extra round trip per
+    /// remaining candidate on a genuine denial, against an availability attack
+    /// that is otherwise unbounded. Erring toward availability is the right
+    /// direction — the caller is refused either way, just later.
     fn auth_verdict_is_authoritative(&self) -> bool {
-        self.provenance == MemberProvenance::LocalRecord
+        false
     }
 }
 
@@ -404,25 +425,57 @@ where
         }
     }
 
+    /// The canonical identity of whoever must hold the private key for this
+    /// request — the key the request signature is verified against.
+    ///
+    /// For a self-contained key id the token *is* that key. For a delegated JWT
+    /// it is the `aud` claim, which is likewise a self-contained key id; this
+    /// mirrors `verify_request_signature`, which verifies the request signature
+    /// against exactly that key.
+    ///
+    /// Deliberately **not** the raw token string. A JWT ends in an ECDSA
+    /// signature over its own header and payload, and ECDSA is malleable, so
+    /// the same JWT — same claims, same `aud`, still passing verification —
+    /// has more than one byte representation. Feeding raw token bytes into the
+    /// request identity would therefore hand one authorized request two
+    /// identities, which is the very bypass the identity is meant to prevent.
+    ///
+    /// A malformed JWT falls back to the whole token: such a token cannot
+    /// authenticate anyway, so the value only has to be deterministic.
+    fn canonical_principal(token: &AuthToken) -> String {
+        let raw = token.as_str();
+        if !raw.contains('.') {
+            return format!("key:{}", raw);
+        }
+        match crate::infrastructure::auth::auth_token::AuthToken::from_jwt(raw) {
+            Ok(parsed) => format!("aud:{}", parsed.payload.aud),
+            Err(_) => format!("raw:{}", raw),
+        }
+    }
+
     /// Identity of a mutation request, for the single-use record.
     ///
-    /// Derived from the **signed message plus the signer**, never from the
-    /// signature bytes. ECDSA signatures are malleable: for a valid `(r, s)`
-    /// the value `(r, n - s)` verifies against the same message and key, so
-    /// hashing the signature would give one authorized request two different
-    /// identities — and re-sending the converted form would slip straight past
-    /// the consumption record and re-commit the mutation.
+    /// Derived from the **signed message plus the canonical signer identity**,
+    /// never from any signature bytes. ECDSA signatures are malleable: for a
+    /// valid `(r, s)` the value `(r, n - s)` verifies against the same message
+    /// and key. That applies to *both* signatures in play here — the request
+    /// signature and the JWT's own signature — so neither may reach this hash.
+    /// Otherwise one authorized request gets two identities, and re-sending the
+    /// converted form slips past the consumption record and re-commits the
+    /// mutation.
     ///
     /// The message already binds operation, resource, timestamp and body
-    /// digest. The token is mixed in so two different callers cannot collide on
-    /// one identity, which would let one of them consume the other's request.
+    /// digest. The principal is mixed in so two different callers cannot
+    /// collide on one identity, which would let one of them consume the
+    /// other's request.
     fn mutation_request_id(token: &AuthToken, signing_message: &str) -> Vec<u8> {
         use sha2::{Digest, Sha256};
+        let principal = Self::canonical_principal(token);
         let mut hasher = Sha256::new();
-        // Length-prefixed so a token ending in the message's leading bytes
-        // cannot be re-split into a different (token, message) pair.
-        hasher.update((token.as_str().len() as u64).to_be_bytes());
-        hasher.update(token.as_str().as_bytes());
+        // Length-prefixed so a principal ending in the message's leading bytes
+        // cannot be re-split into a different (principal, message) pair.
+        hasher.update((principal.len() as u64).to_be_bytes());
+        hasher.update(principal.as_bytes());
         hasher.update(signing_message.as_bytes());
         hasher.finalize().to_vec()
     }
@@ -490,12 +543,13 @@ where
     /// version whose parent is the current head, so the stale content becomes
     /// the latest version.
     ///
-    /// The request identity comes from the **signed message and the signer**,
-    /// never from the signature bytes — see [`Self::mutation_request_id`]. The
-    /// message already commits to operation, resource, timestamp and body
-    /// digest, so no new field has to be added to the wire format to carry a
-    /// nonce, and no encoding of the signature can masquerade as a second
-    /// request.
+    /// The request identity comes from the **signed message and the canonical
+    /// signer identity**, never from signature bytes of any kind — see
+    /// [`Self::mutation_request_id`]. The message already commits to operation,
+    /// resource, timestamp and body digest, so no new field has to be added to
+    /// the wire format to carry a nonce, and no re-encoding of either the
+    /// request signature or the token's own signature can masquerade as a
+    /// second request.
     ///
     /// Consumption happens after verification (an invalid signature must not be
     /// able to burn a legitimate request's identity) and before any state is
@@ -2478,6 +2532,14 @@ where
                 removed_node_id,
                 ..
             } => {
+                // Removal deletes or rewrites the record that decides whether a
+                // relay treats a peer's 403 as final, so the publisher must be
+                // a member of the network it is changing — otherwise any peer
+                // could evict us from our own record just by naming us as
+                // `removed_node_id`. Same rule as the Added arm.
+                self.verify_source_is_existing_member(source_peer_id, content_id)
+                    .await?;
+
                 // If we were removed, delete the local network metadata
                 if removed_node_id == &self.local_node_id {
                     tracing::info!(
@@ -2589,6 +2651,13 @@ where
             } => {
                 // Verify source PeerID matches claimed node ID
                 Self::verify_source_peer_id(source_peer_id, deleted_by_node_id)?;
+
+                // That alone only proves the publisher is who it says it is —
+                // it names *itself*, so any authenticated peer would satisfy
+                // it. Deleting our record requires being a member of the
+                // network being deleted.
+                self.verify_source_is_existing_member(source_peer_id, content_id)
+                    .await?;
 
                 // Skip if we initiated the deletion
                 if deleted_by_node_id == &self.local_node_id {
@@ -3612,12 +3681,15 @@ mod tests {
         ));
     }
 
-    /// 逆に、attested な member(ローカルの ContentNetwork レコード由来)の
-    /// 401/403 は権威がある。実 policy に対して評価した結果なので、他の member
-    /// に聞いても答えは変わらず、聞き続けるのは拒否済みの相手に対して
-    /// コンテンツの存在を漏らすだけになる。
+    /// `record_relay_read_error` は「権威あり」と言われれば打ち切る。
+    ///
+    /// ただし現在この `true` を渡す呼び出し側は無い
+    /// ([`ResolvedMembers::auth_verdict_is_authoritative`] は常に false)。
+    /// レコード自体が最初の 1 通で植え付けられる間は、そこに載った peer の
+    /// 403 も最終判断にはできないためである。owner 署名付き membership
+    /// (#63)が入れば早期打ち切りを戻せるので、その配線だけは残してある。
     #[test]
-    fn attested_member_auth_verdict_is_final() {
+    fn record_relay_read_error_breaks_when_told_the_verdict_is_authoritative() {
         use crate::port::peer_network::{RelayReadError, RelayReadErrorKind};
 
         let mut best = None;
@@ -3668,6 +3740,95 @@ mod tests {
                 "failover must reach every candidate ({provenance:?})"
             );
         }
+    }
+
+    /// 委譲 JWT **自身の署名**も malleable である。生のトークン文字列を ID の
+    /// 入力にすると、claims も `aud` も request signature も変えずに `s` を
+    /// 反転するだけで別 ID を作れてしまい、同一ノードでも再適用できる。
+    ///
+    /// ID は検証後の canonical principal(`aud` の鍵 ID)から導くので、
+    /// JWT のバイト列が変わっても ID は動かない。
+    #[test]
+    fn mutation_request_id_ignores_the_jwt_signature_encoding() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        use p256::ecdsa::{signature::Signer, Signature, SigningKey};
+
+        // 実物と同じ形の JWT を組み立てる(header.payload を P-256 で署名)。
+        let key = SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"ES256","typ":"JWT","ver":"1.0"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(
+            br#"{"iss":"monas:user:alice","aud":"monas:user:bob","jti":"j1","iat":1700000000,"exp":1700003600,"att":[]}"#,
+        );
+        let signing_input = format!("{}.{}", header, payload);
+        let sig: Signature = key.sign(signing_input.as_bytes());
+
+        // 同じ鍵・同じメッセージに対して有効な、もう一方の表現。
+        let alt = Signature::from_scalars(*sig.r(), -*sig.s()).unwrap();
+
+        let jwt_a = format!(
+            "{}.{}",
+            signing_input,
+            URL_SAFE_NO_PAD.encode(sig.to_vec())
+        );
+        let jwt_b = format!(
+            "{}.{}",
+            signing_input,
+            URL_SAFE_NO_PAD.encode(alt.to_vec())
+        );
+        assert_ne!(
+            jwt_a, jwt_b,
+            "2 つの表現が同じでは、このテストは何も証明しない"
+        );
+        // 実際に JWT として解釈できることを確かめる。ここが失敗すると
+        // `canonical_principal` が raw フォールバックに落ち、両者が別 ID に
+        // なるのを「malleability を防げていない」と誤読してしまう。
+        assert!(
+            crate::infrastructure::auth::auth_token::AuthToken::from_jwt(&jwt_a).is_ok(),
+            "テスト用 JWT が本物のスキーマを満たしていない"
+        );
+
+        let msg = StateNodeService::<
+            MockNodeRegistry,
+            MockContentNetworkRepository,
+            MockPeerNetwork,
+            MockEventPublisher,
+            MockContentRepository,
+        >::build_signing_message(
+            "update", "content-1", 1_700_000_000, Some(b"payload")
+        );
+
+        let id_of = |t: &str| {
+            StateNodeService::<
+                MockNodeRegistry,
+                MockContentNetworkRepository,
+                MockPeerNetwork,
+                MockEventPublisher,
+                MockContentRepository,
+            >::mutation_request_id(&AuthToken::new(t.to_string()), &msg)
+        };
+
+        assert_eq!(
+            id_of(&jwt_a),
+            id_of(&jwt_b),
+            "JWT の署名表現を変えても同じリクエストとして識別されなければならない"
+        );
+
+        // 別の aud(＝別の principal)なら当然 ID は変わる。
+        let other_payload = URL_SAFE_NO_PAD.encode(
+            br#"{"iss":"monas:user:alice","aud":"monas:user:carol","jti":"j1","iat":1700000000,"exp":1700003600,"att":[]}"#,
+        );
+        let other_input = format!("{}.{}", header, other_payload);
+        let other_sig: Signature = key.sign(other_input.as_bytes());
+        let jwt_c = format!(
+            "{}.{}",
+            other_input,
+            URL_SAFE_NO_PAD.encode(other_sig.to_vec())
+        );
+        assert_ne!(
+            id_of(&jwt_a),
+            id_of(&jwt_c),
+            "aud が違えば別 principal なので ID も別でなければならない"
+        );
     }
 
     /// mutation の同一性は「署名バイト列」ではなく「署名対象メッセージ + signer」
@@ -4171,6 +4332,91 @@ mod tests {
             .unwrap()
             .expect("record stored");
         assert!(network.has_member_str("node-2"));
+    }
+
+    /// A non-member cannot evict us from our own record by naming us as the
+    /// removed node.
+    ///
+    /// This arm had no publisher check at all, so a single event from any peer
+    /// deleted the `ContentNetwork` record — which is what decides whether a
+    /// relay treats a peer's 403 as final.
+    #[tokio::test]
+    async fn removal_from_a_non_member_cannot_delete_our_record() {
+        let content_repo = Arc::new(RwLock::new(
+            MockContentNetworkRepository::new()
+                .with_network(create_test_network("content-1", vec!["node-1", "node-2"])),
+        ));
+        let service: TestService = StateNodeService::new(
+            MockNodeRegistry::new(),
+            content_repo,
+            Arc::new(MockPeerNetwork::new().with_local_peer_id("node-1")),
+            MockEventPublisher::new(),
+            Arc::new(MockContentRepository::new()),
+            "node-1".to_string(),
+        )
+        .with_authentication_service(TestAuthService)
+        .with_authorization_service(AllowAllAuthorizationService);
+
+        let event = Event::ContentNetworkManagerRemoved {
+            content_id: "content-1".to_string(),
+            removed_node_id: "node-1".to_string(),
+            member_nodes: vec!["node-2".to_string()],
+            reason: "low_capacity".to_string(),
+            timestamp: 12345,
+        };
+
+        let result = service.handle_sync_event(&event, Some("node-9")).await;
+        assert!(result.is_err(), "non-member publisher must be rejected");
+
+        assert!(
+            service
+                .get_content_network_for_test("content-1")
+                .await
+                .unwrap()
+                .is_some(),
+            "our record must survive"
+        );
+    }
+
+    /// A non-member cannot delete our record with a `ContentDeleted` event.
+    ///
+    /// `verify_source_peer_id` alone does not help here: the event names its
+    /// own publisher, so any authenticated peer satisfies it.
+    #[tokio::test]
+    async fn content_deleted_from_a_non_member_cannot_delete_our_record() {
+        let content_repo = Arc::new(RwLock::new(
+            MockContentNetworkRepository::new()
+                .with_network(create_test_network("content-1", vec!["node-1", "node-2"])),
+        ));
+        let service: TestService = StateNodeService::new(
+            MockNodeRegistry::new(),
+            content_repo,
+            Arc::new(MockPeerNetwork::new().with_local_peer_id("node-1")),
+            MockEventPublisher::new(),
+            Arc::new(MockContentRepository::new()),
+            "node-1".to_string(),
+        )
+        .with_authentication_service(TestAuthService)
+        .with_authorization_service(AllowAllAuthorizationService);
+
+        // node-9 both publishes and names itself — the self-claim check passes.
+        let event = Event::ContentDeleted {
+            content_id: "content-1".to_string(),
+            deleted_by_node_id: "node-9".to_string(),
+            timestamp: 12345,
+        };
+
+        let result = service.handle_sync_event(&event, Some("node-9")).await;
+        assert!(result.is_err(), "non-member publisher must be rejected");
+
+        assert!(
+            service
+                .get_content_network_for_test("content-1")
+                .await
+                .unwrap()
+                .is_some(),
+            "our record must survive"
+        );
     }
 
     /// A non-member cannot rewrite the member set of a network we already hold.
