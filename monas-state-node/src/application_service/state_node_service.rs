@@ -3765,16 +3765,8 @@ mod tests {
         // 同じ鍵・同じメッセージに対して有効な、もう一方の表現。
         let alt = Signature::from_scalars(*sig.r(), -*sig.s()).unwrap();
 
-        let jwt_a = format!(
-            "{}.{}",
-            signing_input,
-            URL_SAFE_NO_PAD.encode(sig.to_vec())
-        );
-        let jwt_b = format!(
-            "{}.{}",
-            signing_input,
-            URL_SAFE_NO_PAD.encode(alt.to_vec())
-        );
+        let jwt_a = format!("{}.{}", signing_input, URL_SAFE_NO_PAD.encode(sig.to_vec()));
+        let jwt_b = format!("{}.{}", signing_input, URL_SAFE_NO_PAD.encode(alt.to_vec()));
         assert_ne!(
             jwt_a, jwt_b,
             "2 つの表現が同じでは、このテストは何も証明しない"
