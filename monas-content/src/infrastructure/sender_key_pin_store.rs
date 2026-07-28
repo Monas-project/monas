@@ -61,7 +61,7 @@ impl SenderKeyPinStore for InMemorySenderKeyPinStore {
 }
 
 /// sled 実装。キーは `"sender_pin:{content_id}"`、値は `SenderKeyPin` の JSON。
-/// CEK / share / pubkey / last_seen ストアと同じ `sled::Db` を共有できる。
+/// CEK / share / pubkey ストアと同じ `sled::Db` を共有できる。
 pub struct SledSenderKeyPinStore {
     db: sled::Db,
 }

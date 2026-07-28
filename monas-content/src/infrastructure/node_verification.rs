@@ -34,7 +34,8 @@ pub enum NodeVerificationError {
 }
 
 /// A relay-read `Node` decoded enough to (a) extract the ciphertext payload and
-/// (b) expose the parent version CIDs for the monotonicity check.
+/// (b) expose the parent version CIDs (part of the node, exposed for callers
+/// that need the DAG shape).
 ///
 /// Only the fields the client needs are decoded; the CID is recomputed from the
 /// raw bytes (not from this struct) so decoding never has to round-trip
@@ -43,7 +44,7 @@ pub enum NodeVerificationError {
 pub struct VerifiedNode {
     /// The ciphertext stored in the node payload (`payload.data`).
     pub ciphertext: Vec<u8>,
-    /// Parent version CIDs (`parents`), as strings, for ancestor checks.
+    /// Parent version CIDs (`parents`), as strings.
     pub parents: Vec<String>,
 }
 
