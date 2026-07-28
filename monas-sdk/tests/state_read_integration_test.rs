@@ -487,6 +487,32 @@ async fn cek_rotation_after_revoke_updates_recipient_and_read() {
         read_after_replay.error
     );
 
+    // 同一世代の envelope を再処理しても、送信者鍵・世代・CEK の3つ組は
+    // そのままで read も壊れない。以前はこの経路が「pin は据え置き、CEK だけ
+    // 無条件 save」だったため、並行処理と組み合わせると世代と CEK が食い違う
+    // 状態を作れた(pin=N+1 / CEK=N)。3つ組を1レコードの CAS で入れ替える
+    // ようにしたので、この経路からは不整合が作れない。
+    let reprocess_same_epoch =
+        recipient_controller.decrypt_shared_content(DecryptSharedContentInput {
+            content_id: created.content_id.clone(),
+            private_key: surviving_recipient.private_key.clone(),
+            sender_public_key: shared_surviving.sender_public_key.clone(),
+            recipient_key_id: reissued.recipient_key_id.clone(),
+            key_envelope: reissued.key_envelope.clone(),
+            version: None,
+        });
+    assert!(
+        reprocess_same_epoch.success,
+        "re-processing the current envelope must stay idempotent: {:?}",
+        reprocess_same_epoch.error
+    );
+    let read_after_reprocess = read_latest();
+    assert!(
+        read_after_reprocess.success,
+        "read must still succeed after re-processing the current envelope: {:?}",
+        read_after_reprocess.error
+    );
+
     cleanup_content_artifacts();
 }
 

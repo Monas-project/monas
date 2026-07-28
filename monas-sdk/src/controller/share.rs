@@ -829,23 +829,36 @@ impl MonasController {
         //    unwrap + 復号の成功 = 送信者と鍵世代の正しさが暗号学的に確認できた
         //    時点なので、ここで初めてローカルへ反映する。
         //
-        //    順序が重要: **先に pin を compare-and-advance し、成功した場合にだけ
-        //    CEK を公開する**。pin を無条件 save して後から CEK を書くと、rotation
-        //    前後の envelope(epoch N / N+1)が並行して処理されたとき、後から
-        //    完了した古い epoch が新しい CEK と pin を巻き戻せてしまう。
+        //    3つ組は 1 レコードにまとめて単一の compare-and-swap で入れ替える。
+        //    以前は「pin を CAS してから CEK を別ストアへ save」していたが、
+        //    2 つの commit に分かれている限り、間に別の世代の処理が割り込めば
+        //    `pin = N+1, CEK = N` のような不整合が作れてしまう
+        //    (`SenderKeyPin` のモジュール doc に interleaving を記載)。
+        //
         //    CAS が失敗した = 別の処理が先に同じかより新しい世代へ進めた、なので
-        //    こちらの(古い)CEK は書かない。
+        //    こちらの(古い)3つ組は捨てる。
         let new_pin = monas_content::infrastructure::sender_key_pin_store::SenderKeyPin {
             sender_public_key: effective_sender_public_key,
             key_epoch: input.key_envelope.key_epoch,
+            cek: Some(cek.0.clone()),
         };
-        let should_advance_pin = match &pinned {
-            None => true,
-            Some(pin) => input.key_envelope.key_epoch > pin.key_epoch,
-        };
+        //    ここへ来る時点で、記録済み世代より古い envelope は step 4 で既に
+        //    拒否されている(`stale key envelope`)。よって残るのは「同じ世代」か
+        //    「より新しい世代」のどちらかで、どちらも CAS の期待値が
+        //    「今読んだレコードそのもの」なので巻き戻しにはならない。
+        //
+        //    同一世代でも CAS を通すのは、旧レコードが CEK を持たない
+        //    (この修正より前に作られた、あるいは CEK 保存に失敗した)場合に、
+        //    同じ世代のまま CEK を埋め直して回復できるようにするため。
+        //
+        //    権威レコードが既にこの3つ組そのものなら CAS 自体は不要。ただし
+        //    CEK キャッシュだけが欠けている可能性はあるので、その更新は通す。
+        let already_current = pinned.as_ref() == Some(&new_pin);
 
-        let advanced = if should_advance_pin {
-            match self.sender_pin_store.compare_and_save(
+        let should_refresh_cek_cache = if already_current {
+            true
+        } else {
+            let advanced = match self.sender_pin_store.compare_and_save(
                 content_id.as_str(),
                 pinned.as_ref(),
                 &new_pin,
@@ -861,21 +874,20 @@ impl MonasController {
                         trace_id,
                     );
                 }
-            }
-        } else {
-            // 同一世代の再処理。pin は動かさないが、CEK が未保存のケース
-            // (前回 pin だけ書けて CEK 保存に失敗した等)を回復できるよう
-            // 下で CEK は書く。
-            true
+            };
+            // CAS に負けた場合は、勝った側がより新しい(または同じ)世代を
+            // 書いているので、こちらの CEK でキャッシュを上書きしてはいけない。
+            advanced
         };
 
-        //    CEK は受信者デバイスのローカルストアに留まり、ネットワークには出ない。
-        //    これで share 受信者も state node 経由の検証付き read で復号できる。
-        if advanced {
+        // CEK ストアは上の権威レコードから導出されるキャッシュ。
+        // CEK は受信者デバイスのローカルに留まり、ネットワークには出ない。
+        if should_refresh_cek_cache {
             if let Err(e) = self.content_service.cek_store.save(&content_id, &cek) {
-                // 保存に失敗したまま成功を返すと、呼び出し側は「以後この端末で
-                // 検証付き read ができる」と信じるのに実際は MissingKey で失敗する。
-                // silent degradation を避けるためエラーとして返す(再処理可能)。
+                // 権威レコードには CEK が入っているので、ここで失敗しても
+                // 再処理すればキャッシュを埋め直せる。ただし黙って成功を
+                // 返すと、呼び出し側は「以後この端末で検証付き read ができる」
+                // と信じるのに実際は MissingKey で失敗するため、エラーにする。
                 return ApiResponse::error(
                     ApiError::Internal(format!(
                         "decrypted the shared content but failed to persist its CEK for {}: {e}. \
