@@ -70,11 +70,48 @@ pub struct MonasController {
     /// share 受信者側の送信者公開鍵ピン(TOFU)と受理済み CEK 鍵世代の記録
     /// (KeyEnvelope の送信者認証と rotation 巻き戻し replay 防止)
     sender_pin_store: DynSenderPinStore,
+    /// content 単位の revoke 直列化ロック。
+    content_revoke_locks: ContentLocks,
 }
 
 /// SDK が使う送信者鍵ピンストアの動的型。
 pub(super) type DynSenderPinStore =
     std::sync::Arc<dyn monas_content::infrastructure::sender_key_pin_store::SenderKeyPinStore>;
+
+/// content id ごとの相互排他ロック。
+///
+/// revoke は「ACL・CEK・ローカル ciphertext・state node の状態」を
+/// load-modify-save で更新する複合操作で、そのどれにも version CAS が無い。
+/// `MonasController` は gateway 等で `Arc` 共有され複数リクエストから同時に
+/// 呼ばれるため、同じ content への revoke が並行すると次が起こる:
+///
+/// - 双方が同じ Share を読み、後勝ちで save → 片方の受信者削除が消える
+///   (lost update)
+/// - 異なる CEK が同じ key_epoch として配られる
+/// - ローカル ACL/CEK と state node の ciphertext が別リクエスト由来になる
+///
+/// 根本解決は Share・CEK・ciphertext を1つの transactional CAS にまとめる
+/// ことだが、3ストア + リモート更新にまたがるため、まず content 単位の
+/// 直列化で「並行 revoke が状態を分岐させない」ことを保証する。
+/// ロックはプロセス内のみで、複数 gateway プロセスからの並行 revoke は
+/// カバーしない(その場合は state node 側の CAS が必要)。
+#[derive(Clone, Default)]
+pub(super) struct ContentLocks {
+    inner: Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<std::sync::Mutex<()>>>>>,
+}
+
+impl ContentLocks {
+    /// `content_id` 専用の mutex を取得する。同じ id には常に同じ mutex を返す。
+    pub(super) fn mutex_for(&self, content_id: &str) -> Arc<std::sync::Mutex<()>> {
+        let mut map = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        map.entry(content_id.to_string())
+            .or_insert_with(|| Arc::new(std::sync::Mutex::new(())))
+            .clone()
+    }
+}
 
 impl MonasController {
     pub(super) fn current_unix_timestamp() -> u64 {
@@ -186,6 +223,7 @@ impl MonasController {
                 public_key_directory,
             ),
             sender_pin_store,
+            content_revoke_locks: ContentLocks::default(),
         })
     }
 

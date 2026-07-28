@@ -262,6 +262,8 @@ flowchart TD
 
 `min_valid_issued_at`は時刻ベースの一括失効なので、**残存する受信者のTokenも巻き添えで失効する**。呼び出し側は取り消し後に、残存受信者へ新しいKeyEnvelopeと新しいTokenの両方を配り直す必要がある。SDKは`RevokeShareOutput`で再発行KeyEnvelope（`reissued_envelopes`）と失効時刻（`token_invalidated_at`）の両方を返す。
 
+取り消しはACL・CEK・ローカルciphertext・state node状態にまたがるload-modify-saveであり、そのどれにもversion CASが無い。したがって**同じcontentへの取り消しはcontent単位で直列化する**。並行させると、双方が同じShareを読んで後勝ちでsaveし片方の受信者削除が消える（lost update）、異なるCEKが同じ`key_epoch`として配られる、といった分岐が起こる。SDKのコントローラはgatewayから共有され複数リクエストから同時に呼ばれるため、これは理論上の話ではない。現状の直列化はプロセス内に閉じており、複数gatewayプロセスからの並行取り消しには対応しない — そこまで守るにはShare・CEK・ciphertextを1つのtransactional CASにまとめるか、state node側にCASを置く必要がある。
+
 ---
 
 ## 8. CIDによるコンテンツアドレッシング

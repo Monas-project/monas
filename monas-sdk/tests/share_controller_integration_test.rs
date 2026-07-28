@@ -835,3 +835,145 @@ async fn revoke_share_fails_when_token_invalidation_fails() {
 
     cleanup_content_artifacts();
 }
+
+/// 同じ content への revoke が並行しても、両方の受信者削除が残る。
+///
+/// revoke は ACL・CEK・ローカル ciphertext・state node 状態にまたがる
+/// load-modify-save で、どこにも version CAS が無い。直列化しないと 2 つの
+/// revoke が同じ Share を読んで後勝ちで save し、片方の削除が消える
+/// (lost update)。`MonasController` は gateway から `Arc` 共有されるので、
+/// これは理論上の話ではない。
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_revokes_do_not_lose_either_removal() {
+    let _guard = acquire_test_lock();
+    let mut server = Server::new_async().await;
+    let _create_mock = server
+        .mock("POST", "/content")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"content_id":"concurrent-revoke-remote"}"#)
+        .create_async()
+        .await;
+    let _delegate_mock = server
+        .mock("POST", "/issuer/delegate")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"delegated_token":"dummy.jwt.token","issued_at":1700000000,"expires_at":1700003600,"jti":"jti-concurrent"}"#,
+        )
+        .expect_at_least(1)
+        .create_async()
+        .await;
+    let _update_mock = server
+        .mock("PUT", mockito::Matcher::Regex(r"^/content/.+$".to_string()))
+        .with_status(200)
+        .expect_at_least(1)
+        .create_async()
+        .await;
+
+    let controller = std::sync::Arc::new(MonasController::with_urls(server.url(), server.url()));
+
+    let sender = controller
+        .generate_keypair(GenerateKeypairInput {
+            key_type: KeyType::Secp256r1,
+        })
+        .data
+        .expect("sender keypair should be generated");
+    let recipient_a = controller
+        .generate_keypair(GenerateKeypairInput {
+            key_type: KeyType::Secp256r1,
+        })
+        .data
+        .expect("recipient a keypair should be generated");
+    let recipient_b = controller
+        .generate_keypair(GenerateKeypairInput {
+            key_type: KeyType::Secp256r1,
+        })
+        .data
+        .expect("recipient b keypair should be generated");
+
+    let created = controller
+        .create_content(
+            CreateContentInput {
+                content: URL_SAFE_NO_PAD.encode(b"concurrent-revoke-target"),
+                metadata: Some(ContentMetadata {
+                    name: Some("concurrent-revoke.txt".to_string()),
+                    content_type: Some("text/plain".to_string()),
+                    created_at: None,
+                    updated_at: None,
+                }),
+            },
+            None,
+        )
+        .data
+        .expect("create should return data");
+
+    for recipient in [&recipient_a, &recipient_b] {
+        assert!(
+            controller
+                .share_content(ShareContentInput {
+                    content_id: created.content_id.clone(),
+                    sender_public_key: sender.public_key.clone(),
+                    sender_private_key: sender.private_key.clone(),
+                    recipient_public_key: recipient.public_key.clone(),
+                    permissions: vec![Permission::Read],
+                })
+                .success,
+            "share_content should succeed"
+        );
+    }
+
+    // 2 つの受信者を同時に revoke する
+    let handles: Vec<_> = [&recipient_a, &recipient_b]
+        .into_iter()
+        .map(|recipient| {
+            let controller = controller.clone();
+            let content_id = created.content_id.clone();
+            let sender_public_key = sender.public_key.clone();
+            let sender_private_key = sender.private_key.clone();
+            let recipient_public_key = recipient.public_key.clone();
+            // filesync repository が Tokio reactor を要求するので、素の
+            // std::thread ではなく blocking task として走らせる。
+            tokio::task::spawn_blocking(move || {
+                controller.revoke_share(
+                    RevokeShareInput {
+                        content_id,
+                        remote_content_id: None,
+                        sender_public_key,
+                        sender_private_key,
+                        recipient_public_key,
+                    },
+                    None,
+                )
+            })
+        })
+        .collect();
+
+    for handle in handles {
+        let response = handle.await.expect("revoke task should not panic");
+        assert!(
+            response.success,
+            "concurrent revoke should succeed: {:?}",
+            response.error
+        );
+    }
+
+    // どちらの受信者も復号できない = 両方の削除が残っている。
+    // 片方の削除が lost update で消えていれば、その受信者は復号できてしまう。
+    for (label, recipient) in [("a", &recipient_a), ("b", &recipient_b)] {
+        let shared_again = controller.share_content(ShareContentInput {
+            content_id: created.content_id.clone(),
+            sender_public_key: sender.public_key.clone(),
+            sender_private_key: sender.private_key.clone(),
+            recipient_public_key: recipient.public_key.clone(),
+            permissions: vec![Permission::Read],
+        });
+        assert!(
+            shared_again.success,
+            "re-sharing to recipient {label} should succeed after revoke: {:?}",
+            shared_again.error
+        );
+    }
+
+    cleanup_content_artifacts();
+}

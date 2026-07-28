@@ -456,6 +456,24 @@ impl MonasController {
         // 2. ContentIdに変換
         let content_id = ContentId::new(input.content_id.clone());
 
+        // この content への revoke を直列化する。revoke は ACL・CEK・ローカル
+        // ciphertext・state node 状態にまたがる load-modify-save で、どこにも
+        // version CAS が無い。`MonasController` は gateway から `Arc` 共有され
+        // 同時に呼ばれるため、ロックが無いと 2 つの revoke が同じ Share を読んで
+        // 後勝ちで save し、片方の受信者削除が消える(lost update)。
+        // 異なる CEK が同じ key_epoch として配られる問題も同じ原因。
+        //
+        // snapshot 取得より前にロックを取る: 後にすると、読んだ snapshot が
+        // ロック取得までの間に古くなり、失敗時の巻き戻しが他方の結果を
+        // 上書きしてしまう。
+        //
+        // ロックはプロセス内のみ。複数 gateway プロセスからの並行 revoke は
+        // これでは防げず、state node 側の CAS が必要になる(現状の制約)。
+        let revoke_lock = self.content_revoke_locks.mutex_for(content_id.as_str());
+        let _revoke_guard = revoke_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         let snapshot = match self.capture_revoke_share_snapshot(&content_id) {
             Ok(snapshot) => snapshot,
             Err(e) => return ApiResponse::error(e, trace_id),
