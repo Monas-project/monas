@@ -542,6 +542,84 @@ mod tests {
             .is_err());
     }
 
+    /// cross-resource / cross-operation replay の回帰テスト。
+    /// ある content の update 用に取得した body+署名を、別 content や
+    /// create へ転用できてはならない(署名対象が operation / resource に
+    /// 束縛されているので検証が落ちる)。
+    #[tokio::test]
+    async fn test_body_signature_cannot_be_replayed_across_resource_or_operation() {
+        use crate::port::auth_token::RequestMetadata;
+        use p256::ecdsa::signature::Signer;
+        use sha2::Digest;
+
+        let (adapter, signing_key, key_id) = create_test_adapter();
+        let token = AuthToken::new(key_id);
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let body = b"payload-bytes";
+        let body_digest = hex::encode(sha2::Sha256::digest(body));
+
+        let captured = RequestMetadata {
+            timestamp: ts,
+            operation: "update".to_string(),
+            resource: "content-1".to_string(),
+        };
+        let captured_message = captured.signing_message_with_body_digest(&body_digest);
+        let signature: p256::ecdsa::Signature = signing_key.sign(captured_message.as_bytes());
+        let signature_bytes = signature.to_vec();
+
+        // 正規の組み合わせは通る
+        assert!(adapter
+            .verify_request_signature(&token, &signature_bytes, &captured_message, Some(ts))
+            .await
+            .is_ok());
+
+        // 同じ body・同じ署名を別 content へ転用 → 拒否
+        let other_resource = RequestMetadata {
+            resource: "content-2".to_string(),
+            ..captured.clone()
+        };
+        assert!(adapter
+            .verify_request_signature(
+                &token,
+                &signature_bytes,
+                &other_resource.signing_message_with_body_digest(&body_digest),
+                Some(ts),
+            )
+            .await
+            .is_err());
+
+        // 同じ body・同じ署名を create へ転用 → 拒否
+        let other_operation = RequestMetadata {
+            operation: "create".to_string(),
+            ..captured.clone()
+        };
+        assert!(adapter
+            .verify_request_signature(
+                &token,
+                &signature_bytes,
+                &other_operation.signing_message_with_body_digest(&body_digest),
+                Some(ts),
+            )
+            .await
+            .is_err());
+
+        // body を差し替えても拒否
+        assert!(adapter
+            .verify_request_signature(
+                &token,
+                &signature_bytes,
+                &captured.signing_message_with_body_digest(&hex::encode(sha2::Sha256::digest(
+                    b"tampered"
+                ))),
+                Some(ts),
+            )
+            .await
+            .is_err());
+    }
+
     #[tokio::test]
     async fn test_verify_request_signature_expired_timestamp() {
         let (adapter, signing_key, key_id) = create_test_adapter();

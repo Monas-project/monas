@@ -53,11 +53,45 @@ pub struct RequestMetadata {
     pub resource: String,
 }
 
+/// Domain separation tag for request signatures. Bumping this invalidates
+/// every previously produced signature, which is what we want if the message
+/// structure ever changes.
+pub const REQUEST_SIGNATURE_DOMAIN: &str = "monas-request-v1";
+
 impl RequestMetadata {
-    /// Create signing message for request signature
-    /// Format: "{operation}:{resource}:{timestamp}"
+    /// Create the signing message for a request signature.
+    ///
+    /// Every request signature — with or without a body, JWT or not — commits
+    /// to the same fields, so a signature captured for one request cannot be
+    /// replayed against a different operation or resource (issue: review
+    /// finding "body signature lacks operation/resource").
+    ///
+    /// Format (length-prefixed to keep the concatenation unambiguous):
+    ///
+    /// ```text
+    /// monas-request-v1:<len>:<operation>:<len>:<resource>:<timestamp>:<len>:<body_digest_hex>
+    /// ```
+    ///
+    /// `body_digest_hex` is `sha256(body)` for requests that carry a body, and
+    /// the empty string otherwise. Lengths prevent a crafted operation or
+    /// resource containing `:` from shifting the field boundaries.
     pub fn signing_message(&self) -> String {
-        format!("{}:{}:{}", self.operation, self.resource, self.timestamp)
+        self.signing_message_with_body_digest("")
+    }
+
+    /// Same as [`Self::signing_message`], but committing to a body digest.
+    pub fn signing_message_with_body_digest(&self, body_digest_hex: &str) -> String {
+        format!(
+            "{}:{}:{}:{}:{}:{}:{}:{}",
+            REQUEST_SIGNATURE_DOMAIN,
+            self.operation.len(),
+            self.operation,
+            self.resource.len(),
+            self.resource,
+            self.timestamp,
+            body_digest_hex.len(),
+            body_digest_hex,
+        )
     }
 }
 
@@ -135,5 +169,81 @@ mod tests {
 
         assert_eq!(token1, token2);
         assert_ne!(token1, token3);
+    }
+
+    /// 署名対象が operation / resource / timestamp / body digest すべてに
+    /// 束縛されることの回帰テスト。ここが緩むと、ある content 向けに
+    /// 取得した署名を別 content や別 operation へ転用できてしまう。
+    #[test]
+    fn signing_message_binds_operation_resource_and_timestamp() {
+        let base = RequestMetadata {
+            timestamp: 42,
+            operation: "update".to_string(),
+            resource: "content-1".to_string(),
+        };
+        let msg = base.signing_message();
+        assert!(msg.starts_with("monas-request-v1:"), "msg={msg}");
+
+        let other_op = RequestMetadata {
+            operation: "create".to_string(),
+            ..base.clone()
+        };
+        let other_resource = RequestMetadata {
+            resource: "content-2".to_string(),
+            ..base.clone()
+        };
+        let other_ts = RequestMetadata {
+            timestamp: 43,
+            ..base.clone()
+        };
+        assert_ne!(msg, other_op.signing_message());
+        assert_ne!(msg, other_resource.signing_message());
+        assert_ne!(msg, other_ts.signing_message());
+    }
+
+    #[test]
+    fn signing_message_with_body_digest_stays_bound_to_operation_and_resource() {
+        let update_c1 = RequestMetadata {
+            timestamp: 42,
+            operation: "update".to_string(),
+            resource: "content-1".to_string(),
+        };
+        let digest = "aa".repeat(32);
+        let signed = update_c1.signing_message_with_body_digest(&digest);
+
+        // 同じ body でも別 resource / 別 operation なら署名対象が変わる
+        let update_c2 = RequestMetadata {
+            resource: "content-2".to_string(),
+            ..update_c1.clone()
+        };
+        let create_c1 = RequestMetadata {
+            operation: "create".to_string(),
+            ..update_c1.clone()
+        };
+        assert_ne!(signed, update_c2.signing_message_with_body_digest(&digest));
+        assert_ne!(signed, create_c1.signing_message_with_body_digest(&digest));
+
+        // body が変われば署名対象も変わる / body 有無も区別される
+        assert_ne!(
+            signed,
+            update_c1.signing_message_with_body_digest(&"bb".repeat(32))
+        );
+        assert_ne!(signed, update_c1.signing_message());
+    }
+
+    /// 長さ前置により、区切り文字を含む値でもフィールド境界がずれない。
+    #[test]
+    fn signing_message_is_unambiguous_with_colons() {
+        let a = RequestMetadata {
+            timestamp: 1,
+            operation: "a".to_string(),
+            resource: "b:c".to_string(),
+        };
+        let b = RequestMetadata {
+            timestamp: 1,
+            operation: "a:b".to_string(),
+            resource: "c".to_string(),
+        };
+        assert_ne!(a.signing_message(), b.signing_message());
     }
 }

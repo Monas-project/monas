@@ -314,21 +314,22 @@ where
             )
         })?;
 
-        let message = if let Some(body) = request_body {
-            // Body-based signing: hex(sha256(body + timestamp_be_bytes))
-            use sha2::{Digest, Sha256};
-            let mut hasher = Sha256::new();
-            hasher.update(body);
-            hasher.update(ts.to_be_bytes());
-            hex::encode(hasher.finalize())
-        } else {
-            // Metadata-based signing: {operation}:{resource}:{timestamp}
-            let metadata = RequestMetadata {
-                timestamp: ts,
-                operation: operation.to_string(),
-                resource: resource.to_string(),
-            };
-            metadata.signing_message()
+        // 署名対象は body の有無・トークン種別によらず同一構造で、
+        // operation と resource に必ず束縛される。body がある場合はその digest も
+        // 含める。これがないと、ある content 向けに取得した update の
+        // body+署名を別 content や create へ転用できてしまう。
+        let metadata = RequestMetadata {
+            timestamp: ts,
+            operation: operation.to_string(),
+            resource: resource.to_string(),
+        };
+        let message = match request_body {
+            Some(body) => {
+                use sha2::{Digest, Sha256};
+                let digest = hex::encode(Sha256::digest(body));
+                metadata.signing_message_with_body_digest(&digest)
+            }
+            None => metadata.signing_message(),
         };
 
         auth_service
@@ -3232,10 +3233,26 @@ mod tests {
             .expect("authentication should succeed");
 
         let captured = messages.lock().unwrap();
+        assert_eq!(captured.len(), 1, "exactly one signature check expected");
+        let message = &captured[0];
+
+        // 署名対象は domain-separated かつ operation / resource / timestamp に
+        // 束縛される。content id が入っていないと、ある content 向けの署名を
+        // 別 content の read に再利用できてしまう。
         assert_eq!(
-            captured.as_slice(),
-            ["read:content-abc:1234"],
-            "read signature message must include the content id"
+            message,
+            &RequestMetadata {
+                timestamp: 1234,
+                operation: "read".to_string(),
+                resource: "content-abc".to_string(),
+            }
+            .signing_message(),
+            "read signature message must bind operation, content id and timestamp"
+        );
+        assert!(message.contains("content-abc"), "message={message}");
+        assert!(
+            message.starts_with("monas-request-v1:"),
+            "message={message}"
         );
     }
 

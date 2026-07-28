@@ -172,25 +172,29 @@ fn sign_request(args: &[String]) {
         std::process::exit(1);
     });
 
-    // Construct the signing message.
-    // The message format is identical for every token type (issue #61):
-    // body-based for writes, `{operation}:{resource}:{timestamp}` otherwise.
-    // Delegated JWT requests are signed with the recipient (aud) key over the
-    // same message — the old "{iss}:{aud}:{jti}" fixed string is gone.
-    let message = if !body_b64.is_empty() {
-        // Body-based signing: hex(sha256(body_bytes + timestamp_be_bytes))
+    // Construct the signing message. The structure is identical for every
+    // token type and for body / non-body requests: it always commits to
+    // operation, resource and timestamp, plus the body digest when present.
+    // Must stay in sync with `RequestMetadata::signing_message_with_body_digest`.
+    let body_digest_hex = if body_b64.is_empty() {
+        String::new()
+    } else {
         let body_bytes = STANDARD.decode(&body_b64).unwrap_or_else(|e| {
             eprintln!("Error: Invalid body base64: {}", e);
             std::process::exit(1);
         });
-        let mut hasher = Sha256::new();
-        hasher.update(&body_bytes);
-        hasher.update(timestamp.to_be_bytes());
-        hex::encode(hasher.finalize())
-    } else {
-        // Metadata-based signing: {operation}:{resource}:{timestamp}
-        format!("{}:{}:{}", operation, resource, timestamp)
+        hex::encode(Sha256::digest(&body_bytes))
     };
+    let message = format!(
+        "monas-request-v1:{}:{}:{}:{}:{}:{}:{}",
+        operation.len(),
+        operation,
+        resource.len(),
+        resource,
+        timestamp,
+        body_digest_hex.len(),
+        body_digest_hex,
+    );
 
     // Sign the message
     let signature: p256::ecdsa::Signature = signing_key.sign(message.as_bytes());
