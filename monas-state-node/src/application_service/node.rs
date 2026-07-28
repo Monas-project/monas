@@ -470,14 +470,15 @@ impl StateNode {
                         match result {
                             Ok(received) => {
                                 tracing::debug!(
-                                    "Received event from {}: {:?}",
+                                    "Received event from {:?}: {:?}",
                                     received.source,
                                     received.event.event_type()
                                 );
 
-                                // Forward to service for processing (with source PeerID for verification)
+                                // Forward to service for processing, with the
+                                // authenticated publisher PeerID for origin checks.
                                 match service
-                                    .handle_sync_event(&received.event, Some(&received.source))
+                                    .handle_sync_event(&received.event, received.source.as_deref())
                                     .await
                                 {
                                     Ok(outcome) => {
