@@ -781,42 +781,62 @@ impl MonasController {
                 }
             };
 
-        // 9. 復号成功 = この CEK が本物であることの確認になるので、受信者ローカルの
-        //    cek_store に保存する。これで share 受信者も後から state node 経由の
-        //    検証付き read(read_content_from_state_node)で同じ content を復号できる。
-        //    同一 content_id への保存は上書きなので、CEK ローテーション後に再発行された
-        //    KeyEnvelope を処理すれば保存済み CEK も新しいものへ追従する。
-        //    CEK が出るのは受信者デバイスのローカルストアまでで、ネットワークには出ない。
-        if let Err(e) = self.content_service.cek_store.save(&content_id, &cek) {
-            // 保存に失敗したまま成功を返すと、呼び出し側は「以後この端末で
-            // 検証付き read ができる」と信じるのに実際は MissingKey で失敗する。
-            // silent degradation を避けるためエラーとして返す(再処理可能)。
-            return ApiResponse::error(
-                ApiError::Internal(format!(
-                    "decrypted the shared content but failed to persist its CEK for {}: {e}. \
-                     Re-process the KeyEnvelope to enable state-node reads on this device.",
-                    content_id.as_str()
-                )),
-                trace_id,
-            );
-        }
-
-        // 10. unwrap + 復号の成功 = 送信者と鍵世代の正しさが暗号学的に確認できた
-        //     時点なので、送信者公開鍵をピン留めし(TOFU)、受理した鍵世代を記録する。
+        // 9. ローカル状態(送信者ピン・鍵世代・CEK)の更新。
+        //
+        //    unwrap + 復号の成功 = 送信者と鍵世代の正しさが暗号学的に確認できた
+        //    時点なので、ここで初めてローカルへ反映する。
+        //
+        //    順序が重要: **先に pin を compare-and-advance し、成功した場合にだけ
+        //    CEK を公開する**。pin を無条件 save して後から CEK を書くと、rotation
+        //    前後の envelope(epoch N / N+1)が並行して処理されたとき、後から
+        //    完了した古い epoch が新しい CEK と pin を巻き戻せてしまう。
+        //    CAS が失敗した = 別の処理が先に同じかより新しい世代へ進めた、なので
+        //    こちらの(古い)CEK は書かない。
         let new_pin = monas_content::infrastructure::sender_key_pin_store::SenderKeyPin {
             sender_public_key: effective_sender_public_key,
             key_epoch: input.key_envelope.key_epoch,
         };
-        let should_save_pin = match &pinned {
+        let should_advance_pin = match &pinned {
             None => true,
             Some(pin) => input.key_envelope.key_epoch > pin.key_epoch,
         };
-        if should_save_pin {
-            if let Err(e) = self.sender_pin_store.save(content_id.as_str(), &new_pin) {
+
+        let advanced = if should_advance_pin {
+            match self.sender_pin_store.compare_and_save(
+                content_id.as_str(),
+                pinned.as_ref(),
+                &new_pin,
+            ) {
+                Ok(advanced) => advanced,
+                Err(e) => {
+                    return ApiResponse::error(
+                        ApiError::Internal(format!(
+                            "decrypted the shared content but failed to persist the sender key pin \
+                             for {}: {e}. Re-process the KeyEnvelope.",
+                            content_id.as_str()
+                        )),
+                        trace_id,
+                    );
+                }
+            }
+        } else {
+            // 同一世代の再処理。pin は動かさないが、CEK が未保存のケース
+            // (前回 pin だけ書けて CEK 保存に失敗した等)を回復できるよう
+            // 下で CEK は書く。
+            true
+        };
+
+        //    CEK は受信者デバイスのローカルストアに留まり、ネットワークには出ない。
+        //    これで share 受信者も state node 経由の検証付き read で復号できる。
+        if advanced {
+            if let Err(e) = self.content_service.cek_store.save(&content_id, &cek) {
+                // 保存に失敗したまま成功を返すと、呼び出し側は「以後この端末で
+                // 検証付き read ができる」と信じるのに実際は MissingKey で失敗する。
+                // silent degradation を避けるためエラーとして返す(再処理可能)。
                 return ApiResponse::error(
                     ApiError::Internal(format!(
-                        "decrypted the shared content but failed to persist the sender key pin \
-                         for {}: {e}. Re-process the KeyEnvelope.",
+                        "decrypted the shared content but failed to persist its CEK for {}: {e}. \
+                         Re-process the KeyEnvelope to enable state-node reads on this device.",
                         content_id.as_str()
                     )),
                     trace_id,

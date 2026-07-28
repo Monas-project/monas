@@ -368,6 +368,8 @@ share受信者はKeyEnvelopeの復号成功時にunwrap済みCEKを自デバイ�
 
 wrapのAADには `(content_id, recipient_key_id, key_epoch)` が束縛され、いずれかを書き換えたenvelopeは復号に失敗する。`key_epoch` はCEKの鍵世代（rotationごとに+1）で、受信者は記録済み世代より古いenvelopeを拒否する — rotation前の正規envelopeを再送して保存CEKを旧世代へ巻き戻すreplay攻撃はこれで防がれる。
 
+ローカル状態の更新順序も重要である。受信者側では**送信者ピンと鍵世代をcompare-and-advanceで先に進め、それが成功したときにだけCEKを保存する**。逆順（CEKを先に書き、ピンを無条件に上書きする）だと、ローテーション前後のKeyEnvelopeが並行して処理されたとき、後から完了した古い世代が新しいCEKとピンを巻き戻せてしまう。
+
 アクセス取り消しの安全性は受信者の鍵破棄（強制不能）ではなくCEKローテーションに依存する。revoke時は再暗号化を先に行い、残存受信者にはローテーション後のCEK・進んだkey_epochでKeyEnvelopeを再発行する。受信者が再発行envelopeを処理すると保存済みCEKが更新され、旧CEKのままでは新しい版を復号できない。
 
 ---
