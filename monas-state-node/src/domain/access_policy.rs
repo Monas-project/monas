@@ -26,7 +26,8 @@ pub struct AccessPolicy {
     created_at: u64,
     updated_at: u64,
     /// Minimum valid issued_at timestamp for AuthTokens.
-    /// Tokens with iat < min_valid_issued_at are considered invalidated.
+    /// Tokens with iat <= min_valid_issued_at are considered invalidated
+    /// (`0` means nothing has been revoked yet). See `is_token_valid`.
     #[serde(default)]
     min_valid_issued_at: u64,
 }
@@ -76,12 +77,31 @@ impl AccessPolicy {
         self.min_valid_issued_at
     }
 
-    /// Check if a token with the given issued_at is valid
+    /// Check if a token with the given issued_at is valid.
+    ///
+    /// The cutoff is **exclusive**: a token stamped with exactly
+    /// `min_valid_issued_at` is treated as invalid.
+    ///
+    /// Both values have one-second resolution, so an inclusive cutoff would let
+    /// a token issued in the same second as the revoke survive it — the token's
+    /// `iat` equals the new cutoff, and revoke is supposed to invalidate
+    /// *everything issued before it*. Ordering within a second is not
+    /// observable here, so the only safe reading of an equal timestamp is "this
+    /// might predate the revoke".
+    ///
+    /// The cost is that a token issued in the same second *after* the revoke is
+    /// also rejected. That is the correct direction to err — the caller retries
+    /// a second later and gets a valid token, whereas the other direction hands
+    /// a revoked recipient continued access.
+    ///
+    /// `min_valid_issued_at == 0` means "never revoked" and accepts everything;
+    /// otherwise a token would have to be issued at second 1 or later, which is
+    /// meaningless but would still be a behaviour change for no benefit.
     pub fn is_token_valid(&self, issued_at: u64) -> bool {
-        issued_at >= self.min_valid_issued_at
+        self.min_valid_issued_at == 0 || issued_at > self.min_valid_issued_at
     }
 
-    /// Invalidate all tokens issued before the current time.
+    /// Invalidate every token issued at or before the current time.
     /// Sets min_valid_issued_at to the current timestamp and returns the new value.
     pub fn invalidate_tokens(&mut self) -> u64 {
         let now = current_timestamp();
@@ -157,8 +177,10 @@ mod tests {
 
         // Tokens issued before invalidation are now invalid
         assert!(!policy.is_token_valid(before - 1));
-        // Tokens issued at or after invalidation are valid
-        assert!(policy.is_token_valid(new_min));
+        // The cutoff is exclusive: a token stamped with the same second as the
+        // revoke may well predate it, and one-second resolution cannot tell.
+        // Treating it as valid would let a revoked recipient keep access.
+        assert!(!policy.is_token_valid(new_min));
         assert!(policy.is_token_valid(new_min + 1));
     }
 
@@ -198,6 +220,8 @@ mod tests {
         let policy: AccessPolicy = serde_json::from_value(json).unwrap();
         assert_eq!(policy.min_valid_issued_at(), 500);
         assert!(!policy.is_token_valid(499));
-        assert!(policy.is_token_valid(500));
+        // Exclusive cutoff — see `is_token_valid`.
+        assert!(!policy.is_token_valid(500));
+        assert!(policy.is_token_valid(501));
     }
 }

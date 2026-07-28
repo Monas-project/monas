@@ -260,7 +260,7 @@ flowchart TD
 
 失効を先に行うのは、逆順だと「再暗号化してから失効するまでの窓」で取り消し済みの相手が書き込めてしまうためである。先に失効させておけば、後段が失敗してローカル状態を巻き戻しても、余分な失効が残るだけで害はない。
 
-`min_valid_issued_at`は時刻ベースの一括失効なので、**残存する受信者のTokenも巻き添えで失効する**。呼び出し側は取り消し後に、残存受信者へ新しいKeyEnvelopeと新しいTokenの両方を配り直す必要がある。SDKは`RevokeShareOutput`で再発行KeyEnvelope（`reissued_envelopes`）と失効時刻（`token_invalidated_at`）の両方を返す。
+`min_valid_issued_at`は時刻ベースの一括失効なので、**残存する受信者のTokenも巻き添えで失効する**（判定は排他なので、取り消しと同じ秒に発行されたTokenも失効する）。呼び出し側は取り消し後に、残存受信者へ新しいKeyEnvelopeと新しいTokenの両方を配り直す必要がある。SDKは`RevokeShareOutput`で再発行KeyEnvelope（`reissued_envelopes`）と失効時刻（`token_invalidated_at`）の両方を返す。
 
 取り消しはACL・CEK・ローカルciphertext・state node状態にまたがるload-modify-saveであり、そのどれにもversion CASが無い。したがって**同じcontentへの取り消しはcontent単位で直列化する**。並行させると、双方が同じShareを読んで後勝ちでsaveし片方の受信者削除が消える（lost update）、異なるCEKが同じ`key_epoch`として配られる、といった分岐が起こる。SDKのコントローラはgatewayから共有され複数リクエストから同時に呼ばれるため、これは理論上の話ではない。現状の直列化はプロセス内に閉じており、複数gatewayプロセスからの並行取り消しには対応しない — そこまで守るにはShare・CEK・ciphertextを1つのtransactional CASにまとめるか、state node側にCASを置く必要がある。
 
@@ -347,7 +347,7 @@ Token.att = [
 ]
 ```
 
-Token失効は`min_valid_issued_at`による時刻ベースで管理される。オーナーがこの値を更新することで、それ以前に発行されたすべてのTokenを一括失効できる。
+Token失効は`min_valid_issued_at`による時刻ベースで管理される。オーナーがこの値を更新することで、それ以前に発行されたすべてのTokenを一括失効できる。判定は`iat > min_valid_issued_at`の**排他**であり、等値は無効とする — どちらも秒精度なので、失効と同じ秒に発行されたTokenが失効の前後どちらだったかは区別できず、等値を有効扱いにすると取り消したはずの相手のTokenが生き残る。誤る方向としては、失効直後の同一秒に発行されたTokenまで弾く方が安全である（呼び出し側は1秒後に取り直せば済むが、逆方向は取り消し済みの相手にアクセスを与え続ける）。なお`0`は「一度も失効していない」を意味し、全Tokenを受理する。
 
 役割分担は「権限があること = Token（owner署名のケイパビリティ）」「今このリクエストを送っているのが宛先本人であること = リクエスト署名（Proof of Possession）」の2層である。リクエスト署名の対象はトークン種別・bodyの有無によらず同一構造で、domain separationタグに続けて操作・リソース・timestamp・body digestを長さ前置で連結する（`monas-request-v1:<len>:<操作>:<len>:<リソース>:<timestamp>:<len>:<body digest>`）。**bodyを伴う書き込みでも操作とリソースに束縛される**ため、あるコンテンツ向けに取得した署名を別コンテンツや別操作へ転用することはできない。リプレイ防御は2層で担う。第1に署名内のtimestampの鮮度チェック（5分窓）で、これは「古い署名を無限に使い回せない」ことを保証する。timestampの無いリクエストは認証エラーとなる（サーバ時刻へのフォールバックはしない）。第2に、**mutationについては受理した署名を記録して2度目の提示を拒否する**。鮮度チェックだけでは窓の中で同じ署名を何度でも通せてしまい、update・delete・invalidate・manageは冪等でないため、それは単なる重複ではなく状態の巻き戻しになる — 署名済みの旧ciphertext更新を正規の更新の後に再送すると、サーバはそれを「現在のheadを親とする新しい操作」としてcommitし、古い内容が最新版になる。
 

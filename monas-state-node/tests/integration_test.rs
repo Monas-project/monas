@@ -627,9 +627,17 @@ async fn test_access_control_update_and_verify() {
     let result = service.verify_access("content-1", 500).await.unwrap();
     assert!(!result, "Old tokens should be denied");
 
-    // Verify access with new token (should be allowed)
+    // The cutoff is exclusive: a token stamped with the same second as the
+    // revoke might have been issued just before it, and one-second resolution
+    // cannot tell. Accepting it would leave a revoked recipient with access.
     let result = service.verify_access("content-1", 1000).await.unwrap();
-    assert!(result, "New tokens should be allowed");
+    assert!(!result, "Tokens from the cutoff second should be denied");
+
+    let result = service.verify_access("content-1", 1001).await.unwrap();
+    assert!(
+        result,
+        "Tokens issued strictly after the revoke should be allowed"
+    );
 
     let result = service.verify_access("content-1", 1500).await.unwrap();
     assert!(result, "Future tokens should be allowed");
