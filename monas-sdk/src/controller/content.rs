@@ -12,7 +12,8 @@ use crate::models::content::{
 };
 use crate::models::state_node::{
     StateNodeCreateContentRequest, StateNodeCreateContentResponse, StateNodeDeleteContentResponse,
-    StateNodeErrorResponse, StateNodeUpdateContentRequest, StateNodeUpdateContentResponse,
+    StateNodeErrorResponse, StateNodeInvalidateTokensResponse, StateNodeUpdateContentRequest,
+    StateNodeUpdateContentResponse,
 };
 
 use monas_content::application_service::content_service::{
@@ -691,6 +692,79 @@ impl MonasController {
             }
             Err(e) => Some(ApiResponse::error(
                 ApiError::Internal(format!("Invalid State Node update response JSON: {e}")),
+                trace_id,
+            )),
+        }
+    }
+
+    /// State Node に `POST /content/:id/access/invalidate` を送る
+    /// （`http_api::invalidate_tokens_handler` と同じ契約）。
+    ///
+    /// `min_valid_issued_at` をサーバ時刻へ進め、それ以前に発行された委譲 Token を
+    /// 一括失効させる。revoke で CEK をローテーションしても、取り消された受信者の
+    /// 委譲 write Token は TTL 満了まで有効なまま残るため、これを呼ばないと
+    /// 「取り消したはずの相手が新しい状態へ書き込み続けられる」。
+    ///
+    /// 戻り値は成功時の `new_min_valid_issued_at`。失敗時は `Err` に
+    /// `ApiResponse` を入れて返す（`send_*_to_state_node` 系と違い、
+    /// 呼び出し側で必ず結果を扱わせるため）。
+    pub(super) fn send_invalidate_to_state_node<T>(
+        &self,
+        content_id: &str,
+        auth: Option<&StateNodeAuthContext>,
+        trace_id: String,
+    ) -> Result<Option<u64>, ApiResponse<T>> {
+        let state_node_url = format!(
+            "{}/content/{}/access/invalidate",
+            self.state_node_url, content_id
+        );
+        let signed_auth =
+            self.prepare_state_node_metadata_auth(auth, "invalidate", content_id, &trace_id)?;
+        let req = Self::attach_state_node_auth(
+            self.agent
+                .post(&state_node_url)
+                .header("Content-Type", "application/json"),
+            signed_auth.as_ref(),
+        );
+
+        let resp = match req.send("") {
+            Ok(r) => r,
+            Err(e) => {
+                return Err(ApiResponse::error(
+                    ApiError::from_ureq_error(
+                        "Failed to send token invalidation request to State Node",
+                        e,
+                    ),
+                    trace_id,
+                ));
+            }
+        };
+
+        let status = resp.status().as_u16();
+        let body = match resp.into_body().read_to_string() {
+            Ok(s) => s,
+            Err(e) => {
+                return Err(ApiResponse::error(
+                    ApiError::Internal(format!("Failed to read State Node response body: {e}")),
+                    trace_id,
+                ));
+            }
+        };
+
+        if let Some(err) = Self::try_state_node_http_error(status, &body, trace_id.clone()) {
+            return Err(err);
+        }
+
+        if body.trim().is_empty() {
+            return Ok(None);
+        }
+
+        match serde_json::from_str::<StateNodeInvalidateTokensResponse>(&body) {
+            Ok(parsed) => Ok(Some(parsed.new_min_valid_issued_at)),
+            Err(e) => Err(ApiResponse::error(
+                ApiError::Internal(format!(
+                    "Invalid State Node token invalidation response JSON: {e}"
+                )),
                 trace_id,
             )),
         }

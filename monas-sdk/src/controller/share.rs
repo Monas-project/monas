@@ -423,9 +423,17 @@ impl MonasController {
     /// 1. 入力のバリデーション
     /// 2. ContentIdに変換
     /// 3. 共有先の公開鍵をデコードしてrecipient_key_idを計算
-    /// 4. ShareService::revoke_shareを呼び出し（ACLの更新）
-    /// 5. State Node に更新を送信
-    /// 6. 結果を返却
+    /// 4. State Node の `min_valid_issued_at` を進めて既発行 Token を一括失効
+    /// 5. CEK をローテーションして再暗号化
+    /// 6. ShareService::revoke_shareを呼び出し（ACL 更新 + 残存受信者向け envelope 再発行）
+    /// 7. State Node に再暗号化後の ciphertext を送信
+    /// 8. 結果を返却
+    ///
+    /// 4 が無いと、取り消した相手の委譲 write Token が TTL 満了まで有効なまま残る
+    /// （CEK ローテーションは復号を止めるだけで、書き込み権限は止めない）。
+    ///
+    /// 失効は残存受信者の Token も巻き添えにする。呼び出し側は
+    /// `RevokeShareOutput::token_invalidated_at` より後に Token を再発行すること。
     pub fn revoke_share(
         &self,
         input: RevokeShareInput,
@@ -476,6 +484,38 @@ impl MonasController {
             };
 
         let recipient_key_id = Self::compute_key_id_from_public_key(&recipient_public_key_bytes);
+
+        // 3.5. 先に state node の `min_valid_issued_at` を進めて、既発行の委譲 Token を
+        //      一括失効させる。CEK ローテーションだけでは「取り消した相手が持っている
+        //      write Token」は TTL 満了まで生きたままで、新しい状態へ書き込み続けられる
+        //      (docs/design.md「アクセス取り消し」の定義との食い違い)。
+        //
+        //      順序が invalidate → rotate である理由: 逆にすると、rotate から
+        //      invalidate までの窓で取り消し済みの相手が書き込める。先に失効させて
+        //      おけば、後段が失敗してローカルを巻き戻しても余分な失効が残るだけで、
+        //      害は「残存受信者が Token を再発行してもらう必要がある」ことに留まる
+        //      (これは CEK ローテーション時にどのみち必要になる)。
+        //
+        //      state node 連携なし(`auth` が None、ローカル専用テスト等)の場合は
+        //      失効させる対象の Token も存在しないので何もしない。
+        let state_node_content_id = input
+            .remote_content_id
+            .as_deref()
+            .unwrap_or(&input.content_id)
+            .to_string();
+        let token_invalidated_at = if auth.is_some() {
+            match self.send_invalidate_to_state_node::<RevokeShareOutput>(
+                &state_node_content_id,
+                auth,
+                trace_id.clone(),
+            ) {
+                Ok(v) => v,
+                // ここはまだローカル状態を一切変更していないので巻き戻し不要。
+                Err(response) => return response,
+            }
+        } else {
+            None
+        };
 
         // 4. まず CEK をローテーションして再暗号化する。
         //    ShareService::revoke_share は「その時点の CEK・ciphertext」で残存受信者向け
@@ -545,12 +585,8 @@ impl MonasController {
 
         // State Node は系列ID（remote_content_id）でコンテンツを管理する。
         // ローカル版IDしか送らないと State Node 側で未知のコンテンツ扱いになる。
-        let state_node_content_id = input
-            .remote_content_id
-            .as_deref()
-            .unwrap_or(&input.content_id);
         if let Some(response) = self.send_update_to_state_node(
-            state_node_content_id,
+            &state_node_content_id,
             &reencryption.encrypted_content,
             auth,
             trace_id.clone(),
@@ -591,6 +627,7 @@ impl MonasController {
             revoked: true,
             revoked_at: Some(Utc::now().to_rfc3339()),
             reissued_envelopes,
+            token_invalidated_at,
         };
 
         ApiResponse::success(output, trace_id)

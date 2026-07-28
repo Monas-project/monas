@@ -115,6 +115,14 @@ pub struct RevokeShareOutput {
     /// 新しいものへ更新される(state node 経由の read が引き続き復号できる)。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reissued_envelopes: Vec<ReissuedKeyEnvelope>,
+    /// state node が設定した新しい `min_valid_issued_at`（Unix 秒）。
+    /// これより前に発行された委譲 Token はすべて失効している。
+    /// state node 連携なしで実行した場合は `None`。
+    ///
+    /// CEK ローテーションと違い、これは「取り消した相手がまだ書き込めるか」を
+    /// 決める。残存受信者には、この時刻より後に発行した Token を配り直す必要がある。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_invalidated_at: Option<u64>,
 }
 
 /// revoke 後に残存受信者向けへ再発行された KeyEnvelope。
@@ -242,11 +250,28 @@ mod tests {
             revoked: true,
             revoked_at: Some("2025-12-05T12:34:56Z".into()),
             reissued_envelopes: vec![],
+            token_invalidated_at: None,
         };
         let json = serde_json::to_string(&output).unwrap();
         assert!(json.contains("\"revoked\":true"));
         // 空の envelope リストは serialize されない(後方互換)
         assert!(!json.contains("reissued_envelopes"));
+        // state node 連携なしなら失効時刻も出さない
+        assert!(!json.contains("token_invalidated_at"));
+    }
+
+    #[test]
+    fn test_revoke_share_output_reports_token_invalidation() {
+        let output = RevokeShareOutput {
+            content_id: "test_id".into(),
+            recipient_public_key: "recipient_key".into(),
+            revoked: true,
+            revoked_at: None,
+            reissued_envelopes: vec![],
+            token_invalidated_at: Some(1_700_000_000),
+        };
+        let json = serde_json::to_string(&output).unwrap();
+        assert!(json.contains("\"token_invalidated_at\":1700000000"));
     }
 
     #[test]
@@ -265,6 +290,7 @@ mod tests {
                     key_epoch: 1,
                 },
             }],
+            token_invalidated_at: None,
         };
         let json = serde_json::to_string(&output).unwrap();
         assert!(json.contains("\"reissued_envelopes\""));

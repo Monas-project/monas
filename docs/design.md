@@ -246,15 +246,22 @@ flowchart TD
 
 ### アクセス取り消し
 
+取り消しは2つの独立した権限を同時に断つ必要がある。**復号できること**（CEK を持っていること）と、**書き込めること**（有効な委譲 Token を持っていること）である。CEKのローテーションは前者しか止めない。後者を止めるにはstate-nodeの`min_valid_issued_at`を進めて既発行Tokenを一括失効させる。
 
 ```mermaid
 flowchart TD
-  A([取り消し開始]) --> B[新CEK生成 / コンテンツを再暗号化]
-  B --> C[旧KeyEnvelopeが無効化される]
-  B --> D[継続ユーザーに新KeyEnvelope発行]
-  B --> E[state-nodeのmin_valid_issued_atを更新]
-  E --> F([旧Token一括失効])
+  A([取り消し開始]) --> B[state-nodeのmin_valid_issued_atを更新]
+  B --> C([旧Token一括失効])
+  B --> D[新CEK生成 / コンテンツを再暗号化]
+  D --> E[旧KeyEnvelopeが無効化される]
+  D --> F[継続ユーザーに新KeyEnvelope発行]
+  D --> G[再暗号化後のciphertextをstate-nodeへ送信]
 ```
+
+失効を先に行うのは、逆順だと「再暗号化してから失効するまでの窓」で取り消し済みの相手が書き込めてしまうためである。先に失効させておけば、後段が失敗してローカル状態を巻き戻しても、余分な失効が残るだけで害はない。
+
+`min_valid_issued_at`は時刻ベースの一括失効なので、**残存する受信者のTokenも巻き添えで失効する**。呼び出し側は取り消し後に、残存受信者へ新しいKeyEnvelopeと新しいTokenの両方を配り直す必要がある。SDKは`RevokeShareOutput`で再発行KeyEnvelope（`reissued_envelopes`）と失効時刻（`token_invalidated_at`）の両方を返す。
+
 ---
 
 ## 8. CIDによるコンテンツアドレッシング
