@@ -98,10 +98,13 @@ where
 /// Where a relay candidate list came from, and therefore how much it can be
 /// trusted.
 ///
-/// This distinction matters because a relay hands the caller's token and
-/// request signature to whoever is in the list, and then interprets what comes
-/// back. Both of those are only safe for peers we have some reason to believe
-/// actually hold the content.
+/// This distinction matters because a relay interprets what comes back from
+/// whoever is in the list. Trusting a *negative* answer is only safe from a
+/// peer we have some reason to believe actually holds the content.
+///
+/// It does not affect whether credentials may be forwarded — see
+/// [`ResolvedMembers::as_slice`] for why that is safe regardless of
+/// provenance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MemberProvenance {
     /// The peers come from a local `ContentNetwork` record, which was built
@@ -111,9 +114,7 @@ enum MemberProvenance {
     Attested,
     /// The peers are just DHT neighbours of `sha256(content_id)`. Nothing ties
     /// them to this content: anyone able to place a Peer ID near the key lands
-    /// in this list. Their responses — including authorization verdicts — carry
-    /// no authority, and handing them live credentials is a disclosure to an
-    /// unidentified party.
+    /// in this list, so a denial from one of them carries no authority.
     DhtGuess,
 }
 
@@ -123,33 +124,24 @@ struct ResolvedMembers {
     provenance: MemberProvenance,
 }
 
-/// How many unproven DHT candidates may be handed the caller's credentials
-/// before giving up.
-///
-/// Every candidate tried is one more unidentified party that receives a live
-/// token and request signature, so the failover loop must not simply walk the
-/// whole list. Two keeps one retry for the ordinary case (the first candidate
-/// is offline or lagging) while keeping the disclosure bounded. Attested
-/// members are not capped: they are the nodes the network actually assigned.
-const MAX_UNPROVEN_RELAY_CANDIDATES: usize = 2;
-
 impl ResolvedMembers {
-    /// The candidates that may receive the caller's credentials.
+    /// The relay candidates.
     ///
-    /// Unproven lists are truncated (see [`MAX_UNPROVEN_RELAY_CANDIDATES`]):
-    /// relaying to a DHT neighbour discloses a live token and request signature
-    /// to a party that has shown no connection to the content, so the number of
-    /// such disclosures per request has to be bounded. Removing the disclosure
-    /// entirely needs capabilities that can be down-scoped to a single relay,
-    /// operation and resource — a protocol change tracked separately.
+    /// Every candidate is handed the caller's token and request signature, and
+    /// that is fine even for an unproven peer: the token is either a
+    /// self-contained key id (a public key) or a delegated JWT whose audience
+    /// is likewise a public key, and authorization is proof-of-possession — the
+    /// request signature is verified against the JWT's `aud` key. A peer that
+    /// captures both cannot mint a new request, because it does not hold that
+    /// private key, and the signature it did capture is bound to one operation,
+    /// resource, body and timestamp. Mutations are single-use on top of that.
+    ///
+    /// So the candidate list is not truncated for unproven peers. Doing so
+    /// would cut failover to legitimate members — a real availability cost —
+    /// in exchange for no confidentiality gain, since a peer that sits first in
+    /// DHT distance order receives the credentials regardless of any cap.
     fn as_slice(&self) -> &[String] {
-        match self.provenance {
-            MemberProvenance::Attested => &self.members,
-            MemberProvenance::DhtGuess => {
-                let n = self.members.len().min(MAX_UNPROVEN_RELAY_CANDIDATES);
-                &self.members[..n]
-            }
-        }
+        &self.members
     }
 
     /// Whether a negative authorization verdict from these peers may be treated
@@ -3325,30 +3317,33 @@ mod tests {
         );
     }
 
-    /// 未証明の候補へ credential を配る数には上限がある。
-    /// 候補を1台試すごとに、コンテンツとの関連が何も示されていない相手へ
-    /// 生きた token と署名を渡すことになるため、リスト全体を舐めてはいけない。
+    /// 出自は verdict の扱いだけを変え、候補リストそのものは削らない。
+    ///
+    /// credential は未証明の相手へ渡っても構わない。token は自己完結型 key id
+    /// (公開鍵)か委譲 JWT で、その JWT の `aud` もまた公開鍵であり、認可は
+    /// proof-of-possession だからである — リクエスト署名は `aud` の鍵に対して
+    /// 検証されるので、両方を傍受した相手も秘密鍵を持たない以上、新しい
+    /// リクエストを作れない。傍受した署名自体も操作・リソース・body・timestamp
+    /// に束縛され、mutation はさらに使い切りである。
+    ///
+    /// 逆に候補を削ると、正当な member への failover が減って可用性だけが
+    /// 落ちる。DHT 距離順で先頭に来る相手は上限があろうと credential を
+    /// 受け取るので、機密性は何も改善しない。
     #[test]
-    fn credentials_reach_a_bounded_number_of_unproven_candidates() {
+    fn candidate_list_is_not_truncated_by_provenance() {
         let many: Vec<String> = (0..10).map(|i| format!("peer-{i}")).collect();
 
-        let guessed = ResolvedMembers {
-            members: many.clone(),
-            provenance: MemberProvenance::DhtGuess,
-        };
-        assert_eq!(
-            guessed.as_slice().len(),
-            MAX_UNPROVEN_RELAY_CANDIDATES,
-            "unproven candidates must be capped"
-        );
-
-        // attested member は打ち切らない。ネットワークが実際に割り当てた
-        // ノードなので、可用性のために全部試してよい。
-        let attested = ResolvedMembers {
-            members: many.clone(),
-            provenance: MemberProvenance::Attested,
-        };
-        assert_eq!(attested.as_slice().len(), many.len());
+        for provenance in [MemberProvenance::Attested, MemberProvenance::DhtGuess] {
+            let resolved = ResolvedMembers {
+                members: many.clone(),
+                provenance,
+            };
+            assert_eq!(
+                resolved.as_slice().len(),
+                many.len(),
+                "failover must reach every candidate ({provenance:?})"
+            );
+        }
     }
 
     #[tokio::test]
