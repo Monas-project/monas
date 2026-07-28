@@ -6,6 +6,7 @@
 pub mod auth_token;
 pub mod authentication_service;
 pub mod authorization_service;
+pub mod consumed_request_store;
 pub mod content_repository;
 pub mod event_publisher;
 pub mod peer_network;
@@ -15,6 +16,7 @@ pub mod public_key_registry;
 pub use auth_token::AuthToken;
 pub use authentication_service::AuthenticationService;
 pub use authorization_service::{AuthorizationRequest, AuthorizationResult, AuthorizationService};
+pub use consumed_request_store::{ConsumedRequestStore, InMemoryConsumedRequestStore};
 pub use content_repository::{CommitResult, ContentRepository, SerializedOperation};
 pub use event_publisher::EventPublisher;
 pub use peer_network::PeerNetwork;

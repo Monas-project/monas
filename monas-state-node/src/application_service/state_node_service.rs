@@ -15,6 +15,7 @@ use crate::infrastructure::placement::compute_dht_key;
 use crate::port::auth_token::{AuthToken, RequestMetadata};
 use crate::port::authentication_service::AuthenticationService;
 use crate::port::authorization_service::{AuthorizationRequest, AuthorizationService};
+use crate::port::consumed_request_store::{ConsumedRequestStore, InMemoryConsumedRequestStore};
 use crate::port::content_repository::ContentRepository;
 use crate::port::event_publisher::EventPublisher;
 use crate::port::peer_network::{PeerNetwork, RelayReadError, RelayReadErrorKind};
@@ -92,6 +93,9 @@ where
     capacity_threshold_bytes: u64,
     /// Maximum number of members to add in a single add_member_to_content call.
     max_add_member_count: usize,
+    /// Records mutation requests that have already been accepted, so a captured
+    /// signature cannot be replayed inside its freshness window.
+    consumed_requests: Arc<dyn ConsumedRequestStore>,
 }
 
 /// No-op access control repository for backward compatibility.
@@ -172,7 +176,19 @@ where
             min_replication_factor: config.min_replication_factor,
             capacity_threshold_bytes: config.capacity_threshold_bytes,
             max_add_member_count: config.max_add_member_count,
+            consumed_requests: Arc::new(InMemoryConsumedRequestStore::default()),
         }
+    }
+
+    /// Replace the consumed-request store (builder pattern).
+    ///
+    /// The default is process-local and volatile, which is sound because records
+    /// only need to outlive the signature freshness window. Deployments that
+    /// want replay protection to survive a restart can inject a persistent
+    /// implementation here.
+    pub fn with_consumed_request_store(mut self, store: Arc<dyn ConsumedRequestStore>) -> Self {
+        self.consumed_requests = store;
+        self
     }
 
     /// Set the access control repository (builder pattern).
@@ -270,11 +286,16 @@ where
     /// - If `request_body` is `Some(body)`: signs `hex(sha256(body + timestamp_be_bytes))`
     /// - If `request_body` is `None`: signs `{operation}:{resource}:{timestamp}`
     ///
-    /// Replay protection comes from the timestamp *inside* the signed message
-    /// (freshness window checked by the auth service), so `timestamp` is
-    /// mandatory — there is no server-clock fallback. A token can therefore be
-    /// reused for many requests within its TTL; a stolen signature only allows
-    /// repeating the same operation on the same resource within the window.
+    /// The timestamp *inside* the signed message is checked for freshness by the
+    /// auth service, so `timestamp` is mandatory — there is no server-clock
+    /// fallback. A token can therefore be reused for many requests within its
+    /// TTL.
+    ///
+    /// Freshness alone is **not** replay protection: within the window the same
+    /// signature can be presented any number of times. That is acceptable for
+    /// reads, which are idempotent. Mutations must go through
+    /// [`Self::verify_and_consume_mutation_signature`] instead, which also
+    /// consumes the signature.
     ///
     /// For JWT tokens (containing `.`), the JWT's own P-256 signature is
     /// verified first via `AuthenticationService::verify_jwt_signature`
@@ -341,6 +362,115 @@ where
                     e
                 ))
             })
+    }
+
+    /// Verify a signature for a **mutation**, and consume it so the same signed
+    /// request cannot be applied twice.
+    ///
+    /// The freshness check inside signature verification only bounds how long a
+    /// captured signature stays usable — within that window it can be presented
+    /// any number of times. Reads tolerate that, but `update`, `delete`,
+    /// `invalidate` and `manage` are not idempotent, so a replay is not a
+    /// duplicate: it is a state rollback. Replaying a signed update of old
+    /// ciphertext after a legitimate update commits the old bytes as a *new*
+    /// version whose parent is the current head, so the stale content becomes
+    /// the latest version.
+    ///
+    /// The request identity is the digest of the request signature itself. The
+    /// signature already commits to operation, resource, timestamp and body
+    /// digest, so an identical digest means an identical request — and no new
+    /// field has to be added to the wire format to carry a nonce.
+    ///
+    /// Consumption happens after verification (an invalid signature must not be
+    /// able to burn a legitimate request's identity) and before any state is
+    /// committed.
+    #[allow(clippy::too_many_arguments)]
+    async fn verify_and_consume_mutation_signature(
+        &self,
+        auth_service: &dyn AuthenticationService,
+        token: &AuthToken,
+        signature: &[u8],
+        operation: &str,
+        resource: &str,
+        timestamp: Option<u64>,
+        request_body: Option<&[u8]>,
+    ) -> Result<(), StateNodeError> {
+        self.verify_caller_signature(
+            auth_service,
+            token,
+            signature,
+            operation,
+            resource,
+            timestamp,
+            request_body,
+        )
+        .await?;
+
+        use sha2::{Digest, Sha256};
+        let request_id = Sha256::digest(signature);
+        let now = timestamp.unwrap_or_else(current_timestamp);
+
+        let first_time = self
+            .consumed_requests
+            .record_if_absent(&request_id, now)
+            .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
+
+        if !first_time {
+            return Err(StateNodeError::RequestAlreadyApplied(format!(
+                "this signed {operation} request for {resource} has already been applied. \
+                 Mutations are single-use: re-sign the request with a fresh timestamp instead \
+                 of resending the previous signature."
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Consume a mutation signature on the **relay** path, where this node
+    /// cannot verify it.
+    ///
+    /// A relay holds no access policy, so it forwards the caller's credentials
+    /// to a member and lets the member decide. That means the member is the only
+    /// one that consumes the signature — and a caller who keeps re-sending to the
+    /// relay gets the request applied again every time the relay happens to pick
+    /// a member that has not seen it yet. The replay the consumption record is
+    /// supposed to stop therefore still succeeds through a relay.
+    ///
+    /// So the relay records the signature too, and refuses to forward one it has
+    /// already forwarded. This is not a substitute for the member-side check
+    /// (a caller can always talk to a different relay); it closes the specific
+    /// hole where the *same* relay launders the *same* signature repeatedly.
+    ///
+    /// No verification happens here, which means an unauthenticated caller can
+    /// burn an arbitrary signature digest on this node by presenting it once.
+    /// The cost of that is bounded: it only affects this node, only for the
+    /// freshness window, and only for a digest the attacker already has — if
+    /// they hold the signature they can replay it themselves anyway.
+    fn consume_relayed_mutation_signature(
+        &self,
+        signature: &[u8],
+        operation: &str,
+        resource: &str,
+        timestamp: Option<u64>,
+    ) -> Result<(), StateNodeError> {
+        use sha2::{Digest, Sha256};
+        let request_id = Sha256::digest(signature);
+        let now = timestamp.unwrap_or_else(current_timestamp);
+
+        let first_time = self
+            .consumed_requests
+            .record_if_absent(&request_id, now)
+            .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
+
+        if !first_time {
+            return Err(StateNodeError::RequestAlreadyApplied(format!(
+                "this signed {operation} request for {resource} was already relayed by this node. \
+                 Mutations are single-use: re-sign the request with a fresh timestamp instead \
+                 of resending the previous signature."
+            )));
+        }
+
+        Ok(())
     }
 
     /// Get the local node ID.
@@ -845,7 +975,7 @@ where
             .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))?;
 
         // 1.5. Verify request signature
-        self.verify_caller_signature(
+        self.verify_and_consume_mutation_signature(
             auth_service.as_ref(),
             token,
             request_signature,
@@ -1086,7 +1216,7 @@ where
                 .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))?;
 
             // Verify request signature
-            self.verify_caller_signature(
+            self.verify_and_consume_mutation_signature(
                 auth_service.as_ref(),
                 token,
                 request_signature,
@@ -1152,6 +1282,16 @@ where
             if from_relay {
                 return Err(StateNodeError::ContentNotFound(content_id_vo.clone()));
             }
+
+            // 転送前にこのノードでも署名を消費する。member 側だけで消費すると、
+            // 同じ署名を relay へ送り直すたびに「まだ見ていない member」へ
+            // 振り分けられて再適用できてしまう。
+            self.consume_relayed_mutation_signature(
+                request_signature,
+                "delete",
+                content_id,
+                timestamp,
+            )?;
 
             // Resolve members from our local record, or via DHT discovery when
             // we hold no record (bug #93), then relay with failover.
@@ -1256,7 +1396,7 @@ where
                 .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))?;
 
             // Verify request signature
-            self.verify_caller_signature(
+            self.verify_and_consume_mutation_signature(
                 auth_service.as_ref(),
                 token,
                 request_signature,
@@ -1326,6 +1466,16 @@ where
             if from_relay {
                 return Err(StateNodeError::ContentNotFound(content_id_vo.clone()));
             }
+
+            // 転送前にこのノードでも署名を消費する。member 側だけで消費すると、
+            // 同じ署名を relay へ送り直すたびに「まだ見ていない member」へ
+            // 振り分けられて再適用できてしまう。
+            self.consume_relayed_mutation_signature(
+                request_signature,
+                "update",
+                content_id,
+                timestamp,
+            )?;
 
             // Resolve members from our local record, or via DHT discovery when
             // we hold no record (bug #93), then relay with failover.
@@ -1427,7 +1577,7 @@ where
         let sig = request_signature.ok_or_else(|| {
             StateNodeError::AuthenticationFailed("Request signature is required".to_string())
         })?;
-        self.verify_caller_signature(
+        self.verify_and_consume_mutation_signature(
             auth_service.as_ref(),
             token,
             sig,
@@ -1548,6 +1698,11 @@ where
                 return Err(StateNodeError::ContentNotFound(content_id_vo.clone()));
             }
 
+            // NOTE: invalidate は local / relay の分岐より前に
+            // `verify_and_consume_mutation_signature` を通しているので、
+            // ここで改めて消費する必要はない(するとこのノード自身の
+            // 1 回目の転送が 409 になる)。
+            //
             // Resolve members from our local record, or via DHT discovery when
             // we hold no record (bug #93), then relay with failover.
             let members = self.resolve_members(content_id).await?;
@@ -1630,7 +1785,7 @@ where
         // decides how many members get added, so it is signed too — see
         // `add_members_signing_body` for why the canonical encoding is used
         // instead of the raw JSON bytes.
-        self.verify_caller_signature(
+        self.verify_and_consume_mutation_signature(
             auth_service.as_ref(),
             token,
             request_signature,
@@ -2373,7 +2528,7 @@ where
             .map_err(|_| AccessControlError::NotAuthorized)?;
 
         // Verify request signature
-        self.verify_caller_signature(
+        self.verify_and_consume_mutation_signature(
             auth_service.as_ref(),
             token,
             request_signature,
@@ -2383,7 +2538,12 @@ where
             None,
         )
         .await
-        .map_err(|_| AccessControlError::InvalidSignature)?;
+        // 再送の拒否は偽造の拒否と区別する。潰してしまうと、運用者は
+        // 「攻撃された」のか「正規リクエストが二重に届いた」のか判断できない。
+        .map_err(|e| match e {
+            StateNodeError::RequestAlreadyApplied(_) => AccessControlError::AlreadyApplied,
+            _ => AccessControlError::InvalidSignature,
+        })?;
 
         let content_id_vo = ContentId::new(update.content_id.clone())
             .map_err(|_| AccessControlError::NotAuthorized)?;

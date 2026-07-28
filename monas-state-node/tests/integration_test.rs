@@ -518,7 +518,7 @@ async fn test_crdt_since_version_filtering() {
 // ============================================================================
 
 use monas_state_node::application_service::state_node_service::ServiceConfig;
-use monas_state_node::domain::access_control::AccessControlUpdate;
+use monas_state_node::domain::access_control::{AccessControlError, AccessControlUpdate};
 
 /// Create a test service with access control repository.
 async fn create_test_service_with_ac() -> (Arc<TestServiceWithAC>, Arc<CrslCrdtRepository>, TempDir)
@@ -633,6 +633,132 @@ async fn test_access_control_update_and_verify() {
 
     let result = service.verify_access("content-1", 1500).await.unwrap();
     assert!(result, "Future tokens should be allowed");
+}
+
+/// 署名済み mutation の再送は拒否され、しかも「偽造」ではなく「再送」として
+/// 報告される。
+///
+/// 署名内 timestamp の鮮度チェックは「古い署名を無限に使い回せない」ことしか
+/// 保証せず、5分の窓の中では同じ署名を何度でも通せてしまう。
+///
+/// なお `update_access_control` に限っては、より古い `min_valid_issued_at` への
+/// 巻き戻しはドメイン側の単調性チェックが既に弾いていた。ここで塞ぐのは
+/// **同じ値の再送**で、そちらは素通りしていた。エラーの種類まで検証するのは、
+/// 潰してしまうと運用者が「攻撃された」のか「正規リクエストが二重に届いた」
+/// のか区別できなくなるため。
+#[tokio::test]
+async fn test_signed_mutation_cannot_be_replayed_after_a_newer_one() {
+    let (service, _crdt_repo, _temp_dir) = create_test_service_with_ac().await;
+
+    service.init_access_control("content-1").await.unwrap();
+
+    let sign = |min_valid: u64| {
+        let update = AccessControlUpdate::new("content-1".to_string(), min_valid);
+        let (signature, public_key) = sign_access_control_update(&update);
+        update.with_signature(signature, public_key)
+    };
+
+    // 各リクエストは固有のリクエスト署名を持つ(実運用では署名対象に
+    // timestamp と body が入るので、内容が違えば署名も必ず違う)。
+    let sig_a: Vec<u8> = vec![0xAA];
+    let sig_b: Vec<u8> = vec![0xBB];
+
+    let update_a = sign(1000);
+    let update_b = sign(2000);
+
+    // A → B の順に正規適用
+    service
+        .update_access_control(
+            &update_a,
+            Some(&test_token()),
+            Some(&sig_a),
+            test_timestamp(),
+        )
+        .await
+        .expect("first update should apply");
+    service
+        .update_access_control(
+            &update_b,
+            Some(&test_token()),
+            Some(&sig_b),
+            test_timestamp(),
+        )
+        .await
+        .expect("second update should apply");
+    assert_eq!(
+        service
+            .get_access_control("content-1")
+            .await
+            .unwrap()
+            .unwrap()
+            .min_valid_issued_at(),
+        2000
+    );
+
+    // 攻撃者が捕まえておいた B の署名を再送する。
+    // (A の再送はドメイン側の単調性チェックが別途弾くので、消費記録が
+    //  効いていることを見るにはこちらを使う)
+    let replay = service
+        .update_access_control(
+            &update_b,
+            Some(&test_token()),
+            Some(&sig_b),
+            test_timestamp(),
+        )
+        .await;
+    assert!(replay.is_err(), "replaying a consumed signature must fail");
+    let err = replay.unwrap_err();
+    assert!(
+        matches!(err, AccessControlError::AlreadyApplied),
+        "a replay must be reported as such, not as a forged signature: {err}"
+    );
+
+    // 失効時刻は巻き戻っていない
+    assert_eq!(
+        service
+            .get_access_control("content-1")
+            .await
+            .unwrap()
+            .unwrap()
+            .min_valid_issued_at(),
+        2000,
+        "a rejected replay must not roll the state back"
+    );
+}
+
+/// 同一署名の単純な再送(A → replay(A))も拒否される。
+/// `invalidate` は再送のたびに `min_valid_issued_at` を現在時刻へ進めるため、
+/// 通してしまうと正規リクエスト後に発行された Token まで巻き添えで失効する。
+#[tokio::test]
+async fn test_signed_mutation_is_single_use() {
+    let (service, _crdt_repo, _temp_dir) = create_test_service_with_ac().await;
+
+    service.init_access_control("content-1").await.unwrap();
+
+    let update = AccessControlUpdate::new("content-1".to_string(), 1000);
+    let (signature, public_key) = sign_access_control_update(&update);
+    let update = update.with_signature(signature, public_key);
+    let request_signature: Vec<u8> = vec![0xC0, 0xFF, 0xEE];
+
+    service
+        .update_access_control(
+            &update,
+            Some(&test_token()),
+            Some(&request_signature),
+            test_timestamp(),
+        )
+        .await
+        .expect("first presentation should apply");
+
+    let replay = service
+        .update_access_control(
+            &update,
+            Some(&test_token()),
+            Some(&request_signature),
+            test_timestamp(),
+        )
+        .await;
+    assert!(replay.is_err(), "the same signature must not apply twice");
 }
 
 #[tokio::test]

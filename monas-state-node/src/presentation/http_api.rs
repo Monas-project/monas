@@ -197,6 +197,15 @@ impl IntoResponse for StateNodeError {
                 tracing::warn!("authentication failed: {detail}");
                 "Authentication failed".to_string()
             }
+            // 再送であることは呼び出し側に伝えてよい。伝えないと、正規の
+            // クライアントは「認証に失敗した」と読んで同じ署名で延々と
+            // 再試行してしまう(正しい対処は新しい timestamp で署名し直すこと)。
+            StateNodeError::RequestAlreadyApplied(detail) => {
+                tracing::warn!("replayed request rejected: {detail}");
+                "This signed request has already been applied. Re-sign the request with a fresh \
+                 timestamp instead of resending the previous signature."
+                    .to_string()
+            }
             StateNodeError::AuthorizationFailed(_) => "Authorization failed".to_string(),
             StateNodeError::InvalidCid(_) => "Invalid content identifier".to_string(),
             StateNodeError::InvalidConfiguration(_) => "Invalid request".to_string(),

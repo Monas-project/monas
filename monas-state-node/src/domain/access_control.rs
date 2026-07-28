@@ -161,6 +161,11 @@ pub enum AccessControlError {
     ContentNotFound,
     /// Signature verification failed.
     InvalidSignature,
+    /// The signature verified, but this exact signed request was already
+    /// applied. Kept distinct from [`Self::InvalidSignature`] because the two
+    /// mean opposite things to an operator: a forged request versus a genuine
+    /// one arriving twice.
+    AlreadyApplied,
     /// The signer is not authorized to update access control.
     NotAuthorized,
 }
@@ -177,6 +182,10 @@ impl std::fmt::Display for AccessControlError {
             }
             AccessControlError::ContentNotFound => write!(f, "Content not found"),
             AccessControlError::InvalidSignature => write!(f, "Invalid signature"),
+            AccessControlError::AlreadyApplied => write!(
+                f,
+                "this signed request has already been applied (mutations are single-use)"
+            ),
             AccessControlError::NotAuthorized => write!(f, "Not authorized"),
         }
     }
