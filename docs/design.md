@@ -364,7 +364,9 @@ member証明（ownerがmemberを認証するトークン）は採用しない。
 
 share受信者はKeyEnvelopeの復号成功時にunwrap済みCEKを自デバイスのローカルストアへ保存し、以後は自身もstate-nodeからの検証付きreadで復号できる。CEK・平文がデバイス外に出ることはない（state-nodeは常に暗号文のみを扱う）。
 
-**KeyEnvelopeは送信者認証付き（HPKE Authモード）でラップされる。** 送信者の秘密鍵がwrap計算に混ざり、受信者は送信者の公開鍵を使ってunwrapする — 送信者が本物でなければ復号自体が失敗するため、別途の署名は不要。受信者は最初にunwrapに成功した送信者公開鍵をcontentごとにピン留めし（TOFU）、以後のenvelopeはピン済みの鍵でのみ検証する。これにより、平文を知る第三者が整合するenvelopeを鋳造して受信者の保存CEKを上書き破壊する攻撃を防ぐ。
+**KeyEnvelopeは送信者認証付き（HPKE Authモード）でラップされる。** 送信者の秘密鍵がwrap計算に混ざり、受信者は送信者の公開鍵を使ってunwrapする — 送信者が本物でなければ復号自体が失敗するため、別途の署名は不要。受信者は最初にunwrapに成功した送信者公開鍵をcontentごとにピン留めし（TOFU）、以後のenvelopeはピン済みの鍵でのみ検証する。これにより、**2通目以降**については、平文を知る第三者が自分の鍵で整合するenvelopeを鋳造して受信者の保存CEKを上書き破壊する攻撃を防げる。
+
+ただし**初回は送信者認証ではない**。ピンが無い時点では呼び出し側が渡した公開鍵をそのまま検証鍵に使うため、HPKE Authが証明するのは「その鍵の持ち主がこのenvelopeを作った」ことだけで、「contentのownerが作った」ことではない。平文を知る第三者が自分の鍵で整合するenvelopeを作り、正規のenvelopeより先にピンを取ることは現状防げない（以後、正規のenvelopeがピン不一致で弾かれる）。初回の送信者鍵をowner identityまたは検証済み委譲トークンのissuerへ束縛する修正は、版の真正性と同じくownerを信頼の根に置く話であり、別issueで追跡する。
 
 wrapのAADには `(content_id, recipient_key_id, key_epoch)` が束縛され、いずれかを書き換えたenvelopeは復号に失敗する。`key_epoch` はCEKの鍵世代（rotationごとに+1）で、受信者は記録済み世代より古いenvelopeを拒否する — rotation前の正規envelopeを再送して保存CEKを旧世代へ巻き戻すreplay攻撃はこれで防がれる。
 

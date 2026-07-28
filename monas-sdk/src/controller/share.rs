@@ -660,6 +660,12 @@ impl MonasController {
         // 4. 送信者鍵ピン(TOFU)と鍵世代の検証。
         //    unwrap に使う鍵は「入力された鍵」ではなく「ピン済みの鍵」を優先する:
         //    ピンがある限り、呼び出し側が違う鍵を渡しても検証の根は動かない。
+        //
+        //    NOTE: 初回(ピン未設定)は呼び出し側の鍵をそのまま信頼する TOFU で
+        //    あり、送信者認証ではない。HPKE Auth が示すのは「その鍵の持ち主が
+        //    作った」ことだけで、「owner が作った」ことではないため、平文を知る
+        //    第三者が正規 envelope より先にピンを取れる。初回鍵を owner identity
+        //    へ束縛する修正は trust anchor の課題として別 issue で追跡する。
         let pinned = match self.sender_pin_store.load(content_id.as_str()) {
             Ok(p) => p,
             Err(e) => {
