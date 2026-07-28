@@ -3209,7 +3209,7 @@ mod tests {
             .authorize_read(
                 &test_token(),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
                 "content-genesis-only",
             )
             .await;
