@@ -137,6 +137,10 @@ enum MemberProvenance {
 /// Relay candidates plus the provenance of the list.
 struct ResolvedMembers {
     members: Vec<String>,
+    /// Kept for diagnostics and for #63: once membership is owner-signed,
+    /// `auth_verdict_is_authoritative` reads this again to restore the early
+    /// exit on a denial. Nothing branches on it today — see that method.
+    #[allow(dead_code)]
     provenance: MemberProvenance,
 }
 
@@ -161,15 +165,32 @@ impl ResolvedMembers {
     }
 
     /// Whether a negative authorization verdict from these peers may be treated
-    /// as final.
+    /// as final — i.e. may end the failover loop early.
     ///
-    /// For unproven peers it must not be: a single hostile node squatting near
-    /// the DHT key could otherwise deny every read by answering 403 first, and
-    /// even an honest but partially-synced replica can answer 403 from a policy
-    /// it has not finished replicating. In both cases the right move is to keep
-    /// asking the remaining candidates.
+    /// **Currently always false.** A denial is still kept and returned if no
+    /// candidate produces anything better; what this disables is *stopping* at
+    /// the first one.
+    ///
+    /// For [`MemberProvenance::DhtGuess`] the reason is direct: a single
+    /// hostile node squatting near the DHT key could otherwise deny every read
+    /// by answering 403 first, and even an honest but partially-synced replica
+    /// can answer 403 from a policy it has not finished replicating.
+    ///
+    /// [`MemberProvenance::LocalRecord`] used to return true here, on the
+    /// grounds that a listed member evaluated the caller against the real
+    /// policy. That does not hold while the record itself can be planted: the
+    /// first record for a content is accepted with no prior membership to check
+    /// against, so an attacker who wins that race lands in the list and its 403
+    /// would end the loop — a permanent denial of service against a legitimate
+    /// caller, which is exactly what the DhtGuess case is guarding against.
+    ///
+    /// Restoring the early exit needs owner-signed membership (#63). Until
+    /// then, the cost of always continuing is bounded: one extra round trip per
+    /// remaining candidate on a genuine denial, against an availability attack
+    /// that is otherwise unbounded. Erring toward availability is the right
+    /// direction — the caller is refused either way, just later.
     fn auth_verdict_is_authoritative(&self) -> bool {
-        self.provenance == MemberProvenance::LocalRecord
+        false
     }
 }
 
@@ -2282,6 +2303,14 @@ where
                 removed_node_id,
                 ..
             } => {
+                // Removal deletes or rewrites the record that decides whether a
+                // relay treats a peer's 403 as final, so the publisher must be
+                // a member of the network it is changing — otherwise any peer
+                // could evict us from our own record just by naming us as
+                // `removed_node_id`. Same rule as the Added arm.
+                self.verify_source_is_existing_member(source_peer_id, content_id)
+                    .await?;
+
                 // If we were removed, delete the local network metadata
                 if removed_node_id == &self.local_node_id {
                     tracing::info!(
@@ -2393,6 +2422,13 @@ where
             } => {
                 // Verify source PeerID matches claimed node ID
                 Self::verify_source_peer_id(source_peer_id, deleted_by_node_id)?;
+
+                // That alone only proves the publisher is who it says it is —
+                // it names *itself*, so any authenticated peer would satisfy
+                // it. Deleting our record requires being a member of the
+                // network being deleted.
+                self.verify_source_is_existing_member(source_peer_id, content_id)
+                    .await?;
 
                 // Skip if we initiated the deletion
                 if deleted_by_node_id == &self.local_node_id {
@@ -3370,12 +3406,15 @@ mod tests {
         ));
     }
 
-    /// 逆に、attested な member(ローカルの ContentNetwork レコード由来)の
-    /// 401/403 は権威がある。実 policy に対して評価した結果なので、他の member
-    /// に聞いても答えは変わらず、聞き続けるのは拒否済みの相手に対して
-    /// コンテンツの存在を漏らすだけになる。
+    /// `record_relay_read_error` は「権威あり」と言われれば打ち切る。
+    ///
+    /// ただし現在この `true` を渡す呼び出し側は無い
+    /// ([`ResolvedMembers::auth_verdict_is_authoritative`] は常に false)。
+    /// レコード自体が最初の 1 通で植え付けられる間は、そこに載った peer の
+    /// 403 も最終判断にはできないためである。owner 署名付き membership
+    /// (#63)が入れば早期打ち切りを戻せるので、その配線だけは残してある。
     #[test]
-    fn attested_member_auth_verdict_is_final() {
+    fn record_relay_read_error_breaks_when_told_the_verdict_is_authoritative() {
         use crate::port::peer_network::{RelayReadError, RelayReadErrorKind};
 
         let mut best = None;
@@ -3815,6 +3854,91 @@ mod tests {
             .unwrap()
             .expect("record stored");
         assert!(network.has_member_str("node-2"));
+    }
+
+    /// A non-member cannot evict us from our own record by naming us as the
+    /// removed node.
+    ///
+    /// This arm had no publisher check at all, so a single event from any peer
+    /// deleted the `ContentNetwork` record — which is what decides whether a
+    /// relay treats a peer's 403 as final.
+    #[tokio::test]
+    async fn removal_from_a_non_member_cannot_delete_our_record() {
+        let content_repo = Arc::new(RwLock::new(
+            MockContentNetworkRepository::new()
+                .with_network(create_test_network("content-1", vec!["node-1", "node-2"])),
+        ));
+        let service: TestService = StateNodeService::new(
+            MockNodeRegistry::new(),
+            content_repo,
+            Arc::new(MockPeerNetwork::new().with_local_peer_id("node-1")),
+            MockEventPublisher::new(),
+            Arc::new(MockContentRepository::new()),
+            "node-1".to_string(),
+        )
+        .with_authentication_service(TestAuthService)
+        .with_authorization_service(AllowAllAuthorizationService);
+
+        let event = Event::ContentNetworkManagerRemoved {
+            content_id: "content-1".to_string(),
+            removed_node_id: "node-1".to_string(),
+            member_nodes: vec!["node-2".to_string()],
+            reason: "low_capacity".to_string(),
+            timestamp: 12345,
+        };
+
+        let result = service.handle_sync_event(&event, Some("node-9")).await;
+        assert!(result.is_err(), "non-member publisher must be rejected");
+
+        assert!(
+            service
+                .get_content_network_for_test("content-1")
+                .await
+                .unwrap()
+                .is_some(),
+            "our record must survive"
+        );
+    }
+
+    /// A non-member cannot delete our record with a `ContentDeleted` event.
+    ///
+    /// `verify_source_peer_id` alone does not help here: the event names its
+    /// own publisher, so any authenticated peer satisfies it.
+    #[tokio::test]
+    async fn content_deleted_from_a_non_member_cannot_delete_our_record() {
+        let content_repo = Arc::new(RwLock::new(
+            MockContentNetworkRepository::new()
+                .with_network(create_test_network("content-1", vec!["node-1", "node-2"])),
+        ));
+        let service: TestService = StateNodeService::new(
+            MockNodeRegistry::new(),
+            content_repo,
+            Arc::new(MockPeerNetwork::new().with_local_peer_id("node-1")),
+            MockEventPublisher::new(),
+            Arc::new(MockContentRepository::new()),
+            "node-1".to_string(),
+        )
+        .with_authentication_service(TestAuthService)
+        .with_authorization_service(AllowAllAuthorizationService);
+
+        // node-9 both publishes and names itself — the self-claim check passes.
+        let event = Event::ContentDeleted {
+            content_id: "content-1".to_string(),
+            deleted_by_node_id: "node-9".to_string(),
+            timestamp: 12345,
+        };
+
+        let result = service.handle_sync_event(&event, Some("node-9")).await;
+        assert!(result.is_err(), "non-member publisher must be rejected");
+
+        assert!(
+            service
+                .get_content_network_for_test("content-1")
+                .await
+                .unwrap()
+                .is_some(),
+            "our record must survive"
+        );
     }
 
     /// A non-member cannot rewrite the member set of a network we already hold.
