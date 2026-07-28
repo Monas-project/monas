@@ -95,6 +95,76 @@ where
     max_add_member_count: usize,
 }
 
+/// Where a relay candidate list came from, and therefore how much it can be
+/// trusted.
+///
+/// This distinction matters because a relay hands the caller's token and
+/// request signature to whoever is in the list, and then interprets what comes
+/// back. Both of those are only safe for peers we have some reason to believe
+/// actually hold the content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MemberProvenance {
+    /// The peers come from a local `ContentNetwork` record, which was built
+    /// from a `ContentCreated` event for this content. They are the nodes the
+    /// network actually assigned, so a 401/403 from one of them is a real
+    /// verdict against the real access policy.
+    Attested,
+    /// The peers are just DHT neighbours of `sha256(content_id)`. Nothing ties
+    /// them to this content: anyone able to place a Peer ID near the key lands
+    /// in this list. Their responses — including authorization verdicts — carry
+    /// no authority, and handing them live credentials is a disclosure to an
+    /// unidentified party.
+    DhtGuess,
+}
+
+/// Relay candidates plus the provenance of the list.
+struct ResolvedMembers {
+    members: Vec<String>,
+    provenance: MemberProvenance,
+}
+
+/// How many unproven DHT candidates may be handed the caller's credentials
+/// before giving up.
+///
+/// Every candidate tried is one more unidentified party that receives a live
+/// token and request signature, so the failover loop must not simply walk the
+/// whole list. Two keeps one retry for the ordinary case (the first candidate
+/// is offline or lagging) while keeping the disclosure bounded. Attested
+/// members are not capped: they are the nodes the network actually assigned.
+const MAX_UNPROVEN_RELAY_CANDIDATES: usize = 2;
+
+impl ResolvedMembers {
+    /// The candidates that may receive the caller's credentials.
+    ///
+    /// Unproven lists are truncated (see [`MAX_UNPROVEN_RELAY_CANDIDATES`]):
+    /// relaying to a DHT neighbour discloses a live token and request signature
+    /// to a party that has shown no connection to the content, so the number of
+    /// such disclosures per request has to be bounded. Removing the disclosure
+    /// entirely needs capabilities that can be down-scoped to a single relay,
+    /// operation and resource — a protocol change tracked separately.
+    fn as_slice(&self) -> &[String] {
+        match self.provenance {
+            MemberProvenance::Attested => &self.members,
+            MemberProvenance::DhtGuess => {
+                let n = self.members.len().min(MAX_UNPROVEN_RELAY_CANDIDATES);
+                &self.members[..n]
+            }
+        }
+    }
+
+    /// Whether a negative authorization verdict from these peers may be treated
+    /// as final.
+    ///
+    /// For unproven peers it must not be: a single hostile node squatting near
+    /// the DHT key could otherwise deny every read by answering 403 first, and
+    /// even an honest but partially-synced replica can answer 403 from a policy
+    /// it has not finished replicating. In both cases the right move is to keep
+    /// asking the remaining candidates.
+    fn auth_verdict_is_authoritative(&self) -> bool {
+        self.provenance == MemberProvenance::Attested
+    }
+}
+
 /// No-op access control repository for backward compatibility.
 pub struct NoOpAccessControlRepository;
 
@@ -418,7 +488,7 @@ where
     /// since they indicate a real permission problem rather than a connectivity issue.
     async fn relay_with_failover<F, Fut>(
         &self,
-        members: &[String],
+        members: &ResolvedMembers,
         operation_name: &str,
         relay_fn: F,
     ) -> Result<(), StateNodeError>
@@ -426,7 +496,11 @@ where
         F: Fn(String) -> Fut,
         Fut: std::future::Future<Output = Result<bool, anyhow::Error>>,
     {
-        for (i, member) in members.iter().enumerate() {
+        let authoritative = members.auth_verdict_is_authoritative();
+        let candidates = members.as_slice();
+        let mut auth_error: Option<StateNodeError> = None;
+
+        for (i, member) in candidates.iter().enumerate() {
             match relay_fn(member.clone()).await {
                 Ok(true) => return Ok(()),
                 Ok(false) => {
@@ -435,29 +509,51 @@ where
                         operation_name,
                         member,
                         i + 1,
-                        members.len()
+                        candidates.len()
                     );
                 }
                 Err(e) => {
                     let err_msg = e.to_string();
-                    // Don't failover on auth errors — they'll fail on every member
                     if err_msg.contains("Authorization failed")
                         || err_msg.contains("Authentication failed")
                     {
-                        return Err(Self::classify_relay_error(err_msg));
+                        // An attested member evaluated the request against the
+                        // real policy, so every other member would answer the
+                        // same — stop here.
+                        if authoritative {
+                            return Err(Self::classify_relay_error(err_msg));
+                        }
+                        // Unproven candidate: its verdict proves nothing (it may
+                        // not hold the content at all), so it must not end the
+                        // loop — otherwise one hostile peer near the DHT key
+                        // could block every write with a single fabricated 403.
+                        // Remember it as the answer of last resort and continue.
+                        tracing::warn!(
+                            "Relay {} got an auth verdict from unproven candidate {} ({}/{}): {} \
+                             — continuing failover",
+                            operation_name,
+                            member,
+                            i + 1,
+                            candidates.len(),
+                            err_msg
+                        );
+                        auth_error.get_or_insert_with(|| Self::classify_relay_error(err_msg));
+                        continue;
                     }
                     tracing::warn!(
                         "Relay {} failed on member {} ({}/{}): {}",
                         operation_name,
                         member,
                         i + 1,
-                        members.len(),
+                        candidates.len(),
                         err_msg
                     );
                 }
             }
         }
-        Err(StateNodeError::NoAvailableMembers)
+        // Nothing succeeded. An auth verdict, even from an unproven candidate,
+        // is a more useful answer than "no members available".
+        Err(auth_error.unwrap_or(StateNodeError::NoAvailableMembers))
     }
 
     /// Resolve the member nodes that own a content, for relay/sync purposes.
@@ -472,7 +568,7 @@ where
     ///
     /// The local node is always excluded from the result. Returns
     /// `NoAvailableMembers` if no candidate remains.
-    async fn resolve_members(&self, content_id: &str) -> Result<Vec<String>, StateNodeError> {
+    async fn resolve_members(&self, content_id: &str) -> Result<ResolvedMembers, StateNodeError> {
         let local_record = self
             .content_repo
             .read()
@@ -481,19 +577,24 @@ where
             .await
             .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
 
-        let mut members: Vec<String> = match local_record {
-            Some(network) => network.member_nodes_as_strings(),
+        let (mut members, provenance) = match local_record {
+            Some(network) => (
+                network.member_nodes_as_strings(),
+                MemberProvenance::Attested,
+            ),
             None => {
                 // No local record: discover the members via the DHT. Request
                 // `k + 1` candidates so that excluding ourselves still leaves
                 // up to `k`, mirroring create_content's placement.
                 let key = compute_dht_key(content_id);
-                self.peer_network
+                let peers = self
+                    .peer_network
                     .find_closest_peers(key, self.min_replication_factor + 1)
                     .await
                     .map_err(|e| {
                         StateNodeError::NetworkError(NetworkError::ConnectionFailed(e.to_string()))
-                    })?
+                    })?;
+                (peers, MemberProvenance::DhtGuess)
             }
         };
 
@@ -501,7 +602,10 @@ where
         if members.is_empty() {
             return Err(StateNodeError::NoAvailableMembers);
         }
-        Ok(members)
+        Ok(ResolvedMembers {
+            members,
+            provenance,
+        })
     }
 
     /// Whether this node actually replicates the content (holds its genesis
@@ -668,10 +772,11 @@ where
         timestamp: Option<u64>,
     ) -> Result<(Vec<u8>, String), StateNodeError> {
         let members = self.resolve_members(content_id).await?;
+        let authoritative = members.auth_verdict_is_authoritative();
         let sig: &[u8] = request_signature.unwrap_or(&[]);
 
         let mut best: Option<RelayReadError> = None;
-        for member in &members {
+        for member in members.as_slice() {
             match self
                 .peer_network
                 .relay_read_content(member, content_id, version, token.as_str(), sig, timestamp)
@@ -685,9 +790,10 @@ where
                         content_id,
                         e
                     );
-                    match Self::record_relay_read_error(&mut best, e) {
-                        // An auth verdict is authoritative — the member DID
-                        // evaluate the request. Do not let a later member's
+                    match Self::record_relay_read_error(&mut best, e, authoritative) {
+                        // An auth verdict from an attested member is
+                        // authoritative — it DID evaluate the request against
+                        // the real policy. Do not let a later member's
                         // transport failure overwrite it.
                         ControlFlow::Break(final_err) => {
                             return Err(Self::relay_read_error_to_state_error(
@@ -716,10 +822,11 @@ where
         timestamp: Option<u64>,
     ) -> Result<Vec<String>, StateNodeError> {
         let members = self.resolve_members(content_id).await?;
+        let authoritative = members.auth_verdict_is_authoritative();
         let sig: &[u8] = request_signature.unwrap_or(&[]);
 
         let mut best: Option<RelayReadError> = None;
-        for member in &members {
+        for member in members.as_slice() {
             match self
                 .peer_network
                 .relay_read_history(member, content_id, token.as_str(), sig, timestamp)
@@ -733,7 +840,7 @@ where
                         content_id,
                         e
                     );
-                    match Self::record_relay_read_error(&mut best, e) {
+                    match Self::record_relay_read_error(&mut best, e, authoritative) {
                         ControlFlow::Break(final_err) => {
                             return Err(Self::relay_read_error_to_state_error(
                                 content_id, final_err,
@@ -753,21 +860,49 @@ where
 
     /// Fold one member's relayed-read failure into the running best error.
     ///
-    /// Auth verdicts (401/403) short-circuit the member loop: the member
-    /// evaluated the caller against the real policy, so asking further
-    /// members cannot change the answer. NotFound is kept over transport
-    /// errors but the loop continues — a lagging member may miss a version
-    /// another member can still serve.
+    /// Auth verdicts (401/403) short-circuit the member loop **only when the
+    /// candidate list is attested** (`authoritative`): such a member evaluated
+    /// the caller against the real policy, so asking further members cannot
+    /// change the answer, and continuing would just leak that the content
+    /// exists to a caller who was already refused.
+    ///
+    /// When the list is a DHT guess, a 401/403 proves nothing — the responder
+    /// may not hold the content at all. Treating it as final would let one
+    /// hostile peer near the DHT key deny every read by answering 403 first,
+    /// and would also let an honest replica that has not finished replicating
+    /// the policy stop failover to a healthy one. So the verdict is remembered
+    /// (it is a better answer than a transport error, and is what the caller
+    /// sees if nothing better turns up) but the loop keeps going.
+    ///
+    /// NotFound is kept over transport errors but never short-circuits — a
+    /// lagging member may miss a version another member can still serve.
     fn record_relay_read_error(
         best: &mut Option<RelayReadError>,
         err: RelayReadError,
+        authoritative: bool,
     ) -> ControlFlow<RelayReadError> {
         match err.kind {
             RelayReadErrorKind::AuthenticationFailed | RelayReadErrorKind::AuthorizationFailed => {
-                ControlFlow::Break(err)
+                if authoritative {
+                    return ControlFlow::Break(err);
+                }
+                // Unproven responder: keep the verdict as the best answer so
+                // far (it beats NotFound and transport errors), but let the
+                // remaining candidates have their say.
+                *best = Some(err);
+                ControlFlow::Continue(())
             }
             RelayReadErrorKind::NotFound => {
-                *best = Some(err);
+                // Do not let a NotFound overwrite an auth verdict we are
+                // holding on to from an unproven peer: the verdict is the more
+                // specific answer.
+                if !matches!(
+                    best.as_ref().map(|b| b.kind),
+                    Some(RelayReadErrorKind::AuthenticationFailed)
+                        | Some(RelayReadErrorKind::AuthorizationFailed)
+                ) {
+                    *best = Some(err);
+                }
                 ControlFlow::Continue(())
             }
             RelayReadErrorKind::Other => {
@@ -3102,6 +3237,118 @@ mod tests {
             result,
             Err(StateNodeError::AuthorizationFailed(_))
         ));
+    }
+
+    /// 未証明の DHT 候補が返した 401/403 で member loop を打ち切ってはいけない。
+    /// 打ち切ると、DHT キーの近くに Peer ID を置いた 1 台が 403 を返すだけで
+    /// あらゆる read を止められる(可用性への攻撃)。正規 member でも policy の
+    /// 複製が終わっていなければ 403 を返し得るので、健全なレプリカへの failover
+    /// を潰さないためにも継続する必要がある。
+    #[test]
+    fn unproven_peer_auth_verdict_does_not_stop_failover() {
+        use crate::port::peer_network::{RelayReadError, RelayReadErrorKind};
+
+        let mut best = None;
+        let flow = StateNodeService::<
+            MockNodeRegistry,
+            MockContentNetworkRepository,
+            MockPeerNetwork,
+            MockEventPublisher,
+            MockContentRepository,
+        >::record_relay_read_error(
+            &mut best,
+            RelayReadError {
+                kind: RelayReadErrorKind::AuthorizationFailed,
+                message: "fabricated 403".to_string(),
+            },
+            false, // 未証明の候補
+        );
+        assert!(
+            matches!(flow, ControlFlow::Continue(())),
+            "an unproven peer's verdict must not end the loop"
+        );
+        // ただし答えとしては保持する(次の候補が何も返さなければこれを返す)
+        assert!(matches!(
+            best.as_ref().map(|b| b.kind),
+            Some(RelayReadErrorKind::AuthorizationFailed)
+        ));
+
+        // 後続候補の NotFound で auth verdict を上書きしない。
+        // 上書きすると「拒否された」が「存在しない」に化ける。
+        let flow = StateNodeService::<
+            MockNodeRegistry,
+            MockContentNetworkRepository,
+            MockPeerNetwork,
+            MockEventPublisher,
+            MockContentRepository,
+        >::record_relay_read_error(
+            &mut best,
+            RelayReadError {
+                kind: RelayReadErrorKind::NotFound,
+                message: "not here".to_string(),
+            },
+            false,
+        );
+        assert!(matches!(flow, ControlFlow::Continue(())));
+        assert!(matches!(
+            best.as_ref().map(|b| b.kind),
+            Some(RelayReadErrorKind::AuthorizationFailed)
+        ));
+    }
+
+    /// 逆に、attested な member(ローカルの ContentNetwork レコード由来)の
+    /// 401/403 は権威がある。実 policy に対して評価した結果なので、他の member
+    /// に聞いても答えは変わらず、聞き続けるのは拒否済みの相手に対して
+    /// コンテンツの存在を漏らすだけになる。
+    #[test]
+    fn attested_member_auth_verdict_is_final() {
+        use crate::port::peer_network::{RelayReadError, RelayReadErrorKind};
+
+        let mut best = None;
+        let flow = StateNodeService::<
+            MockNodeRegistry,
+            MockContentNetworkRepository,
+            MockPeerNetwork,
+            MockEventPublisher,
+            MockContentRepository,
+        >::record_relay_read_error(
+            &mut best,
+            RelayReadError {
+                kind: RelayReadErrorKind::AuthorizationFailed,
+                message: "real verdict".to_string(),
+            },
+            true, // attested member
+        );
+        assert!(
+            matches!(flow, ControlFlow::Break(_)),
+            "an attested member's verdict is authoritative"
+        );
+    }
+
+    /// 未証明の候補へ credential を配る数には上限がある。
+    /// 候補を1台試すごとに、コンテンツとの関連が何も示されていない相手へ
+    /// 生きた token と署名を渡すことになるため、リスト全体を舐めてはいけない。
+    #[test]
+    fn credentials_reach_a_bounded_number_of_unproven_candidates() {
+        let many: Vec<String> = (0..10).map(|i| format!("peer-{i}")).collect();
+
+        let guessed = ResolvedMembers {
+            members: many.clone(),
+            provenance: MemberProvenance::DhtGuess,
+        };
+        assert_eq!(
+            guessed.as_slice().len(),
+            MAX_UNPROVEN_RELAY_CANDIDATES,
+            "unproven candidates must be capped"
+        );
+
+        // attested member は打ち切らない。ネットワークが実際に割り当てた
+        // ノードなので、可用性のために全部試してよい。
+        let attested = ResolvedMembers {
+            members: many.clone(),
+            provenance: MemberProvenance::Attested,
+        };
+        assert_eq!(attested.as_slice().len(), many.len());
     }
 
     #[tokio::test]
