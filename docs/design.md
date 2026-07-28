@@ -157,7 +157,7 @@ presentation/   Axum HTTP API (port: 4002)
 
 | 機能 | 実装 |
 |------|------|
-| コンテンツ暗号化 | AES-256-CTR（IVランダム生成） |
+| コンテンツ暗号化 | AES-256-GCM（AEAD、12バイトランダムnonce。保存形式は `nonce \|\| ciphertext \|\| tag`） |
 | 鍵生成・管理 | CEK（Content Encryption Key）の生成・保存・削除 |
 | コンテンツアドレッシング | SHA-256によるCID生成 |
 | 鍵共有 | HPKE（RFC 9180、DH-KEM P-256）によるCEKのラップ |
@@ -169,7 +169,7 @@ presentation/   Axum HTTP API (port: 4002)
 domain/         Content, ContentId, Share, Permission, KeyEnvelope
 application/    ContentService（CRUD + fetch + reencrypt）
                 ShareService（grant, revoke, unwrap_cek）
-infrastructure/ AES-256-CTR, HPKE, Sled, monas-filesync
+infrastructure/ AES-256-GCM, HPKE, Sled, monas-filesync
 presentation/   Axum HTTP API (port: 4001)
 ```
 
