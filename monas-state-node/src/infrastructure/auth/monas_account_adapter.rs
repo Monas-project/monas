@@ -119,14 +119,41 @@ impl MonasAccountAdapter {
         )
         .context("Signature verification failed")?;
 
-        // Check timestamp to prevent replay attacks
+        // Bound how long a signature stays usable.
+        //
+        // This is a freshness check, NOT replay protection: inside the window
+        // the same signature can be presented any number of times. RFC 9449
+        // (DPoP) §11.1 makes the same split — it requires servers to accept a
+        // proof only "for a relatively brief period on the order of seconds or
+        // minutes", and separately recommends storing the proof's identifier
+        // for that window so a proof cannot be used twice, noting that a
+        // single-use check "provides a very strong protection against DPoP
+        // proof replay". Monas does the same: mutations are consumed by
+        // `verify_and_consume_mutation_signature`, keyed on the signature
+        // digest. Reads are idempotent and rely on freshness alone.
+        //
+        // https://www.rfc-editor.org/rfc/rfc9449.html#section-11.1
         if let Some(timestamp) = context.timestamp {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_secs();
 
-            // Reject if timestamp is older than 5 minutes
+            // 300s matches the ceiling AWS SigV4 uses for the same job ("a
+            // request must reach AWS within five minutes of the time stamp"),
+            // and sits inside RFC 9449's "seconds or minutes".
+            //
+            // The floor is set by how long a request legitimately takes to
+            // arrive: gateway hop, then a state-node relay whose per-peer
+            // budget is `PEER_NETWORK_TIMEOUT` (30s), possibly preceded by DHT
+            // discovery, with failover retrying across candidates. Tens of
+            // seconds is realistic; 300s leaves generous headroom.
+            //
+            // The window is therefore loose rather than tuned. It could be
+            // tightened once real request latency is measured, which is worth
+            // doing because it directly bounds how long a captured read
+            // signature stays replayable — but it must not be cut below the
+            // relay failover budget or legitimate reads start failing.
             const MAX_AGE_SECS: u64 = 300;
             if now > timestamp + MAX_AGE_SECS {
                 return Err(anyhow::anyhow!(
@@ -134,7 +161,8 @@ impl MonasAccountAdapter {
                 ));
             }
 
-            // Reject if timestamp is in the future (allow 30 seconds clock skew)
+            // Future-dated timestamps are a clock-sync problem, not a latency
+            // one, so they get their own much smaller allowance.
             const MAX_CLOCK_SKEW_SECS: u64 = 30;
             if timestamp > now + MAX_CLOCK_SKEW_SECS {
                 return Err(anyhow::anyhow!("Invalid timestamp (too far in the future)"));
