@@ -110,11 +110,27 @@ where
 /// provenance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MemberProvenance {
-    /// The peers come from a local `ContentNetwork` record, which was built
-    /// from a `ContentCreated` event for this content. They are the nodes the
-    /// network actually assigned, so a 401/403 from one of them is a real
-    /// verdict against the real access policy.
-    Attested,
+    /// The peers come from a local `ContentNetwork` record, built from a
+    /// `ContentCreated` / `ContentNetworkManagerAdded` event that named this
+    /// node as a member.
+    ///
+    /// This is **not** a cryptographic attestation by the content owner.
+    /// Events carry no owner signature, so the membership set inside the event
+    /// is the publisher's own claim. What is verified is the *publisher*:
+    /// gossipsub runs in `Signed` + `Strict` mode, so the author field is
+    /// authenticated, and `handle_sync_event` binds it — `ContentCreated` must
+    /// come from the creator it names, and a membership change must come from
+    /// a node already in the network it changes.
+    ///
+    /// Two gaps remain, both requiring a protocol change to close (tracked
+    /// separately): the very first record for a content is accepted without a
+    /// prior membership to check against, and an authenticated member can
+    /// still claim a member set of its choosing.
+    ///
+    /// It is nevertheless a far better basis than [`Self::DhtGuess`], where
+    /// nothing at all ties a peer to the content — so a 401/403 from a listed
+    /// member is treated as a real verdict.
+    LocalRecord,
     /// The peers are just DHT neighbours of `sha256(content_id)`. Nothing ties
     /// them to this content: anyone able to place a Peer ID near the key lands
     /// in this list, so a denial from one of them carries no authority.
@@ -156,7 +172,7 @@ impl ResolvedMembers {
     /// it has not finished replicating. In both cases the right move is to keep
     /// asking the remaining candidates.
     fn auth_verdict_is_authoritative(&self) -> bool {
-        self.provenance == MemberProvenance::Attested
+        self.provenance == MemberProvenance::LocalRecord
     }
 }
 
@@ -741,7 +757,7 @@ where
         let (mut members, provenance) = match local_record {
             Some(network) => (
                 network.member_nodes_as_strings(),
-                MemberProvenance::Attested,
+                MemberProvenance::LocalRecord,
             ),
             None => {
                 // No local record: discover the members via the DHT. Request
@@ -2307,10 +2323,56 @@ where
         Ok(())
     }
 
+    /// Verify that the publisher of a membership-changing event is itself a
+    /// member of the network it is changing.
+    ///
+    /// Returns `Ok(())` when we hold no local record for the content: there is
+    /// no membership to check against, and no existing record to overwrite.
+    /// Also returns `Ok(())` when `source_peer_id` is `None` (the event did not
+    /// arrive over an authenticated channel — see `handle_sync_event`).
+    async fn verify_source_is_existing_member(
+        &self,
+        source_peer_id: Option<&str>,
+        content_id: &str,
+    ) -> Result<(), StateNodeError> {
+        let Some(source) = source_peer_id else {
+            return Ok(());
+        };
+
+        let existing = self
+            .content_repo
+            .read()
+            .await
+            .get_content_network(content_id)
+            .await
+            .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
+
+        match existing {
+            Some(network) if !network.has_member_str(source) => {
+                tracing::warn!(
+                    "Rejecting membership change for {} from non-member {}",
+                    content_id,
+                    source
+                );
+                Err(StateNodeError::Internal(format!(
+                    "Publisher {} is not a member of content network {}",
+                    source, content_id
+                )))
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Handle a sync event from another node.
     ///
-    /// The `source_peer_id` parameter is used to verify that events claiming
-    /// to be from a particular node actually came from that peer's PeerID.
+    /// The `source_peer_id` parameter is the **authenticated publisher** of the
+    /// event (gossipsub `Message::source`, not the forwarding peer), used to
+    /// verify that events claiming to be from a particular node actually came
+    /// from that peer.
+    ///
+    /// `None` means the origin could not be established; origin-bound checks
+    /// are skipped in that case, so callers must pass the authenticated value
+    /// whenever one exists.
     ///
     /// Returns `ApplyOutcome::NeedsSync` when the caller should perform content
     /// synchronization (e.g., call `ContentSyncService::sync_from_peers`).
@@ -2373,6 +2435,18 @@ where
                 if !member_nodes.contains(&self.local_node_id) {
                     return Ok(ApplyOutcome::Ignored);
                 }
+
+                // Unlike `ContentCreated`, this event names no publisher —
+                // `added_node_id` is the node being added, which is usually us.
+                // The publisher is whichever node ran the redundancy check, so
+                // the check that fits is membership: only a node already in the
+                // network we remember may change that network's member set.
+                //
+                // If we hold no record, there is nothing to check against and
+                // nothing being overwritten, so the event is accepted as
+                // bootstrap — the same position `ContentCreated` is in.
+                self.verify_source_is_existing_member(source_peer_id, content_id)
+                    .await?;
 
                 // When handling sync events, we create network with NodeIds directly
                 let content_id_vo = ContentId::new(content_id.clone())?;
@@ -2448,9 +2522,17 @@ where
 
             Event::ContentCreated {
                 content_id,
+                creator_node_id,
                 member_nodes,
                 ..
             } => {
+                // The event asserts a membership set that this node will store
+                // and later act on, so the publisher must at least be the
+                // creator it claims to be. `create_content` always publishes
+                // with `creator_node_id == self.local_node_id`, so this holds
+                // for every legitimate event.
+                Self::verify_source_peer_id(source_peer_id, creator_node_id)?;
+
                 // Only store network metadata if we're a member
                 if !member_nodes.contains(&self.local_node_id) {
                     return Ok(ApplyOutcome::Ignored);
@@ -3575,7 +3657,7 @@ mod tests {
     fn candidate_list_is_not_truncated_by_provenance() {
         let many: Vec<String> = (0..10).map(|i| format!("peer-{i}")).collect();
 
-        for provenance in [MemberProvenance::Attested, MemberProvenance::DhtGuess] {
+        for provenance in [MemberProvenance::LocalRecord, MemberProvenance::DhtGuess] {
             let resolved = ResolvedMembers {
                 members: many.clone(),
                 provenance,
@@ -4024,6 +4106,118 @@ mod tests {
             .unwrap();
         assert!(network.has_member_str("node-1"));
         assert!(network.has_member_str("node-2"));
+    }
+
+    /// A peer cannot plant a `ContentNetwork` record by publishing a
+    /// `ContentCreated` that names someone else as the creator.
+    ///
+    /// Without this check any node could name us in `member_nodes` for a
+    /// content of its choosing, and the record would read back as
+    /// `MemberProvenance::LocalRecord` — which decides whether a 403 from a
+    /// listed peer is treated as final.
+    #[tokio::test]
+    async fn content_created_from_a_peer_other_than_the_creator_is_rejected() {
+        let service = create_test_service("node-1");
+
+        let event = Event::ContentCreated {
+            content_id: "content-1".to_string(),
+            creator_node_id: "node-2".to_string(),
+            content_size: 100,
+            member_nodes: vec!["node-1".to_string(), "node-2".to_string()],
+            timestamp: 12345,
+        };
+
+        // Published by node-9, which is neither the claimed creator nor in the
+        // member set.
+        let result = service.handle_sync_event(&event, Some("node-9")).await;
+        assert!(result.is_err(), "unrelated publisher must be rejected");
+
+        let network = service
+            .get_content_network_for_test("content-1")
+            .await
+            .unwrap();
+        assert!(network.is_none(), "no record may be planted");
+    }
+
+    /// The legitimate path still works: `create_content` publishes with
+    /// `creator_node_id == local_node_id`, so the authenticated publisher
+    /// matches the claimed creator.
+    #[tokio::test]
+    async fn content_created_from_the_real_creator_is_accepted() {
+        let service = create_test_service("node-1");
+
+        let event = Event::ContentCreated {
+            content_id: "content-1".to_string(),
+            creator_node_id: "node-2".to_string(),
+            content_size: 100,
+            member_nodes: vec!["node-1".to_string(), "node-2".to_string()],
+            timestamp: 12345,
+        };
+
+        let outcome = service
+            .handle_sync_event(&event, Some("node-2"))
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            ApplyOutcome::NeedsSync {
+                content_id: "content-1".to_string()
+            }
+        );
+
+        let network = service
+            .get_content_network_for_test("content-1")
+            .await
+            .unwrap()
+            .expect("record stored");
+        assert!(network.has_member_str("node-2"));
+    }
+
+    /// A non-member cannot rewrite the member set of a network we already hold.
+    #[tokio::test]
+    async fn membership_change_from_a_non_member_is_rejected() {
+        let node_registry = MockNodeRegistry::new();
+        let content_repo = Arc::new(RwLock::new(
+            MockContentNetworkRepository::new()
+                .with_network(create_test_network("content-1", vec!["node-1", "node-2"])),
+        ));
+        let peer_network = Arc::new(MockPeerNetwork::new().with_local_peer_id("node-1"));
+
+        let service: TestService = StateNodeService::new(
+            node_registry,
+            content_repo,
+            peer_network,
+            MockEventPublisher::new(),
+            Arc::new(MockContentRepository::new()),
+            "node-1".to_string(),
+        )
+        .with_authentication_service(TestAuthService)
+        .with_authorization_service(AllowAllAuthorizationService);
+
+        // node-9 is not in the network, but tries to add itself to it.
+        let event = Event::ContentNetworkManagerAdded {
+            content_id: "content-1".to_string(),
+            added_node_id: "node-9".to_string(),
+            member_nodes: vec![
+                "node-1".to_string(),
+                "node-2".to_string(),
+                "node-9".to_string(),
+            ],
+            timestamp: 12345,
+        };
+
+        let result = service.handle_sync_event(&event, Some("node-9")).await;
+        assert!(result.is_err(), "non-member publisher must be rejected");
+
+        let network = service
+            .get_content_network_for_test("content-1")
+            .await
+            .unwrap()
+            .expect("record still present");
+        assert!(
+            !network.has_member_str("node-9"),
+            "member set must be unchanged"
+        );
     }
 
     #[tokio::test]
