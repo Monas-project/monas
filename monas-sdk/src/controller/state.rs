@@ -334,12 +334,34 @@ impl MonasController {
         }
 
         // CEK ロード + AES-GCM 復号 + plain CID 照合
+        //
+        // CEK は「送信者ピンの権威レコード」を優先する。CEK ストアは、その
+        // レコードから導出されるキャッシュに過ぎず、CAS 成功後の書き込み順が
+        // 入れ替わると古い世代へ巻き戻り得る(世代 N の handler が CAS 後に
+        // 停止し、その間に N+1 が権威レコードとキャッシュを進め、その後 N が
+        // 再開してキャッシュだけを N に戻す)。権威レコードから直接引けば、
+        // その巻き戻りは read に影響しない。
+        //
+        // 自分で作成した content には送信者ピンが存在しないので、その場合は
+        // 従来どおりストアを引く。
         let local_content_id =
             monas_content::domain::content_id::ContentId::new(input.local_content_id.clone());
+        let pinned_cek = match self.sender_pin_store.load(&input.local_content_id) {
+            Ok(pin) => pin
+                .and_then(|p| p.cek)
+                .map(monas_content::domain::content::ContentEncryptionKey),
+            Err(e) => {
+                return ApiResponse::error(
+                    ApiError::Internal(format!("sender key pin store error: {e}")),
+                    trace_id,
+                );
+            }
+        };
         let plaintext = match self.content_service.verify_and_decrypt_relay_read(
             &node_bytes,
             &version,
             local_content_id,
+            pinned_cek,
         ) {
             Ok(read) => read.plaintext,
             Err(e) => {
