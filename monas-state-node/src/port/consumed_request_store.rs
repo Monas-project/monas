@@ -10,10 +10,16 @@
 //! なってしまう。
 //!
 //! そこで、受理した mutation リクエストを一意に識別する値を記録し、2度目の
-//! 提示を拒否する。識別子には**リクエスト署名そのものの digest** を使う。
-//! 署名は operation / resource / timestamp / body digest すべてに束縛されて
-//! いるので、これが一致する = 完全に同じリクエストの再送である。新しい
-//! フィールドをワイヤ形式へ足す必要がない。
+//! 提示を拒否する。識別子は**署名対象メッセージと signer** から導く
+//! (`StateNodeService::mutation_request_id`)。メッセージは operation /
+//! resource / timestamp / body digest すべてに束縛されているので、これが
+//! 一致する = 完全に同じリクエストの再送であり、新しいフィールドをワイヤ形式へ
+//! 足す必要もない。
+//!
+//! **署名バイト列の digest を識別子にしてはならない。** ECDSA は malleable で、
+//! 有効な `(r, s)` に対し `(r, n - s)` も同じメッセージ・同じ鍵で検証を通る。
+//! 署名を hash すると 1 つの承認済みリクエストが 2 つの識別子を持ち、攻撃者は
+//! 捕捉した署名を 1 回変換するだけでこの記録をすり抜けられてしまう。
 //!
 //! ## 保持期間
 //!
@@ -42,7 +48,11 @@ pub trait ConsumedRequestStore: Send + Sync {
     /// 拒否すること。記録と判定は不可分でなければならない。同時に届いた同一
     /// リクエストの両方が `true` を受け取ると、二重適用を防げない。
     ///
-    /// `now` は署名検証で使った現在時刻(Unix 秒)。期限切れ記録の掃除に使う。
+    /// `now` は**このノードの現在時刻**(Unix 秒)。期限切れ記録の掃除に使う。
+    ///
+    /// caller が申告した署名内 timestamp を渡してはならない。許容 skew の範囲で
+    /// 未来寄りの timestamp を持つ有効なリクエストを先に出せば、まだ鮮度窓の
+    /// 中にある記録を早期に掃除させられ、その後で古い署名を再提示できてしまう。
     fn record_if_absent(
         &self,
         request_id: &[u8],
@@ -105,6 +115,31 @@ mod tests {
         assert!(!store.record_if_absent(b"sig-a", now).unwrap());
         // 違う署名は独立
         assert!(store.record_if_absent(b"sig-b", now).unwrap());
+    }
+
+    /// GC はサーバ時刻で動くので、caller が timestamp を前後させても
+    /// 記録を早期に落とせない。ここでは「時刻が進まない限り記録は消えない」
+    /// ことを、時刻を戻す提示も含めて確認する。
+    #[test]
+    fn out_of_order_presentations_cannot_evict_a_live_record() {
+        let store = InMemoryConsumedRequestStore::default();
+        let now = 1_000_000;
+
+        assert!(store.record_if_absent(b"victim", now).unwrap());
+
+        // 別リクエストが「未来寄り」に見える時刻で届いても、呼び出し側は
+        // サーバ時刻を渡すので窓は動かない = victim は生き残る。
+        assert!(store.record_if_absent(b"other", now).unwrap());
+        assert!(
+            !store.record_if_absent(b"victim", now).unwrap(),
+            "a live record must not be evictable by other traffic"
+        );
+
+        // 時刻が戻る向きの提示でも復活しない
+        assert!(
+            !store.record_if_absent(b"victim", now - 100).unwrap(),
+            "an earlier presentation must not resurrect the record"
+        );
     }
 
     /// 鮮度窓を過ぎた記録は捨てられる。捨てても安全なのは、その署名が

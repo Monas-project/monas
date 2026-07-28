@@ -129,8 +129,8 @@ impl MonasAccountAdapter {
         // for that window so a proof cannot be used twice, noting that a
         // single-use check "provides a very strong protection against DPoP
         // proof replay". Monas does the same: mutations are consumed by
-        // `verify_and_consume_mutation_signature`, keyed on the signature
-        // digest. Reads are idempotent and rely on freshness alone.
+        // `verify_and_consume_mutation_signature`, keyed on the signed message
+        // and signer. Reads are idempotent and rely on freshness alone.
         //
         // https://www.rfc-editor.org/rfc/rfc9449.html#section-11.1
         if let Some(timestamp) = context.timestamp {
@@ -709,6 +709,61 @@ mod tests {
             )
             .await
             .is_err());
+    }
+
+    /// revoke の `new_min_valid_issued_at` は「どこまでの Token を失効させるか」
+    /// を決めるので、署名対象に入っていなければならない。入っていないと、
+    /// 同じ token・署名・timestamp のまま失効時刻だけ差し替えられる
+    /// (add-members の `count` と同種の欠落)。
+    #[tokio::test]
+    async fn test_revoke_cutoff_cannot_be_substituted() {
+        use crate::domain::access_control::AccessControlUpdate;
+        use crate::port::auth_token::RequestMetadata;
+        use p256::ecdsa::signature::Signer;
+        use sha2::Digest;
+
+        let (adapter, signing_key, key_id) = create_test_adapter();
+        let token = AuthToken::new(key_id);
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let metadata = RequestMetadata {
+            timestamp: ts,
+            operation: "revoke".to_string(),
+            resource: "content-1".to_string(),
+        };
+        let digest_for = |cutoff: u64| {
+            let update = AccessControlUpdate::new("content-1".to_string(), cutoff);
+            hex::encode(sha2::Sha256::digest(update.signing_message()))
+        };
+
+        // caller は cutoff=2000 に対して署名する
+        let signed_message = metadata.signing_message_with_body_digest(&digest_for(2000));
+        let signature: p256::ecdsa::Signature = signing_key.sign(signed_message.as_bytes());
+        let signature_bytes = signature.to_vec();
+
+        assert!(adapter
+            .verify_request_signature(&token, &signature_bytes, &signed_message, Some(ts))
+            .await
+            .is_ok());
+
+        // cutoff を差し替えた request は検証で落ちる
+        for tampered in [0u64, 1, 1999, 2001, u64::MAX] {
+            assert!(
+                adapter
+                    .verify_request_signature(
+                        &token,
+                        &signature_bytes,
+                        &metadata.signing_message_with_body_digest(&digest_for(tampered)),
+                        Some(ts),
+                    )
+                    .await
+                    .is_err(),
+                "cutoff={tampered} への差し替えが通ってしまった"
+            );
+        }
     }
 
     #[tokio::test]

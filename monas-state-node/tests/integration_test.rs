@@ -658,8 +658,9 @@ async fn test_signed_mutation_cannot_be_replayed_after_a_newer_one() {
         update.with_signature(signature, public_key)
     };
 
-    // 各リクエストは固有のリクエスト署名を持つ(実運用では署名対象に
-    // timestamp と body が入るので、内容が違えば署名も必ず違う)。
+    // 消費記録の ID は署名対象メッセージから導かれる。revoke は
+    // `new_min_valid_issued_at` を body として署名対象に含めるので、
+    // A(1000)と B(2000)は同じ timestamp でも別リクエストになる。
     let sig_a: Vec<u8> = vec![0xAA];
     let sig_b: Vec<u8> = vec![0xBB];
 
@@ -723,6 +724,64 @@ async fn test_signed_mutation_cannot_be_replayed_after_a_newer_one() {
             .min_valid_issued_at(),
         2000,
         "a rejected replay must not roll the state back"
+    );
+}
+
+/// 署名のバイト表現を変えても再送は通らない。
+///
+/// ECDSA は malleable で、有効な `(r, s)` に対し `(r, n - s)` も同じメッセージ・
+/// 同じ鍵で検証を通る。消費記録の ID を署名バイト列の digest にしていると、
+/// 攻撃者は捕捉した署名を 1 回変換するだけで「別のリクエスト」として通せてしまい、
+/// 状態巻き戻しが成立する。ID は署名対象メッセージから導くのでこれは効かない。
+#[tokio::test]
+async fn test_signed_mutation_replay_survives_signature_malleability() {
+    use p256::ecdsa::Signature;
+
+    let (service, _crdt_repo, _temp_dir) = create_test_service_with_ac().await;
+    service.init_access_control("content-1").await.unwrap();
+
+    let update = AccessControlUpdate::new("content-1".to_string(), 1000);
+    let (signature, public_key) = sign_access_control_update(&update);
+    let update = update.with_signature(signature, public_key);
+
+    // 実際の P-256 署名を作り、その malleable な相方を用意する。
+    // (mock 認証はリクエスト署名の中身を見ないので、ここで検証したいのは
+    //  「バイト列が違っても同じリクエストとして消費されるか」だけ)
+    use p256::ecdsa::{signature::Signer, SigningKey};
+    use p256::elliptic_curve::rand_core::OsRng;
+    let key = SigningKey::random(&mut OsRng);
+    let sig: Signature = key.sign(b"monas-request-v1:6:revoke:9:content-1:1700000000:0:");
+    let canonical = sig.to_vec();
+    let malleated = Signature::from_scalars(*sig.r(), -*sig.s())
+        .unwrap()
+        .to_vec();
+    assert_ne!(
+        canonical, malleated,
+        "the two encodings must differ, otherwise this test proves nothing"
+    );
+
+    service
+        .update_access_control(
+            &update,
+            Some(&test_token()),
+            Some(&canonical),
+            test_timestamp(),
+        )
+        .await
+        .expect("first presentation should apply");
+
+    // 同じリクエストを、別バイト列の署名で再送する
+    let replay = service
+        .update_access_control(
+            &update,
+            Some(&test_token()),
+            Some(&malleated),
+            test_timestamp(),
+        )
+        .await;
+    assert!(
+        matches!(replay, Err(AccessControlError::AlreadyApplied)),
+        "a re-encoded signature must not buy a second application: {replay:?}"
     );
 }
 

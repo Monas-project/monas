@@ -363,6 +363,54 @@ where
     /// verified first via `AuthenticationService::verify_jwt_signature`
     /// (over the received wire bytes), and the request signature is then
     /// verified against the audience (`aud`) key.
+    /// Build the canonical message a request signature commits to.
+    ///
+    /// Single source of truth for both verification and the replay-consumption
+    /// identity, so the two can never drift apart.
+    fn build_signing_message(
+        operation: &str,
+        resource: &str,
+        timestamp: u64,
+        request_body: Option<&[u8]>,
+    ) -> String {
+        let metadata = RequestMetadata {
+            timestamp,
+            operation: operation.to_string(),
+            resource: resource.to_string(),
+        };
+        match request_body {
+            Some(body) => {
+                use sha2::{Digest, Sha256};
+                let digest = hex::encode(Sha256::digest(body));
+                metadata.signing_message_with_body_digest(&digest)
+            }
+            None => metadata.signing_message(),
+        }
+    }
+
+    /// Identity of a mutation request, for the single-use record.
+    ///
+    /// Derived from the **signed message plus the signer**, never from the
+    /// signature bytes. ECDSA signatures are malleable: for a valid `(r, s)`
+    /// the value `(r, n - s)` verifies against the same message and key, so
+    /// hashing the signature would give one authorized request two different
+    /// identities — and re-sending the converted form would slip straight past
+    /// the consumption record and re-commit the mutation.
+    ///
+    /// The message already binds operation, resource, timestamp and body
+    /// digest. The token is mixed in so two different callers cannot collide on
+    /// one identity, which would let one of them consume the other's request.
+    fn mutation_request_id(token: &AuthToken, signing_message: &str) -> Vec<u8> {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        // Length-prefixed so a token ending in the message's leading bytes
+        // cannot be re-split into a different (token, message) pair.
+        hasher.update((token.as_str().len() as u64).to_be_bytes());
+        hasher.update(token.as_str().as_bytes());
+        hasher.update(signing_message.as_bytes());
+        hasher.finalize().to_vec()
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn verify_caller_signature(
         &self,
@@ -401,19 +449,7 @@ where
         // operation と resource に必ず束縛される。body がある場合はその digest も
         // 含める。これがないと、ある content 向けに取得した update の
         // body+署名を別 content や create へ転用できてしまう。
-        let metadata = RequestMetadata {
-            timestamp: ts,
-            operation: operation.to_string(),
-            resource: resource.to_string(),
-        };
-        let message = match request_body {
-            Some(body) => {
-                use sha2::{Digest, Sha256};
-                let digest = hex::encode(Sha256::digest(body));
-                metadata.signing_message_with_body_digest(&digest)
-            }
-            None => metadata.signing_message(),
-        };
+        let message = Self::build_signing_message(operation, resource, ts, request_body);
 
         auth_service
             .verify_request_signature(token, signature, &message, timestamp)
@@ -438,10 +474,12 @@ where
     /// version whose parent is the current head, so the stale content becomes
     /// the latest version.
     ///
-    /// The request identity is the digest of the request signature itself. The
-    /// signature already commits to operation, resource, timestamp and body
-    /// digest, so an identical digest means an identical request — and no new
-    /// field has to be added to the wire format to carry a nonce.
+    /// The request identity comes from the **signed message and the signer**,
+    /// never from the signature bytes — see [`Self::mutation_request_id`]. The
+    /// message already commits to operation, resource, timestamp and body
+    /// digest, so no new field has to be added to the wire format to carry a
+    /// nonce, and no encoding of the signature can masquerade as a second
+    /// request.
     ///
     /// Consumption happens after verification (an invalid signature must not be
     /// able to burn a legitimate request's identity) and before any state is
@@ -468,13 +506,22 @@ where
         )
         .await?;
 
-        use sha2::{Digest, Sha256};
-        let request_id = Sha256::digest(signature);
-        let now = timestamp.unwrap_or_else(current_timestamp);
+        // Freshness already established that `timestamp` is present.
+        let ts = timestamp.ok_or_else(|| {
+            StateNodeError::AuthenticationFailed(
+                "X-Request-Timestamp is required for request signature verification".to_string(),
+            )
+        })?;
+        let signing_message = Self::build_signing_message(operation, resource, ts, request_body);
+        let request_id = Self::mutation_request_id(token, &signing_message);
 
+        // Retention is measured on *our* clock, not the caller's. Using the
+        // signed timestamp would let a caller inside the allowed skew present a
+        // future-dated request to evict entries that are still live, then
+        // re-present an older signature whose record had just been dropped.
         let first_time = self
             .consumed_requests
-            .record_if_absent(&request_id, now)
+            .record_if_absent(&request_id, current_timestamp())
             .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
 
         if !first_time {
@@ -510,18 +557,26 @@ where
     /// they hold the signature they can replay it themselves anyway.
     fn consume_relayed_mutation_signature(
         &self,
-        signature: &[u8],
+        token: &AuthToken,
         operation: &str,
         resource: &str,
         timestamp: Option<u64>,
+        request_body: Option<&[u8]>,
     ) -> Result<(), StateNodeError> {
-        use sha2::{Digest, Sha256};
-        let request_id = Sha256::digest(signature);
-        let now = timestamp.unwrap_or_else(current_timestamp);
+        // Same identity the verifying member will derive, so a request consumed
+        // here is the same request there. Derived from the signed message, never
+        // from the signature bytes — see `mutation_request_id`.
+        let ts = timestamp.ok_or_else(|| {
+            StateNodeError::AuthenticationFailed(
+                "X-Request-Timestamp is required for request signature verification".to_string(),
+            )
+        })?;
+        let signing_message = Self::build_signing_message(operation, resource, ts, request_body);
+        let request_id = Self::mutation_request_id(token, &signing_message);
 
         let first_time = self
             .consumed_requests
-            .record_if_absent(&request_id, now)
+            .record_if_absent(&request_id, current_timestamp())
             .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
 
         if !first_time {
@@ -1413,12 +1468,7 @@ where
             // 転送前にこのノードでも署名を消費する。member 側だけで消費すると、
             // 同じ署名を relay へ送り直すたびに「まだ見ていない member」へ
             // 振り分けられて再適用できてしまう。
-            self.consume_relayed_mutation_signature(
-                request_signature,
-                "delete",
-                content_id,
-                timestamp,
-            )?;
+            self.consume_relayed_mutation_signature(token, "delete", content_id, timestamp, None)?;
 
             // Resolve members from our local record, or via DHT discovery when
             // we hold no record (bug #93), then relay with failover.
@@ -1598,10 +1648,11 @@ where
             // 同じ署名を relay へ送り直すたびに「まだ見ていない member」へ
             // 振り分けられて再適用できてしまう。
             self.consume_relayed_mutation_signature(
-                request_signature,
+                token,
                 "update",
                 content_id,
                 timestamp,
+                Some(data),
             )?;
 
             // Resolve members from our local record, or via DHT discovery when
@@ -2662,7 +2713,11 @@ where
             "revoke",
             &update.content_id,
             timestamp,
-            None,
+            // `new_min_valid_issued_at` decides *which* tokens get revoked, so
+            // it has to be inside the signature — same reason `add-members`
+            // signs its `count`. `signing_message()` is the canonical encoding
+            // the owner already signs, so reusing it keeps one definition.
+            Some(&update.signing_message()),
         )
         .await
         // 再送の拒否は偽造の拒否と区別する。潰してしまうと、運用者は
@@ -3531,6 +3586,104 @@ mod tests {
                 "failover must reach every candidate ({provenance:?})"
             );
         }
+    }
+
+    /// mutation の同一性は「署名バイト列」ではなく「署名対象メッセージ + signer」
+    /// から導く。ECDSA は malleable なので、署名の digest を ID にすると、
+    /// 1 つの承認済みリクエストが 2 つの ID を持ってしまい、`s` を反転した
+    /// 署名を送り直すだけで消費記録をすり抜けて再適用できてしまう。
+    #[test]
+    fn mutation_request_id_ignores_the_signature_encoding() {
+        let token = AuthToken::new("user:04aaaa".to_string());
+        let msg = StateNodeService::<
+            MockNodeRegistry,
+            MockContentNetworkRepository,
+            MockPeerNetwork,
+            MockEventPublisher,
+            MockContentRepository,
+        >::build_signing_message(
+            "update", "content-1", 1_700_000_000, Some(b"payload")
+        );
+
+        let id_of = |t: &AuthToken, m: &str| {
+            StateNodeService::<
+                MockNodeRegistry,
+                MockContentNetworkRepository,
+                MockPeerNetwork,
+                MockEventPublisher,
+                MockContentRepository,
+            >::mutation_request_id(t, m)
+        };
+
+        // 同じ (token, message) は常に同じ ID。署名は一切入力に含まれないので、
+        // その表現がどうであれ ID は動かない。
+        assert_eq!(id_of(&token, &msg), id_of(&token, &msg));
+
+        // 署名対象が 1 ビットでも違えば別 ID
+        for other in [
+            StateNodeService::<
+                MockNodeRegistry,
+                MockContentNetworkRepository,
+                MockPeerNetwork,
+                MockEventPublisher,
+                MockContentRepository,
+            >::build_signing_message(
+                "update", "content-2", 1_700_000_000, Some(b"payload")
+            ),
+            StateNodeService::<
+                MockNodeRegistry,
+                MockContentNetworkRepository,
+                MockPeerNetwork,
+                MockEventPublisher,
+                MockContentRepository,
+            >::build_signing_message(
+                "delete", "content-1", 1_700_000_000, Some(b"payload")
+            ),
+            StateNodeService::<
+                MockNodeRegistry,
+                MockContentNetworkRepository,
+                MockPeerNetwork,
+                MockEventPublisher,
+                MockContentRepository,
+            >::build_signing_message(
+                "update", "content-1", 1_700_000_001, Some(b"payload")
+            ),
+            StateNodeService::<
+                MockNodeRegistry,
+                MockContentNetworkRepository,
+                MockPeerNetwork,
+                MockEventPublisher,
+                MockContentRepository,
+            >::build_signing_message(
+                "update", "content-1", 1_700_000_000, Some(b"tampered")
+            ),
+        ] {
+            assert_ne!(id_of(&token, &msg), id_of(&token, &other));
+        }
+
+        // 別の caller は別 ID。同じにすると、一方が他方のリクエストを
+        // 先に消費してしまう。
+        let other_token = AuthToken::new("user:04bbbb".to_string());
+        assert_ne!(id_of(&token, &msg), id_of(&other_token, &msg));
+    }
+
+    /// token と message の境界が曖昧だと、片方の末尾ともう片方の先頭を
+    /// 付け替えた別の組み合わせが同じ ID になり得る。長さ前置でそれを防ぐ。
+    #[test]
+    fn mutation_request_id_separates_token_from_message() {
+        let id_of = |t: &str, m: &str| {
+            StateNodeService::<
+                MockNodeRegistry,
+                MockContentNetworkRepository,
+                MockPeerNetwork,
+                MockEventPublisher,
+                MockContentRepository,
+            >::mutation_request_id(&AuthToken::new(t.to_string()), m)
+        };
+        assert_ne!(
+            id_of("user:04ab", "cd-message"),
+            id_of("user:04", "abcd-message")
+        );
     }
 
     #[tokio::test]

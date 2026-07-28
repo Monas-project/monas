@@ -84,6 +84,26 @@ impl SignatureVerifier {
         // Parse signature from DER or raw format
         let sig = Signature::from_slice(signature).context("Invalid P256 signature format")?;
 
+        // NOTE on ECDSA malleability.
+        //
+        // For any valid `(r, s)` the value `(r, n - s)` verifies against the
+        // same message and key, so one authorized request has two distinct
+        // signature encodings. Both are accepted here *on purpose*: rejecting
+        // high-S would break every existing caller, because none of the signers
+        // in this repo (nor monas-account, which real clients use) normalize
+        // before sending, and S is high about half the time.
+        //
+        // Nothing security-relevant depends on the encoding being unique. The
+        // single-use record for mutations is keyed on the signed *message* and
+        // the signer — see `StateNodeService::mutation_request_id` — precisely
+        // so that a re-encoded signature cannot masquerade as a second request.
+        // Deriving that identity from the signature bytes would have made this
+        // malleability a replay bypass.
+        //
+        // Normalizing at the signing side and then requiring low-S here is the
+        // stricter end state, but it is a wire-compatibility break that has to
+        // land in the signers first.
+
         // Verify signature
         verifying_key
             .verify(message, &sig)
@@ -152,6 +172,39 @@ mod tests {
         // Verify should fail
         let result = SignatureVerifier::verify_auth_token_signature(&token, &public_key_bytes);
         assert!(result.is_err());
+    }
+
+    /// ECDSA の malleability を明示的に記録しておく。
+    ///
+    /// 有効な `(r, s)` に対し `(r, n - s)` も同じメッセージ・同じ鍵で検証を通り、
+    /// バイト列は異なる。この検証器は**両方を受理する**(既存クライアントの
+    /// 署名を壊さないため)。したがって「署名バイト列は 1 リクエストにつき一意」
+    /// という前提を置いてはならない。mutation の再送防止はこの前提を使わず、
+    /// 署名対象メッセージから ID を導いている。
+    #[test]
+    fn both_signature_encodings_verify_so_bytes_are_not_a_request_identity() {
+        use p256::ecdsa::Signature;
+
+        let signing_key = SigningKey::random(&mut OsRng);
+        let verifying_key = signing_key.verifying_key();
+        let public_key_bytes = verifying_key.to_encoded_point(false).as_bytes().to_vec();
+
+        let message = b"monas-request-v1:6:update:9:content-1:1700000000:0:";
+        let signature: Signature = signing_key.sign(message);
+        let flipped = Signature::from_scalars(*signature.r(), -*signature.s()).unwrap();
+
+        assert_ne!(
+            signature.to_vec(),
+            flipped.to_vec(),
+            "the two encodings must differ in bytes"
+        );
+        for encoding in [signature.to_vec(), flipped.to_vec()] {
+            assert!(
+                SignatureVerifier::verify_request_signature(message, &encoding, &public_key_bytes,)
+                    .is_ok(),
+                "both encodings authenticate the same request"
+            );
+        }
     }
 
     #[test]
