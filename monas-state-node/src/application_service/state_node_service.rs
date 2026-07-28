@@ -521,9 +521,16 @@ where
     /// read path).
     ///
     /// Authenticates the caller (token + request signature) and grants access
-    /// when the caller is the content owner or the authorization service
-    /// grants `ReadContent`. Content without a policy is readable (it may not
-    /// have a policy yet) — same semantics as the HTTP read path.
+    /// only when the caller is the content owner or the authorization service
+    /// grants `ReadContent`.
+    ///
+    /// Fail-closed in both directions: an error loading the policy denies, and
+    /// **a missing policy also denies**. A replica can legitimately hold a
+    /// genesis without its owner policy — the create operation carries
+    /// `access_policy: None` and the owner policy arrives as a separate
+    /// operation, and `apply_operations` tolerates partial application — so
+    /// treating "no policy" as public would expose ciphertext and history of
+    /// such content to any authenticated caller.
     pub async fn authorize_read(
         &self,
         token: &AuthToken,
@@ -573,8 +580,15 @@ where
             ));
         }
 
-        // No policy exists yet — allow, matching the HTTP read path.
-        Ok(())
+        // No policy on this replica. This is not proof that the content is
+        // public — it is indistinguishable from "the owner policy operation has
+        // not been applied here (yet)". Deny rather than serve ciphertext and
+        // history without an authorization contract.
+        Err(StateNodeError::AuthorizationFailed(format!(
+            "no access policy is available for {content_id} on this node: refusing the read \
+             (the policy may not have replicated here yet — retry, or read from a node that \
+             has it)"
+        )))
     }
 
     /// Serve a relayed data read on a member node (bug #93 hardened read path).
@@ -3116,9 +3130,14 @@ mod tests {
         assert!(result.is_ok(), "owner must be allowed: {result:?}");
     }
 
+    /// policy が無いレプリカでの read は拒否する(fail-closed)。
+    ///
+    /// create genesis は `access_policy: None` で作られ owner policy は別
+    /// operation として届くため、「genesis はあるが policy が無い」状態は
+    /// 部分同期で実際に起こり得る。これを public 扱いにすると、認可契約の
+    /// 無いまま暗号文と履歴を任意の認証済み caller に渡してしまう。
     #[tokio::test]
-    async fn test_authorize_read_allows_when_no_policy() {
-        // Documented semantics: content without a policy is readable.
+    async fn test_authorize_read_denies_when_policy_is_missing() {
         let service = create_test_service("node-1");
         let result = service
             .authorize_read(
@@ -3128,7 +3147,53 @@ mod tests {
                 "content-1",
             )
             .await;
-        assert!(result.is_ok());
+        match result {
+            Err(StateNodeError::AuthorizationFailed(msg)) => {
+                assert!(msg.contains("no access policy"), "msg={msg}");
+            }
+            other => panic!("expected AuthorizationFailed, got: {other:?}"),
+        }
+    }
+
+    /// 「genesis はレプリカにあるが owner policy がまだ届いていない」状態を
+    /// 直接再現し、非 owner の read が拒否されることを確認する。
+    /// これが塞ぐ実シナリオ(create の Create payload は `access_policy: None`
+    /// で、owner policy は別 operation として届く)。
+    #[tokio::test]
+    async fn test_authorize_read_denies_on_genesis_only_replica() {
+        let service = create_test_service("node-1");
+
+        // genesis(コンテンツ本体)だけが存在し、access_policies は空のまま
+        service
+            .crdt_repo
+            .contents
+            .lock()
+            .await
+            .insert("content-genesis-only".to_string(), b"ciphertext".to_vec());
+        assert!(
+            service
+                .crdt_repo
+                .access_policies
+                .lock()
+                .await
+                .get("content-genesis-only")
+                .is_none(),
+            "precondition: replica must not have the owner policy yet"
+        );
+
+        let result = service
+            .authorize_read(
+                &test_token(),
+                Some(&test_request_signature()),
+                None,
+                "content-genesis-only",
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(StateNodeError::AuthorizationFailed(_))),
+            "genesis-only replica must not serve reads without a policy: {result:?}"
+        );
     }
 
     /// The read request signature must be verified against a message bound to
