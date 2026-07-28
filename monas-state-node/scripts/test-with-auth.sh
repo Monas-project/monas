@@ -67,10 +67,14 @@ generate_signature() {
     local operation="$2"
     local resource="$3"
     local body_b64="$4"
+    local add_members_count="$5"
 
     local sign_args="sign-request --private-key $private_key --operation $operation --resource $resource"
     if [ -n "$body_b64" ]; then
         sign_args="$sign_args --body $body_b64"
+    fi
+    if [ -n "$add_members_count" ]; then
+        sign_args="$sign_args --add-members-count $add_members_count"
     fi
 
     local output
@@ -235,7 +239,8 @@ if [ -n "$CONTENT_ID" ]; then
     fi
 
     # メンバー追加（count形式）
-    generate_signature "$TEST_PRIVATE_KEY" "manage" "$CONTENT_ID"
+    # count は署名対象。body を差し替えると署名検証で落ちる
+    generate_signature "$TEST_PRIVATE_KEY" "manage" "$CONTENT_ID" "" "1"
 
     log_test "コンテンツネットワークにメンバーを追加"
     MEMBER_RESPONSE=$(curl -s -X POST "$BASE_URL/content/$CONTENT_ID/members" \
@@ -258,6 +263,27 @@ if [ -n "$CONTENT_ID" ]; then
         log_fail "メンバー追加 (期待: HTTP 200 or 503, 実際: HTTP $MEMBER_STATUS)"
         ((TESTS_FAILED++))
         echo "$MEMBER_BODY"
+    fi
+
+    # count 差し替え: count=1 の署名で count=8 を送る
+    generate_signature "$TEST_PRIVATE_KEY" "manage" "$CONTENT_ID" "" "1"
+
+    log_test "メンバー追加のcount差し替えを拒否"
+    TAMPER_RESPONSE=$(curl -s -X POST "$BASE_URL/content/$CONTENT_ID/members" \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer $TEST_KEY_ID" \
+        -H "X-Request-Signature: $LAST_SIGNATURE" \
+        -H "X-Request-Timestamp: $LAST_TIMESTAMP" \
+        -d '{"count": 8}' \
+        -w "\n%{http_code}" 2>/dev/null)
+    TAMPER_STATUS=$(echo "$TAMPER_RESPONSE" | tail -n1)
+    if [ "$TAMPER_STATUS" = "401" ]; then
+        log_success "count差し替えを拒否 (HTTP 401)"
+        ((TESTS_PASSED++))
+    else
+        log_fail "count差し替えを拒否 (期待: HTTP 401, 実際: HTTP $TAMPER_STATUS)"
+        ((TESTS_FAILED++))
+        echo "$TAMPER_RESPONSE" | sed '$d'
     fi
 
     echo ""

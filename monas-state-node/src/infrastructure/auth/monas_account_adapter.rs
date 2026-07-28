@@ -620,6 +620,69 @@ mod tests {
             .is_err());
     }
 
+    /// add-members の `count` は HTTP body 由来で、実際に追加される member 数を
+    /// 決める。署名対象に入っていないと、同じ token・署名・timestamp のまま
+    /// count だけ差し替えられる(上限で clamp されるが 1 → 上限への改ざんは成立
+    /// してしまう)。canonical encoding した body が署名へ束縛されることを確認する。
+    #[tokio::test]
+    async fn test_add_members_count_cannot_be_substituted() {
+        use crate::port::auth_token::{add_members_signing_body, RequestMetadata};
+        use p256::ecdsa::signature::Signer;
+        use sha2::Digest;
+
+        let (adapter, signing_key, key_id) = create_test_adapter();
+        let token = AuthToken::new(key_id);
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let metadata = RequestMetadata {
+            timestamp: ts,
+            operation: "manage".to_string(),
+            resource: "content-1".to_string(),
+        };
+        let digest_for =
+            |count: usize| hex::encode(sha2::Sha256::digest(add_members_signing_body(count)));
+
+        // caller は count=1 に対して署名する
+        let signed_message = metadata.signing_message_with_body_digest(&digest_for(1));
+        let signature: p256::ecdsa::Signature = signing_key.sign(signed_message.as_bytes());
+        let signature_bytes = signature.to_vec();
+
+        assert!(adapter
+            .verify_request_signature(&token, &signature_bytes, &signed_message, Some(ts))
+            .await
+            .is_ok());
+
+        // body の count を差し替えた request は検証で落ちる
+        for tampered in [0usize, 2, 8, 1000] {
+            assert!(
+                adapter
+                    .verify_request_signature(
+                        &token,
+                        &signature_bytes,
+                        &metadata.signing_message_with_body_digest(&digest_for(tampered)),
+                        Some(ts),
+                    )
+                    .await
+                    .is_err(),
+                "count={tampered} への差し替えが通ってしまった"
+            );
+        }
+
+        // body なしの manage 署名としても転用できない
+        assert!(adapter
+            .verify_request_signature(
+                &token,
+                &signature_bytes,
+                &metadata.signing_message(),
+                Some(ts)
+            )
+            .await
+            .is_err());
+    }
+
     #[tokio::test]
     async fn test_verify_request_signature_expired_timestamp() {
         let (adapter, signing_key, key_id) = create_test_adapter();

@@ -95,6 +95,22 @@ impl RequestMetadata {
     }
 }
 
+/// Canonical byte encoding of the `add-members` request body for signing.
+///
+/// `count` controls how many nodes get added to a content network, so it must
+/// be covered by the request signature — otherwise the same token, signature
+/// and timestamp can be replayed with a different `count` (it is clamped to
+/// `max_add_member_count`, but raising `1` to the clamp is still a mutation the
+/// caller never authorized).
+///
+/// The HTTP body itself is not signable as-is: it is JSON, so whitespace and
+/// key order vary between clients producing different digests for the same
+/// request. Instead both sides derive the same canonical bytes from the parsed
+/// value. Keep the tag so a future field cannot collide with this encoding.
+pub fn add_members_signing_body(count: usize) -> Vec<u8> {
+    format!("add-members:count={count}").into_bytes()
+}
+
 impl AuthToken {
     /// Create a new authentication token
     pub fn new(raw: String) -> Self {
@@ -229,6 +245,22 @@ mod tests {
             update_c1.signing_message_with_body_digest(&"bb".repeat(32))
         );
         assert_ne!(signed, update_c1.signing_message());
+    }
+
+    /// count ごとに異なるバイト列になること。ここが衝突すると、
+    /// ある count 用の署名を別の count へ転用できてしまう。
+    #[test]
+    fn add_members_signing_body_is_distinct_per_count() {
+        let bodies: Vec<Vec<u8>> = [0usize, 1, 2, 10, 100]
+            .iter()
+            .map(|c| add_members_signing_body(*c))
+            .collect();
+        for (i, a) in bodies.iter().enumerate() {
+            for b in bodies.iter().skip(i + 1) {
+                assert_ne!(a, b);
+            }
+        }
+        assert_eq!(add_members_signing_body(3), b"add-members:count=3".to_vec());
     }
 
     /// 長さ前置により、区切り文字を含む値でもフィールド境界がずれない。

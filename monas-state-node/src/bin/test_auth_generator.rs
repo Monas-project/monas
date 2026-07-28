@@ -2,6 +2,7 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     Engine as _,
 };
+use monas_state_node::port::auth_token::add_members_signing_body;
 use p256::ecdsa::{signature::Signer, SigningKey};
 use p256::elliptic_curve::rand_core::OsRng;
 use serde_json::json;
@@ -61,6 +62,7 @@ fn print_usage(program: &str) {
     eprintln!("    --resource <res>                     Resource (content_id or 'content')");
     eprintln!("    --timestamp <ts>                     Unix timestamp");
     eprintln!("    [--body <base64>]                    Request body (base64, for create/update)");
+    eprintln!("    [--add-members-count <n>]            Canonical add-members body (for manage)");
     eprintln!("    (delegated JWT requests sign the same message with the recipient key)");
     eprintln!("  generate-token [content_id]           - Generate an auth token (JWT)");
     eprintln!("  generate-share-token                  - Generate a share token for another user");
@@ -95,17 +97,27 @@ fn generate_test_auth_data() {
 
 /// Sign a request with the correct message format.
 ///
-/// For requests WITH body (create/update):
-///   message = hex(sha256(body_bytes + timestamp_be_bytes))
+/// Every request — with or without a body, JWT or not — signs the same
+/// structure, which always commits to operation, resource and timestamp:
 ///
-/// For requests WITHOUT body (delete/read/invalidate/manage/revoke):
-///   message = "{operation}:{resource}:{timestamp}"
+/// ```text
+/// monas-request-v1:<len>:<operation>:<len>:<resource>:<timestamp>:<len>:<body_digest_hex>
+/// ```
+///
+/// `body_digest_hex` is `sha256(body_bytes)` when `--body` is given and the
+/// empty string otherwise. Must stay in sync with
+/// `RequestMetadata::signing_message_with_body_digest`.
+///
+/// `--add-members-count` is a convenience for the `manage` operation: it
+/// derives the same canonical body bytes the state node reconstructs from the
+/// parsed JSON (see `add_members_signing_body`).
 fn sign_request(args: &[String]) {
     let mut private_key_hex = String::new();
     let mut operation = String::new();
     let mut resource = String::new();
     let mut timestamp_str = String::new();
     let mut body_b64 = String::new();
+    let mut add_members_count: Option<usize> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -138,6 +150,15 @@ fn sign_request(args: &[String]) {
                 i += 1;
                 if i < args.len() {
                     body_b64 = args[i].clone();
+                }
+            }
+            "--add-members-count" => {
+                i += 1;
+                if i < args.len() {
+                    add_members_count = Some(args[i].parse().unwrap_or_else(|e| {
+                        eprintln!("Error: Invalid --add-members-count: {}", e);
+                        std::process::exit(1);
+                    }));
                 }
             }
             _ => {}
@@ -176,7 +197,13 @@ fn sign_request(args: &[String]) {
     // token type and for body / non-body requests: it always commits to
     // operation, resource and timestamp, plus the body digest when present.
     // Must stay in sync with `RequestMetadata::signing_message_with_body_digest`.
-    let body_digest_hex = if body_b64.is_empty() {
+    if !body_b64.is_empty() && add_members_count.is_some() {
+        eprintln!("Error: --body and --add-members-count are mutually exclusive");
+        std::process::exit(1);
+    }
+    let body_digest_hex = if let Some(count) = add_members_count {
+        hex::encode(Sha256::digest(add_members_signing_body(count)))
+    } else if body_b64.is_empty() {
         String::new()
     } else {
         let body_bytes = STANDARD.decode(&body_b64).unwrap_or_else(|e| {

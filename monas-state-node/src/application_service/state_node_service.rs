@@ -1626,7 +1626,10 @@ where
             .await
             .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))?;
 
-        // Verify request signature
+        // Verify request signature. `count` comes from the HTTP body and
+        // decides how many members get added, so it is signed too — see
+        // `add_members_signing_body` for why the canonical encoding is used
+        // instead of the raw JSON bytes.
         self.verify_caller_signature(
             auth_service.as_ref(),
             token,
@@ -1634,7 +1637,7 @@ where
             "manage",
             content_id,
             timestamp,
-            None,
+            Some(&crate::port::auth_token::add_members_signing_body(count)),
         )
         .await?;
 
