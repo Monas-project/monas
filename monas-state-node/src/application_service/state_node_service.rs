@@ -381,9 +381,12 @@ where
 
     /// Verify the caller's request signature.
     ///
-    /// The signed message is identical for every token type (issue #61):
-    /// - If `request_body` is `Some(body)`: signs `hex(sha256(body + timestamp_be_bytes))`
-    /// - If `request_body` is `None`: signs `{operation}:{resource}:{timestamp}`
+    /// The signed message is identical for every token type (issue #61) and is
+    /// built by [`Self::build_signing_message`]:
+    /// `monas-request-v1:<len>:<op>:<len>:<resource>:<timestamp>:<len>:<digest>`
+    /// where `digest` is `hex(sha256(body))` when a body is present and empty
+    /// otherwise. Every field is length-prefixed, so no two distinct requests
+    /// can produce the same message by shifting a boundary.
     ///
     /// The timestamp *inside* the signed message is checked for freshness by the
     /// auth service, so `timestamp` is mandatory — there is no server-clock

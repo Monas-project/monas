@@ -7,7 +7,10 @@
 //! 1. Owner check: if the identity is the owner, access is granted immediately
 //! 2. AuthToken check: non-owners must provide a valid AuthToken (JWT)
 //!    - Token signature is verified against the owner's public key
-//!    - Token's iat must be >= policy's min_valid_issued_at
+//!    - Token's iat must be > policy's min_valid_issued_at (exclusive cutoff:
+//!      both have one-second resolution, so a token stamped with the same
+//!      second as the revoke may well predate it). `min_valid_issued_at == 0`
+//!      means nothing has been revoked and accepts everything.
 //!    - Token must grant the required capability
 
 use crate::domain::auth_capability::AuthCapability;
