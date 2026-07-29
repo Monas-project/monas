@@ -605,8 +605,7 @@ where
         Ok(())
     }
 
-    /// Consume a mutation signature on the **relay** path, where this node
-    /// cannot verify it.
+    /// Consume a mutation signature on the **relay** path.
     ///
     /// A relay holds no access policy, so it forwards the caller's credentials
     /// to a member and lets the member decide. That means the member is the only
@@ -620,19 +619,54 @@ where
     /// (a caller can always talk to a different relay); it closes the specific
     /// hole where the *same* relay launders the *same* signature repeatedly.
     ///
-    /// No verification happens here, which means an unauthenticated caller can
-    /// burn an arbitrary signature digest on this node by presenting it once.
-    /// The cost of that is bounded: it only affects this node, only for the
-    /// freshness window, and only for a digest the attacker already has — if
-    /// they hold the signature they can replay it themselves anyway.
-    fn consume_relayed_mutation_signature(
+    /// **The signature is verified before anything is recorded.** The relay can
+    /// do this without a policy: `verify_caller_signature` is purely
+    /// cryptographic — the token's own signature, then the request signature
+    /// against the key the token designates. Only *authorization* needs the
+    /// policy, and that stays with the member.
+    ///
+    /// Verifying first is load-bearing, not defence in depth. The request id is
+    /// derived from the signed message and the principal — operation, resource,
+    /// timestamp, body digest, `aud` — every part of which is public. Recording
+    /// it before verification would let anyone burn a legitimate caller's id
+    /// with a garbage signature: send a `delete` for their content stamped with
+    /// the current second (no body, so the message is fully predictable) and
+    /// their real request comes back `RequestAlreadyApplied`. Repeat each second
+    /// and the target can never mutate anything through this relay.
+    ///
+    /// An earlier revision recorded first and argued the cost was bounded
+    /// because the id was "a digest the attacker already has". That was true
+    /// while the id *was* the signature digest; it stopped being true when the
+    /// id moved to the signed message, and this is the correction.
+    async fn consume_relayed_mutation_signature(
         &self,
         token: &AuthToken,
+        signature: &[u8],
         operation: &str,
         resource: &str,
         timestamp: Option<u64>,
         request_body: Option<&[u8]>,
     ) -> Result<(), StateNodeError> {
+        let auth_service = self.auth_service.as_ref().ok_or_else(|| {
+            StateNodeError::AuthenticationFailed(
+                "Authentication service is not configured".to_string(),
+            )
+        })?;
+
+        // Cryptographic verification only — authorization is the member's job.
+        // A forged or replayed-with-a-bad-signature request must not be able to
+        // reach the store at all.
+        self.verify_caller_signature(
+            auth_service.as_ref(),
+            token,
+            signature,
+            operation,
+            resource,
+            timestamp,
+            request_body,
+        )
+        .await?;
+
         // Same identity the verifying member will derive, so a request consumed
         // here is the same request there. Derived from the signed message, never
         // from the signature bytes — see `mutation_request_id`.
@@ -1538,7 +1572,15 @@ where
             // 転送前にこのノードでも署名を消費する。member 側だけで消費すると、
             // 同じ署名を relay へ送り直すたびに「まだ見ていない member」へ
             // 振り分けられて再適用できてしまう。
-            self.consume_relayed_mutation_signature(token, "delete", content_id, timestamp, None)?;
+            self.consume_relayed_mutation_signature(
+                token,
+                request_signature,
+                "delete",
+                content_id,
+                timestamp,
+                None,
+            )
+            .await?;
 
             // Resolve members from our local record, or via DHT discovery when
             // we hold no record (bug #93), then relay with failover.
@@ -1719,11 +1761,13 @@ where
             // 振り分けられて再適用できてしまう。
             self.consume_relayed_mutation_signature(
                 token,
+                request_signature,
                 "update",
                 content_id,
                 timestamp,
                 Some(data),
-            )?;
+            )
+            .await?;
 
             // Resolve members from our local record, or via DHT discovery when
             // we hold no record (bug #93), then relay with failover.
@@ -3740,6 +3784,123 @@ mod tests {
                 "failover must reach every candidate ({provenance:?})"
             );
         }
+    }
+
+    /// 署名を検証しない認証サービス以外は全部通す mock。
+    /// `bad` と完全一致する署名だけを拒否する。
+    struct RejectsOneSignature {
+        bad: Vec<u8>,
+    }
+
+    #[async_trait::async_trait]
+    impl AuthenticationService for RejectsOneSignature {
+        async fn authenticate(
+            &self,
+            token: &AuthToken,
+            _context: Option<&crate::port::auth_token::AuthContext>,
+        ) -> Result<Identity> {
+            Identity::user(token.as_str().to_string()).map_err(|e| anyhow::anyhow!(e.to_string()))
+        }
+
+        async fn is_valid(&self, token: &AuthToken) -> Result<bool> {
+            Ok(!token.is_empty())
+        }
+
+        async fn verify_request_signature(
+            &self,
+            _token: &AuthToken,
+            signature: &[u8],
+            _message: &str,
+            _timestamp: Option<u64>,
+        ) -> Result<()> {
+            if signature == self.bad.as_slice() {
+                anyhow::bail!("invalid signature");
+            }
+            Ok(())
+        }
+
+        async fn verify_jwt_signature(&self, _token: &AuthToken) -> Result<()> {
+            Ok(())
+        }
+
+        async fn get_issuer(&self, token: &AuthToken) -> Result<Option<Identity>> {
+            Ok(Some(
+                Identity::user(token.as_str().to_string())
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?,
+            ))
+        }
+    }
+
+    /// relay は**署名を検証してから**消費記録を書く。
+    ///
+    /// request id は署名対象メッセージと principal から導かれ、その構成要素
+    /// (操作・リソース・timestamp・body digest・`aud`)は**すべて公開情報**である。
+    /// 検証前に記録すると、鍵も有効な署名も持たない第三者が、対象ユーザーの
+    /// 正規リクエストの id をゴミ署名で先に焼き潰せてしまう —
+    /// body の無い `delete` は現在秒を入れるだけでメッセージが完全に予測でき、
+    /// 毎秒繰り返せばそのユーザーはこの relay 経由で何も更新できなくなる。
+    #[tokio::test]
+    async fn an_invalid_signature_cannot_burn_a_legitimate_request_id() {
+        let token = AuthToken::new("user:04aaaa".to_string());
+        let forged: Vec<u8> = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let genuine: Vec<u8> = vec![0x01, 0x02, 0x03];
+
+        let service: TestService = StateNodeService::new(
+            MockNodeRegistry::new(),
+            Arc::new(RwLock::new(MockContentNetworkRepository::new())),
+            Arc::new(MockPeerNetwork::new().with_local_peer_id("node-1")),
+            MockEventPublisher::new(),
+            Arc::new(MockContentRepository::new()),
+            "node-1".to_string(),
+        )
+        .with_authentication_service(RejectsOneSignature {
+            bad: forged.clone(),
+        })
+        .with_authorization_service(AllowAllAuthorizationService);
+
+        // 攻撃者が、被害者の principal・対象 content・現在秒で `delete` を
+        // 先回りして送る。署名は持っていないので出鱈目。
+        let attack = service
+            .consume_relayed_mutation_signature(
+                &token,
+                &forged,
+                "delete",
+                "content-1",
+                Some(1_700_000_000),
+                None,
+            )
+            .await;
+        assert!(attack.is_err(), "無効な署名は拒否されなければならない");
+
+        // 同じ principal・同じメッセージの正規リクエストが、まだ通ること。
+        // ここが Err になるなら記録が先に書かれている＝ DoS が成立している。
+        service
+            .consume_relayed_mutation_signature(
+                &token,
+                &genuine,
+                "delete",
+                "content-1",
+                Some(1_700_000_000),
+                None,
+            )
+            .await
+            .expect("正規リクエストが先取りで潰されてはならない");
+
+        // 使い切りそのものは維持されている(2 度目は拒否)。
+        let replay = service
+            .consume_relayed_mutation_signature(
+                &token,
+                &genuine,
+                "delete",
+                "content-1",
+                Some(1_700_000_000),
+                None,
+            )
+            .await;
+        assert!(
+            matches!(replay, Err(StateNodeError::RequestAlreadyApplied(_))),
+            "同じ署名済みリクエストの 2 度目は拒否されなければならない"
+        );
     }
 
     /// 委譲 JWT **自身の署名**も malleable である。生のトークン文字列を ID の
