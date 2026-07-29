@@ -23,6 +23,13 @@ CYAN='\033[0;36m'
 MAGENTA='\033[0;35m'
 NC='\033[0m' # No Color
 
+# e2e は常に 4 ノード構成で行う(start-local-nodes.sh / ci-e2e.sh と一致)。
+# creator + 3 members(MIN_REPLICATION_FACTOR=3)。create を受けたノード
+# (CREATOR_PORT)は意図的に member にならず local CRDT を持たないため、
+# そのノード経由の read は必ず relay read 経路(#54/#55)を通る。
+NODE_PORTS="8080 8081 8082 8083"
+CREATOR_PORT=8080
+
 # ログ関数
 log_info() {
     echo -e "${GREEN}[INFO]${NC} $1"
@@ -121,7 +128,7 @@ check_nodes_running() {
     log_info "ノードの起動状態を確認しています..."
 
     local all_running=true
-    for port in 8080 8081 8082; do
+    for port in $NODE_PORTS; do
         if curl -s "http://127.0.0.1:$port/health" > /dev/null 2>&1; then
             log_success "ノード (ポート $port) は起動しています"
         else
@@ -191,7 +198,7 @@ test_auth_request() {
 # ノード登録
 register_nodes() {
     log_info "ノード登録を行います..."
-    for port in 8080 8081 8082; do
+    for port in $NODE_PORTS; do
         curl -s -X POST "http://127.0.0.1:$port/node/register" \
             -H "Content-Type: application/json" \
             -d '{"total_capacity": 10000000}' > /dev/null 2>&1 || true
@@ -304,9 +311,9 @@ echo ""
 sleep 0.2
 log_step "全ノードから content データを即座に取得できるか確認"
 
-IMMEDIATE_MEMBERS=0
-for port in 8080 8081 8082; do
-    generate_signature "$ACCOUNT1_PRIVATE_KEY" "read" "content"
+IMMEDIATE_SERVING=0
+for port in $NODE_PORTS; do
+    generate_signature "$ACCOUNT1_PRIVATE_KEY" "read" "$CONTENT_ID"
     DATA_RESPONSE=$(curl -s "http://127.0.0.1:$port/content/$CONTENT_ID/data" \
         -H "Authorization: Bearer $ACCOUNT1_KEY_ID" \
         -H "X-Request-Signature: $LAST_SIGNATURE" \
@@ -314,20 +321,22 @@ for port in 8080 8081 8082; do
     if echo "$DATA_RESPONSE" | jq -e '.data' > /dev/null 2>&1; then
         FETCHED_DATA=$(echo "$DATA_RESPONSE" | jq -r '.data' 2>/dev/null)
         if [ -n "$FETCHED_DATA" ] && [ "$FETCHED_DATA" != "null" ]; then
-            DECODED=$(echo "$FETCHED_DATA" | base64 -d 2>/dev/null || echo "(decode failed)")
-            log_info "  ノード (ポート $port): data=$DECODED (member: data あり)"
-            IMMEDIATE_MEMBERS=$((IMMEDIATE_MEMBERS + 1))
+            # 応答は Node 全体の CBOR なので中身は表示せずサイズだけログする
+            # (relay read があるため、data が返る = member とは限らない)
+            DATA_BYTES=$(echo "$FETCHED_DATA" | base64 -d 2>/dev/null | wc -c | tr -d ' ')
+            log_info "  ノード (ポート $port): data あり (Node CBOR ${DATA_BYTES} bytes, local または relay)"
+            IMMEDIATE_SERVING=$((IMMEDIATE_SERVING + 1))
         else
-            log_info "  ノード (ポート $port): member だが data が空"
+            log_info "  ノード (ポート $port): data が空"
         fi
     else
-        log_info "  ノード (ポート $port): member ではない"
+        log_info "  ノード (ポート $port): data なし"
     fi
 done
 
 log_test "少なくとも1つの member が create 直後にデータを保持していること (push-before-announce race の回帰防止)"
-if [ "$IMMEDIATE_MEMBERS" -ge 1 ]; then
-    log_success "即時同期 OK: $IMMEDIATE_MEMBERS 個の member がデータを保持"
+if [ "$IMMEDIATE_SERVING" -ge 1 ]; then
+    log_success "即時同期 OK: $IMMEDIATE_SERVING 個のノードがデータを提供 (local または relay)"
     TESTS_PASSED=$((TESTS_PASSED + 1))
 else
     log_fail "即時同期 NG: どの member も create 直後にデータを取得できませんでした"
@@ -335,7 +344,50 @@ else
     TESTS_FAILED=$((TESTS_FAILED + 1))
 fi
 
-# スモークモード: ここまで(content 作成 201 + 即時同期)で打ち切る。
+# ----------------------------------------------------------------------------
+# Step 2.6: 非 member ノード経由の relay read 検証 (#54/#55 の回帰テスト)
+# ----------------------------------------------------------------------------
+# creator ノード(CREATOR_PORT)は create_content で意図的に member から除外され、
+# local CRDT コピーを持たない(state_node_service.rs の create_content 参照)。
+# したがってこのノードへの read が data を返す = member への relay read が
+# 機能していることの直接の証明になる。
+# ============================================================================
+
+echo ""
+echo -e "${BLUE}=== Step 2.6: 非 member (creator) 経由の relay read 検証 ===${NC}"
+echo ""
+
+relay_read_ok() {
+    generate_signature "$ACCOUNT1_PRIVATE_KEY" "read" "$CONTENT_ID"
+    local resp
+    resp=$(curl -s "http://127.0.0.1:$CREATOR_PORT/content/$CONTENT_ID/data" \
+        -H "Authorization: Bearer $ACCOUNT1_KEY_ID" \
+        -H "X-Request-Signature: $LAST_SIGNATURE" \
+        -H "X-Request-Timestamp: $LAST_TIMESTAMP" 2>/dev/null)
+    RELAY_READ_RESPONSE="$resp"
+    local data
+    data=$(echo "$resp" | jq -r '.data // empty' 2>/dev/null)
+    [ -n "$data" ] && [ "$data" != "null" ]
+}
+
+log_step "creator ノード (ポート $CREATOR_PORT, 非 member) へ read を送信 (最大10秒ポーリング)"
+log_test "非 member ノード経由の relay read でデータと version が返ること"
+if poll_until 10 1 relay_read_ok; then
+    RELAY_VERSION=$(echo "$RELAY_READ_RESPONSE" | jq -r '.version // empty' 2>/dev/null)
+    if [ -n "$RELAY_VERSION" ] && [ "$RELAY_VERSION" != "null" ]; then
+        log_success "relay read OK: version=$RELAY_VERSION (client はこの CID で Node CBOR を検証できる)"
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+    else
+        log_fail "relay read で data は返ったが version が空 (クライアント側 CID 検証が不可能になる)"
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+    fi
+else
+    log_fail "非 member ノード経由の relay read が10秒以内に成功しませんでした"
+    log_fail "  → member への read relay (#54) が機能していない可能性があります"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+
+# スモークモード: ここまで(content 作成 201 + 即時同期 + relay read)で打ち切る。
 # CI の e2e ジョブはこのスモークだけを回し、request-response の DialFailure
 # 回帰(作成が 201 を返し、メンバーが即時にデータを保持する)をピンポイントで
 # 担保する。grant/revoke/invalidate を含むフルシナリオには別途の既知課題が
@@ -356,7 +408,7 @@ fi
 # content_networkの形成を確認（各ノードでcontentsリストを確認）
 sleep 2
 log_step "content_networkの形成を確認"
-for port in 8080 8081 8082; do
+for port in $NODE_PORTS; do
     count=$(curl -s "http://127.0.0.1:$port/contents" | jq '. | length' 2>/dev/null || echo "0")
     log_info "  ノード (ポート $port): $count 個のコンテンツを認識"
 done
@@ -444,8 +496,8 @@ echo ""
 # 固定の sleep 5 は遅い CI ランナーで伝播が間に合わず flaky になっていた。
 updated_content_visible() {
     local p
-    for p in 8080 8081 8082; do
-        generate_signature "$ACCOUNT1_PRIVATE_KEY" "read" "content"
+    for p in $NODE_PORTS; do
+        generate_signature "$ACCOUNT1_PRIVATE_KEY" "read" "$CONTENT_ID"
         local resp
         resp=$(curl -s "http://127.0.0.1:$p/content/$CONTENT_ID/data" \
             -H "Authorization: Bearer $ACCOUNT1_KEY_ID" \
@@ -463,8 +515,8 @@ log_step "gossipsubによる更新の伝播を待機 (最大15秒ポーリング
 poll_until 15 1 updated_content_visible || log_warn "15秒以内に更新の伝播を確認できませんでした(以降の検証で再確認します)"
 
 log_step "各ノードでcontentデータを取得し、更新が反映されていることを確認"
-for port in 8080 8081 8082; do
-    generate_signature "$ACCOUNT1_PRIVATE_KEY" "read" "content"
+for port in $NODE_PORTS; do
+    generate_signature "$ACCOUNT1_PRIVATE_KEY" "read" "$CONTENT_ID"
     DATA_RESPONSE=$(curl -s "http://127.0.0.1:$port/content/$CONTENT_ID/data" \
         -H "Authorization: Bearer $ACCOUNT1_KEY_ID" \
         -H "X-Request-Signature: $LAST_SIGNATURE" \
@@ -472,18 +524,18 @@ for port in 8080 8081 8082; do
 
     if echo "$DATA_RESPONSE" | jq -e '.data' > /dev/null 2>&1; then
         FETCHED_DATA=$(echo "$DATA_RESPONSE" | jq -r '.data' 2>/dev/null)
-        DECODED=$(echo "$FETCHED_DATA" | base64 -d 2>/dev/null || echo "(decode failed)")
-        log_info "  ノード (ポート $port): data=$DECODED"
+        DATA_BYTES=$(echo "$FETCHED_DATA" | base64 -d 2>/dev/null | wc -c | tr -d ' ')
+        log_info "  ノード (ポート $port): data あり (Node CBOR ${DATA_BYTES} bytes)"
     else
-        log_info "  ノード (ポート $port): データ取得不可（memberでない可能性）"
+        log_info "  ノード (ポート $port): データ取得不可"
     fi
 done
 
 # memberノードでデータを検証
 log_test "少なくとも1つのノードで更新データが取得できること"
 VERIFIED=false
-for port in 8080 8081 8082; do
-    generate_signature "$ACCOUNT1_PRIVATE_KEY" "read" "content"
+for port in $NODE_PORTS; do
+    generate_signature "$ACCOUNT1_PRIVATE_KEY" "read" "$CONTENT_ID"
     DATA_RESPONSE=$(curl -s "http://127.0.0.1:$port/content/$CONTENT_ID/data" \
         -H "Authorization: Bearer $ACCOUNT1_KEY_ID" \
         -H "X-Request-Signature: $LAST_SIGNATURE" \

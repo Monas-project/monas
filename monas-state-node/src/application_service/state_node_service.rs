@@ -15,6 +15,7 @@ use crate::infrastructure::placement::compute_dht_key;
 use crate::port::auth_token::{AuthToken, RequestMetadata};
 use crate::port::authentication_service::AuthenticationService;
 use crate::port::authorization_service::{AuthorizationRequest, AuthorizationService};
+use crate::port::consumed_request_store::{ConsumedRequestStore, InMemoryConsumedRequestStore};
 use crate::port::content_repository::ContentRepository;
 use crate::port::event_publisher::EventPublisher;
 use crate::port::peer_network::{PeerNetwork, RelayReadError, RelayReadErrorKind};
@@ -92,6 +93,108 @@ where
     capacity_threshold_bytes: u64,
     /// Maximum number of members to add in a single add_member_to_content call.
     max_add_member_count: usize,
+    /// Records mutation requests that have already been accepted, so a captured
+    /// signature cannot be replayed inside its freshness window.
+    consumed_requests: Arc<dyn ConsumedRequestStore>,
+}
+
+/// Where a relay candidate list came from, and therefore how much it can be
+/// trusted.
+///
+/// This distinction matters because a relay interprets what comes back from
+/// whoever is in the list. Trusting a *negative* answer is only safe from a
+/// peer we have some reason to believe actually holds the content.
+///
+/// It does not affect whether credentials may be forwarded — see
+/// [`ResolvedMembers::as_slice`] for why that is safe regardless of
+/// provenance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MemberProvenance {
+    /// The peers come from a local `ContentNetwork` record, built from a
+    /// `ContentCreated` / `ContentNetworkManagerAdded` event that named this
+    /// node as a member.
+    ///
+    /// This is **not** a cryptographic attestation by the content owner.
+    /// Events carry no owner signature, so the membership set inside the event
+    /// is the publisher's own claim. What is verified is the *publisher*:
+    /// gossipsub runs in `Signed` + `Strict` mode, so the author field is
+    /// authenticated, and `handle_sync_event` binds it — `ContentCreated` must
+    /// come from the creator it names, and a membership change must come from
+    /// a node already in the network it changes.
+    ///
+    /// Two gaps remain, both requiring a protocol change to close (tracked
+    /// separately): the very first record for a content is accepted without a
+    /// prior membership to check against, and an authenticated member can
+    /// still claim a member set of its choosing.
+    ///
+    /// It is nevertheless a far better basis than [`Self::DhtGuess`], where
+    /// nothing at all ties a peer to the content — so a 401/403 from a listed
+    /// member is treated as a real verdict.
+    LocalRecord,
+    /// The peers are just DHT neighbours of `sha256(content_id)`. Nothing ties
+    /// them to this content: anyone able to place a Peer ID near the key lands
+    /// in this list, so a denial from one of them carries no authority.
+    DhtGuess,
+}
+
+/// Relay candidates plus the provenance of the list.
+struct ResolvedMembers {
+    members: Vec<String>,
+    /// Kept for diagnostics and for #63: once membership is owner-signed,
+    /// `auth_verdict_is_authoritative` reads this again to restore the early
+    /// exit on a denial. Nothing branches on it today — see that method.
+    #[allow(dead_code)]
+    provenance: MemberProvenance,
+}
+
+impl ResolvedMembers {
+    /// The relay candidates.
+    ///
+    /// Every candidate is handed the caller's token and request signature, and
+    /// that is fine even for an unproven peer: the token is either a
+    /// self-contained key id (a public key) or a delegated JWT whose audience
+    /// is likewise a public key, and authorization is proof-of-possession — the
+    /// request signature is verified against the JWT's `aud` key. A peer that
+    /// captures both cannot mint a new request, because it does not hold that
+    /// private key, and the signature it did capture is bound to one operation,
+    /// resource, body and timestamp. Mutations are single-use on top of that.
+    ///
+    /// So the candidate list is not truncated for unproven peers. Doing so
+    /// would cut failover to legitimate members — a real availability cost —
+    /// in exchange for no confidentiality gain, since a peer that sits first in
+    /// DHT distance order receives the credentials regardless of any cap.
+    fn as_slice(&self) -> &[String] {
+        &self.members
+    }
+
+    /// Whether a negative authorization verdict from these peers may be treated
+    /// as final — i.e. may end the failover loop early.
+    ///
+    /// **Currently always false.** A denial is still kept and returned if no
+    /// candidate produces anything better; what this disables is *stopping* at
+    /// the first one.
+    ///
+    /// For [`MemberProvenance::DhtGuess`] the reason is direct: a single
+    /// hostile node squatting near the DHT key could otherwise deny every read
+    /// by answering 403 first, and even an honest but partially-synced replica
+    /// can answer 403 from a policy it has not finished replicating.
+    ///
+    /// [`MemberProvenance::LocalRecord`] used to return true here, on the
+    /// grounds that a listed member evaluated the caller against the real
+    /// policy. That does not hold while the record itself can be planted: the
+    /// first record for a content is accepted with no prior membership to check
+    /// against, so an attacker who wins that race lands in the list and its 403
+    /// would end the loop — a permanent denial of service against a legitimate
+    /// caller, which is exactly what the DhtGuess case is guarding against.
+    ///
+    /// Restoring the early exit needs owner-signed membership (#63). Until
+    /// then, the cost of always continuing is bounded: one extra round trip per
+    /// remaining candidate on a genuine denial, against an availability attack
+    /// that is otherwise unbounded. Erring toward availability is the right
+    /// direction — the caller is refused either way, just later.
+    fn auth_verdict_is_authoritative(&self) -> bool {
+        false
+    }
 }
 
 /// No-op access control repository for backward compatibility.
@@ -172,7 +275,19 @@ where
             min_replication_factor: config.min_replication_factor,
             capacity_threshold_bytes: config.capacity_threshold_bytes,
             max_add_member_count: config.max_add_member_count,
+            consumed_requests: Arc::new(InMemoryConsumedRequestStore::default()),
         }
+    }
+
+    /// Replace the consumed-request store (builder pattern).
+    ///
+    /// The default is process-local and volatile, which is sound because records
+    /// only need to outlive the signature freshness window. Deployments that
+    /// want replay protection to survive a restart can inject a persistent
+    /// implementation here.
+    pub fn with_consumed_request_store(mut self, store: Arc<dyn ConsumedRequestStore>) -> Self {
+        self.consumed_requests = store;
+        self
     }
 
     /// Set the access control repository (builder pattern).
@@ -222,12 +337,18 @@ where
 
     /// Authenticate a caller for read operations.
     ///
+    /// The request signature is bound to the specific `content_id` (message
+    /// `read:{content_id}:{timestamp}`), so a signature captured by one node
+    /// cannot be replayed to read other content. Mirrors the delete path,
+    /// which already signs over the content id.
+    ///
     /// Returns the authenticated identity on success.
     pub async fn authenticate_for_read(
         &self,
         token: &AuthToken,
         request_signature: Option<&[u8]>,
         timestamp: Option<u64>,
+        content_id: &str,
     ) -> Result<Identity, StateNodeError> {
         let auth_service = self.auth_service.as_ref().ok_or_else(|| {
             StateNodeError::InvalidConfiguration("Authentication not configured".to_string())
@@ -238,25 +359,18 @@ where
             .await
             .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))?;
 
-        // Verify caller signature:
-        // - JWT tokens: verify JWT's own P-256 signature
-        // - type:id tokens: verify request signature (mandatory)
-        let sig = if token.as_str().contains('.') {
-            // JWT: signature is inside the token itself, pass empty slice
-            &[] as &[u8]
-        } else {
-            request_signature.ok_or_else(|| {
-                StateNodeError::AuthenticationFailed(
-                    "Request signature is required for non-JWT tokens".to_string(),
-                )
-            })?
-        };
+        // Verify caller signature for all token types. The signed message is
+        // `read:{content_id}:{timestamp}` regardless of token kind; JWT tokens
+        // additionally have their own owner signature verified.
+        let sig = request_signature.ok_or_else(|| {
+            StateNodeError::AuthenticationFailed("Request signature is required".to_string())
+        })?;
         self.verify_caller_signature(
             auth_service.as_ref(),
             token,
             sig,
             "read",
-            "content",
+            content_id,
             timestamp,
             None,
         )
@@ -267,15 +381,108 @@ where
 
     /// Verify the caller's request signature.
     ///
-    /// For JWT tokens (containing `.`), verifies the JWT's own P-256 signature
-    /// via `AuthenticationService::verify_jwt_signature`. JWT tokens contain
-    /// operation/resource/timestamp in their payload, so no separate request
-    /// body signature is needed.
+    /// The signed message is identical for every token type (issue #61) and is
+    /// built by [`Self::build_signing_message`]:
+    /// `monas-request-v1:<len>:<op>:<len>:<resource>:<timestamp>:<len>:<digest>`
+    /// where `digest` is `hex(sha256(body))` when a body is present and empty
+    /// otherwise. Every field is length-prefixed, so no two distinct requests
+    /// can produce the same message by shifting a boundary.
     ///
-    /// For `type:id` tokens (e.g., `user:alice`), constructs a signing message
-    /// and delegates to `AuthenticationService::verify_request_signature`:
-    /// - If `request_body` is `Some(body)`: signs `hex(sha256(body + timestamp_be_bytes))`
-    /// - If `request_body` is `None`: signs `{operation}:{resource}:{timestamp}`
+    /// The timestamp *inside* the signed message is checked for freshness by the
+    /// auth service, so `timestamp` is mandatory — there is no server-clock
+    /// fallback. A token can therefore be reused for many requests within its
+    /// TTL.
+    ///
+    /// Freshness alone is **not** replay protection: within the window the same
+    /// signature can be presented any number of times. That is acceptable for
+    /// reads, which are idempotent. Mutations must go through
+    /// [`Self::verify_and_consume_mutation_signature`] instead, which also
+    /// consumes the signature.
+    ///
+    /// For JWT tokens (containing `.`), the JWT's own P-256 signature is
+    /// verified first via `AuthenticationService::verify_jwt_signature`
+    /// (over the received wire bytes), and the request signature is then
+    /// verified against the audience (`aud`) key.
+    /// Build the canonical message a request signature commits to.
+    ///
+    /// Single source of truth for both verification and the replay-consumption
+    /// identity, so the two can never drift apart.
+    fn build_signing_message(
+        operation: &str,
+        resource: &str,
+        timestamp: u64,
+        request_body: Option<&[u8]>,
+    ) -> String {
+        let metadata = RequestMetadata {
+            timestamp,
+            operation: operation.to_string(),
+            resource: resource.to_string(),
+        };
+        match request_body {
+            Some(body) => {
+                use sha2::{Digest, Sha256};
+                let digest = hex::encode(Sha256::digest(body));
+                metadata.signing_message_with_body_digest(&digest)
+            }
+            None => metadata.signing_message(),
+        }
+    }
+
+    /// The canonical identity of whoever must hold the private key for this
+    /// request — the key the request signature is verified against.
+    ///
+    /// For a self-contained key id the token *is* that key. For a delegated JWT
+    /// it is the `aud` claim, which is likewise a self-contained key id; this
+    /// mirrors `verify_request_signature`, which verifies the request signature
+    /// against exactly that key.
+    ///
+    /// Deliberately **not** the raw token string. A JWT ends in an ECDSA
+    /// signature over its own header and payload, and ECDSA is malleable, so
+    /// the same JWT — same claims, same `aud`, still passing verification —
+    /// has more than one byte representation. Feeding raw token bytes into the
+    /// request identity would therefore hand one authorized request two
+    /// identities, which is the very bypass the identity is meant to prevent.
+    ///
+    /// A malformed JWT falls back to the whole token: such a token cannot
+    /// authenticate anyway, so the value only has to be deterministic.
+    fn canonical_principal(token: &AuthToken) -> String {
+        let raw = token.as_str();
+        if !raw.contains('.') {
+            return format!("key:{}", raw);
+        }
+        match crate::infrastructure::auth::auth_token::AuthToken::from_jwt(raw) {
+            Ok(parsed) => format!("aud:{}", parsed.payload.aud),
+            Err(_) => format!("raw:{}", raw),
+        }
+    }
+
+    /// Identity of a mutation request, for the single-use record.
+    ///
+    /// Derived from the **signed message plus the canonical signer identity**,
+    /// never from any signature bytes. ECDSA signatures are malleable: for a
+    /// valid `(r, s)` the value `(r, n - s)` verifies against the same message
+    /// and key. That applies to *both* signatures in play here — the request
+    /// signature and the JWT's own signature — so neither may reach this hash.
+    /// Otherwise one authorized request gets two identities, and re-sending the
+    /// converted form slips past the consumption record and re-commits the
+    /// mutation.
+    ///
+    /// The message already binds operation, resource, timestamp and body
+    /// digest. The principal is mixed in so two different callers cannot
+    /// collide on one identity, which would let one of them consume the
+    /// other's request.
+    fn mutation_request_id(token: &AuthToken, signing_message: &str) -> Vec<u8> {
+        use sha2::{Digest, Sha256};
+        let principal = Self::canonical_principal(token);
+        let mut hasher = Sha256::new();
+        // Length-prefixed so a principal ending in the message's leading bytes
+        // cannot be re-split into a different (principal, message) pair.
+        hasher.update((principal.len() as u64).to_be_bytes());
+        hasher.update(principal.as_bytes());
+        hasher.update(signing_message.as_bytes());
+        hasher.finalize().to_vec()
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn verify_caller_signature(
         &self,
@@ -287,40 +494,34 @@ where
         timestamp: Option<u64>,
         request_body: Option<&[u8]>,
     ) -> Result<(), StateNodeError> {
-        // JWT tokens: verify the JWT's own signature
+        // JWT tokens: the token itself is a signed capability — verify the
+        // owner's signature before trusting any of its claims.
         if token.as_str().contains('.') {
-            return auth_service.verify_jwt_signature(token).await.map_err(|e| {
-                StateNodeError::AuthenticationFailed(format!(
-                    "JWT signature verification failed: {}",
-                    e
-                ))
-            });
+            auth_service
+                .verify_jwt_signature(token)
+                .await
+                .map_err(|e| {
+                    StateNodeError::AuthenticationFailed(format!(
+                        "JWT signature verification failed: {}",
+                        e
+                    ))
+                })?;
         }
 
-        // non-JWT tokens: verify request signature
-        let ts = timestamp.unwrap_or_else(|| {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
-        });
+        // Freshness is part of the signed message. Falling back to the server
+        // clock would let a caller omit the timestamp and bypass the max-age
+        // check entirely, so a missing timestamp is an authentication error.
+        let ts = timestamp.ok_or_else(|| {
+            StateNodeError::AuthenticationFailed(
+                "X-Request-Timestamp is required for request signature verification".to_string(),
+            )
+        })?;
 
-        let message = if let Some(body) = request_body {
-            // Body-based signing: hex(sha256(body + timestamp_be_bytes))
-            use sha2::{Digest, Sha256};
-            let mut hasher = Sha256::new();
-            hasher.update(body);
-            hasher.update(ts.to_be_bytes());
-            hex::encode(hasher.finalize())
-        } else {
-            // Metadata-based signing: {operation}:{resource}:{timestamp}
-            let metadata = RequestMetadata {
-                timestamp: ts,
-                operation: operation.to_string(),
-                resource: resource.to_string(),
-            };
-            metadata.signing_message()
-        };
+        // 署名対象は body の有無・トークン種別によらず同一構造で、
+        // operation と resource に必ず束縛される。body がある場合はその digest も
+        // 含める。これがないと、ある content 向けに取得した update の
+        // body+署名を別 content や create へ転用できてしまう。
+        let message = Self::build_signing_message(operation, resource, ts, request_body);
 
         auth_service
             .verify_request_signature(token, signature, &message, timestamp)
@@ -331,6 +532,169 @@ where
                     e
                 ))
             })
+    }
+
+    /// Verify a signature for a **mutation**, and consume it so the same signed
+    /// request cannot be applied twice.
+    ///
+    /// The freshness check inside signature verification only bounds how long a
+    /// captured signature stays usable — within that window it can be presented
+    /// any number of times. Reads tolerate that, but `update`, `delete`,
+    /// `invalidate` and `manage` are not idempotent, so a replay is not a
+    /// duplicate: it is a state rollback. Replaying a signed update of old
+    /// ciphertext after a legitimate update commits the old bytes as a *new*
+    /// version whose parent is the current head, so the stale content becomes
+    /// the latest version.
+    ///
+    /// The request identity comes from the **signed message and the canonical
+    /// signer identity**, never from signature bytes of any kind — see
+    /// [`Self::mutation_request_id`]. The message already commits to operation,
+    /// resource, timestamp and body digest, so no new field has to be added to
+    /// the wire format to carry a nonce, and no re-encoding of either the
+    /// request signature or the token's own signature can masquerade as a
+    /// second request.
+    ///
+    /// Consumption happens after verification (an invalid signature must not be
+    /// able to burn a legitimate request's identity) and before any state is
+    /// committed.
+    #[allow(clippy::too_many_arguments)]
+    async fn verify_and_consume_mutation_signature(
+        &self,
+        auth_service: &dyn AuthenticationService,
+        token: &AuthToken,
+        signature: &[u8],
+        operation: &str,
+        resource: &str,
+        timestamp: Option<u64>,
+        request_body: Option<&[u8]>,
+    ) -> Result<(), StateNodeError> {
+        self.verify_caller_signature(
+            auth_service,
+            token,
+            signature,
+            operation,
+            resource,
+            timestamp,
+            request_body,
+        )
+        .await?;
+
+        // Freshness already established that `timestamp` is present.
+        let ts = timestamp.ok_or_else(|| {
+            StateNodeError::AuthenticationFailed(
+                "X-Request-Timestamp is required for request signature verification".to_string(),
+            )
+        })?;
+        let signing_message = Self::build_signing_message(operation, resource, ts, request_body);
+        let request_id = Self::mutation_request_id(token, &signing_message);
+
+        // Retention is measured on *our* clock, not the caller's. Using the
+        // signed timestamp would let a caller inside the allowed skew present a
+        // future-dated request to evict entries that are still live, then
+        // re-present an older signature whose record had just been dropped.
+        let first_time = self
+            .consumed_requests
+            .record_if_absent(&request_id, current_timestamp())
+            .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
+
+        if !first_time {
+            return Err(StateNodeError::RequestAlreadyApplied(format!(
+                "this signed {operation} request for {resource} has already been applied. \
+                 Mutations are single-use: re-sign the request with a fresh timestamp instead \
+                 of resending the previous signature."
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Consume a mutation signature on the **relay** path.
+    ///
+    /// A relay holds no access policy, so it forwards the caller's credentials
+    /// to a member and lets the member decide. That means the member is the only
+    /// one that consumes the signature — and a caller who keeps re-sending to the
+    /// relay gets the request applied again every time the relay happens to pick
+    /// a member that has not seen it yet. The replay the consumption record is
+    /// supposed to stop therefore still succeeds through a relay.
+    ///
+    /// So the relay records the signature too, and refuses to forward one it has
+    /// already forwarded. This is not a substitute for the member-side check
+    /// (a caller can always talk to a different relay); it closes the specific
+    /// hole where the *same* relay launders the *same* signature repeatedly.
+    ///
+    /// **The signature is verified before anything is recorded.** The relay can
+    /// do this without a policy: `verify_caller_signature` is purely
+    /// cryptographic — the token's own signature, then the request signature
+    /// against the key the token designates. Only *authorization* needs the
+    /// policy, and that stays with the member.
+    ///
+    /// Verifying first is load-bearing, not defence in depth. The request id is
+    /// derived from the signed message and the principal — operation, resource,
+    /// timestamp, body digest, `aud` — every part of which is public. Recording
+    /// it before verification would let anyone burn a legitimate caller's id
+    /// with a garbage signature: send a `delete` for their content stamped with
+    /// the current second (no body, so the message is fully predictable) and
+    /// their real request comes back `RequestAlreadyApplied`. Repeat each second
+    /// and the target can never mutate anything through this relay.
+    ///
+    /// An earlier revision recorded first and argued the cost was bounded
+    /// because the id was "a digest the attacker already has". That was true
+    /// while the id *was* the signature digest; it stopped being true when the
+    /// id moved to the signed message, and this is the correction.
+    async fn consume_relayed_mutation_signature(
+        &self,
+        token: &AuthToken,
+        signature: &[u8],
+        operation: &str,
+        resource: &str,
+        timestamp: Option<u64>,
+        request_body: Option<&[u8]>,
+    ) -> Result<(), StateNodeError> {
+        let auth_service = self.auth_service.as_ref().ok_or_else(|| {
+            StateNodeError::AuthenticationFailed(
+                "Authentication service is not configured".to_string(),
+            )
+        })?;
+
+        // Cryptographic verification only — authorization is the member's job.
+        // A forged or replayed-with-a-bad-signature request must not be able to
+        // reach the store at all.
+        self.verify_caller_signature(
+            auth_service.as_ref(),
+            token,
+            signature,
+            operation,
+            resource,
+            timestamp,
+            request_body,
+        )
+        .await?;
+
+        // Same identity the verifying member will derive, so a request consumed
+        // here is the same request there. Derived from the signed message, never
+        // from the signature bytes — see `mutation_request_id`.
+        let ts = timestamp.ok_or_else(|| {
+            StateNodeError::AuthenticationFailed(
+                "X-Request-Timestamp is required for request signature verification".to_string(),
+            )
+        })?;
+        let signing_message = Self::build_signing_message(operation, resource, ts, request_body);
+        let request_id = Self::mutation_request_id(token, &signing_message);
+
+        let first_time = self
+            .consumed_requests
+            .record_if_absent(&request_id, current_timestamp())
+            .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
+
+        if !first_time {
+            return Err(StateNodeError::RequestAlreadyApplied(format!(
+                "this signed {operation} request for {resource} was already relayed by this node. \
+                 Mutations are single-use: re-sign the request with a fresh timestamp instead \
+                 of resending the previous signature."
+            )));
+        }
+
+        Ok(())
     }
 
     /// Get the local node ID.
@@ -392,7 +756,7 @@ where
     /// since they indicate a real permission problem rather than a connectivity issue.
     async fn relay_with_failover<F, Fut>(
         &self,
-        members: &[String],
+        members: &ResolvedMembers,
         operation_name: &str,
         relay_fn: F,
     ) -> Result<(), StateNodeError>
@@ -400,7 +764,11 @@ where
         F: Fn(String) -> Fut,
         Fut: std::future::Future<Output = Result<bool, anyhow::Error>>,
     {
-        for (i, member) in members.iter().enumerate() {
+        let authoritative = members.auth_verdict_is_authoritative();
+        let candidates = members.as_slice();
+        let mut auth_error: Option<StateNodeError> = None;
+
+        for (i, member) in candidates.iter().enumerate() {
             match relay_fn(member.clone()).await {
                 Ok(true) => return Ok(()),
                 Ok(false) => {
@@ -409,29 +777,51 @@ where
                         operation_name,
                         member,
                         i + 1,
-                        members.len()
+                        candidates.len()
                     );
                 }
                 Err(e) => {
                     let err_msg = e.to_string();
-                    // Don't failover on auth errors — they'll fail on every member
                     if err_msg.contains("Authorization failed")
                         || err_msg.contains("Authentication failed")
                     {
-                        return Err(Self::classify_relay_error(err_msg));
+                        // An attested member evaluated the request against the
+                        // real policy, so every other member would answer the
+                        // same — stop here.
+                        if authoritative {
+                            return Err(Self::classify_relay_error(err_msg));
+                        }
+                        // Unproven candidate: its verdict proves nothing (it may
+                        // not hold the content at all), so it must not end the
+                        // loop — otherwise one hostile peer near the DHT key
+                        // could block every write with a single fabricated 403.
+                        // Remember it as the answer of last resort and continue.
+                        tracing::warn!(
+                            "Relay {} got an auth verdict from unproven candidate {} ({}/{}): {} \
+                             — continuing failover",
+                            operation_name,
+                            member,
+                            i + 1,
+                            candidates.len(),
+                            err_msg
+                        );
+                        auth_error.get_or_insert_with(|| Self::classify_relay_error(err_msg));
+                        continue;
                     }
                     tracing::warn!(
                         "Relay {} failed on member {} ({}/{}): {}",
                         operation_name,
                         member,
                         i + 1,
-                        members.len(),
+                        candidates.len(),
                         err_msg
                     );
                 }
             }
         }
-        Err(StateNodeError::NoAvailableMembers)
+        // Nothing succeeded. An auth verdict, even from an unproven candidate,
+        // is a more useful answer than "no members available".
+        Err(auth_error.unwrap_or(StateNodeError::NoAvailableMembers))
     }
 
     /// Resolve the member nodes that own a content, for relay/sync purposes.
@@ -446,7 +836,7 @@ where
     ///
     /// The local node is always excluded from the result. Returns
     /// `NoAvailableMembers` if no candidate remains.
-    async fn resolve_members(&self, content_id: &str) -> Result<Vec<String>, StateNodeError> {
+    async fn resolve_members(&self, content_id: &str) -> Result<ResolvedMembers, StateNodeError> {
         let local_record = self
             .content_repo
             .read()
@@ -455,19 +845,24 @@ where
             .await
             .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
 
-        let mut members: Vec<String> = match local_record {
-            Some(network) => network.member_nodes_as_strings(),
+        let (mut members, provenance) = match local_record {
+            Some(network) => (
+                network.member_nodes_as_strings(),
+                MemberProvenance::LocalRecord,
+            ),
             None => {
                 // No local record: discover the members via the DHT. Request
                 // `k + 1` candidates so that excluding ourselves still leaves
                 // up to `k`, mirroring create_content's placement.
                 let key = compute_dht_key(content_id);
-                self.peer_network
+                let peers = self
+                    .peer_network
                     .find_closest_peers(key, self.min_replication_factor + 1)
                     .await
                     .map_err(|e| {
                         StateNodeError::NetworkError(NetworkError::ConnectionFailed(e.to_string()))
-                    })?
+                    })?;
+                (peers, MemberProvenance::DhtGuess)
             }
         };
 
@@ -475,7 +870,10 @@ where
         if members.is_empty() {
             return Err(StateNodeError::NoAvailableMembers);
         }
-        Ok(members)
+        Ok(ResolvedMembers {
+            members,
+            provenance,
+        })
     }
 
     /// Whether this node actually replicates the content (holds its genesis
@@ -495,9 +893,16 @@ where
     /// read path).
     ///
     /// Authenticates the caller (token + request signature) and grants access
-    /// when the caller is the content owner or the authorization service
-    /// grants `ReadContent`. Content without a policy is readable (it may not
-    /// have a policy yet) — same semantics as the HTTP read path.
+    /// only when the caller is the content owner or the authorization service
+    /// grants `ReadContent`.
+    ///
+    /// Fail-closed in both directions: an error loading the policy denies, and
+    /// **a missing policy also denies**. A replica can legitimately hold a
+    /// genesis without its owner policy — the create operation carries
+    /// `access_policy: None` and the owner policy arrives as a separate
+    /// operation, and `apply_operations` tolerates partial application — so
+    /// treating "no policy" as public would expose ciphertext and history of
+    /// such content to any authenticated caller.
     pub async fn authorize_read(
         &self,
         token: &AuthToken,
@@ -506,7 +911,7 @@ where
         content_id: &str,
     ) -> Result<(), StateNodeError> {
         let identity = self
-            .authenticate_for_read(token, request_signature, timestamp)
+            .authenticate_for_read(token, request_signature, timestamp, content_id)
             .await?;
 
         // Fail closed: an error loading the policy must deny, not fall through
@@ -547,8 +952,15 @@ where
             ));
         }
 
-        // No policy exists yet — allow, matching the HTTP read path.
-        Ok(())
+        // No policy on this replica. This is not proof that the content is
+        // public — it is indistinguishable from "the owner policy operation has
+        // not been applied here (yet)". Deny rather than serve ciphertext and
+        // history without an authorization contract.
+        Err(StateNodeError::AuthorizationFailed(format!(
+            "no access policy is available for {content_id} on this node: refusing the read \
+             (the policy may not have replicated here yet — retry, or read from a node that \
+             has it)"
+        )))
     }
 
     /// Serve a relayed data read on a member node (bug #93 hardened read path).
@@ -568,19 +980,22 @@ where
             .await?;
 
         let content_id_vo = ContentId::new(content_id.to_string())?;
+        // Return the whole crsl-lib Node (CBOR), not just the payload, so the
+        // client can recompute the CID and verify the response was not
+        // tampered with (docs/design.md §10「read応答の完全性検証」).
         match version {
             Some(v) => {
-                let data = self
+                let node_bytes = self
                     .crdt_repo
-                    .get_version(content_id, v)
+                    .get_version_node_bytes(content_id, v)
                     .await
                     .map_err(|e| StateNodeError::StorageError(e.to_string()))?
                     .ok_or(StateNodeError::ContentNotFound(content_id_vo))?;
-                Ok((data, v.to_string()))
+                Ok((node_bytes, v.to_string()))
             }
             None => self
                 .crdt_repo
-                .get_latest_with_version(content_id)
+                .get_latest_node_bytes_with_version(content_id)
                 .await
                 .map_err(|e| StateNodeError::StorageError(e.to_string()))?
                 .ok_or(StateNodeError::ContentNotFound(content_id_vo)),
@@ -628,10 +1043,11 @@ where
         timestamp: Option<u64>,
     ) -> Result<(Vec<u8>, String), StateNodeError> {
         let members = self.resolve_members(content_id).await?;
+        let authoritative = members.auth_verdict_is_authoritative();
         let sig: &[u8] = request_signature.unwrap_or(&[]);
 
         let mut best: Option<RelayReadError> = None;
-        for member in &members {
+        for member in members.as_slice() {
             match self
                 .peer_network
                 .relay_read_content(member, content_id, version, token.as_str(), sig, timestamp)
@@ -645,9 +1061,10 @@ where
                         content_id,
                         e
                     );
-                    match Self::record_relay_read_error(&mut best, e) {
-                        // An auth verdict is authoritative — the member DID
-                        // evaluate the request. Do not let a later member's
+                    match Self::record_relay_read_error(&mut best, e, authoritative) {
+                        // An auth verdict from an attested member is
+                        // authoritative — it DID evaluate the request against
+                        // the real policy. Do not let a later member's
                         // transport failure overwrite it.
                         ControlFlow::Break(final_err) => {
                             return Err(Self::relay_read_error_to_state_error(
@@ -676,10 +1093,11 @@ where
         timestamp: Option<u64>,
     ) -> Result<Vec<String>, StateNodeError> {
         let members = self.resolve_members(content_id).await?;
+        let authoritative = members.auth_verdict_is_authoritative();
         let sig: &[u8] = request_signature.unwrap_or(&[]);
 
         let mut best: Option<RelayReadError> = None;
-        for member in &members {
+        for member in members.as_slice() {
             match self
                 .peer_network
                 .relay_read_history(member, content_id, token.as_str(), sig, timestamp)
@@ -693,7 +1111,7 @@ where
                         content_id,
                         e
                     );
-                    match Self::record_relay_read_error(&mut best, e) {
+                    match Self::record_relay_read_error(&mut best, e, authoritative) {
                         ControlFlow::Break(final_err) => {
                             return Err(Self::relay_read_error_to_state_error(
                                 content_id, final_err,
@@ -713,21 +1131,49 @@ where
 
     /// Fold one member's relayed-read failure into the running best error.
     ///
-    /// Auth verdicts (401/403) short-circuit the member loop: the member
-    /// evaluated the caller against the real policy, so asking further
-    /// members cannot change the answer. NotFound is kept over transport
-    /// errors but the loop continues — a lagging member may miss a version
-    /// another member can still serve.
+    /// Auth verdicts (401/403) short-circuit the member loop **only when the
+    /// candidate list is attested** (`authoritative`): such a member evaluated
+    /// the caller against the real policy, so asking further members cannot
+    /// change the answer, and continuing would just leak that the content
+    /// exists to a caller who was already refused.
+    ///
+    /// When the list is a DHT guess, a 401/403 proves nothing — the responder
+    /// may not hold the content at all. Treating it as final would let one
+    /// hostile peer near the DHT key deny every read by answering 403 first,
+    /// and would also let an honest replica that has not finished replicating
+    /// the policy stop failover to a healthy one. So the verdict is remembered
+    /// (it is a better answer than a transport error, and is what the caller
+    /// sees if nothing better turns up) but the loop keeps going.
+    ///
+    /// NotFound is kept over transport errors but never short-circuits — a
+    /// lagging member may miss a version another member can still serve.
     fn record_relay_read_error(
         best: &mut Option<RelayReadError>,
         err: RelayReadError,
+        authoritative: bool,
     ) -> ControlFlow<RelayReadError> {
         match err.kind {
             RelayReadErrorKind::AuthenticationFailed | RelayReadErrorKind::AuthorizationFailed => {
-                ControlFlow::Break(err)
+                if authoritative {
+                    return ControlFlow::Break(err);
+                }
+                // Unproven responder: keep the verdict as the best answer so
+                // far (it beats NotFound and transport errors), but let the
+                // remaining candidates have their say.
+                *best = Some(err);
+                ControlFlow::Continue(())
             }
             RelayReadErrorKind::NotFound => {
-                *best = Some(err);
+                // Do not let a NotFound overwrite an auth verdict we are
+                // holding on to from an unproven peer: the verdict is the more
+                // specific answer.
+                if !matches!(
+                    best.as_ref().map(|b| b.kind),
+                    Some(RelayReadErrorKind::AuthenticationFailed)
+                        | Some(RelayReadErrorKind::AuthorizationFailed)
+                ) {
+                    *best = Some(err);
+                }
                 ControlFlow::Continue(())
             }
             RelayReadErrorKind::Other => {
@@ -818,7 +1264,7 @@ where
             .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))?;
 
         // 1.5. Verify request signature
-        self.verify_caller_signature(
+        self.verify_and_consume_mutation_signature(
             auth_service.as_ref(),
             token,
             request_signature,
@@ -1059,7 +1505,7 @@ where
                 .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))?;
 
             // Verify request signature
-            self.verify_caller_signature(
+            self.verify_and_consume_mutation_signature(
                 auth_service.as_ref(),
                 token,
                 request_signature,
@@ -1125,6 +1571,19 @@ where
             if from_relay {
                 return Err(StateNodeError::ContentNotFound(content_id_vo.clone()));
             }
+
+            // 転送前にこのノードでも署名を消費する。member 側だけで消費すると、
+            // 同じ署名を relay へ送り直すたびに「まだ見ていない member」へ
+            // 振り分けられて再適用できてしまう。
+            self.consume_relayed_mutation_signature(
+                token,
+                request_signature,
+                "delete",
+                content_id,
+                timestamp,
+                None,
+            )
+            .await?;
 
             // Resolve members from our local record, or via DHT discovery when
             // we hold no record (bug #93), then relay with failover.
@@ -1229,7 +1688,7 @@ where
                 .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))?;
 
             // Verify request signature
-            self.verify_caller_signature(
+            self.verify_and_consume_mutation_signature(
                 auth_service.as_ref(),
                 token,
                 request_signature,
@@ -1299,6 +1758,19 @@ where
             if from_relay {
                 return Err(StateNodeError::ContentNotFound(content_id_vo.clone()));
             }
+
+            // 転送前にこのノードでも署名を消費する。member 側だけで消費すると、
+            // 同じ署名を relay へ送り直すたびに「まだ見ていない member」へ
+            // 振り分けられて再適用できてしまう。
+            self.consume_relayed_mutation_signature(
+                token,
+                request_signature,
+                "update",
+                content_id,
+                timestamp,
+                Some(data),
+            )
+            .await?;
 
             // Resolve members from our local record, or via DHT discovery when
             // we hold no record (bug #93), then relay with failover.
@@ -1396,19 +1868,11 @@ where
             .await
             .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))?;
 
-        // 2.5. Verify request signature (mandatory)
-        // JWT tokens: signature is inside the token itself, pass empty slice
-        // type:id tokens: require request signature
-        let sig = if token.as_str().contains('.') {
-            &[] as &[u8]
-        } else {
-            request_signature.ok_or_else(|| {
-                StateNodeError::AuthenticationFailed(
-                    "Request signature is required for non-JWT tokens".to_string(),
-                )
-            })?
-        };
-        self.verify_caller_signature(
+        // 2.5. Verify request signature (mandatory for all token types)
+        let sig = request_signature.ok_or_else(|| {
+            StateNodeError::AuthenticationFailed("Request signature is required".to_string())
+        })?;
+        self.verify_and_consume_mutation_signature(
             auth_service.as_ref(),
             token,
             sig,
@@ -1529,6 +1993,11 @@ where
                 return Err(StateNodeError::ContentNotFound(content_id_vo.clone()));
             }
 
+            // NOTE: invalidate は local / relay の分岐より前に
+            // `verify_and_consume_mutation_signature` を通しているので、
+            // ここで改めて消費する必要はない(するとこのノード自身の
+            // 1 回目の転送が 409 になる)。
+            //
             // Resolve members from our local record, or via DHT discovery when
             // we hold no record (bug #93), then relay with failover.
             let members = self.resolve_members(content_id).await?;
@@ -1607,15 +2076,18 @@ where
             .await
             .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))?;
 
-        // Verify request signature
-        self.verify_caller_signature(
+        // Verify request signature. `count` comes from the HTTP body and
+        // decides how many members get added, so it is signed too — see
+        // `add_members_signing_body` for why the canonical encoding is used
+        // instead of the raw JSON bytes.
+        self.verify_and_consume_mutation_signature(
             auth_service.as_ref(),
             token,
             request_signature,
             "manage",
             content_id,
             timestamp,
-            None,
+            Some(&crate::port::auth_token::add_members_signing_body(count)),
         )
         .await?;
 
@@ -1952,10 +2424,56 @@ where
         Ok(())
     }
 
+    /// Verify that the publisher of a membership-changing event is itself a
+    /// member of the network it is changing.
+    ///
+    /// Returns `Ok(())` when we hold no local record for the content: there is
+    /// no membership to check against, and no existing record to overwrite.
+    /// Also returns `Ok(())` when `source_peer_id` is `None` (the event did not
+    /// arrive over an authenticated channel — see `handle_sync_event`).
+    async fn verify_source_is_existing_member(
+        &self,
+        source_peer_id: Option<&str>,
+        content_id: &str,
+    ) -> Result<(), StateNodeError> {
+        let Some(source) = source_peer_id else {
+            return Ok(());
+        };
+
+        let existing = self
+            .content_repo
+            .read()
+            .await
+            .get_content_network(content_id)
+            .await
+            .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
+
+        match existing {
+            Some(network) if !network.has_member_str(source) => {
+                tracing::warn!(
+                    "Rejecting membership change for {} from non-member {}",
+                    content_id,
+                    source
+                );
+                Err(StateNodeError::Internal(format!(
+                    "Publisher {} is not a member of content network {}",
+                    source, content_id
+                )))
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Handle a sync event from another node.
     ///
-    /// The `source_peer_id` parameter is used to verify that events claiming
-    /// to be from a particular node actually came from that peer's PeerID.
+    /// The `source_peer_id` parameter is the **authenticated publisher** of the
+    /// event (gossipsub `Message::source`, not the forwarding peer), used to
+    /// verify that events claiming to be from a particular node actually came
+    /// from that peer.
+    ///
+    /// `None` means the origin could not be established; origin-bound checks
+    /// are skipped in that case, so callers must pass the authenticated value
+    /// whenever one exists.
     ///
     /// Returns `ApplyOutcome::NeedsSync` when the caller should perform content
     /// synchronization (e.g., call `ContentSyncService::sync_from_peers`).
@@ -2019,6 +2537,18 @@ where
                     return Ok(ApplyOutcome::Ignored);
                 }
 
+                // Unlike `ContentCreated`, this event names no publisher —
+                // `added_node_id` is the node being added, which is usually us.
+                // The publisher is whichever node ran the redundancy check, so
+                // the check that fits is membership: only a node already in the
+                // network we remember may change that network's member set.
+                //
+                // If we hold no record, there is nothing to check against and
+                // nothing being overwritten, so the event is accepted as
+                // bootstrap — the same position `ContentCreated` is in.
+                self.verify_source_is_existing_member(source_peer_id, content_id)
+                    .await?;
+
                 // When handling sync events, we create network with NodeIds directly
                 let content_id_vo = ContentId::new(content_id.clone())?;
 
@@ -2049,6 +2579,14 @@ where
                 removed_node_id,
                 ..
             } => {
+                // Removal deletes or rewrites the record that decides whether a
+                // relay treats a peer's 403 as final, so the publisher must be
+                // a member of the network it is changing — otherwise any peer
+                // could evict us from our own record just by naming us as
+                // `removed_node_id`. Same rule as the Added arm.
+                self.verify_source_is_existing_member(source_peer_id, content_id)
+                    .await?;
+
                 // If we were removed, delete the local network metadata
                 if removed_node_id == &self.local_node_id {
                     tracing::info!(
@@ -2093,9 +2631,17 @@ where
 
             Event::ContentCreated {
                 content_id,
+                creator_node_id,
                 member_nodes,
                 ..
             } => {
+                // The event asserts a membership set that this node will store
+                // and later act on, so the publisher must at least be the
+                // creator it claims to be. `create_content` always publishes
+                // with `creator_node_id == self.local_node_id`, so this holds
+                // for every legitimate event.
+                Self::verify_source_peer_id(source_peer_id, creator_node_id)?;
+
                 // Only store network metadata if we're a member
                 if !member_nodes.contains(&self.local_node_id) {
                     return Ok(ApplyOutcome::Ignored);
@@ -2152,6 +2698,13 @@ where
             } => {
                 // Verify source PeerID matches claimed node ID
                 Self::verify_source_peer_id(source_peer_id, deleted_by_node_id)?;
+
+                // That alone only proves the publisher is who it says it is —
+                // it names *itself*, so any authenticated peer would satisfy
+                // it. Deleting our record requires being a member of the
+                // network being deleted.
+                self.verify_source_is_existing_member(source_peer_id, content_id)
+                    .await?;
 
                 // Skip if we initiated the deletion
                 if deleted_by_node_id == &self.local_node_id {
@@ -2351,17 +2904,26 @@ where
             .map_err(|_| AccessControlError::NotAuthorized)?;
 
         // Verify request signature
-        self.verify_caller_signature(
+        self.verify_and_consume_mutation_signature(
             auth_service.as_ref(),
             token,
             request_signature,
             "revoke",
             &update.content_id,
             timestamp,
-            None,
+            // `new_min_valid_issued_at` decides *which* tokens get revoked, so
+            // it has to be inside the signature — same reason `add-members`
+            // signs its `count`. `signing_message()` is the canonical encoding
+            // the owner already signs, so reusing it keeps one definition.
+            Some(&update.signing_message()),
         )
         .await
-        .map_err(|_| AccessControlError::InvalidSignature)?;
+        // 再送の拒否は偽造の拒否と区別する。潰してしまうと、運用者は
+        // 「攻撃された」のか「正規リクエストが二重に届いた」のか判断できない。
+        .map_err(|e| match e {
+            StateNodeError::RequestAlreadyApplied(_) => AccessControlError::AlreadyApplied,
+            _ => AccessControlError::InvalidSignature,
+        })?;
 
         let content_id_vo = ContentId::new(update.content_id.clone())
             .map_err(|_| AccessControlError::NotAuthorized)?;
@@ -2497,6 +3059,17 @@ mod tests {
         vec![0x01]
     }
 
+    /// timestamp は署名検証で構造的に必須(issue #61)。mock 認証でも
+    /// 存在チェックは実コードを通るため、現在時刻を渡す。
+    fn test_timestamp() -> Option<u64> {
+        Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+    }
+
     type TestService = StateNodeService<
         MockNodeRegistry,
         MockContentNetworkRepository,
@@ -2598,6 +3171,32 @@ mod tests {
         }
     }
 
+    /// timestamp が無いリクエストは署名検証に到達する前に拒否される
+    /// (issue #61: freshness は署名内 timestamp が担うため、欠如は
+    /// サーバ時刻へのフォールバックではなく認証エラー)。
+    #[tokio::test]
+    async fn test_create_content_requires_timestamp() {
+        let mut capacities = HashMap::new();
+        capacities.insert("peer-1".to_string(), 500);
+        let service = create_service_with_peers("node-1", vec!["peer-1".to_string()], capacities);
+
+        let result = service
+            .create_content(
+                b"test data",
+                Some(&test_token()),
+                Some(&test_request_signature()),
+                None,
+            )
+            .await;
+
+        match result {
+            Err(StateNodeError::AuthenticationFailed(msg)) => {
+                assert!(msg.contains("X-Request-Timestamp"), "msg={msg}");
+            }
+            other => panic!("expected AuthenticationFailed, got: {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn test_create_content_with_peers() {
         let mut capacities = HashMap::new();
@@ -2620,7 +3219,7 @@ mod tests {
                 b"test data",
                 Some(&test_token()),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
             )
             .await
             .unwrap();
@@ -2666,7 +3265,7 @@ mod tests {
                 b"test data",
                 Some(&test_token()),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
             )
             .await
             .unwrap();
@@ -2703,7 +3302,7 @@ mod tests {
                 b"test data",
                 Some(&test_token()),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
             )
             .await;
 
@@ -2723,7 +3322,7 @@ mod tests {
                 b"test data",
                 Some(&test_token()),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
             )
             .await;
 
@@ -2769,7 +3368,7 @@ mod tests {
                 b"new data",
                 Some(&test_token()),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
             )
             .await
             .unwrap();
@@ -2816,7 +3415,7 @@ mod tests {
                 b"new data",
                 Some(&test_token()),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
             )
             .await;
 
@@ -2849,7 +3448,7 @@ mod tests {
                 b"data",
                 Some(&test_token()),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
             )
             .await;
 
@@ -2876,7 +3475,7 @@ mod tests {
                 b"data",
                 Some(&test_token()),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
             )
             .await;
 
@@ -2908,7 +3507,7 @@ mod tests {
                 "content-1",
                 Some(&test_token()),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
             )
             .await;
 
@@ -2943,7 +3542,7 @@ mod tests {
                 b"data",
                 Some(&test_token()),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
             )
             .await;
 
@@ -2987,7 +3586,7 @@ mod tests {
                 None,
                 &test_token(),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
             )
             .await;
         assert!(matches!(result, Err(StateNodeError::ContentNotFound(_))));
@@ -3022,7 +3621,7 @@ mod tests {
                 None,
                 &test_token(),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
             )
             .await
             .expect("relayed read should succeed");
@@ -3063,13 +3662,427 @@ mod tests {
                 None,
                 &test_token(),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
             )
             .await;
         assert!(matches!(
             result,
             Err(StateNodeError::AuthorizationFailed(_))
         ));
+    }
+
+    /// 未証明の DHT 候補が返した 401/403 で member loop を打ち切ってはいけない。
+    /// 打ち切ると、DHT キーの近くに Peer ID を置いた 1 台が 403 を返すだけで
+    /// あらゆる read を止められる(可用性への攻撃)。正規 member でも policy の
+    /// 複製が終わっていなければ 403 を返し得るので、健全なレプリカへの failover
+    /// を潰さないためにも継続する必要がある。
+    #[test]
+    fn unproven_peer_auth_verdict_does_not_stop_failover() {
+        use crate::port::peer_network::{RelayReadError, RelayReadErrorKind};
+
+        let mut best = None;
+        let flow = StateNodeService::<
+            MockNodeRegistry,
+            MockContentNetworkRepository,
+            MockPeerNetwork,
+            MockEventPublisher,
+            MockContentRepository,
+        >::record_relay_read_error(
+            &mut best,
+            RelayReadError {
+                kind: RelayReadErrorKind::AuthorizationFailed,
+                message: "fabricated 403".to_string(),
+            },
+            false, // 未証明の候補
+        );
+        assert!(
+            matches!(flow, ControlFlow::Continue(())),
+            "an unproven peer's verdict must not end the loop"
+        );
+        // ただし答えとしては保持する(次の候補が何も返さなければこれを返す)
+        assert!(matches!(
+            best.as_ref().map(|b| b.kind),
+            Some(RelayReadErrorKind::AuthorizationFailed)
+        ));
+
+        // 後続候補の NotFound で auth verdict を上書きしない。
+        // 上書きすると「拒否された」が「存在しない」に化ける。
+        let flow = StateNodeService::<
+            MockNodeRegistry,
+            MockContentNetworkRepository,
+            MockPeerNetwork,
+            MockEventPublisher,
+            MockContentRepository,
+        >::record_relay_read_error(
+            &mut best,
+            RelayReadError {
+                kind: RelayReadErrorKind::NotFound,
+                message: "not here".to_string(),
+            },
+            false,
+        );
+        assert!(matches!(flow, ControlFlow::Continue(())));
+        assert!(matches!(
+            best.as_ref().map(|b| b.kind),
+            Some(RelayReadErrorKind::AuthorizationFailed)
+        ));
+    }
+
+    /// `record_relay_read_error` は「権威あり」と言われれば打ち切る。
+    ///
+    /// ただし現在この `true` を渡す呼び出し側は無い
+    /// ([`ResolvedMembers::auth_verdict_is_authoritative`] は常に false)。
+    /// レコード自体が最初の 1 通で植え付けられる間は、そこに載った peer の
+    /// 403 も最終判断にはできないためである。owner 署名付き membership
+    /// (#63)が入れば早期打ち切りを戻せるので、その配線だけは残してある。
+    #[test]
+    fn record_relay_read_error_breaks_when_told_the_verdict_is_authoritative() {
+        use crate::port::peer_network::{RelayReadError, RelayReadErrorKind};
+
+        let mut best = None;
+        let flow = StateNodeService::<
+            MockNodeRegistry,
+            MockContentNetworkRepository,
+            MockPeerNetwork,
+            MockEventPublisher,
+            MockContentRepository,
+        >::record_relay_read_error(
+            &mut best,
+            RelayReadError {
+                kind: RelayReadErrorKind::AuthorizationFailed,
+                message: "real verdict".to_string(),
+            },
+            true, // attested member
+        );
+        assert!(
+            matches!(flow, ControlFlow::Break(_)),
+            "an attested member's verdict is authoritative"
+        );
+    }
+
+    /// 出自は verdict の扱いだけを変え、候補リストそのものは削らない。
+    ///
+    /// credential は未証明の相手へ渡っても構わない。token は自己完結型 key id
+    /// (公開鍵)か委譲 JWT で、その JWT の `aud` もまた公開鍵であり、認可は
+    /// proof-of-possession だからである — リクエスト署名は `aud` の鍵に対して
+    /// 検証されるので、両方を傍受した相手も秘密鍵を持たない以上、新しい
+    /// リクエストを作れない。傍受した署名自体も操作・リソース・body・timestamp
+    /// に束縛され、mutation はさらに使い切りである。
+    ///
+    /// 逆に候補を削ると、正当な member への failover が減って可用性だけが
+    /// 落ちる。DHT 距離順で先頭に来る相手は上限があろうと credential を
+    /// 受け取るので、機密性は何も改善しない。
+    #[test]
+    fn candidate_list_is_not_truncated_by_provenance() {
+        let many: Vec<String> = (0..10).map(|i| format!("peer-{i}")).collect();
+
+        for provenance in [MemberProvenance::LocalRecord, MemberProvenance::DhtGuess] {
+            let resolved = ResolvedMembers {
+                members: many.clone(),
+                provenance,
+            };
+            assert_eq!(
+                resolved.as_slice().len(),
+                many.len(),
+                "failover must reach every candidate ({provenance:?})"
+            );
+        }
+    }
+
+    /// 署名を検証しない認証サービス以外は全部通す mock。
+    /// `bad` と完全一致する署名だけを拒否する。
+    struct RejectsOneSignature {
+        bad: Vec<u8>,
+    }
+
+    #[async_trait::async_trait]
+    impl AuthenticationService for RejectsOneSignature {
+        async fn authenticate(
+            &self,
+            token: &AuthToken,
+            _context: Option<&crate::port::auth_token::AuthContext>,
+        ) -> Result<Identity> {
+            Identity::user(token.as_str().to_string()).map_err(|e| anyhow::anyhow!(e.to_string()))
+        }
+
+        async fn is_valid(&self, token: &AuthToken) -> Result<bool> {
+            Ok(!token.is_empty())
+        }
+
+        async fn verify_request_signature(
+            &self,
+            _token: &AuthToken,
+            signature: &[u8],
+            _message: &str,
+            _timestamp: Option<u64>,
+        ) -> Result<()> {
+            if signature == self.bad.as_slice() {
+                anyhow::bail!("invalid signature");
+            }
+            Ok(())
+        }
+
+        async fn verify_jwt_signature(&self, _token: &AuthToken) -> Result<()> {
+            Ok(())
+        }
+
+        async fn get_issuer(&self, token: &AuthToken) -> Result<Option<Identity>> {
+            Ok(Some(
+                Identity::user(token.as_str().to_string())
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?,
+            ))
+        }
+    }
+
+    /// relay は**署名を検証してから**消費記録を書く。
+    ///
+    /// request id は署名対象メッセージと principal から導かれ、その構成要素
+    /// (操作・リソース・timestamp・body digest・`aud`)は**すべて公開情報**である。
+    /// 検証前に記録すると、鍵も有効な署名も持たない第三者が、対象ユーザーの
+    /// 正規リクエストの id をゴミ署名で先に焼き潰せてしまう —
+    /// body の無い `delete` は現在秒を入れるだけでメッセージが完全に予測でき、
+    /// 毎秒繰り返せばそのユーザーはこの relay 経由で何も更新できなくなる。
+    #[tokio::test]
+    async fn an_invalid_signature_cannot_burn_a_legitimate_request_id() {
+        let token = AuthToken::new("user:04aaaa".to_string());
+        let forged: Vec<u8> = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let genuine: Vec<u8> = vec![0x01, 0x02, 0x03];
+
+        let service: TestService = StateNodeService::new(
+            MockNodeRegistry::new(),
+            Arc::new(RwLock::new(MockContentNetworkRepository::new())),
+            Arc::new(MockPeerNetwork::new().with_local_peer_id("node-1")),
+            MockEventPublisher::new(),
+            Arc::new(MockContentRepository::new()),
+            "node-1".to_string(),
+        )
+        .with_authentication_service(RejectsOneSignature {
+            bad: forged.clone(),
+        })
+        .with_authorization_service(AllowAllAuthorizationService);
+
+        // 攻撃者が、被害者の principal・対象 content・現在秒で `delete` を
+        // 先回りして送る。署名は持っていないので出鱈目。
+        let attack = service
+            .consume_relayed_mutation_signature(
+                &token,
+                &forged,
+                "delete",
+                "content-1",
+                Some(1_700_000_000),
+                None,
+            )
+            .await;
+        assert!(attack.is_err(), "無効な署名は拒否されなければならない");
+
+        // 同じ principal・同じメッセージの正規リクエストが、まだ通ること。
+        // ここが Err になるなら記録が先に書かれている＝ DoS が成立している。
+        service
+            .consume_relayed_mutation_signature(
+                &token,
+                &genuine,
+                "delete",
+                "content-1",
+                Some(1_700_000_000),
+                None,
+            )
+            .await
+            .expect("正規リクエストが先取りで潰されてはならない");
+
+        // 使い切りそのものは維持されている(2 度目は拒否)。
+        let replay = service
+            .consume_relayed_mutation_signature(
+                &token,
+                &genuine,
+                "delete",
+                "content-1",
+                Some(1_700_000_000),
+                None,
+            )
+            .await;
+        assert!(
+            matches!(replay, Err(StateNodeError::RequestAlreadyApplied(_))),
+            "同じ署名済みリクエストの 2 度目は拒否されなければならない"
+        );
+    }
+
+    /// 委譲 JWT **自身の署名**も malleable である。生のトークン文字列を ID の
+    /// 入力にすると、claims も `aud` も request signature も変えずに `s` を
+    /// 反転するだけで別 ID を作れてしまい、同一ノードでも再適用できる。
+    ///
+    /// ID は検証後の canonical principal(`aud` の鍵 ID)から導くので、
+    /// JWT のバイト列が変わっても ID は動かない。
+    #[test]
+    fn mutation_request_id_ignores_the_jwt_signature_encoding() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        use p256::ecdsa::{signature::Signer, Signature, SigningKey};
+
+        // 実物と同じ形の JWT を組み立てる(header.payload を P-256 で署名)。
+        let key = SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"ES256","typ":"JWT","ver":"1.0"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(
+            br#"{"iss":"monas:user:alice","aud":"monas:user:bob","jti":"j1","iat":1700000000,"exp":1700003600,"att":[]}"#,
+        );
+        let signing_input = format!("{}.{}", header, payload);
+        let sig: Signature = key.sign(signing_input.as_bytes());
+
+        // 同じ鍵・同じメッセージに対して有効な、もう一方の表現。
+        let alt = Signature::from_scalars(*sig.r(), -*sig.s()).unwrap();
+
+        let jwt_a = format!("{}.{}", signing_input, URL_SAFE_NO_PAD.encode(sig.to_vec()));
+        let jwt_b = format!("{}.{}", signing_input, URL_SAFE_NO_PAD.encode(alt.to_vec()));
+        assert_ne!(
+            jwt_a, jwt_b,
+            "2 つの表現が同じでは、このテストは何も証明しない"
+        );
+        // 実際に JWT として解釈できることを確かめる。ここが失敗すると
+        // `canonical_principal` が raw フォールバックに落ち、両者が別 ID に
+        // なるのを「malleability を防げていない」と誤読してしまう。
+        assert!(
+            crate::infrastructure::auth::auth_token::AuthToken::from_jwt(&jwt_a).is_ok(),
+            "テスト用 JWT が本物のスキーマを満たしていない"
+        );
+
+        let msg = StateNodeService::<
+            MockNodeRegistry,
+            MockContentNetworkRepository,
+            MockPeerNetwork,
+            MockEventPublisher,
+            MockContentRepository,
+        >::build_signing_message(
+            "update", "content-1", 1_700_000_000, Some(b"payload")
+        );
+
+        let id_of = |t: &str| {
+            StateNodeService::<
+                MockNodeRegistry,
+                MockContentNetworkRepository,
+                MockPeerNetwork,
+                MockEventPublisher,
+                MockContentRepository,
+            >::mutation_request_id(&AuthToken::new(t.to_string()), &msg)
+        };
+
+        assert_eq!(
+            id_of(&jwt_a),
+            id_of(&jwt_b),
+            "JWT の署名表現を変えても同じリクエストとして識別されなければならない"
+        );
+
+        // 別の aud(＝別の principal)なら当然 ID は変わる。
+        let other_payload = URL_SAFE_NO_PAD.encode(
+            br#"{"iss":"monas:user:alice","aud":"monas:user:carol","jti":"j1","iat":1700000000,"exp":1700003600,"att":[]}"#,
+        );
+        let other_input = format!("{}.{}", header, other_payload);
+        let other_sig: Signature = key.sign(other_input.as_bytes());
+        let jwt_c = format!(
+            "{}.{}",
+            other_input,
+            URL_SAFE_NO_PAD.encode(other_sig.to_vec())
+        );
+        assert_ne!(
+            id_of(&jwt_a),
+            id_of(&jwt_c),
+            "aud が違えば別 principal なので ID も別でなければならない"
+        );
+    }
+
+    /// mutation の同一性は「署名バイト列」ではなく「署名対象メッセージ + signer」
+    /// から導く。ECDSA は malleable なので、署名の digest を ID にすると、
+    /// 1 つの承認済みリクエストが 2 つの ID を持ってしまい、`s` を反転した
+    /// 署名を送り直すだけで消費記録をすり抜けて再適用できてしまう。
+    #[test]
+    fn mutation_request_id_ignores_the_signature_encoding() {
+        let token = AuthToken::new("user:04aaaa".to_string());
+        let msg = StateNodeService::<
+            MockNodeRegistry,
+            MockContentNetworkRepository,
+            MockPeerNetwork,
+            MockEventPublisher,
+            MockContentRepository,
+        >::build_signing_message(
+            "update", "content-1", 1_700_000_000, Some(b"payload")
+        );
+
+        let id_of = |t: &AuthToken, m: &str| {
+            StateNodeService::<
+                MockNodeRegistry,
+                MockContentNetworkRepository,
+                MockPeerNetwork,
+                MockEventPublisher,
+                MockContentRepository,
+            >::mutation_request_id(t, m)
+        };
+
+        // 同じ (token, message) は常に同じ ID。署名は一切入力に含まれないので、
+        // その表現がどうであれ ID は動かない。
+        assert_eq!(id_of(&token, &msg), id_of(&token, &msg));
+
+        // 署名対象が 1 ビットでも違えば別 ID
+        for other in [
+            StateNodeService::<
+                MockNodeRegistry,
+                MockContentNetworkRepository,
+                MockPeerNetwork,
+                MockEventPublisher,
+                MockContentRepository,
+            >::build_signing_message(
+                "update", "content-2", 1_700_000_000, Some(b"payload")
+            ),
+            StateNodeService::<
+                MockNodeRegistry,
+                MockContentNetworkRepository,
+                MockPeerNetwork,
+                MockEventPublisher,
+                MockContentRepository,
+            >::build_signing_message(
+                "delete", "content-1", 1_700_000_000, Some(b"payload")
+            ),
+            StateNodeService::<
+                MockNodeRegistry,
+                MockContentNetworkRepository,
+                MockPeerNetwork,
+                MockEventPublisher,
+                MockContentRepository,
+            >::build_signing_message(
+                "update", "content-1", 1_700_000_001, Some(b"payload")
+            ),
+            StateNodeService::<
+                MockNodeRegistry,
+                MockContentNetworkRepository,
+                MockPeerNetwork,
+                MockEventPublisher,
+                MockContentRepository,
+            >::build_signing_message(
+                "update", "content-1", 1_700_000_000, Some(b"tampered")
+            ),
+        ] {
+            assert_ne!(id_of(&token, &msg), id_of(&token, &other));
+        }
+
+        // 別の caller は別 ID。同じにすると、一方が他方のリクエストを
+        // 先に消費してしまう。
+        let other_token = AuthToken::new("user:04bbbb".to_string());
+        assert_ne!(id_of(&token, &msg), id_of(&other_token, &msg));
+    }
+
+    /// token と message の境界が曖昧だと、片方の末尾ともう片方の先頭を
+    /// 付け替えた別の組み合わせが同じ ID になり得る。長さ前置でそれを防ぐ。
+    #[test]
+    fn mutation_request_id_separates_token_from_message() {
+        let id_of = |t: &str, m: &str| {
+            StateNodeService::<
+                MockNodeRegistry,
+                MockContentNetworkRepository,
+                MockPeerNetwork,
+                MockEventPublisher,
+                MockContentRepository,
+            >::mutation_request_id(&AuthToken::new(t.to_string()), m)
+        };
+        assert_ne!(
+            id_of("user:04ab", "cd-message"),
+            id_of("user:04", "abcd-message")
+        );
     }
 
     #[tokio::test]
@@ -3091,26 +4104,178 @@ mod tests {
             .authorize_read(
                 &test_token(),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
                 "content-1",
             )
             .await;
         assert!(result.is_ok(), "owner must be allowed: {result:?}");
     }
 
+    /// policy が無いレプリカでの read は拒否する(fail-closed)。
+    ///
+    /// create genesis は `access_policy: None` で作られ owner policy は別
+    /// operation として届くため、「genesis はあるが policy が無い」状態は
+    /// 部分同期で実際に起こり得る。これを public 扱いにすると、認可契約の
+    /// 無いまま暗号文と履歴を任意の認証済み caller に渡してしまう。
     #[tokio::test]
-    async fn test_authorize_read_allows_when_no_policy() {
-        // Documented semantics: content without a policy is readable.
+    async fn test_authorize_read_denies_when_policy_is_missing() {
         let service = create_test_service("node-1");
         let result = service
             .authorize_read(
                 &test_token(),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
                 "content-1",
             )
             .await;
-        assert!(result.is_ok());
+        match result {
+            Err(StateNodeError::AuthorizationFailed(msg)) => {
+                assert!(msg.contains("no access policy"), "msg={msg}");
+            }
+            other => panic!("expected AuthorizationFailed, got: {other:?}"),
+        }
+    }
+
+    /// 「genesis はレプリカにあるが owner policy がまだ届いていない」状態を
+    /// 直接再現し、非 owner の read が拒否されることを確認する。
+    /// これが塞ぐ実シナリオ(create の Create payload は `access_policy: None`
+    /// で、owner policy は別 operation として届く)。
+    #[tokio::test]
+    async fn test_authorize_read_denies_on_genesis_only_replica() {
+        let service = create_test_service("node-1");
+
+        // genesis(コンテンツ本体)だけが存在し、access_policies は空のまま
+        service
+            .crdt_repo
+            .contents
+            .lock()
+            .await
+            .insert("content-genesis-only".to_string(), b"ciphertext".to_vec());
+        assert!(
+            service
+                .crdt_repo
+                .access_policies
+                .lock()
+                .await
+                .get("content-genesis-only")
+                .is_none(),
+            "precondition: replica must not have the owner policy yet"
+        );
+
+        let result = service
+            .authorize_read(
+                &test_token(),
+                Some(&test_request_signature()),
+                test_timestamp(),
+                "content-genesis-only",
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(StateNodeError::AuthorizationFailed(_))),
+            "genesis-only replica must not serve reads without a policy: {result:?}"
+        );
+    }
+
+    /// The read request signature must be verified against a message bound to
+    /// the specific content id (`read:{content_id}:{timestamp}`), not a
+    /// generic `read:content:{timestamp}`. This keeps a signature forwarded to
+    /// relay members (or leaked to a non-member node) from being replayed to
+    /// read other content (PR #54 review).
+    #[tokio::test]
+    async fn test_read_signature_message_is_bound_to_content_id() {
+        struct CapturingAuthService {
+            messages: Arc<std::sync::Mutex<Vec<String>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl AuthenticationService for CapturingAuthService {
+            async fn authenticate(
+                &self,
+                token: &AuthToken,
+                _context: Option<&crate::port::auth_token::AuthContext>,
+            ) -> Result<Identity> {
+                Identity::user(token.as_str().to_string())
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))
+            }
+
+            async fn is_valid(&self, token: &AuthToken) -> Result<bool> {
+                Ok(!token.is_empty())
+            }
+
+            async fn verify_request_signature(
+                &self,
+                _token: &AuthToken,
+                _signature: &[u8],
+                message: &str,
+                _timestamp: Option<u64>,
+            ) -> Result<()> {
+                self.messages.lock().unwrap().push(message.to_string());
+                Ok(())
+            }
+
+            async fn verify_jwt_signature(&self, _token: &AuthToken) -> Result<()> {
+                Ok(())
+            }
+
+            async fn get_issuer(&self, token: &AuthToken) -> Result<Option<Identity>> {
+                Ok(Some(
+                    Identity::user(token.as_str().to_string())
+                        .map_err(|e| anyhow::anyhow!(e.to_string()))?,
+                ))
+            }
+        }
+
+        let messages = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let node_registry = MockNodeRegistry::new();
+        let content_repo = Arc::new(RwLock::new(MockContentNetworkRepository::new()));
+        let peer_network = Arc::new(MockPeerNetwork::new().with_local_peer_id("node-1"));
+        let event_publisher = MockEventPublisher::new();
+        let crdt_repo = Arc::new(MockContentRepository::new());
+        let service: TestService = StateNodeService::new(
+            node_registry,
+            content_repo,
+            peer_network,
+            event_publisher,
+            crdt_repo,
+            "node-1".to_string(),
+        )
+        .with_authentication_service(CapturingAuthService {
+            messages: Arc::clone(&messages),
+        });
+
+        service
+            .authenticate_for_read(
+                &test_token(),
+                Some(&test_request_signature()),
+                Some(1234),
+                "content-abc",
+            )
+            .await
+            .expect("authentication should succeed");
+
+        let captured = messages.lock().unwrap();
+        assert_eq!(captured.len(), 1, "exactly one signature check expected");
+        let message = &captured[0];
+
+        // 署名対象は domain-separated かつ operation / resource / timestamp に
+        // 束縛される。content id が入っていないと、ある content 向けの署名を
+        // 別 content の read に再利用できてしまう。
+        assert_eq!(
+            message,
+            &RequestMetadata {
+                timestamp: 1234,
+                operation: "read".to_string(),
+                resource: "content-abc".to_string(),
+            }
+            .signing_message(),
+            "read signature message must bind operation, content id and timestamp"
+        );
+        assert!(message.contains("content-abc"), "message={message}");
+        assert!(
+            message.starts_with("monas-request-v1:"),
+            "message={message}"
+        );
     }
 
     #[tokio::test]
@@ -3161,7 +4326,7 @@ mod tests {
             .authorize_read(
                 &test_token(),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
                 "content-1",
             )
             .await;
@@ -3182,7 +4347,7 @@ mod tests {
             .authorize_read(
                 &test_token(),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
                 "content-1",
             )
             .await;
@@ -3199,7 +4364,7 @@ mod tests {
                 None,
                 &test_token(),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
             )
             .await;
         assert!(result.is_err());
@@ -3258,6 +4423,203 @@ mod tests {
             .unwrap();
         assert!(network.has_member_str("node-1"));
         assert!(network.has_member_str("node-2"));
+    }
+
+    /// A peer cannot plant a `ContentNetwork` record by publishing a
+    /// `ContentCreated` that names someone else as the creator.
+    ///
+    /// Without this check any node could name us in `member_nodes` for a
+    /// content of its choosing, and the record would read back as
+    /// `MemberProvenance::LocalRecord` — which decides whether a 403 from a
+    /// listed peer is treated as final.
+    #[tokio::test]
+    async fn content_created_from_a_peer_other_than_the_creator_is_rejected() {
+        let service = create_test_service("node-1");
+
+        let event = Event::ContentCreated {
+            content_id: "content-1".to_string(),
+            creator_node_id: "node-2".to_string(),
+            content_size: 100,
+            member_nodes: vec!["node-1".to_string(), "node-2".to_string()],
+            timestamp: 12345,
+        };
+
+        // Published by node-9, which is neither the claimed creator nor in the
+        // member set.
+        let result = service.handle_sync_event(&event, Some("node-9")).await;
+        assert!(result.is_err(), "unrelated publisher must be rejected");
+
+        let network = service
+            .get_content_network_for_test("content-1")
+            .await
+            .unwrap();
+        assert!(network.is_none(), "no record may be planted");
+    }
+
+    /// The legitimate path still works: `create_content` publishes with
+    /// `creator_node_id == local_node_id`, so the authenticated publisher
+    /// matches the claimed creator.
+    #[tokio::test]
+    async fn content_created_from_the_real_creator_is_accepted() {
+        let service = create_test_service("node-1");
+
+        let event = Event::ContentCreated {
+            content_id: "content-1".to_string(),
+            creator_node_id: "node-2".to_string(),
+            content_size: 100,
+            member_nodes: vec!["node-1".to_string(), "node-2".to_string()],
+            timestamp: 12345,
+        };
+
+        let outcome = service
+            .handle_sync_event(&event, Some("node-2"))
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            ApplyOutcome::NeedsSync {
+                content_id: "content-1".to_string()
+            }
+        );
+
+        let network = service
+            .get_content_network_for_test("content-1")
+            .await
+            .unwrap()
+            .expect("record stored");
+        assert!(network.has_member_str("node-2"));
+    }
+
+    /// A non-member cannot evict us from our own record by naming us as the
+    /// removed node.
+    ///
+    /// This arm had no publisher check at all, so a single event from any peer
+    /// deleted the `ContentNetwork` record — which is what decides whether a
+    /// relay treats a peer's 403 as final.
+    #[tokio::test]
+    async fn removal_from_a_non_member_cannot_delete_our_record() {
+        let content_repo = Arc::new(RwLock::new(
+            MockContentNetworkRepository::new()
+                .with_network(create_test_network("content-1", vec!["node-1", "node-2"])),
+        ));
+        let service: TestService = StateNodeService::new(
+            MockNodeRegistry::new(),
+            content_repo,
+            Arc::new(MockPeerNetwork::new().with_local_peer_id("node-1")),
+            MockEventPublisher::new(),
+            Arc::new(MockContentRepository::new()),
+            "node-1".to_string(),
+        )
+        .with_authentication_service(TestAuthService)
+        .with_authorization_service(AllowAllAuthorizationService);
+
+        let event = Event::ContentNetworkManagerRemoved {
+            content_id: "content-1".to_string(),
+            removed_node_id: "node-1".to_string(),
+            member_nodes: vec!["node-2".to_string()],
+            reason: "low_capacity".to_string(),
+            timestamp: 12345,
+        };
+
+        let result = service.handle_sync_event(&event, Some("node-9")).await;
+        assert!(result.is_err(), "non-member publisher must be rejected");
+
+        assert!(
+            service
+                .get_content_network_for_test("content-1")
+                .await
+                .unwrap()
+                .is_some(),
+            "our record must survive"
+        );
+    }
+
+    /// A non-member cannot delete our record with a `ContentDeleted` event.
+    ///
+    /// `verify_source_peer_id` alone does not help here: the event names its
+    /// own publisher, so any authenticated peer satisfies it.
+    #[tokio::test]
+    async fn content_deleted_from_a_non_member_cannot_delete_our_record() {
+        let content_repo = Arc::new(RwLock::new(
+            MockContentNetworkRepository::new()
+                .with_network(create_test_network("content-1", vec!["node-1", "node-2"])),
+        ));
+        let service: TestService = StateNodeService::new(
+            MockNodeRegistry::new(),
+            content_repo,
+            Arc::new(MockPeerNetwork::new().with_local_peer_id("node-1")),
+            MockEventPublisher::new(),
+            Arc::new(MockContentRepository::new()),
+            "node-1".to_string(),
+        )
+        .with_authentication_service(TestAuthService)
+        .with_authorization_service(AllowAllAuthorizationService);
+
+        // node-9 both publishes and names itself — the self-claim check passes.
+        let event = Event::ContentDeleted {
+            content_id: "content-1".to_string(),
+            deleted_by_node_id: "node-9".to_string(),
+            timestamp: 12345,
+        };
+
+        let result = service.handle_sync_event(&event, Some("node-9")).await;
+        assert!(result.is_err(), "non-member publisher must be rejected");
+
+        assert!(
+            service
+                .get_content_network_for_test("content-1")
+                .await
+                .unwrap()
+                .is_some(),
+            "our record must survive"
+        );
+    }
+
+    /// A non-member cannot rewrite the member set of a network we already hold.
+    #[tokio::test]
+    async fn membership_change_from_a_non_member_is_rejected() {
+        let node_registry = MockNodeRegistry::new();
+        let content_repo = Arc::new(RwLock::new(
+            MockContentNetworkRepository::new()
+                .with_network(create_test_network("content-1", vec!["node-1", "node-2"])),
+        ));
+        let peer_network = Arc::new(MockPeerNetwork::new().with_local_peer_id("node-1"));
+
+        let service: TestService = StateNodeService::new(
+            node_registry,
+            content_repo,
+            peer_network,
+            MockEventPublisher::new(),
+            Arc::new(MockContentRepository::new()),
+            "node-1".to_string(),
+        )
+        .with_authentication_service(TestAuthService)
+        .with_authorization_service(AllowAllAuthorizationService);
+
+        // node-9 is not in the network, but tries to add itself to it.
+        let event = Event::ContentNetworkManagerAdded {
+            content_id: "content-1".to_string(),
+            added_node_id: "node-9".to_string(),
+            member_nodes: vec![
+                "node-1".to_string(),
+                "node-2".to_string(),
+                "node-9".to_string(),
+            ],
+            timestamp: 12345,
+        };
+
+        let result = service.handle_sync_event(&event, Some("node-9")).await;
+        assert!(result.is_err(), "non-member publisher must be rejected");
+
+        let network = service
+            .get_content_network_for_test("content-1")
+            .await
+            .unwrap()
+            .expect("record still present");
+        assert!(
+            !network.has_member_str("node-9"),
+            "member set must be unchanged"
+        );
     }
 
     #[tokio::test]
@@ -3562,7 +4924,7 @@ mod tests {
                 b"new data",
                 Some(&test_token()),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
             )
             .await;
 

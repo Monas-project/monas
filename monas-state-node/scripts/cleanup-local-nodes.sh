@@ -76,7 +76,7 @@ fi
 
 # ポートが使用されているか確認
 log_info "ポートの使用状況を確認しています..."
-for port in 8080 8081 8082; do
+for port in 8080 8081 8082 8083; do
     if lsof -i:$port > /dev/null 2>&1; then
         log_warn "ポート $port がまだ使用されています"
         # ポートを使用しているプロセスを表示
@@ -90,7 +90,7 @@ done
 if [ "$1" = "--all" ] || [ "$1" = "--data" ]; then
     log_warn "データディレクトリを削除しています..."
 
-    for node in node1 node2 node3; do
+    for node in node1 node2 node3 node4; do
         if [ -d "data/$node" ]; then
             rm -rf "data/$node"
             log_info "data/$node を削除しました"

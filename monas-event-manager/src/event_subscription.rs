@@ -485,7 +485,7 @@ impl EventSubscriptions {
         let subscriptions = self.subscriptions.read().await;
         let mut health_status = HashMap::new();
 
-        for (_, subscribers) in subscriptions.iter() {
+        for subscribers in subscriptions.values() {
             for subscriber in subscribers {
                 let status = if subscriber.is_healthy().await {
                     ConnectionStatus::Connected
@@ -505,7 +505,7 @@ impl EventSubscriptions {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let subscriptions = self.subscriptions.read().await;
         let persistence = self.dead_letter_manager.as_ref();
-        for (_, subscribers) in subscriptions.iter() {
+        for subscribers in subscriptions.values() {
             for subscriber in subscribers {
                 subscriber.process_retry_queue(persistence).await;
             }
@@ -579,7 +579,7 @@ impl EventSubscriptions {
         let subscriptions = self.subscriptions.read().await;
 
         // Add to retry queue of all subscribers
-        for (_, subscribers) in subscriptions.iter() {
+        for subscribers in subscriptions.values() {
             for subscriber in subscribers {
                 subscriber.add_to_retry_queue(message.clone()).await;
             }

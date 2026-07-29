@@ -12,7 +12,7 @@ use crate::{
     application_service::{content_service::ContentService, share_service::ShareService},
     infrastructure::{
         content_id::Sha256ContentIdGenerator,
-        encryption::{Aes256CtrContentEncryption, OsRngContentEncryptionKeyGenerator},
+        encryption::{Aes256GcmContentEncryption, OsRngContentEncryptionKeyGenerator},
         key_store::InMemoryContentEncryptionKeyStore,
         key_wrapping::HpkeV1KeyWrapping,
         public_key_directory::InMemoryPublicKeyDirectory,
@@ -36,7 +36,7 @@ struct AppState {
             Sha256ContentIdGenerator,
             MultiStorageRepository,
             OsRngContentEncryptionKeyGenerator,
-            Aes256CtrContentEncryption,
+            Aes256GcmContentEncryption,
             InMemoryContentEncryptionKeyStore,
         >,
     >,
@@ -68,7 +68,7 @@ pub fn create_router() -> Router {
         content_id_generator: Sha256ContentIdGenerator,
         content_repository: content_repository.clone(),
         key_generator: OsRngContentEncryptionKeyGenerator,
-        encryptor: Aes256CtrContentEncryption,
+        encryptor: Aes256GcmContentEncryption,
         cek_store: cek_store.clone(),
     };
 

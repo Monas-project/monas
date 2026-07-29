@@ -100,6 +100,10 @@ pub struct Share {
     content_id: ContentId,
     /// key = KeyId
     recipients: HashMap<KeyId, ShareRecipient>,
+    /// CEK の鍵世代。rotation(revoke による再暗号化)のたびに +1 される。
+    /// KeyEnvelope に載り、受信者側の旧世代 envelope 拒否(replay 防止)の基準になる。
+    #[serde(default)]
+    key_epoch: u64,
 }
 
 impl Share {
@@ -110,7 +114,18 @@ impl Share {
         Self {
             content_id,
             recipients: HashMap::new(),
+            key_epoch: 0,
         }
+    }
+
+    /// 現在の CEK 鍵世代。
+    pub fn key_epoch(&self) -> u64 {
+        self.key_epoch
+    }
+
+    /// CEK rotation(再暗号化)に合わせて鍵世代を進める。
+    pub fn bump_key_epoch(&mut self) {
+        self.key_epoch += 1;
     }
 
     /// Read 権限の付与。
@@ -184,6 +199,7 @@ impl Share {
         Self {
             content_id: new_content_id,
             recipients: self.recipients.clone(),
+            key_epoch: self.key_epoch,
         }
     }
 

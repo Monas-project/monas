@@ -11,8 +11,6 @@ path = "src/lib.rs"
 [dependencies]
 monas-filesync = { path = "../monas-filesync", optional = true }
 aes-gcm = "0.10.3"
-aes = "0.8"
-ctr = "0.9"
 rand_core = { version = "0.6.4", features = ["std"] }
 rand = "0.8.5"
 chrono = { version = "0.4.40", features = ["serde"] }
@@ -32,6 +30,13 @@ base64 = "0.22"
 sled = "0.34"
 hpke-rs = { version = "0.4", features = ["hazmat"] }
 hpke-rs-rust-crypto = "0.3"
+# For verifying relay-read responses: recompute the crsl-lib Node CID from the
+# returned Node CBOR (docs/design/read-response-integrity.md §8). Versions must
+# match crsl-lib's (cid 0.11, multihash 0.19, serde_cbor 0.11) so the recomputed
+# CID string is byte-identical.
+serde_cbor = "0.11"
+cid = { version = "0.11", features = ["serde"] }
+multihash = "0.19"
 
 [features]
 default = ["filesync"]
@@ -39,3 +44,6 @@ filesync = ["monas-filesync", "monas-filesync/cloud-connectivity"]
 
 [dev-dependencies]
 tempfile = "3.19.1"
+# Parity test only: build a real crsl-lib Node and confirm our from-CBOR CID
+# recompute matches Node::content_id() exactly. Same rev as monas-state-node.
+crsl-lib = { git = "https://github.com/Monas-project/crsl-lib", rev = "e13b86ce6d6a9c27ebd01a9b4fe82d6bc18f8a01" }

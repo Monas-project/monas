@@ -193,7 +193,19 @@ impl IntoResponse for StateNodeError {
             StateNodeError::NotAMember { .. } => self.to_string(),
             StateNodeError::PermissionDenied(_) => "Permission denied".to_string(),
             StateNodeError::InvalidUcanToken(_) => "Invalid authentication token".to_string(),
-            StateNodeError::AuthenticationFailed(_) => "Authentication failed".to_string(),
+            StateNodeError::AuthenticationFailed(detail) => {
+                tracing::warn!("authentication failed: {detail}");
+                "Authentication failed".to_string()
+            }
+            // 再送であることは呼び出し側に伝えてよい。伝えないと、正規の
+            // クライアントは「認証に失敗した」と読んで同じ署名で延々と
+            // 再試行してしまう(正しい対処は新しい timestamp で署名し直すこと)。
+            StateNodeError::RequestAlreadyApplied(detail) => {
+                tracing::warn!("replayed request rejected: {detail}");
+                "This signed request has already been applied. Re-sign the request with a fresh \
+                 timestamp instead of resending the previous signature."
+                    .to_string()
+            }
             StateNodeError::AuthorizationFailed(_) => "Authorization failed".to_string(),
             StateNodeError::InvalidCid(_) => "Invalid content identifier".to_string(),
             StateNodeError::InvalidConfiguration(_) => "Invalid request".to_string(),
@@ -717,20 +729,28 @@ async fn get_content_data(
 
     let crdt_repo = state.crdt_repo();
 
-    // Get data based on version parameter
-    let data_result = if let Some(version) = &query.version {
-        crdt_repo.get_version(&content_id, version).await
+    // Return the whole Node (CBOR), matching the relay branch above, so the
+    // client always verifies the same format (recompute CID) regardless of
+    // whether this node held the content locally or relayed the read.
+    // (docs/design.md §10「read応答の完全性検証」)
+    let data_result: Result<Option<(Vec<u8>, String)>, _> = if let Some(version) = &query.version {
+        crdt_repo
+            .get_version_node_bytes(&content_id, version)
+            .await
+            .map(|opt| opt.map(|bytes| (bytes, version.clone())))
     } else {
-        crdt_repo.get_latest(&content_id).await
+        crdt_repo
+            .get_latest_node_bytes_with_version(&content_id)
+            .await
     };
 
     match data_result {
-        Ok(Some(data)) => {
+        Ok(Some((data, served_version))) => {
             let encoded = base64::engine::general_purpose::STANDARD.encode(&data);
             Json(ContentDataResponse {
                 content_id,
                 data: encoded,
-                version: query.version,
+                version: Some(served_version),
             })
             .into_response()
         }
@@ -811,7 +831,12 @@ async fn get_content_version(
 
     let crdt_repo = state.crdt_repo();
 
-    match crdt_repo.get_version(&content_id, &version).await {
+    // Return the whole Node (CBOR), matching the relay branch, so the client
+    // verifies the same format everywhere (§8.1).
+    match crdt_repo
+        .get_version_node_bytes(&content_id, &version)
+        .await
+    {
         Ok(Some(data)) => {
             let encoded = base64::engine::general_purpose::STANDARD.encode(&data);
             Json(ContentDataResponse {

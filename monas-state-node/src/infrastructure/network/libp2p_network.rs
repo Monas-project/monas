@@ -108,8 +108,21 @@ pub struct GossipsubMessage {
 /// Parsed domain event received from Gossipsub.
 #[derive(Debug, Clone)]
 pub struct ReceivedEvent {
-    /// The source peer ID.
-    pub source: String,
+    /// The peer that **published** the message, as authenticated by gossipsub.
+    ///
+    /// This is `Message::source`, not `propagation_source`: the mesh forwards
+    /// messages, so the peer that handed us the bytes is generally not the one
+    /// that produced them. Under `MessageAuthenticity::Signed` +
+    /// `ValidationMode::Strict` the author field is required and the message
+    /// signature is verified against it before delivery, so a forwarder cannot
+    /// alter it. Authorization checks must use this field — using the
+    /// forwarder would both accept forged origins and reject honest multi-hop
+    /// delivery.
+    ///
+    /// `None` only if a message somehow arrives without an author, which
+    /// Strict mode rejects; callers treat it as "unverifiable" and skip
+    /// origin-bound checks rather than trusting it.
+    pub source: Option<String>,
     /// The parsed domain event.
     pub event: Event,
 }
@@ -1029,8 +1042,10 @@ impl Libp2pNetwork {
                             domain_event.event_type()
                         );
 
+                        // Bind to the authenticated publisher, not the peer
+                        // that forwarded it to us — see `ReceivedEvent::source`.
                         let received = ReceivedEvent {
-                            source: propagation_source.to_string(),
+                            source: message.source.map(|p| p.to_string()),
                             event: domain_event,
                         };
 
@@ -1169,8 +1184,11 @@ impl Libp2pNetwork {
                 // binding `sender_peer == bs.creator_node_id` stops creator
                 // impersonation. Requiring that `local_peer` appear in
                 // `member_nodes` stops a malicious peer from fabricating a
-                // network on an unrelated victim node. The residual risk
-                // matches the Gossipsub ContentCreated trust model.
+                // network on an unrelated victim node. This mirrors the
+                // Gossipsub `ContentCreated` path, which binds the
+                // authenticated publisher to the creator it claims; the
+                // residual risk is the same — an authenticated creator can
+                // still declare a member set of its choosing.
                 if bs.creator_node_id != sender_peer {
                     return Err(format!(
                         "bootstrap creator_node_id {} does not match sender {}",

@@ -67,6 +67,50 @@ pub struct MonasController {
     content_service: ContentServiceInstance,
     /// ShareService
     share_service: ShareServiceInstance,
+    /// share 受信者側の送信者公開鍵ピン(TOFU)と受理済み CEK 鍵世代の記録
+    /// (KeyEnvelope の送信者認証と rotation 巻き戻し replay 防止)
+    sender_pin_store: DynSenderPinStore,
+    /// content 単位の revoke 直列化ロック。
+    content_revoke_locks: ContentLocks,
+}
+
+/// SDK が使う送信者鍵ピンストアの動的型。
+pub(super) type DynSenderPinStore =
+    std::sync::Arc<dyn monas_content::infrastructure::sender_key_pin_store::SenderKeyPinStore>;
+
+/// content id ごとの相互排他ロック。
+///
+/// revoke は「ACL・CEK・ローカル ciphertext・state node の状態」を
+/// load-modify-save で更新する複合操作で、そのどれにも version CAS が無い。
+/// `MonasController` は gateway 等で `Arc` 共有され複数リクエストから同時に
+/// 呼ばれるため、同じ content への revoke が並行すると次が起こる:
+///
+/// - 双方が同じ Share を読み、後勝ちで save → 片方の受信者削除が消える
+///   (lost update)
+/// - 異なる CEK が同じ key_epoch として配られる
+/// - ローカル ACL/CEK と state node の ciphertext が別リクエスト由来になる
+///
+/// 根本解決は Share・CEK・ciphertext を1つの transactional CAS にまとめる
+/// ことだが、3ストア + リモート更新にまたがるため、まず content 単位の
+/// 直列化で「並行 revoke が状態を分岐させない」ことを保証する。
+/// ロックはプロセス内のみで、複数 gateway プロセスからの並行 revoke は
+/// カバーしない(その場合は state node 側の CAS が必要)。
+#[derive(Clone, Default)]
+pub(super) struct ContentLocks {
+    inner: Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<std::sync::Mutex<()>>>>>,
+}
+
+impl ContentLocks {
+    /// `content_id` 専用の mutex を取得する。同じ id には常に同じ mutex を返す。
+    pub(super) fn mutex_for(&self, content_id: &str) -> Arc<std::sync::Mutex<()>> {
+        let mut map = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        map.entry(content_id.to_string())
+            .or_insert_with(|| Arc::new(std::sync::Mutex::new(())))
+            .clone()
+    }
 }
 
 impl MonasController {
@@ -159,7 +203,7 @@ impl MonasController {
         // stateless thin client and push CEK / share ownership to State Node,
         // or (b) define an explicit pluggable port for CEK ownership semantics.
         let content_repository = Self::create_content_repository();
-        let (cek_store, share_repository, public_key_directory) =
+        let (cek_store, share_repository, public_key_directory, sender_pin_store) =
             Self::create_persistence(&config.persistence)?;
         let agent = Self::build_agent(&config);
 
@@ -178,6 +222,8 @@ impl MonasController {
                 share_repository,
                 public_key_directory,
             ),
+            sender_pin_store,
+            content_revoke_locks: ContentLocks::default(),
         })
     }
 
@@ -210,13 +256,22 @@ impl MonasController {
     /// CEK / Share / Public key directory の 3 ストアに共有させる。sled は path 単位で
     /// 排他 flock を取るため、同じディレクトリを 2 度 open すると 2 個目が
     /// 失敗する (`MONAS_PERSISTENCE_DIR` 設定時の本番経路で必ず再現)。
-    /// キー空間は `cek:` / `share:` / `pubkey:` プレフィックスで分離されている。
+    /// キー空間は `cek:` / `share:` / `pubkey:` / `sender_pin:` プレフィックスで分離されている。
     fn create_persistence(
         persistence: &PersistenceConfig,
-    ) -> Result<(DynCekStore, DynShareRepository, DynPublicKeyDirectory), ApiError> {
+    ) -> Result<
+        (
+            DynCekStore,
+            DynShareRepository,
+            DynPublicKeyDirectory,
+            DynSenderPinStore,
+        ),
+        ApiError,
+    > {
         use monas_content::infrastructure::{
             key_store::{InMemoryContentEncryptionKeyStore, SledContentEncryptionKeyStore},
             public_key_directory::{InMemoryPublicKeyDirectory, SledPublicKeyDirectory},
+            sender_key_pin_store::{InMemorySenderKeyPinStore, SledSenderKeyPinStore},
             share_repository::{InMemoryShareRepository, SledShareRepository},
         };
 
@@ -230,7 +285,8 @@ impl MonasController {
                 let cek: DynCekStore = Arc::new(InMemoryContentEncryptionKeyStore::default());
                 let share: DynShareRepository = Arc::new(InMemoryShareRepository::default());
                 let pkd: DynPublicKeyDirectory = Arc::new(InMemoryPublicKeyDirectory::default());
-                Ok((cek, share, pkd))
+                let sender_pin: DynSenderPinStore = Arc::new(InMemorySenderKeyPinStore::default());
+                Ok((cek, share, pkd, sender_pin))
             }
             PersistenceConfig::Sled { dir } => {
                 if let Err(e) = std::fs::create_dir_all(dir) {
@@ -239,17 +295,19 @@ impl MonasController {
                     )));
                 }
                 // sled は path 単位で flock を取るので 1 度だけ開く。
-                // `sled::Db` は Arc ベースで Clone 可能なので、3 つのストアに同じ Db を渡す。
+                // `sled::Db` は Arc ベースで Clone 可能なので、4 つのストアに同じ Db を渡す。
                 let db = sled::open(dir).map_err(|e| {
                     ApiError::Internal(format!("failed to open sled DB at {dir:?}: {e}"))
                 })?;
                 let cek = SledContentEncryptionKeyStore::with_db(db.clone());
                 let share = SledShareRepository::with_db(db.clone());
-                let pkd = SledPublicKeyDirectory::with_db(db);
+                let pkd = SledPublicKeyDirectory::with_db(db.clone());
+                let sender_pin = SledSenderKeyPinStore::with_db(db);
                 let cek: DynCekStore = Arc::new(cek);
                 let share: DynShareRepository = Arc::new(share);
                 let pkd: DynPublicKeyDirectory = Arc::new(pkd);
-                Ok((cek, share, pkd))
+                let sender_pin: DynSenderPinStore = Arc::new(sender_pin);
+                Ok((cek, share, pkd, sender_pin))
             }
         }
     }
@@ -262,14 +320,14 @@ impl MonasController {
         use monas_content::application_service::content_service::ContentService;
         use monas_content::infrastructure::{
             content_id::Sha256ContentIdGenerator,
-            encryption::{Aes256CtrContentEncryption, OsRngContentEncryptionKeyGenerator},
+            encryption::{Aes256GcmContentEncryption, OsRngContentEncryptionKeyGenerator},
         };
 
         ContentService {
             content_id_generator: Sha256ContentIdGenerator,
             content_repository,
             key_generator: OsRngContentEncryptionKeyGenerator,
-            encryptor: Aes256CtrContentEncryption,
+            encryptor: Aes256GcmContentEncryption,
             cek_store,
         }
     }

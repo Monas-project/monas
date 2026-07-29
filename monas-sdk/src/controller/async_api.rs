@@ -28,7 +28,8 @@ use crate::models::share::{
 };
 use crate::models::state::{
     GetHistoryInput, GetHistoryOutput, GetLatestVersionInput, GetLatestVersionOutput,
-    VerifyIntegrityInput, VerifyIntegrityOutput,
+    ReadContentFromStateNodeInput, ReadContentFromStateNodeOutput, VerifyIntegrityInput,
+    VerifyIntegrityOutput,
 };
 
 use super::MonasController;
@@ -166,6 +167,22 @@ impl MonasController {
         auth: Option<StateNodeAuthContext>,
     ) -> ApiResponse<GetHistoryOutput> {
         match tokio::task::spawn_blocking(move || self.get_history(input, auth.as_ref())).await {
+            Ok(resp) => resp,
+            Err(e) => map_join_error(e, fallback_trace_id()),
+        }
+    }
+
+    /// `read_content_from_state_node` の async 版。
+    pub async fn read_content_from_state_node_async(
+        self: Arc<Self>,
+        input: ReadContentFromStateNodeInput,
+        auth: Option<StateNodeAuthContext>,
+    ) -> ApiResponse<ReadContentFromStateNodeOutput> {
+        match tokio::task::spawn_blocking(move || {
+            self.read_content_from_state_node(input, auth.as_ref())
+        })
+        .await
+        {
             Ok(resp) => resp,
             Err(e) => map_join_error(e, fallback_trace_id()),
         }

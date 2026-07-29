@@ -31,7 +31,7 @@ impl TestKeyPair {
     /// * `_name` - Unused (kept for API compatibility). Key ID is derived from public key.
     ///
     /// # Returns
-    /// A new TestKeyPair with self-contained key ID format: "monas:type:{public_key_hex}"
+    /// A new TestKeyPair with self-contained key ID format: "type:{public_key_hex}"
     pub fn generate(identity_type: &str, _name: &str) -> Self {
         let secret = SecretKey::random(&mut OsRng);
         let signing_key = SigningKey::from(secret);
@@ -40,7 +40,7 @@ impl TestKeyPair {
         // Get uncompressed public key (65 bytes: 0x04 + X + Y)
         let public_key_bytes = verifying_key.to_encoded_point(false).as_bytes().to_vec();
 
-        let key_id = format!("monas:{}:{}", identity_type, hex::encode(&public_key_bytes));
+        let key_id = format!("{}:{}", identity_type, hex::encode(&public_key_bytes));
 
         Self {
             secret_key: signing_key,
@@ -127,18 +127,14 @@ impl TestKeyPair {
 
     /// Sign a request using this key pair
     ///
-    /// The request signature format is: "{iss}:{aud}:{jti}"
-    ///
-    /// # Arguments
-    /// * `auth_token` - The AuthToken being used for the request
+    /// The request signature format is `{operation}:{resource}:{timestamp}` —
+    /// identical for every token type (issue #61). The old "{iss}:{aud}:{jti}"
+    /// fixed string is gone: freshness lives inside the signed message.
     ///
     /// # Returns
     /// The request signature bytes
-    pub fn sign_request(&self, auth_token: &AuthToken) -> Vec<u8> {
-        let message = format!(
-            "{}:{}:{}",
-            auth_token.payload.iss, auth_token.payload.aud, auth_token.payload.jti
-        );
+    pub fn sign_request(&self, operation: &str, resource: &str, timestamp: u64) -> Vec<u8> {
+        let message = format!("{operation}:{resource}:{timestamp}");
         self.sign(message.as_bytes())
     }
 }
@@ -161,7 +157,7 @@ impl TestPublicKeyRepository {
     /// Register a public key for a key ID
     ///
     /// # Arguments
-    /// * `key_id` - The key ID to register (format: "monas:type:id")
+    /// * `key_id` - The key ID to register (format: "type:id")
     /// * `public_key` - The public key bytes (uncompressed format)
     pub fn register(&mut self, key_id: &str, public_key: Vec<u8>) {
         self.keys.insert(key_id.to_string(), public_key);
@@ -208,11 +204,11 @@ mod tests {
     #[test]
     fn test_generate_key_pair() {
         let alice = TestKeyPair::generate("user", "alice");
-        assert!(alice.key_id().starts_with("monas:user:04"));
+        assert!(alice.key_id().starts_with("user:04"));
         assert_eq!(alice.public_key().len(), 65); // Uncompressed P256 key
         assert_eq!(alice.public_key()[0], 0x04); // Uncompressed format marker
                                                  // key_id should contain the full hex-encoded public key
-        let expected_key_id = format!("monas:user:{}", hex::encode(alice.public_key()));
+        let expected_key_id = format!("user:{}", hex::encode(alice.public_key()));
         assert_eq!(alice.key_id(), expected_key_id);
     }
 
@@ -247,18 +243,21 @@ mod tests {
 
     #[test]
     fn test_sign_request() {
-        let alice = TestKeyPair::generate("user", "alice");
         let bob = TestKeyPair::generate("user", "bob");
 
-        let token = alice.create_auth_token(
-            &bob,
-            "monas://content/test123",
-            vec![CapabilityAction::Read],
-            None,
-        );
-
-        let request_sig = bob.sign_request(&token);
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let request_sig = bob.sign_request("read", "content-1", ts);
         assert!(!request_sig.is_empty());
+
+        // 統一形式 `{operation}:{resource}:{timestamp}` に対する署名として検証できる
+        let message = format!("read:content-1:{ts}");
+        use p256::ecdsa::signature::Verifier;
+        let vk = bob.secret_key.verifying_key();
+        let sig = p256::ecdsa::Signature::from_slice(&request_sig).unwrap();
+        assert!(vk.verify(message.as_bytes(), &sig).is_ok());
     }
 
     #[test]

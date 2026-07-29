@@ -289,6 +289,66 @@ where
         Ok(plaintext)
     }
 
+    /// Verify and decrypt a relay-read response fetched from a state node.
+    ///
+    /// The state node returns the whole crsl-lib `Node` (CBOR). This:
+    /// 1. Recomputes the Node CID and confirms it equals `expected_version_cid`
+    ///    (tamper detection — a relay peer cannot fabricate the payload).
+    /// 2. Extracts the ciphertext from the Node payload.
+    /// 3. Loads the CEK for `local_content_id` and AES-GCM-decrypts.
+    ///
+    /// This is the client-side core of the verified read path
+    /// (`docs/design.md` §10「read応答の完全性検証」). It verifies **payload
+    /// authenticity only**: that these bytes are the ones named by
+    /// `expected_version_cid`. It does not establish that the version is the
+    /// canonical head, the latest, or the work of an authorized writer.
+    ///
+    /// There is **no monotonicity check anywhere** — neither here nor in the
+    /// SDK above. One existed and was removed: forged `parents` bypass it, and
+    /// it could not tell a legitimate sync lag from an attack, so it broke
+    /// honest reads without stopping dishonest ones. Version authenticity needs
+    /// an owner/writer-signed trust anchor, tracked in issue #59.
+    ///
+    /// Returns the plaintext and the verified node's parent CIDs. The parents
+    /// are returned for callers that want to inspect the DAG; nothing in the
+    /// SDK currently consumes them.
+    /// `cek` を渡した場合はそれを使い、`None` の場合だけローカルの CEK ストアを
+    /// 引く。呼び出し側が「どの CEK が正しいか」をより確実に知っている場合
+    /// (share 受信者は送信者ピンの権威レコードに CEK を持つ)、ストアより
+    /// そちらを優先させるための引数である。ストアは書き込み順が入れ替わると
+    /// 巻き戻り得るキャッシュに過ぎない。
+    pub fn verify_and_decrypt_relay_read(
+        &self,
+        node_bytes: &[u8],
+        expected_version_cid: &str,
+        local_content_id: ContentId,
+        cek: Option<ContentEncryptionKey>,
+    ) -> Result<VerifiedRead, VerifiedReadError> {
+        let verified = crate::infrastructure::node_verification::verify_and_extract(
+            node_bytes,
+            expected_version_cid,
+        )
+        .map_err(VerifiedReadError::NodeVerification)?;
+
+        let key = match cek {
+            Some(key) => key,
+            None => self
+                .cek_store
+                .load(&local_content_id)
+                .map_err(VerifiedReadError::KeyStore)?
+                .ok_or(VerifiedReadError::MissingKey)?,
+        };
+
+        let plaintext = self
+            .decrypt_with_cek(local_content_id, key, verified.ciphertext)
+            .map_err(VerifiedReadError::Decrypt)?;
+
+        Ok(VerifiedRead {
+            plaintext,
+            parents: verified.parents,
+        })
+    }
+
     /// コンテンツ削除ユースケース。
     ///
     /// - 物理削除ではなく、ドメインオブジェクト上で `is_deleted` フラグとバッファをクリアして保存する「論理削除」
@@ -631,6 +691,26 @@ pub enum DecryptWithCekError {
     ContentIdMismatch { expected: String, actual: String },
     #[error("domain error: {0:?}")]
     Domain(ContentError),
+}
+
+/// Result of a verified relay read: the plaintext plus the verified node's
+/// parent version CIDs (used by the caller for the monotonicity check).
+#[derive(Debug)]
+pub struct VerifiedRead {
+    pub plaintext: Vec<u8>,
+    pub parents: Vec<String>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum VerifiedReadError {
+    #[error("node verification failed: {0}")]
+    NodeVerification(crate::infrastructure::node_verification::NodeVerificationError),
+    #[error("key store error: {0:?}")]
+    KeyStore(ContentEncryptionKeyStoreError),
+    #[error("no content encryption key for this content")]
+    MissingKey,
+    #[error("decrypt failed: {0}")]
+    Decrypt(DecryptWithCekError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -990,6 +1070,39 @@ mod tests {
             guard.remove(content_id.as_str());
             Ok(())
         }
+    }
+
+    /// crsl-lib `Node` と同じ CBOR 形状のバイト列を作る
+    /// (`node_verification` が受理する最小構成)。
+    fn make_test_node_bytes(ciphertext: &[u8]) -> Vec<u8> {
+        #[derive(serde::Serialize)]
+        struct Payload<'a> {
+            data: &'a [u8],
+            access_policy: Option<()>,
+        }
+        #[derive(serde::Serialize)]
+        struct Metadata {
+            policy_type: Option<()>,
+        }
+        #[derive(serde::Serialize)]
+        struct Node<'a> {
+            payload: Payload<'a>,
+            parents: Vec<()>,
+            genesis: Option<()>,
+            timestamp: u64,
+            metadata: Metadata,
+        }
+        serde_cbor::to_vec(&Node {
+            payload: Payload {
+                data: ciphertext,
+                access_policy: None,
+            },
+            parents: vec![],
+            genesis: None,
+            timestamp: 0,
+            metadata: Metadata { policy_type: None },
+        })
+        .unwrap()
     }
 
     fn build_service<R, K, E, S>(
@@ -1496,6 +1609,82 @@ mod tests {
             .expect("decrypt_with_cek should succeed when content_id matches");
 
         assert_eq!(result, plaintext);
+    }
+
+    /// `verify_and_decrypt_relay_read` は、明示的に渡された CEK を
+    /// ローカルの CEK ストアより優先する。
+    ///
+    /// ストアは権威レコード(送信者ピン)から導出されるキャッシュに過ぎず、
+    /// CAS の外で書かれるため書き込み順が入れ替わると古い世代へ巻き戻り得る
+    /// (世代 N の handler が CAS 後に停止し、その間に N+1 が権威レコードと
+    ///  キャッシュを進め、その後 N が再開してキャッシュだけを N へ戻す)。
+    /// read が権威レコード側の CEK を使えば、その巻き戻りは影響しない。
+    #[test]
+    fn verified_read_prefers_the_explicit_cek_over_the_store() {
+        /// 鍵を実際に見る暗号化器。鍵の 1 バイト目を XOR するだけだが、
+        /// 「どの CEK で復号したか」がテストから観測できるようになる。
+        struct KeySensitiveEncryptor;
+        impl ContentEncryption for KeySensitiveEncryptor {
+            fn encrypt(
+                &self,
+                key: &ContentEncryptionKey,
+                plaintext: &[u8],
+            ) -> Result<Vec<u8>, ContentError> {
+                Ok(plaintext.iter().map(|b| b ^ key.0[0]).collect())
+            }
+            fn decrypt(
+                &self,
+                key: &ContentEncryptionKey,
+                ciphertext: &[u8],
+            ) -> Result<Vec<u8>, ContentError> {
+                Ok(ciphertext.iter().map(|b| b ^ key.0[0]).collect())
+            }
+        }
+
+        let (repo, _storage) = TestContentRepository::new(false);
+        let (key_store, _key_storage) = TestKeyStore::new(false, false);
+        let service = build_service(repo, TestKeyGenerator, KeySensitiveEncryptor, key_store);
+
+        // 権威レコード側の(正しい)CEK と、巻き戻ったキャッシュ側の CEK
+        let authoritative = ContentEncryptionKey(vec![0x11]);
+        let stale_cache = ContentEncryptionKey(vec![0x22]);
+
+        let plaintext = b"authoritative-cek-wins".to_vec();
+        let ciphertext = service
+            .encryptor
+            .encrypt(&authoritative, &plaintext)
+            .expect("encrypt");
+        let content_id = service.content_id_generator.generate(&plaintext);
+
+        // キャッシュには古い世代の CEK が入っている
+        service
+            .cek_store
+            .save(&content_id, &stale_cache)
+            .expect("save stale cache");
+
+        let node_bytes = make_test_node_bytes(&ciphertext);
+        let version =
+            crate::infrastructure::node_verification::recompute_node_cid(&node_bytes).unwrap();
+
+        // 権威レコードの CEK を渡せば復号できる
+        let read = service
+            .verify_and_decrypt_relay_read(
+                &node_bytes,
+                &version,
+                content_id.clone(),
+                Some(authoritative),
+            )
+            .expect("the explicit CEK must be used");
+        assert_eq!(read.plaintext, plaintext);
+
+        // 渡さなければ巻き戻ったキャッシュが使われ、平文が一致しない
+        // (= この経路に依存していると read が壊れる)
+        let fallback =
+            service.verify_and_decrypt_relay_read(&node_bytes, &version, content_id, None);
+        assert!(
+            fallback.is_err() || fallback.unwrap().plaintext != plaintext,
+            "the stale cache must not yield the correct plaintext"
+        );
     }
 
     #[test]

@@ -727,8 +727,18 @@ async fn delete_content_uses_account_signature_for_metadata_request() {
         .expect("create should return data");
     create_mock.assert();
 
-    let expected_signing_message =
-        BASE64_STANDARD.encode(format!("delete:{}:1818181818", "bafkdelete-signed").as_bytes());
+    // 署名対象は domain-separated かつ長さ前置の統一形式
+    // (`monas-request-v1:<len>:<op>:<len>:<resource>:<ts>:<len>:<body_digest>`)。
+    // body なしリクエストなので body digest は空。
+    let resource = "bafkdelete-signed";
+    let expected_signing_message = BASE64_STANDARD.encode(
+        format!(
+            "monas-request-v1:6:delete:{}:{}:1818181818:0:",
+            resource.len(),
+            resource
+        )
+        .as_bytes(),
+    );
 
     let account_sign_mock = account_server
         .mock("POST", "/accounts/sign")

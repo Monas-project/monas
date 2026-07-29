@@ -12,7 +12,8 @@ use crate::models::content::{
 };
 use crate::models::state_node::{
     StateNodeCreateContentRequest, StateNodeCreateContentResponse, StateNodeDeleteContentResponse,
-    StateNodeErrorResponse, StateNodeUpdateContentRequest, StateNodeUpdateContentResponse,
+    StateNodeErrorResponse, StateNodeInvalidateTokensResponse, StateNodeUpdateContentRequest,
+    StateNodeUpdateContentResponse,
 };
 
 use monas_content::application_service::content_service::{
@@ -24,7 +25,7 @@ use monas_content::domain::content::{Content, ContentEncryptionKey, StorageProvi
 use monas_content::domain::content_id::ContentId;
 use monas_content::infrastructure::{
     content_id::Sha256ContentIdGenerator,
-    encryption::{Aes256CtrContentEncryption, OsRngContentEncryptionKeyGenerator},
+    encryption::{Aes256GcmContentEncryption, OsRngContentEncryptionKeyGenerator},
     MultiStorageRepository,
 };
 
@@ -38,7 +39,7 @@ pub(super) type ContentServiceInstance = ContentService<
     Sha256ContentIdGenerator,
     MultiStorageRepository,
     OsRngContentEncryptionKeyGenerator,
-    Aes256CtrContentEncryption,
+    Aes256GcmContentEncryption,
     DynCekStore,
 >;
 
@@ -96,15 +97,36 @@ impl MonasController {
         req
     }
 
-    fn build_content_signature_message(content_bytes: &[u8], timestamp: u64) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(content_bytes);
-        hasher.update(timestamp.to_be_bytes());
-        hex::encode(hasher.finalize())
-    }
+    /// Domain separation tag. State Node 側 `REQUEST_SIGNATURE_DOMAIN` と一致させる。
+    const REQUEST_SIGNATURE_DOMAIN: &'static str = "monas-request-v1";
 
-    fn build_metadata_signature_message(operation: &str, resource: &str, timestamp: u64) -> String {
-        format!("{operation}:{resource}:{timestamp}")
+    /// リクエスト署名の署名対象を組み立てる。
+    ///
+    /// body の有無によらず operation / resource / timestamp に必ず束縛し、
+    /// body がある場合はその digest も含める。State Node 側
+    /// (`RequestMetadata::signing_message_with_body_digest`)と同一形式でなければ
+    /// 署名検証が通らないため、変更するときは両方を揃えること。
+    fn build_request_signature_message(
+        operation: &str,
+        resource: &str,
+        timestamp: u64,
+        body: Option<&[u8]>,
+    ) -> String {
+        let body_digest_hex = match body {
+            Some(bytes) => hex::encode(Sha256::digest(bytes)),
+            None => String::new(),
+        };
+        format!(
+            "{}:{}:{}:{}:{}:{}:{}:{}",
+            Self::REQUEST_SIGNATURE_DOMAIN,
+            operation.len(),
+            operation,
+            resource.len(),
+            resource,
+            timestamp,
+            body_digest_hex.len(),
+            body_digest_hex,
+        )
     }
 
     fn map_account_http_status_to_api_response<T>(
@@ -202,9 +224,16 @@ impl MonasController {
         })
     }
 
+    /// body を伴う書き込み(create / update)の署名を用意する。
+    ///
+    /// `operation` / `resource` は State Node 側が
+    /// `verify_caller_signature` へ渡す値と一致させること
+    /// (create は `("create", "content")`、update は `("update", content_id)`)。
     fn prepare_state_node_content_auth<T>(
         &self,
         auth: Option<&StateNodeAuthContext>,
+        operation: &str,
+        resource: &str,
         content_bytes: &[u8],
         trace_id: &str,
     ) -> Result<Option<StateNodeAuthContext>, ApiResponse<T>> {
@@ -212,7 +241,12 @@ impl MonasController {
             return Ok(None);
         };
         let timestamp = self.resolve_request_timestamp(ctx, trace_id)?;
-        let signing_message = Self::build_content_signature_message(content_bytes, timestamp);
+        let signing_message = Self::build_request_signature_message(
+            operation,
+            resource,
+            timestamp,
+            Some(content_bytes),
+        );
         self.sign_state_node_message_with_account(&signing_message, timestamp, trace_id)
             .map(Some)
     }
@@ -229,7 +263,7 @@ impl MonasController {
         };
         let timestamp = self.resolve_request_timestamp(ctx, trace_id)?;
         let signing_message =
-            Self::build_metadata_signature_message(operation, resource, timestamp);
+            Self::build_request_signature_message(operation, resource, timestamp, None);
         self.sign_state_node_message_with_account(&signing_message, timestamp, trace_id)
             .map(Some)
     }
@@ -504,8 +538,13 @@ impl MonasController {
                 ));
             }
         };
-        let signed_auth =
-            self.prepare_state_node_content_auth(auth, encrypted_content, &trace_id)?;
+        let signed_auth = self.prepare_state_node_content_auth(
+            auth,
+            "create",
+            "content",
+            encrypted_content,
+            &trace_id,
+        )?;
 
         let state_node_url = format!("{}/content", self.state_node_url);
         let req = Self::attach_state_node_auth(
@@ -591,11 +630,16 @@ impl MonasController {
                 ));
             }
         };
-        let signed_auth =
-            match self.prepare_state_node_content_auth(auth, encrypted_content, &trace_id) {
-                Ok(auth) => auth,
-                Err(response) => return Some(response),
-            };
+        let signed_auth = match self.prepare_state_node_content_auth(
+            auth,
+            "update",
+            content_id,
+            encrypted_content,
+            &trace_id,
+        ) {
+            Ok(auth) => auth,
+            Err(response) => return Some(response),
+        };
 
         let state_node_url = format!("{}/content/{}", self.state_node_url, content_id);
         let req = Self::attach_state_node_auth(
@@ -648,6 +692,79 @@ impl MonasController {
             }
             Err(e) => Some(ApiResponse::error(
                 ApiError::Internal(format!("Invalid State Node update response JSON: {e}")),
+                trace_id,
+            )),
+        }
+    }
+
+    /// State Node に `POST /content/:id/access/invalidate` を送る
+    /// （`http_api::invalidate_tokens_handler` と同じ契約）。
+    ///
+    /// `min_valid_issued_at` をサーバ時刻へ進め、それ以前に発行された委譲 Token を
+    /// 一括失効させる。revoke で CEK をローテーションしても、取り消された受信者の
+    /// 委譲 write Token は TTL 満了まで有効なまま残るため、これを呼ばないと
+    /// 「取り消したはずの相手が新しい状態へ書き込み続けられる」。
+    ///
+    /// 戻り値は成功時の `new_min_valid_issued_at`。失敗時は `Err` に
+    /// `ApiResponse` を入れて返す（`send_*_to_state_node` 系と違い、
+    /// 呼び出し側で必ず結果を扱わせるため）。
+    pub(super) fn send_invalidate_to_state_node<T>(
+        &self,
+        content_id: &str,
+        auth: Option<&StateNodeAuthContext>,
+        trace_id: String,
+    ) -> Result<Option<u64>, ApiResponse<T>> {
+        let state_node_url = format!(
+            "{}/content/{}/access/invalidate",
+            self.state_node_url, content_id
+        );
+        let signed_auth =
+            self.prepare_state_node_metadata_auth(auth, "invalidate", content_id, &trace_id)?;
+        let req = Self::attach_state_node_auth(
+            self.agent
+                .post(&state_node_url)
+                .header("Content-Type", "application/json"),
+            signed_auth.as_ref(),
+        );
+
+        let resp = match req.send("") {
+            Ok(r) => r,
+            Err(e) => {
+                return Err(ApiResponse::error(
+                    ApiError::from_ureq_error(
+                        "Failed to send token invalidation request to State Node",
+                        e,
+                    ),
+                    trace_id,
+                ));
+            }
+        };
+
+        let status = resp.status().as_u16();
+        let body = match resp.into_body().read_to_string() {
+            Ok(s) => s,
+            Err(e) => {
+                return Err(ApiResponse::error(
+                    ApiError::Internal(format!("Failed to read State Node response body: {e}")),
+                    trace_id,
+                ));
+            }
+        };
+
+        if let Some(err) = Self::try_state_node_http_error(status, &body, trace_id.clone()) {
+            return Err(err);
+        }
+
+        if body.trim().is_empty() {
+            return Ok(None);
+        }
+
+        match serde_json::from_str::<StateNodeInvalidateTokensResponse>(&body) {
+            Ok(parsed) => Ok(Some(parsed.new_min_valid_issued_at)),
+            Err(e) => Err(ApiResponse::error(
+                ApiError::Internal(format!(
+                    "Invalid State Node token invalidation response JSON: {e}"
+                )),
                 trace_id,
             )),
         }
@@ -1089,20 +1206,58 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_content_signature_message_hashes_content_bytes_and_timestamp() {
-        let message = MonasController::build_content_signature_message(b"abc", 42);
-        assert_eq!(message.len(), 64);
+    fn request_signature_message_binds_operation_resource_timestamp() {
+        let base = MonasController::build_request_signature_message("delete", "c1", 42, None);
+        assert!(base.starts_with("monas-request-v1:"), "msg={base}");
+
+        // 4 つのフィールドはどれが変わっても署名対象が変わる
         assert_ne!(
-            message,
-            MonasController::build_content_signature_message(b"abc", 43)
+            base,
+            MonasController::build_request_signature_message("read", "c1", 42, None)
+        );
+        assert_ne!(
+            base,
+            MonasController::build_request_signature_message("delete", "c2", 42, None)
+        );
+        assert_ne!(
+            base,
+            MonasController::build_request_signature_message("delete", "c1", 43, None)
         );
     }
 
     #[test]
-    fn build_metadata_signature_message_formats_operation_resource_and_timestamp() {
-        assert_eq!(
-            MonasController::build_metadata_signature_message("delete", "test", 42),
-            "delete:test:42"
+    fn request_signature_message_binds_body_and_stays_bound_to_resource() {
+        let with_body =
+            MonasController::build_request_signature_message("update", "c1", 42, Some(b"abc"));
+
+        // body が変われば署名対象も変わる
+        assert_ne!(
+            with_body,
+            MonasController::build_request_signature_message("update", "c1", 42, Some(b"abd"))
+        );
+        // body 付きでも operation / resource に束縛される(cross-resource /
+        // cross-operation replay を防ぐ)
+        assert_ne!(
+            with_body,
+            MonasController::build_request_signature_message("update", "c2", 42, Some(b"abc"))
+        );
+        assert_ne!(
+            with_body,
+            MonasController::build_request_signature_message("create", "c1", 42, Some(b"abc"))
+        );
+        // body 有無も区別される
+        assert_ne!(
+            with_body,
+            MonasController::build_request_signature_message("update", "c1", 42, None)
+        );
+    }
+
+    /// 区切り文字を含む値でフィールド境界がずれない(長さ前置のおかげ)。
+    #[test]
+    fn request_signature_message_is_unambiguous_with_colons() {
+        assert_ne!(
+            MonasController::build_request_signature_message("a", "b:c", 1, None),
+            MonasController::build_request_signature_message("a:b", "c", 1, None)
         );
     }
 }

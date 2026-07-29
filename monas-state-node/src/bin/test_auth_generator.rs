@@ -2,6 +2,7 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     Engine as _,
 };
+use monas_state_node::port::auth_token::add_members_signing_body;
 use p256::ecdsa::{signature::Signer, SigningKey};
 use p256::elliptic_curve::rand_core::OsRng;
 use serde_json::json;
@@ -61,6 +62,8 @@ fn print_usage(program: &str) {
     eprintln!("    --resource <res>                     Resource (content_id or 'content')");
     eprintln!("    --timestamp <ts>                     Unix timestamp");
     eprintln!("    [--body <base64>]                    Request body (base64, for create/update)");
+    eprintln!("    [--add-members-count <n>]            Canonical add-members body (for manage)");
+    eprintln!("    (delegated JWT requests sign the same message with the recipient key)");
     eprintln!("  generate-token [content_id]           - Generate an auth token (JWT)");
     eprintln!("  generate-share-token                  - Generate a share token for another user");
 }
@@ -88,23 +91,33 @@ fn generate_test_auth_data() {
 
     // Machine-readable output for script consumption
     println!("PRIVATE_KEY={}", hex::encode(private_key_bytes));
-    println!("PUBLIC_KEY={}", &public_key_hex);
-    println!("KEY_ID=user:{}", &public_key_hex);
+    println!("PUBLIC_KEY={public_key_hex}");
+    println!("KEY_ID=user:{public_key_hex}");
 }
 
 /// Sign a request with the correct message format.
 ///
-/// For requests WITH body (create/update):
-///   message = hex(sha256(body_bytes + timestamp_be_bytes))
+/// Every request — with or without a body, JWT or not — signs the same
+/// structure, which always commits to operation, resource and timestamp:
 ///
-/// For requests WITHOUT body (delete/read/invalidate/manage/revoke):
-///   message = "{operation}:{resource}:{timestamp}"
+/// ```text
+/// monas-request-v1:<len>:<operation>:<len>:<resource>:<timestamp>:<len>:<body_digest_hex>
+/// ```
+///
+/// `body_digest_hex` is `sha256(body_bytes)` when `--body` is given and the
+/// empty string otherwise. Must stay in sync with
+/// `RequestMetadata::signing_message_with_body_digest`.
+///
+/// `--add-members-count` is a convenience for the `manage` operation: it
+/// derives the same canonical body bytes the state node reconstructs from the
+/// parsed JSON (see `add_members_signing_body`).
 fn sign_request(args: &[String]) {
     let mut private_key_hex = String::new();
     let mut operation = String::new();
     let mut resource = String::new();
     let mut timestamp_str = String::new();
     let mut body_b64 = String::new();
+    let mut add_members_count: Option<usize> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -139,6 +152,15 @@ fn sign_request(args: &[String]) {
                     body_b64 = args[i].clone();
                 }
             }
+            "--add-members-count" => {
+                i += 1;
+                if i < args.len() {
+                    add_members_count = Some(args[i].parse().unwrap_or_else(|e| {
+                        eprintln!("Error: Invalid --add-members-count: {}", e);
+                        std::process::exit(1);
+                    }));
+                }
+            }
             _ => {}
         }
         i += 1;
@@ -171,21 +193,35 @@ fn sign_request(args: &[String]) {
         std::process::exit(1);
     });
 
-    // Construct the signing message
-    let message = if !body_b64.is_empty() {
-        // Body-based signing: hex(sha256(body_bytes + timestamp_be_bytes))
+    // Construct the signing message. The structure is identical for every
+    // token type and for body / non-body requests: it always commits to
+    // operation, resource and timestamp, plus the body digest when present.
+    // Must stay in sync with `RequestMetadata::signing_message_with_body_digest`.
+    if !body_b64.is_empty() && add_members_count.is_some() {
+        eprintln!("Error: --body and --add-members-count are mutually exclusive");
+        std::process::exit(1);
+    }
+    let body_digest_hex = if let Some(count) = add_members_count {
+        hex::encode(Sha256::digest(add_members_signing_body(count)))
+    } else if body_b64.is_empty() {
+        String::new()
+    } else {
         let body_bytes = STANDARD.decode(&body_b64).unwrap_or_else(|e| {
             eprintln!("Error: Invalid body base64: {}", e);
             std::process::exit(1);
         });
-        let mut hasher = Sha256::new();
-        hasher.update(&body_bytes);
-        hasher.update(timestamp.to_be_bytes());
-        hex::encode(hasher.finalize())
-    } else {
-        // Metadata-based signing: {operation}:{resource}:{timestamp}
-        format!("{}:{}:{}", operation, resource, timestamp)
+        hex::encode(Sha256::digest(&body_bytes))
     };
+    let message = format!(
+        "monas-request-v1:{}:{}:{}:{}:{}:{}:{}",
+        operation.len(),
+        operation,
+        resource.len(),
+        resource,
+        timestamp,
+        body_digest_hex.len(),
+        body_digest_hex,
+    );
 
     // Sign the message
     let signature: p256::ecdsa::Signature = signing_key.sign(message.as_bytes());
@@ -197,6 +233,26 @@ fn sign_request(args: &[String]) {
     println!("MESSAGE={}", message);
 }
 
+/// Delegated-JWT payload used by `generate-share-token`.
+///
+/// NOTE: 署名検証はワイヤ上の `header.payload` セグメントに対して行われる
+/// ようになったため(issue #60)、フィールド順序に検証上の意味はもう無い。
+/// 発行側の形として monas-account の `DelegationClaims` に揃えている。
+#[derive(serde::Serialize)]
+struct ShareTokenPayload {
+    iss: String,
+    aud: String,
+    exp: u64,
+    iat: u64,
+    jti: String,
+    att: Vec<ShareTokenCapability>,
+}
+
+#[derive(serde::Serialize)]
+struct ShareTokenCapability {
+    with: String,
+    can: String,
+}
 fn generate_auth_token(content_id: Option<String>) {
     let signing_key = SigningKey::random(&mut OsRng);
     let verifying_key = signing_key.verifying_key();
@@ -323,14 +379,11 @@ fn generate_share_token(args: &[String]) {
 
     let recipient_key_id = format!("user:{}", hex::encode(&recipient_public_key_bytes));
 
-    let caps: Vec<serde_json::Value> = capabilities_str
+    let caps: Vec<ShareTokenCapability> = capabilities_str
         .split(',')
-        .map(|c| {
-            let action = c.trim();
-            json!({
-                "with": format!("monas://content/{}", content_id),
-                "can": action
-            })
+        .map(|c| ShareTokenCapability {
+            with: format!("monas://content/{}", content_id),
+            can: c.trim().to_string(),
         })
         .collect();
 
@@ -347,17 +400,18 @@ fn generate_share_token(args: &[String]) {
 
     let jti = Uuid::new_v4().to_string();
 
-    let payload = json!({
-        "iss": owner_key_id,
-        "aud": recipient_key_id,
-        "exp": now + expiry,
-        "iat": now,
-        "jti": jti,
-        "att": caps
-    });
+    let payload = ShareTokenPayload {
+        iss: owner_key_id.clone(),
+        aud: recipient_key_id.clone(),
+        exp: now + expiry,
+        iat: now,
+        jti: jti.clone(),
+        att: caps,
+    };
 
     let header_b64 = URL_SAFE_NO_PAD.encode(header.to_string());
-    let payload_b64 = URL_SAFE_NO_PAD.encode(payload.to_string());
+    let payload_b64 =
+        URL_SAFE_NO_PAD.encode(serde_json::to_string(&payload).expect("payload serialization"));
 
     let signing_input = format!("{}.{}", header_b64, payload_b64);
 

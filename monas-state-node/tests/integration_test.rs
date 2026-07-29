@@ -106,6 +106,17 @@ fn test_request_signature() -> Vec<u8> {
     vec![0x01]
 }
 
+/// timestamp は署名検証で構造的に必須(issue #61)。mock 認証でも
+/// 存在チェックは実コードを通るため、現在時刻を渡す。
+fn test_timestamp() -> Option<u64> {
+    Some(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    )
+}
+
 fn sign_access_control_update(update: &AccessControlUpdate) -> (Vec<u8>, Vec<u8>) {
     use p256::ecdsa::signature::DigestSigner;
     use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
@@ -202,7 +213,7 @@ async fn test_create_content() {
             data,
             Some(&test_token()),
             Some(&test_request_signature()),
-            None,
+            test_timestamp(),
         )
         .await;
 
@@ -507,7 +518,7 @@ async fn test_crdt_since_version_filtering() {
 // ============================================================================
 
 use monas_state_node::application_service::state_node_service::ServiceConfig;
-use monas_state_node::domain::access_control::AccessControlUpdate;
+use monas_state_node::domain::access_control::{AccessControlError, AccessControlUpdate};
 
 /// Create a test service with access control repository.
 async fn create_test_service_with_ac() -> (Arc<TestServiceWithAC>, Arc<CrslCrdtRepository>, TempDir)
@@ -606,7 +617,7 @@ async fn test_access_control_update_and_verify() {
             &update,
             Some(&test_token()),
             Some(&test_request_signature()),
-            None,
+            test_timestamp(),
         )
         .await
         .unwrap();
@@ -616,12 +627,205 @@ async fn test_access_control_update_and_verify() {
     let result = service.verify_access("content-1", 500).await.unwrap();
     assert!(!result, "Old tokens should be denied");
 
-    // Verify access with new token (should be allowed)
+    // The cutoff is exclusive: a token stamped with the same second as the
+    // revoke might have been issued just before it, and one-second resolution
+    // cannot tell. Accepting it would leave a revoked recipient with access.
     let result = service.verify_access("content-1", 1000).await.unwrap();
-    assert!(result, "New tokens should be allowed");
+    assert!(!result, "Tokens from the cutoff second should be denied");
+
+    let result = service.verify_access("content-1", 1001).await.unwrap();
+    assert!(
+        result,
+        "Tokens issued strictly after the revoke should be allowed"
+    );
 
     let result = service.verify_access("content-1", 1500).await.unwrap();
     assert!(result, "Future tokens should be allowed");
+}
+
+/// 署名済み mutation の再送は拒否され、しかも「偽造」ではなく「再送」として
+/// 報告される。
+///
+/// 署名内 timestamp の鮮度チェックは「古い署名を無限に使い回せない」ことしか
+/// 保証せず、5分の窓の中では同じ署名を何度でも通せてしまう。
+///
+/// なお `update_access_control` に限っては、より古い `min_valid_issued_at` への
+/// 巻き戻しはドメイン側の単調性チェックが既に弾いていた。ここで塞ぐのは
+/// **同じ値の再送**で、そちらは素通りしていた。エラーの種類まで検証するのは、
+/// 潰してしまうと運用者が「攻撃された」のか「正規リクエストが二重に届いた」
+/// のか区別できなくなるため。
+#[tokio::test]
+async fn test_signed_mutation_cannot_be_replayed_after_a_newer_one() {
+    let (service, _crdt_repo, _temp_dir) = create_test_service_with_ac().await;
+
+    service.init_access_control("content-1").await.unwrap();
+
+    let sign = |min_valid: u64| {
+        let update = AccessControlUpdate::new("content-1".to_string(), min_valid);
+        let (signature, public_key) = sign_access_control_update(&update);
+        update.with_signature(signature, public_key)
+    };
+
+    // 消費記録の ID は署名対象メッセージから導かれる。revoke は
+    // `new_min_valid_issued_at` を body として署名対象に含めるので、
+    // A(1000)と B(2000)は同じ timestamp でも別リクエストになる。
+    let sig_a: Vec<u8> = vec![0xAA];
+    let sig_b: Vec<u8> = vec![0xBB];
+
+    let update_a = sign(1000);
+    let update_b = sign(2000);
+
+    // A → B の順に正規適用
+    service
+        .update_access_control(
+            &update_a,
+            Some(&test_token()),
+            Some(&sig_a),
+            test_timestamp(),
+        )
+        .await
+        .expect("first update should apply");
+    service
+        .update_access_control(
+            &update_b,
+            Some(&test_token()),
+            Some(&sig_b),
+            test_timestamp(),
+        )
+        .await
+        .expect("second update should apply");
+    assert_eq!(
+        service
+            .get_access_control("content-1")
+            .await
+            .unwrap()
+            .unwrap()
+            .min_valid_issued_at(),
+        2000
+    );
+
+    // 攻撃者が捕まえておいた B の署名を再送する。
+    // (A の再送はドメイン側の単調性チェックが別途弾くので、消費記録が
+    //  効いていることを見るにはこちらを使う)
+    let replay = service
+        .update_access_control(
+            &update_b,
+            Some(&test_token()),
+            Some(&sig_b),
+            test_timestamp(),
+        )
+        .await;
+    assert!(replay.is_err(), "replaying a consumed signature must fail");
+    let err = replay.unwrap_err();
+    assert!(
+        matches!(err, AccessControlError::AlreadyApplied),
+        "a replay must be reported as such, not as a forged signature: {err}"
+    );
+
+    // 失効時刻は巻き戻っていない
+    assert_eq!(
+        service
+            .get_access_control("content-1")
+            .await
+            .unwrap()
+            .unwrap()
+            .min_valid_issued_at(),
+        2000,
+        "a rejected replay must not roll the state back"
+    );
+}
+
+/// 署名のバイト表現を変えても再送は通らない。
+///
+/// ECDSA は malleable で、有効な `(r, s)` に対し `(r, n - s)` も同じメッセージ・
+/// 同じ鍵で検証を通る。消費記録の ID を署名バイト列の digest にしていると、
+/// 攻撃者は捕捉した署名を 1 回変換するだけで「別のリクエスト」として通せてしまい、
+/// 状態巻き戻しが成立する。ID は署名対象メッセージから導くのでこれは効かない。
+#[tokio::test]
+async fn test_signed_mutation_replay_survives_signature_malleability() {
+    use p256::ecdsa::Signature;
+
+    let (service, _crdt_repo, _temp_dir) = create_test_service_with_ac().await;
+    service.init_access_control("content-1").await.unwrap();
+
+    let update = AccessControlUpdate::new("content-1".to_string(), 1000);
+    let (signature, public_key) = sign_access_control_update(&update);
+    let update = update.with_signature(signature, public_key);
+
+    // 実際の P-256 署名を作り、その malleable な相方を用意する。
+    // (mock 認証はリクエスト署名の中身を見ないので、ここで検証したいのは
+    //  「バイト列が違っても同じリクエストとして消費されるか」だけ)
+    use p256::ecdsa::{signature::Signer, SigningKey};
+    use p256::elliptic_curve::rand_core::OsRng;
+    let key = SigningKey::random(&mut OsRng);
+    let sig: Signature = key.sign(b"monas-request-v1:6:revoke:9:content-1:1700000000:0:");
+    let canonical = sig.to_vec();
+    let malleated = Signature::from_scalars(*sig.r(), -*sig.s())
+        .unwrap()
+        .to_vec();
+    assert_ne!(
+        canonical, malleated,
+        "the two encodings must differ, otherwise this test proves nothing"
+    );
+
+    service
+        .update_access_control(
+            &update,
+            Some(&test_token()),
+            Some(&canonical),
+            test_timestamp(),
+        )
+        .await
+        .expect("first presentation should apply");
+
+    // 同じリクエストを、別バイト列の署名で再送する
+    let replay = service
+        .update_access_control(
+            &update,
+            Some(&test_token()),
+            Some(&malleated),
+            test_timestamp(),
+        )
+        .await;
+    assert!(
+        matches!(replay, Err(AccessControlError::AlreadyApplied)),
+        "a re-encoded signature must not buy a second application: {replay:?}"
+    );
+}
+
+/// 同一署名の単純な再送(A → replay(A))も拒否される。
+/// `invalidate` は再送のたびに `min_valid_issued_at` を現在時刻へ進めるため、
+/// 通してしまうと正規リクエスト後に発行された Token まで巻き添えで失効する。
+#[tokio::test]
+async fn test_signed_mutation_is_single_use() {
+    let (service, _crdt_repo, _temp_dir) = create_test_service_with_ac().await;
+
+    service.init_access_control("content-1").await.unwrap();
+
+    let update = AccessControlUpdate::new("content-1".to_string(), 1000);
+    let (signature, public_key) = sign_access_control_update(&update);
+    let update = update.with_signature(signature, public_key);
+    let request_signature: Vec<u8> = vec![0xC0, 0xFF, 0xEE];
+
+    service
+        .update_access_control(
+            &update,
+            Some(&test_token()),
+            Some(&request_signature),
+            test_timestamp(),
+        )
+        .await
+        .expect("first presentation should apply");
+
+    let replay = service
+        .update_access_control(
+            &update,
+            Some(&test_token()),
+            Some(&request_signature),
+            test_timestamp(),
+        )
+        .await;
+    assert!(replay.is_err(), "the same signature must not apply twice");
 }
 
 #[tokio::test]
@@ -657,7 +861,7 @@ async fn test_access_control_update_missing_signature() {
             &update,
             Some(&test_token()),
             Some(&test_request_signature()),
-            None,
+            test_timestamp(),
         )
         .await;
     assert!(result.is_err());
@@ -1095,7 +1299,7 @@ async fn test_update_content_requires_authentication() {
             data,
             None,
             Some(&test_request_signature()),
-            None,
+            test_timestamp(),
         )
         .await;
     assert!(result.is_err());
@@ -1277,7 +1481,7 @@ async fn test_authorization_denied_prevents_create_content() {
             data,
             Some(&test_token()),
             Some(&test_request_signature()),
-            None,
+            test_timestamp(),
         )
         .await;
 
@@ -1347,7 +1551,7 @@ async fn test_access_control_update_signature_verification() {
             &update,
             Some(&test_token()),
             Some(&test_request_signature()),
-            None,
+            test_timestamp(),
         )
         .await;
 

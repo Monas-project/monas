@@ -211,16 +211,15 @@ impl StateNode {
             node_id.clone(),
         ));
 
-        // Create auth services with public key registry for identity verification
-        let auth_public_key_repo = Arc::new(
-            crate::infrastructure::persistence::SledPublicKeyRepository::open(
-                config.data_dir.join("auth_public_keys"),
-            )
-            .context("Failed to open auth public key repository")?,
-        );
+        // Create auth services.
+        // NOTE: 旧 jti nonce ストア(委譲トークンの TTL 内再利用と矛盾していた)は
+        // 廃止した(issue #61)。リプレイ防御は「署名内 timestamp の鮮度チェック」
+        // と「mutation の署名を使い切りにする消費記録」の2層が担う。後者は
+        // `StateNodeService` が保持するので、ここで組み立てる必要はない。
+        // 失効させる単位が *トークン* から *リクエスト署名* へ変わったのが要点で、
+        // これならトークンの再利用を妨げずに mutation の再送だけを止められる。
         let auth_service = MonasAccountAdapter::new();
-        let authz_service =
-            UcanAdapter::new(crdt_repo_dyn.clone()).with_nonce_store(auth_public_key_repo.clone());
+        let authz_service = UcanAdapter::new(crdt_repo_dyn.clone());
 
         // Create service with CRDT repository
         let service = Arc::new(
@@ -470,14 +469,15 @@ impl StateNode {
                         match result {
                             Ok(received) => {
                                 tracing::debug!(
-                                    "Received event from {}: {:?}",
+                                    "Received event from {:?}: {:?}",
                                     received.source,
                                     received.event.event_type()
                                 );
 
-                                // Forward to service for processing (with source PeerID for verification)
+                                // Forward to service for processing, with the
+                                // authenticated publisher PeerID for origin checks.
                                 match service
-                                    .handle_sync_event(&received.event, Some(&received.source))
+                                    .handle_sync_event(&received.event, received.source.as_deref())
                                     .await
                                 {
                                     Ok(outcome) => {
