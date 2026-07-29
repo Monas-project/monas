@@ -356,7 +356,9 @@ Token失効は`min_valid_issued_at`による時刻ベースで管理される。
 ここで「ローカルレコード」は**owner署名によるattestationではない**。イベントにowner署名は無く、member集合は発行元の自己申告である。検証されているのは**発行元**の方で、Gossipsubを`MessageAuthenticity::Signed` + `ValidationMode::Strict`で運用しているため著者フィールドは必須かつ署名検証済みであり、これを次の2点に束縛している。
 
 - `ContentCreated`は、名乗っている`creator_node_id`本人からの発行でなければ拒否する
-- member集合の変更（`ContentNetworkManagerAdded`）は、こちらが保持しているそのネットワークの既存memberからの発行でなければ拒否する
+- member集合を変える`ContentNetworkManagerAdded` / `ContentNetworkManagerRemoved`は、こちらが保持しているそのネットワークの既存memberからの発行でなければ拒否する
+- `ContentDeleted`は上記に加えて、名乗っている`deleted_by_node_id`本人からの発行であることも確認する。ただしこのイベントは発行元を*自分で*名乗るので、その照合だけでは「認証済みなら誰でも通る」ことにしかならない。ローカルレコードを消せるのは既存memberだけである
+- `ContentUpdated`は、名乗っている`updated_node_id`本人からの発行でなければ拒否する
 
 なお束縛に使うのはGossipsubの`Message::source`（**発行元**）であって`propagation_source`（直前の転送元）ではない。meshは多段転送するため、転送元で判定すると正規の多段配送を落としつつ偽装を通してしまう。
 
