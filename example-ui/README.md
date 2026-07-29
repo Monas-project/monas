@@ -4,7 +4,7 @@ A minimal, Google-Drive-like web UI for the Monas protocol, built on the
 **monas-sdk** via the **monas-gateway** HTTP API. It lets you **create, open,
 edit, rename, share, revoke and delete** files and folders, and surfaces the
 encryption + state-node work behind every action in a live **Protocol activity**
-panel (CEK → AES-256-CTR → SHA-256 CID → storage → state-node → HPKE).
+panel (CEK → AES-256-GCM → SHA-256 CID → storage → state-node → HPKE).
 
 The UI talks to a **single backend — the gateway** — which embeds the SDK and
 orchestrates everything server-side:
@@ -61,6 +61,7 @@ send permissive CORS headers.
 | Share             | `POST /share`                         | `ShareContent{Input,Output}`      |
 | Prove access      | `POST /share/decrypt`                 | `DecryptSharedContent{Input,Out}` |
 | Revoke            | `POST /share/revoke`                  | `RevokeShare{Input,Output}`       |
+| Verified read     | `POST /state/read`                    | `ReadContentFromStateNode{In,Out}`|
 | (history/version) | `POST /state/history`, `/state/...`   | `state` models                    |
 
 Notes on the contract:
@@ -71,9 +72,30 @@ Notes on the contract:
   (`{ success, data, error: { type, message }, trace_id }`); the client unwraps
   `data` or throws the typed error.
 - `POST /content`, `PUT/DELETE /content/{id}`, `POST /share/revoke` and the
-  `/state/*` calls require an **`X-Request-Timestamp`** header. The UI sends the
-  current Unix time; the SDK then signs the state-node request via the account
-  service.
+  `/state/*` calls require an **`X-Request-Timestamp`** header (the gateway
+  returns 401 without it). The UI sends the current Unix time; the SDK then
+  signs the state-node request via the account service.
+- **Two read paths, and they prove different things.** `GET /content/{id}`
+  reads the gateway's own local store — convenient, but it never touches the
+  network, so it proves nothing about what the state node holds.
+  `POST /state/read` fetches the version from the state node (relayed to a
+  member when the contacted node isn't one) and verifies it: the Node CID is
+  recomputed, the CEK decrypts it (AES-256-GCM) and the plaintext is
+  re-addressed to the local id. The preview modal exposes both.
+  What the verified read does *not* prove is that the version is the newest or
+  that a legitimate writer produced it — version metadata has no trust anchor
+  yet (issue #59).
+- **Sharing is HPKE Auth mode.** `/share` and `/share/revoke` take the sender's
+  *private* key (the SDK never stores it) because the wrap mixes it in;
+  `/share/decrypt` correspondingly takes the sender's **public key**, not a
+  self-asserted `sender_key_id`. The recipient TOFU-pins that key on the first
+  envelope for a content and rejects any later envelope that doesn't match.
+- **`key_epoch` must be carried through untouched.** Every revoke rotates the
+  CEK and bumps the epoch, and recipients reject envelopes older than the epoch
+  they've recorded (rollback replay defence). A revoke therefore also returns
+  `reissued_envelopes` for the *surviving* recipients — the UI swaps those into
+  its registry, because a recipient left holding the pre-rotation envelope can
+  no longer decrypt.
 
 ## Accounts & the signing key
 

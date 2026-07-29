@@ -92,7 +92,7 @@ export function Sidebar({
       </NavItem>
 
       <div className="side-meta">
-        Files are encrypted client-side (AES-256-CTR), addressed by SHA-256 CID,
+        Files are encrypted client-side (AES-256-GCM), addressed by SHA-256 CID,
         and synced to the Monas <code>state-node</code> network.
       </div>
     </nav>

@@ -4,7 +4,12 @@
 import { createStore } from "./store";
 import type { Entry } from "../types";
 
-const store = createStore<Entry[]>("monas.registry.v2", []);
+// v3: content encryption moved from AES-256-CTR to AES-256-GCM and KeyEnvelope
+// gained `key_epoch`, so every v2 entry points at ciphertext the backend can no
+// longer decrypt and every v2 share grant carries an envelope the recipient now
+// rejects. There is nothing to migrate — the ids are dead — so this starts
+// clean rather than surfacing entries that only fail on open.
+const store = createStore<Entry[]>("monas.registry.v3", []);
 
 export const useEntries = () => store.use();
 

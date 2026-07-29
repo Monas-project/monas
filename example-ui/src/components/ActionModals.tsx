@@ -110,7 +110,7 @@ export function FileEditorModal({
           className="input"
           value={text}
           onChange={(e) => setText(e.target.value)}
-          placeholder="Type the file contents… (the SDK AES-256-CTR-encrypts this before storage)"
+          placeholder="Type the file contents… (the SDK AES-256-GCM-encrypts this before storage)"
         />
         <div className="hint">{new Blob([text]).size} bytes · plaintext stays client-side until the gateway encrypts it</div>
       </div>

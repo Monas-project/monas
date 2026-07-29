@@ -1,4 +1,4 @@
-// Browser-side helpers. The protocol crypto (CEK, AES-256-CTR, HPKE, CID) all
+// Browser-side helpers. The protocol crypto (CEK, AES-256-GCM, HPKE, CID) all
 // runs server-side inside monas-sdk via the gateway. Here we only need base64 /
 // base64url plumbing, because the SDK models exchange bytes as base64url.
 

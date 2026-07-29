@@ -113,6 +113,18 @@ try {
   await page.locator(".btn.sm", { hasText: "Verify integrity" }).click();
   await page.waitForSelector(".badge.synced >> text=valid", { timeout: 60_000 });
   report("Integrity verify → valid", true);
+
+  // 5b. verified read straight off the state node (relay → member, CID
+  // recompute + AES-GCM decrypt + plain-CID recheck). Distinct from the
+  // preview above, which never leaves the gateway's own store.
+  await page.locator(".btn.sm", { hasText: "Read from state-node" }).click();
+  await page.waitForSelector(".badge.synced >> text=verified", { timeout: 90_000 });
+  const readText = await page.locator(".field .preview-box").last().textContent();
+  report(
+    "Verified read from state-node",
+    (readText || "").includes("Hello from the E2E run"),
+    (readText || "").slice(0, 60),
+  );
   await shot("3-preview-state");
   await page.keyboard.press("Escape");
 

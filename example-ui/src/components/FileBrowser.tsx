@@ -54,7 +54,7 @@ function Row({
         <span className="fname">{entry.name}</span>
         <div className="badges">
           {isFile && (
-            <span className="badge enc" title="Encrypted with AES-256-CTR">
+            <span className="badge enc" title="Encrypted with AES-256-GCM">
               <Lock size={11} /> enc
             </span>
           )}

@@ -307,6 +307,7 @@ export default function App() {
             permissions: input.permissions,
             senderKeyId: g.sender_key_id,
             recipientKeyId: g.recipient_key_id,
+            senderPublicKeyB64Url: g.sender_public_key,
             envelope: g.key_envelope,
             grantedAt: Date.now(),
           },
@@ -323,12 +324,40 @@ export default function App() {
     if (!active) return;
     setBusy(true);
     const specs = flows.revokeFlow({ entry, identity: active, recipientPublicKeyB64Url });
-    const { ok } = await run("Revoke", entry.name, specs);
+    const { ok, ctx } = await run("Revoke", entry.name, specs);
     if (ok) {
-      updateEntry(entry.id, {
-        shares: entry.shares.filter((s) => s.recipientPublicKeyB64Url !== recipientPublicKeyB64Url),
-      });
-      pushToast("Access revoked & content re-encrypted", "success");
+      const r = ctx.revoke as shareApi.RevokeShareOutput | undefined;
+      // Revoking rotates the CEK, so every *surviving* recipient's envelope is
+      // reissued under the new key_epoch. Keeping the old envelope would leave
+      // them unable to decrypt, and re-presenting it is rejected as a
+      // rollback replay — so swap in the reissued one, keyed by recipientKeyId.
+      const reissued = new Map(
+        (r?.reissued_envelopes ?? []).map((e) => [e.recipient_key_id, e.key_envelope]),
+      );
+      const shares = entry.shares
+        .filter((s) => s.recipientPublicKeyB64Url !== recipientPublicKeyB64Url)
+        .map((s) => {
+          const fresh = reissued.get(s.recipientKeyId);
+          return fresh ? { ...s, envelope: fresh, reissuedAt: Date.now() } : s;
+        });
+      updateEntry(entry.id, { shares });
+
+      const stale = shares.filter((s) => !reissued.has(s.recipientKeyId)).length;
+      const cutoff = r?.token_invalidated_at
+        ? ` · tokens issued before ${new Date(r.token_invalidated_at * 1000).toLocaleTimeString()} are void`
+        : "";
+      pushToast(
+        `Access revoked & content re-encrypted${cutoff}`,
+        // A surviving recipient with no reissued envelope can no longer read;
+        // that is a real problem for the demo, so don't report it as success.
+        stale > 0 ? "error" : "success",
+      );
+      if (stale > 0) {
+        pushToast(
+          `${stale} other recipient(s) got no reissued envelope and can no longer decrypt`,
+          "error",
+        );
+      }
     } else {
       pushToast("Revoke failed", "error");
     }

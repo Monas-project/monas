@@ -96,7 +96,8 @@ export function ShareModal({
                   ))}
                 </div>
                 <div className="mono" style={{ fontSize: 10.5 }}>
-                  KeyId {s.recipientKeyId}
+                  KeyId {s.recipientKeyId} · epoch {s.envelope.key_epoch}
+                  {s.reissuedAt ? " · re-wrapped after a revoke" : ""}
                 </div>
               </div>
               <button

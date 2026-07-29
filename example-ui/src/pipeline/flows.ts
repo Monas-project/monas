@@ -1,13 +1,14 @@
 // Flow builders: each returns the ordered StepSpec[] for one Drive action.
 //
 // With the SDK, a single gateway call does the whole orchestration server-side
-// (CEK → AES-256-CTR → SHA-256 CID → storage → state-node + signing). So each
+// (CEK → AES-256-GCM → SHA-256 CID → storage → state-node + signing). So each
 // flow has ONE real gateway call, surrounded by illustrative steps that narrate
 // the protocol and read ids out of the response. The real call is noted in each
 // step's title; illustrative steps have a short min duration for legibility.
 
 import * as contentApi from "../api/content";
 import * as shareApi from "../api/share";
+import * as stateApi from "../api/stateNode";
 import { byteLengthOfBase64Url, short } from "../api/crypto";
 import type { Entry, Identity, Permission } from "../types";
 import type { StepSpec } from "./types";
@@ -35,7 +36,7 @@ export function createFileFlow(input: {
     },
     {
       title: "Encrypt content · gateway call",
-      hint: "monas-sdk · AES-256-CTR",
+      hint: "monas-sdk · AES-256-GCM",
       kind: "crypto",
       minMs: 160,
       exec: async (ctx) => {
@@ -98,7 +99,7 @@ export function updateFileFlow(input: {
   return [
     {
       title: "Re-encrypt updated content · gateway call",
-      hint: "monas-sdk · AES-256-CTR",
+      hint: "monas-sdk · AES-256-GCM",
       kind: "crypto",
       minMs: 160,
       exec: async (ctx) => {
@@ -148,7 +149,7 @@ export function openFileFlow(input: { entry: Entry }): StepSpec[] {
     },
     {
       title: "Fetch & decrypt · gateway call",
-      hint: "monas-sdk · AES-256-CTR",
+      hint: "monas-sdk · AES-256-GCM",
       kind: "verify",
       minMs: 200,
       exec: async (ctx) => {
@@ -156,6 +157,58 @@ export function openFileFlow(input: { entry: Entry }): StepSpec[] {
         ctx.get = resp;
         const n = byteLengthOfBase64Url(resp.content);
         return `${fmtBytes(n)} of plaintext recovered with the CEK`;
+      },
+    },
+  ];
+}
+
+// ------------------------------------------------- verified read (state node)
+// Distinct from openFileFlow: that one reads the gateway's own local store and
+// never touches the network. This pulls the crsl-lib Node from the state node
+// (relayed to a member if the contacted node isn't one) and verifies it before
+// showing anything — CID recomputation, AES-GCM decryption, plain CID recheck.
+export function readFromStateNodeFlow(input: {
+  entry: Entry;
+  version?: string; // omit to read the newest version the state node reports
+}): StepSpec[] {
+  const { entry } = input;
+  return [
+    {
+      title: "Sign read request",
+      hint: "read:{content_id}:{ts}",
+      kind: "state",
+      minMs: 180,
+      exec: async () =>
+        "Read signed via the account key, bound to this content id and timestamp (5-min freshness window)",
+    },
+    {
+      title: "Fetch version from state-node · gateway call",
+      hint: "relay → member · verified",
+      kind: "verify",
+      minMs: 200,
+      exec: async (ctx) => {
+        const resp = await stateApi.readFromStateNode({
+          contentId: entry.remoteContentId || entry.localContentId!,
+          localContentId: entry.localContentId!,
+          version: input.version,
+        });
+        ctx.read = resp;
+        const n = byteLengthOfBase64Url(resp.content);
+        return `Version ${short(resp.version)} returned · ${fmtBytes(n)} of plaintext`;
+      },
+    },
+    {
+      title: "Verify payload authenticity",
+      hint: "CID recompute · AES-GCM · plain CID",
+      kind: "verify",
+      minMs: 220,
+      exec: async (ctx) => {
+        const r = ctx.read as stateApi.ReadFromStateNodeOutput;
+        return (
+          `Node CBOR re-hashed to ${short(r.version)}, decrypted under the CEK and the ` +
+          `plaintext re-addressed to ${short(r.local_content_id)} — a non-member relay ` +
+          `cannot forge this. (Version freshness is NOT proven — issue #59.)`
+        );
       },
     },
   ];
@@ -202,18 +255,22 @@ export function shareFlow(input: {
   const steps: StepSpec[] = [
     {
       title: "Wrap CEK for recipient · gateway call",
-      hint: "HPKE · DH-KEM P-256",
+      hint: "HPKE Auth · DH-KEM P-256",
       kind: "share",
       minMs: 180,
       exec: async (ctx) => {
         const grant = await shareApi.shareContent({
           contentId: entry.localContentId!,
           senderPublicKeyB64Url: identity.publicKeyB64Url,
+          senderPrivateKeyB64Url: identity.privateKeyB64Url,
           recipientPublicKeyB64Url: input.recipientPublicKeyB64Url,
           permissions: input.permissions,
         });
         ctx.share = grant;
-        return `KeyEnvelope created (RFC 9180 HPKE) for KeyId ${short(grant.recipient_key_id, 8, 6)}`;
+        return (
+          `KeyEnvelope created (RFC 9180 HPKE, Auth mode) for KeyId ` +
+          `${short(grant.recipient_key_id, 8, 6)} · epoch ${grant.key_envelope.key_epoch}`
+        );
       },
     },
     {
@@ -239,7 +296,7 @@ export function shareFlow(input: {
   if (input.recipientPrivateKeyB64Url) {
     steps.push({
       title: "Recipient unwraps & decrypts · gateway call",
-      hint: "HPKE open · AES-256-CTR",
+      hint: "HPKE Auth open · AES-256-GCM",
       kind: "verify",
       minMs: 180,
       exec: async (ctx) => {
@@ -247,12 +304,14 @@ export function shareFlow(input: {
         const res = await shareApi.decryptSharedContent({
           contentId: entry.localContentId!,
           privateKeyB64Url: input.recipientPrivateKeyB64Url!,
-          senderKeyId: g.sender_key_id,
+          // Auth-mode unwrap is bound to the sender's key, TOFU-pinned on the
+          // recipient's first envelope for this content.
+          senderPublicKeyB64Url: g.sender_public_key,
           recipientKeyId: g.recipient_key_id,
           keyEnvelope: g.key_envelope,
         });
         const n = byteLengthOfBase64Url(res.content);
-        return `Round-trip OK · ${fmtBytes(n)} of plaintext recovered as the recipient`;
+        return `Round-trip OK · ${fmtBytes(n)} of plaintext recovered as the recipient (sender key pinned)`;
       },
     });
   }
@@ -268,16 +327,20 @@ export function revokeFlow(input: {
   const { entry, identity } = input;
   return [
     {
-      title: "Re-encrypt under new CEK",
-      hint: "AES-256-CTR",
-      kind: "crypto",
-      minMs: 240,
+      // Order matters and is the reverse of what reads naturally: tokens are
+      // invalidated BEFORE the CEK is rotated. The other way round leaves a
+      // window between re-encryption and invalidation in which the revoked
+      // recipient can still write.
+      title: "Invalidate prior tokens",
+      hint: "min_valid_issued_at",
+      kind: "state",
+      minMs: 200,
       exec: async () =>
-        "A fresh CEK is generated and the content re-encrypted so old keys no longer open it",
+        "Token cutoff advanced on the state-node first — before rotation, so the revoked recipient cannot write in between",
     },
     {
-      title: "Revoke share · gateway call",
-      hint: "monas-sdk",
+      title: "Revoke & re-encrypt under new CEK · gateway call",
+      hint: "monas-sdk · AES-256-GCM",
       kind: "cleanup",
       minMs: 180,
       exec: async (ctx) => {
@@ -285,18 +348,33 @@ export function revokeFlow(input: {
           contentId: entry.localContentId!,
           remoteContentId: entry.remoteContentId,
           senderPublicKeyB64Url: identity.publicKeyB64Url,
+          senderPrivateKeyB64Url: identity.privateKeyB64Url,
           recipientPublicKeyB64Url: input.recipientPublicKeyB64Url,
         });
         ctx.revoke = r;
-        return `Access revoked=${r.revoked}; remaining users re-wrapped`;
+        const reissued = r.reissued_envelopes?.length ?? 0;
+        const cutoff = r.token_invalidated_at
+          ? ` · token cutoff ${r.token_invalidated_at}`
+          : "";
+        return `Access revoked=${r.revoked} · ${reissued} surviving recipient(s) re-wrapped${cutoff}`;
       },
     },
     {
-      title: "Invalidate prior tokens",
-      hint: "min_valid_issued_at",
-      kind: "state",
+      title: "Reissue envelopes to surviving recipients",
+      hint: "HPKE Auth · new key_epoch",
+      kind: "share",
       minMs: 200,
-      exec: async () => "Token cutoff advanced on the state-node; previously issued tokens are void",
+      exec: async (ctx) => {
+        const r = ctx.revoke as shareApi.RevokeShareOutput;
+        const reissued = r.reissued_envelopes ?? [];
+        if (reissued.length === 0)
+          return "No other recipients — nothing to reissue";
+        const epoch = reissued[0].key_envelope.key_epoch;
+        return (
+          `${reissued.length} envelope(s) reissued at epoch ${epoch}; each recipient must ` +
+          `process theirs or it can no longer decrypt`
+        );
+      },
     },
   ];
 }

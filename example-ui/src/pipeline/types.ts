@@ -7,7 +7,7 @@
 
 export type StepKind =
   | "key" // keypair / KeyId
-  | "crypto" // CEK gen, AES-256-CTR, re-encryption
+  | "crypto" // CEK gen, AES-256-GCM, re-encryption
   | "address" // SHA-256 CID computation
   | "storage" // filesync provider save/fetch
   | "state" // state-node / Content Network / CRDT
@@ -20,7 +20,7 @@ export type StepStatus = "pending" | "running" | "done" | "error" | "skipped";
 export interface StepView {
   id: string;
   title: string;
-  hint: string; // short technical label, e.g. "AES-256-CTR"
+  hint: string; // short technical label, e.g. "AES-256-GCM"
   kind: StepKind;
   status: StepStatus;
   detail?: string; // populated at runtime (ids, sizes, responses)

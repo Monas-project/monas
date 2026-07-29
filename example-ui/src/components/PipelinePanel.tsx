@@ -103,7 +103,7 @@ export function PipelinePanel({
         {runs.length === 0 ? (
           <div className="pipe-empty">
             Every action (create, update, share, revoke, delete) runs through
-            Monas: <b>CEK → AES-256-CTR → SHA-256 CID → storage → state-node</b>.
+            Monas: <b>CEK → AES-256-GCM → SHA-256 CID → storage → state-node</b>.
             <br />
             <br />
             Run an action and the steps appear here live.

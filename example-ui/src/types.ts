@@ -14,6 +14,16 @@ export type View =
   | { kind: "synced" } // files registered on a state-node
   | { kind: "shared" }; // files with at least one share
 
+// A KeyEnvelope as returned by the gateway. `key_epoch` advances on every CEK
+// rotation (revoke); the recipient rejects envelopes older than the epoch it
+// has already recorded, so it must be carried through untouched.
+export interface KeyEnvelopeData {
+  enc: string;
+  wrapped_cek: string;
+  ciphertext: string;
+  key_epoch: number;
+}
+
 // A recipient a file has been shared with. We keep the KeyEnvelope material so
 // the demo can later unwrap + decrypt (HPKE round-trip) to prove access.
 export interface ShareGrant {
@@ -22,8 +32,16 @@ export interface ShareGrant {
   permissions: Permission[];
   senderKeyId: string;
   recipientKeyId: string;
-  envelope: { enc: string; wrapped_cek: string; ciphertext: string };
+  /** Sender public key the recipient TOFU-pins. HPKE runs in Auth mode, so
+   *  unwrap is only possible against the key that actually did the wrap —
+   *  the recipient needs this, not the (self-asserted) sender_key_id. */
+  senderPublicKeyB64Url: string;
+  envelope: KeyEnvelopeData;
   grantedAt: number;
+  /** Set when a revoke of *another* recipient rotated the CEK and reissued
+   *  this grant's envelope. The recipient must process the new envelope
+   *  before it can decrypt again. */
+  reissuedAt?: number;
 }
 
 // One row in the Drive. Folders are purely logical (path prefixes); only files

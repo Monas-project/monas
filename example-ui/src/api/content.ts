@@ -1,5 +1,5 @@
 // Content operations via the gateway (monas-sdk content controller).
-// The SDK does: CEK gen → AES-256-CTR → SHA-256 CID → storage → state-node
+// The SDK does: CEK gen → AES-256-GCM → SHA-256 CID → storage → state-node
 // register/update/delete (+ signing via account). All content is base64url.
 import { gateway } from "./http";
 
