@@ -10,3 +10,16 @@ vite.config.ts.timestamp-*.mjs
 
 # Demo-recording harness — not part of the app (kept locally, not committed).
 recording/
+
+# Playwright run artifacts (traces, screenshots, HTML report).
+test-results/
+playwright-report/
+blob-report/
+.playwright-artifacts-*/
+
+# Playwright agent definitions — regenerate with
+#   npx playwright init-agents --loop=<claude|codex|vscode|opencode>
+# The choice of loop is per-developer, and these must be regenerated whenever
+# Playwright is updated, so they are not committed.
+.claude/
+.mcp.json

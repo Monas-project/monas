@@ -49,6 +49,76 @@ icon) — there are presets for *local (proxied)* and a *public API*. ⚠️ Poi
 at a cross-origin URL directly (not through the proxy) requires that server to
 send permissive CORS headers.
 
+## Tests
+
+```bash
+npm test                 # Playwright suite (tests/) — ~22s
+npm run test:ui          # same, in the Playwright UI runner
+npm run test:e2e-stack   # the full protocol happy path (e2e-verify.mjs)
+```
+
+Both need a running stack. `npm test` only needs vite + gateway + account;
+`test:e2e-stack` additionally exercises the state-node round trip, so it wants
+the 4-node cluster (`monas-state-node/scripts/start-local-nodes.sh` — 4 nodes,
+because `create_content` excludes the creator from the member set).
+
+Two suites, deliberately split by what they cost and what they prove:
+
+| | `tests/` (`npm test`) | `e2e-verify.mjs` |
+| --- | --- | --- |
+| Proves | the **UI** behaves — every control does what it claims | the **protocol** works end to end |
+| Content mutations | none (seeds `localStorage` directly) | many, against 4 real nodes |
+| Runtime | ~22s | minutes |
+
+`tests/` avoids content mutations on purpose: a create is a real crypto +
+4-node round trip, so a suite that made one per scenario would take minutes and
+mostly re-test the protocol that `e2e-verify.mjs` already covers. Where a
+scenario needs a file to exist, it writes a registry entry into `localStorage`
+and reloads.
+
+Modal structure is asserted with **ARIA snapshots** (`toMatchAriaSnapshot`)
+rather than CSS selectors, so the whole control set of a dialog is checked in
+one assertion and the tests survive styling changes.
+
+### Tests that document known bugs
+
+Two tests are named `[KNOWN BUG]`. They assert the **current, wrong** behaviour
+so the suite stays green while the defect is recorded — and they flip to
+**failing** the moment someone fixes it, which is the signal to update them.
+Both were verified to actually discriminate (applying the fix makes them fail):
+
+- **G-34** — with *Paste public key* selected and the field empty, *Wrap CEK &
+  share* stays enabled and does nothing: `submit()` returns early
+  (`ShareModal.tsx:53`). No toast, no validation. It should be disabled.
+- **S-07** — *Test connection* calls `saveEndpoints(cfg)` before probing
+  (`SettingsModal.tsx:27`), so an endpoint edit you never saved is persisted
+  and survives reload. *Reset to proxy* only resets component state
+  (`SettingsModal.tsx:41`), so it cannot undo this.
+
+The plan the suite was generated from lives in `specs/ui-coverage.md`
+(49 scenarios); the tests here cover the P0 subset that needs no fixtures.
+
+### Extending the suite
+
+The plan and the tests were produced with [Playwright
+Agents](https://playwright.dev/docs/test-agents) — a *planner* explores the
+running app and writes the plan, a *generator* turns plan entries into specs
+while verifying selectors against the live UI, and a *healer* repairs tests
+whose locators have drifted. The agent definitions are gitignored (they are
+per-developer and must be regenerated when Playwright is updated):
+
+```bash
+npx playwright init-agents --loop=claude   # or codex | vscode | opencode
+```
+
+`tests/seed.spec.ts` is the bootstrap the planner starts from: it clears
+`localStorage` and creates the signing account, without which content
+operations are refused and most of the UI is unreachable.
+
+Note that the agents are used at **authoring** time only. What runs in CI is
+ordinary, deterministic Playwright code — no model is in the execution loop,
+so the suite cannot go non-deterministic on a model update.
+
 ## Gateway / SDK endpoints used
 
 | Action            | Gateway call                          | SDK model                         |
