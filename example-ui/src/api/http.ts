@@ -91,9 +91,13 @@ export async function gateway<T>(path: string, opts: RequestOptions = {}): Promi
 }
 
 // Health probe for the connection indicator (gateway GET /health → 200).
-export async function probeGateway(): Promise<boolean> {
+// Pass `base` to probe a candidate endpoint without committing it. The
+// Settings dialog needs this: testing an endpoint you have not saved must not
+// change what the rest of the app is talking to.
+export async function probeGateway(base?: string): Promise<boolean> {
+  const target = (base ?? gatewayBase()).replace(/\/+$/, "");
   try {
-    const res = await fetch(gatewayBase() + "/health", { method: "GET" });
+    const res = await fetch(target + "/health", { method: "GET" });
     return res.ok;
   } catch {
     return false;

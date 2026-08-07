@@ -141,32 +141,22 @@ test("S-06b: Test connection reports unreachable for a dead endpoint", async ({ 
   await page.getByRole("button", { name: "Test connection" }).click();
   await expect(page.locator(".toast.error", { hasText: "gateway ✗ unreachable" })).toBeVisible();
 
-  // Mandatory cleanup — `test()` already wrote :9 to storage (see S-07), so
-  // Reset alone is not enough; Save is what actually clears it.
-  await page.getByRole("button", { name: "Reset to proxy" }).click();
-  await expect(gateway).toHaveValue("/api");
-  await page.getByRole("button", { name: "Save" }).click();
-  await expect(page.locator(".overlay")).toHaveCount(0);
-  expect(await readStorage(page, ENDPOINT_KEY)).toEqual({
-    gateway: "/api",
-    accountService: "/account-api",
-  });
+  // No cleanup needed: probing no longer writes to storage, so a failed test
+  // leaves the app on the endpoint it was already using.
+  expect(await readStorage(page, ENDPOINT_KEY)).toBeNull();
+  await page.keyboard.press("Escape");
+  await expect(page.locator(".conn-item .dot.up")).toBeVisible();
 });
 
 /**
- * KNOWN BUG — SettingsModal.tsx:27.
+ * "Test connection" must probe the endpoint in the form WITHOUT committing it.
  *
- * `test()` calls `saveEndpoints(cfg)` before probing ("probe reads from
- * storage"), so clicking "Test connection" writes the *unsaved* edit to
- * localStorage. Escaping the modal without pressing Save therefore still
- * leaves the tested endpoint persisted, and it survives a reload.
- *
- * This test asserts the CURRENT (buggy) behaviour so the suite stays green
- * while documenting the defect. WHEN THE BUG IS FIXED THIS TEST WILL FAIL —
- * that is intended: flip the assertion to `toBeNull()` (a cancelled test must
- * not touch storage) and delete this note.
+ * It used to call `saveEndpoints(cfg)` first, because the probe could only read
+ * the endpoint back out of storage — so merely testing an endpoint persisted
+ * it, and a cancelled edit silently took effect. `probeGateway` now accepts the
+ * candidate URL directly, so the probe no longer has a side effect.
  */
-test("S-07: Test connection silently persists an unsaved endpoint [KNOWN BUG]", async ({
+test("S-07: Test connection probes without persisting an unsaved endpoint", async ({
   page,
 }) => {
   expect(await readStorage(page, ENDPOINT_KEY)).toBeNull();
@@ -178,38 +168,61 @@ test("S-07: Test connection silently persists an unsaved endpoint [KNOWN BUG]", 
   await page.getByRole("button", { name: "Test connection" }).click();
   await expect(page.locator(".toast", { hasText: /gateway/ })).toBeVisible();
 
+  // Probing alone must not write anything.
+  expect(await readStorage(page, ENDPOINT_KEY)).toBeNull();
+
   // Cancel — explicitly NOT pressing Save.
   await page.keyboard.press("Escape");
   await expect(page.locator(".overlay")).toHaveCount(0);
 
-  // INTENDED: null (a cancelled edit must not be persisted).
-  // ACTUAL: the tested endpoint was written to storage by the probe.
-  expect(await readStorage(page, ENDPOINT_KEY)).toEqual({
-    gateway: "http://127.0.0.1:3000",
-    accountService: "/account-api",
-  });
+  expect(await readStorage(page, ENDPOINT_KEY)).toBeNull();
 
-  // ...and it survives a reload, so the next session talks to :3000.
+  // The app is still talking to the proxy, and that survives a reload.
   await page.reload();
-  expect(await readStorage(page, ENDPOINT_KEY)).toEqual({
-    gateway: "http://127.0.0.1:3000",
-    accountService: "/account-api",
-  });
+  expect(await readStorage(page, ENDPOINT_KEY)).toBeNull();
 
-  /**
-   * KNOWN BUG (2) — SettingsModal.tsx:41. `Reset to proxy` only sets component
-   * state; it never writes storage. So after the above, a user who resets and
-   * closes still leaves :3000 persisted.
-   */
+  // Since a cancelled test leaves nothing behind, "Reset to proxy" has nothing
+  // to undo — it only needs to restore the form, which Save then commits.
   const reopened = await openSettings(page);
+  await page.getByRole("button", { name: PRESET_DIRECT }).click();
   await page.getByRole("button", { name: "Reset to proxy" }).click();
   await expect(reopened.gateway).toHaveValue("/api");
-  await page.keyboard.press("Escape");
+  await page.getByRole("button", { name: "Save" }).click();
   await expect(page.locator(".overlay")).toHaveCount(0);
 
-  // INTENDED: `/api`. ACTUAL: Reset did not persist, so :3000 remains.
   expect(await readStorage(page, ENDPOINT_KEY)).toEqual({
-    gateway: "http://127.0.0.1:3000",
+    gateway: "/api",
     accountService: "/account-api",
   });
+});
+
+/**
+ * The probe result must describe the endpoint being tested — including when
+ * that endpoint is unusable from the browser.
+ *
+ * The "Local (direct :3000)" preset bypasses the Vite proxy, and monas-gateway
+ * sends no CORS headers, so the browser blocks it. Testing it must therefore
+ * report ✗ unreachable: a ✓ here would mean the probe is measuring something
+ * other than the endpoint in the form (which is exactly what the old
+ * save-then-probe implementation did).
+ *
+ * This is the regression guard for having decoupled probing from saving.
+ */
+test("S-07b: probing reports the tested endpoint, not the one in use", async ({ page }) => {
+  // The proxy endpoint currently in effect is reachable...
+  await expect(page.locator(".conn-item .dot.up")).toBeVisible();
+
+  const { gateway } = await openSettings(page);
+  await page.getByRole("button", { name: PRESET_DIRECT }).click();
+  await expect(gateway).toHaveValue("http://127.0.0.1:3000");
+
+  // ...but the direct endpoint is CORS-blocked from the browser, and the probe
+  // must say so rather than reporting on the still-active proxy.
+  await page.getByRole("button", { name: "Test connection" }).click();
+  await expect(page.locator(".toast.error", { hasText: "gateway ✗ unreachable" })).toBeVisible();
+
+  // The failed test left the app untouched: still unsaved, still on the proxy.
+  expect(await readStorage(page, ENDPOINT_KEY)).toBeNull();
+  await page.keyboard.press("Escape");
+  await expect(page.locator(".conn-item .dot.up")).toBeVisible();
 });

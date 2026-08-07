@@ -80,20 +80,22 @@ Modal structure is asserted with **ARIA snapshots** (`toMatchAriaSnapshot`)
 rather than CSS selectors, so the whole control set of a dialog is checked in
 one assertion and the tests survive styling changes.
 
-### Tests that document known bugs
+### Bugs this suite found (and now guards)
 
-Two tests are named `[KNOWN BUG]`. They assert the **current, wrong** behaviour
-so the suite stays green while the defect is recorded — and they flip to
-**failing** the moment someone fixes it, which is the signal to update them.
-Both were verified to actually discriminate (applying the fix makes them fail):
+Writing the suite surfaced two defects, both since fixed. The tests are the
+regression guards — reverting either fix makes them fail, which was verified
+rather than assumed:
 
 - **G-34** — with *Paste public key* selected and the field empty, *Wrap CEK &
-  share* stays enabled and does nothing: `submit()` returns early
-  (`ShareModal.tsx:53`). No toast, no validation. It should be disabled.
-- **S-07** — *Test connection* calls `saveEndpoints(cfg)` before probing
-  (`SettingsModal.tsx:27`), so an endpoint edit you never saved is persisted
-  and survives reload. *Reset to proxy* only resets component state
-  (`SettingsModal.tsx:41`), so it cannot undo this.
+  share* stayed enabled and did nothing: both branches of `submit()` return
+  early on missing input, with no toast and no validation. The button is now
+  gated on a `recipientReady` check and the empty field explains why.
+- **S-07** — *Test connection* called `saveEndpoints(cfg)` before probing,
+  because the probe could only read the endpoint back out of storage. Testing
+  an endpoint therefore committed it, and *Reset to proxy* only resets
+  component state, so a cancelled edit could not be undone from the dialog.
+  `probeGateway(base?)` now takes the candidate URL, so probing has no side
+  effect.
 
 The plan the suite was generated from lives in `specs/ui-coverage.md`
 (49 scenarios); the tests here cover the P0 subset that needs no fixtures.

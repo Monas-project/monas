@@ -39,6 +39,14 @@ export function ShareModal({
 
   const permissions: Permission[] = canWrite ? ["read", "write"] : ["read"];
 
+  // Whether submitting can actually do anything. Both branches of submit()
+  // bail out early when their input is missing, so without this the button
+  // stayed enabled and clicking it was a silent no-op.
+  const recipientReady =
+    mode === "identity"
+      ? others.some((i) => i.label === pickLabel)
+      : pubKey.trim().length > 0;
+
   const submit = () => {
     if (mode === "identity") {
       const who = others.find((i) => i.label === pickLabel);
@@ -70,7 +78,12 @@ export function ShareModal({
           <button className="btn" onClick={onClose}>
             Close
           </button>
-          <button className="btn primary" disabled={busy} onClick={submit}>
+          <button
+            className="btn primary"
+            disabled={busy || !recipientReady}
+            title={recipientReady ? undefined : "Choose a recipient identity or paste a public key"}
+            onClick={submit}
+          >
             {busy ? <span className="spinner" /> : <Lock size={14} />} Wrap CEK & share
           </button>
         </>
@@ -169,6 +182,11 @@ export function ShareModal({
               onChange={(e) => setPubKey(e.target.value)}
               placeholder="P-256 public key, base64url (from the gateway /keypair)"
             />
+            {!pubKey.trim() && (
+              <div className="hint">
+                Paste a recipient public key to enable sharing.
+              </div>
+            )}
           </div>
           <div className="field">
             <label>Label (optional)</label>

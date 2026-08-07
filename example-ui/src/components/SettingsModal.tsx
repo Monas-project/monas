@@ -22,10 +22,13 @@ export function SettingsModal({ onClose, onSaved }: { onClose: () => void; onSav
     onClose();
   };
 
+  // Probes the endpoint currently in the form WITHOUT persisting it. It used
+  // to call saveEndpoints() first (the probe could only read from storage), so
+  // testing an endpoint silently committed it — and "Reset to proxy" only
+  // resets component state, so there was no way to undo it from this dialog.
   const test = async () => {
     setTesting(true);
-    saveEndpoints(cfg); // probe reads from storage
-    const ok = await probeGateway();
+    const ok = await probeGateway(cfg.gateway);
     setTesting(false);
     pushToast(`gateway ${ok ? "✓ reachable" : "✗ unreachable"}`, ok ? "success" : "error");
   };
