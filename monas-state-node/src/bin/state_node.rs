@@ -5,6 +5,9 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use libp2p::Multiaddr;
+use monas_state_node::infrastructure::network::bootstrap::{
+    is_dns_addr, parse_bootstrap_addr, BootstrapParseError,
+};
 use monas_state_node::{StateNode, StateNodeConfig};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -44,6 +47,16 @@ struct Args {
     #[arg(long, default_value = "9090")]
     p2p_port: u16,
 
+    /// Disable mDNS local-network peer discovery.
+    ///
+    /// mDNS only reaches peers in the same broadcast domain, so it does
+    /// nothing in a real deployment (VPC, cross-internet) but works locally.
+    /// Pass this when a local cluster should behave like a deployed one —
+    /// otherwise mDNS can quietly paper over failures in the discovery paths
+    /// production actually depends on.
+    #[arg(long)]
+    disable_mdns: bool,
+
     /// Log level (trace, debug, info, warn, error).
     #[arg(long, default_value = "info")]
     log_level: String,
@@ -69,31 +82,39 @@ async fn main() -> Result<()> {
         listen_addrs: vec![format!("/ip4/0.0.0.0/tcp/{}", args.p2p_port)
             .parse::<Multiaddr>()
             .context("Failed to parse P2P listen address")?],
+        enable_mdns: !args.disable_mdns,
         ..Default::default()
     };
+    if args.disable_mdns {
+        tracing::info!(
+            "mDNS disabled; discovery relies on bootstrap peers, Kademlia and the peer store"
+        );
+    }
 
     // Parse and add bootstrap addresses
     for addr_str in &args.bootstrap {
-        tracing::info!("Bootstrap address: {}", addr_str);
-
-        // Parse multiaddr and extract peer ID
-        if let Ok(addr) = Multiaddr::from_str(addr_str) {
-            // Extract peer ID from the multiaddr (last component should be /p2p/<peer_id>)
-            if let Some(libp2p::multiaddr::Protocol::P2p(peer_id)) = addr.iter().last() {
-                // Create address without the /p2p/ suffix for Kademlia
-                let addr_without_p2p: Multiaddr = addr
-                    .iter()
-                    .filter(|p| !matches!(p, libp2p::multiaddr::Protocol::P2p(_)))
-                    .collect();
-                network_config
-                    .bootstrap_nodes
-                    .push((peer_id, addr_without_p2p));
-                tracing::info!("Added bootstrap peer: {}", peer_id);
-            } else {
+        match parse_bootstrap_addr(addr_str) {
+            Ok((peer_id, addr)) => {
+                if !is_dns_addr(&addr) {
+                    // Not fatal, but worth saying out loud: a literal IP is
+                    // frozen for the lifetime of the process, so if this peer
+                    // is ever recreated on a different address we will dial
+                    // the old one forever.
+                    tracing::warn!(
+                        "Bootstrap address {} uses a literal IP; it will not be \
+                         re-resolved if that peer moves. Prefer /dns4/<host>/…",
+                        addr_str
+                    );
+                }
+                tracing::info!("Added bootstrap peer {} at {}", peer_id, addr);
+                network_config.bootstrap_nodes.push((peer_id, addr));
+            }
+            Err(BootstrapParseError::MissingPeerId) => {
                 tracing::warn!("Bootstrap address missing peer ID: {}", addr_str);
             }
-        } else {
-            tracing::warn!("Failed to parse bootstrap address: {}", addr_str);
+            Err(BootstrapParseError::Malformed) => {
+                tracing::warn!("Failed to parse bootstrap address: {}", addr_str);
+            }
         }
     }
 
