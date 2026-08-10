@@ -469,10 +469,9 @@ impl MonasController {
         //
         // ロックはプロセス内のみ。複数 gateway プロセスからの並行 revoke は
         // これでは防げず、state node 側の CAS が必要になる(現状の制約)。
-        let revoke_lock = self.content_revoke_locks.mutex_for(content_id.as_str());
-        let _revoke_guard = revoke_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // ガードを drop するとエントリは表から消えるので、revoke した content の
+        // 数だけレジストリが伸び続けることはない。
+        let _revoke_guard = self.content_revoke_locks.lock(content_id.as_str());
 
         let snapshot = match self.capture_revoke_share_snapshot(&content_id) {
             Ok(snapshot) => snapshot,
@@ -855,7 +854,7 @@ impl MonasController {
         //
         //    CAS が失敗した = 別の処理が先に同じかより新しい世代へ進めた、なので
         //    こちらの(古い)3つ組は捨てる。
-        let new_pin = monas_content::infrastructure::sender_key_pin_store::SenderKeyPin {
+        let new_pin = monas_content::application_service::share_service::SenderKeyPin {
             sender_public_key: effective_sender_public_key,
             key_epoch: input.key_envelope.key_epoch,
             cek: Some(cek.0.clone()),
