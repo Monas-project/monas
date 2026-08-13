@@ -15,6 +15,7 @@ use crate::domain::events::Event;
 use crate::infrastructure::disk_capacity;
 use crate::port::content_repository::{ContentRepository, SerializedOperation};
 use crate::port::peer_network::PeerNetwork;
+use crate::port::peer_network::{RelayReadError, RelayReadErrorKind};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -42,7 +43,18 @@ const PEER_NETWORK_TIMEOUT: Duration = Duration::from_secs(30);
 /// which processes them using StateNodeService.
 pub struct RelayRequest {
     pub kind: RelayRequestKind,
-    pub reply: oneshot::Sender<Result<()>>,
+    pub reply:
+        oneshot::Sender<std::result::Result<RelayOutcome, crate::domain::errors::StateNodeError>>,
+}
+
+/// Result payload of a processed relay request.
+pub enum RelayOutcome {
+    /// Write relays (update/delete/invalidate) complete without a payload.
+    Done,
+    /// Relayed data read: raw bytes plus the version that was served.
+    Data { data: Vec<u8>, version: String },
+    /// Relayed history read.
+    History { versions: Vec<String> },
 }
 
 /// The kind of relay request.
@@ -66,6 +78,20 @@ pub enum RelayRequestKind {
         request_signature: Vec<u8>,
         timestamp: Option<u64>,
     },
+    ReadContent {
+        content_id: String,
+        /// `None` reads the latest version; `Some(v)` a specific version CID.
+        version: Option<String>,
+        auth_token: String,
+        request_signature: Vec<u8>,
+        timestamp: Option<u64>,
+    },
+    ReadHistory {
+        content_id: String,
+        auth_token: String,
+        request_signature: Vec<u8>,
+        timestamp: Option<u64>,
+    },
 }
 
 /// Gossipsub message received from the network.
@@ -82,8 +108,21 @@ pub struct GossipsubMessage {
 /// Parsed domain event received from Gossipsub.
 #[derive(Debug, Clone)]
 pub struct ReceivedEvent {
-    /// The source peer ID.
-    pub source: String,
+    /// The peer that **published** the message, as authenticated by gossipsub.
+    ///
+    /// This is `Message::source`, not `propagation_source`: the mesh forwards
+    /// messages, so the peer that handed us the bytes is generally not the one
+    /// that produced them. Under `MessageAuthenticity::Signed` +
+    /// `ValidationMode::Strict` the author field is required and the message
+    /// signature is verified against it before delivery, so a forwarder cannot
+    /// alter it. Authorization checks must use this field — using the
+    /// forwarder would both accept forged origins and reject honest multi-hop
+    /// delivery.
+    ///
+    /// `None` only if a message somehow arrives without an author, which
+    /// Strict mode rejects; callers treat it as "unverifiable" and skip
+    /// origin-bound checks rather than trusting it.
+    pub source: Option<String>,
     /// The parsed domain event.
     pub event: Event,
 }
@@ -210,6 +249,23 @@ enum SwarmCommand {
         timestamp: Option<u64>,
         reply: oneshot::Sender<Result<bool>>,
     },
+    RelayReadContent {
+        peer_id: PeerId,
+        content_id: String,
+        version: Option<String>,
+        auth_token: String,
+        request_signature: Vec<u8>,
+        timestamp: Option<u64>,
+        reply: RelayReadReply,
+    },
+    RelayReadHistory {
+        peer_id: PeerId,
+        content_id: String,
+        auth_token: String,
+        request_signature: Vec<u8>,
+        timestamp: Option<u64>,
+        reply: RelayHistoryReply,
+    },
     /// Send a response back through a ResponseChannel.
     /// Used by spawned relay tasks to send responses without blocking the swarm loop.
     SendRelayResponse {
@@ -220,6 +276,26 @@ enum SwarmCommand {
 
 /// TTL for pending requests. Entries older than this are cleaned up to prevent memory leaks.
 const PENDING_REQUEST_TTL: Duration = Duration::from_secs(120);
+
+/// Reply payload of a relayed data read: `(data, served_version)`.
+type RelayReadReply = oneshot::Sender<std::result::Result<(Vec<u8>, String), RelayReadError>>;
+/// Reply payload of a relayed history read.
+type RelayHistoryReply = oneshot::Sender<std::result::Result<Vec<String>, RelayReadError>>;
+
+/// Map a member-side service error to the wire verdict for relayed reads.
+fn relay_read_error_kind(e: &crate::domain::errors::StateNodeError) -> RelayReadErrorKind {
+    use crate::domain::errors::StateNodeError as E;
+    match e {
+        E::ContentNotFound(_) => RelayReadErrorKind::NotFound,
+        E::AuthenticationFailed(_) | E::InvalidUcanToken(_) => {
+            RelayReadErrorKind::AuthenticationFailed
+        }
+        E::AuthorizationFailed(_) | E::PermissionDenied(_) => {
+            RelayReadErrorKind::AuthorizationFailed
+        }
+        _ => RelayReadErrorKind::Other,
+    }
+}
 
 /// Pending requests tracking with TTL support.
 ///
@@ -238,6 +314,8 @@ struct PendingRequests {
     relay_update_queries: HashMap<OutboundRequestId, oneshot::Sender<Result<bool>>>,
     relay_delete_queries: HashMap<OutboundRequestId, oneshot::Sender<Result<bool>>>,
     relay_invalidate_tokens_queries: HashMap<OutboundRequestId, oneshot::Sender<Result<bool>>>,
+    relay_read_queries: HashMap<OutboundRequestId, RelayReadReply>,
+    relay_history_queries: HashMap<OutboundRequestId, RelayHistoryReply>,
     /// Timestamps for all pending request IDs, used for TTL-based cleanup.
     timestamps: HashMap<u64, tokio::time::Instant>,
 }
@@ -261,6 +339,8 @@ impl PendingRequests {
         self.relay_delete_queries.retain(|_, s| !s.is_closed());
         self.relay_invalidate_tokens_queries
             .retain(|_, s| !s.is_closed());
+        self.relay_read_queries.retain(|_, s| !s.is_closed());
+        self.relay_history_queries.retain(|_, s| !s.is_closed());
 
         // Clean up expired timestamps
         self.timestamps
@@ -756,6 +836,46 @@ impl Libp2pNetwork {
                     .relay_invalidate_tokens_queries
                     .insert(request_id, reply);
             }
+            SwarmCommand::RelayReadContent {
+                peer_id,
+                content_id,
+                version,
+                auth_token,
+                request_signature,
+                timestamp,
+                reply,
+            } => {
+                let request_id = swarm.behaviour_mut().request_response.send_request(
+                    &peer_id,
+                    ContentRequest::ReadContent {
+                        content_id,
+                        version,
+                        auth_token,
+                        request_signature,
+                        timestamp,
+                    },
+                );
+                pending.relay_read_queries.insert(request_id, reply);
+            }
+            SwarmCommand::RelayReadHistory {
+                peer_id,
+                content_id,
+                auth_token,
+                request_signature,
+                timestamp,
+                reply,
+            } => {
+                let request_id = swarm.behaviour_mut().request_response.send_request(
+                    &peer_id,
+                    ContentRequest::ReadHistory {
+                        content_id,
+                        auth_token,
+                        request_signature,
+                        timestamp,
+                    },
+                );
+                pending.relay_history_queries.insert(request_id, reply);
+            }
             SwarmCommand::SendRelayResponse { channel, response } => {
                 if let Err(e) = swarm
                     .behaviour_mut()
@@ -922,8 +1042,10 @@ impl Libp2pNetwork {
                             domain_event.event_type()
                         );
 
+                        // Bind to the authenticated publisher, not the peer
+                        // that forwarded it to us — see `ReceivedEvent::source`.
                         let received = ReceivedEvent {
-                            source: propagation_source.to_string(),
+                            source: message.source.map(|p| p.to_string()),
                             event: domain_event,
                         };
 
@@ -1013,6 +1135,12 @@ impl Libp2pNetwork {
                 if let Some(reply) = pending.relay_invalidate_tokens_queries.remove(&request_id) {
                     let _ = reply.send(Err(anyhow::anyhow!("{}", err_msg)));
                 }
+                if let Some(reply) = pending.relay_read_queries.remove(&request_id) {
+                    let _ = reply.send(Err(RelayReadError::other(&err_msg)));
+                }
+                if let Some(reply) = pending.relay_history_queries.remove(&request_id) {
+                    let _ = reply.send(Err(RelayReadError::other(&err_msg)));
+                }
             }
             _ => {}
         }
@@ -1056,8 +1184,11 @@ impl Libp2pNetwork {
                 // binding `sender_peer == bs.creator_node_id` stops creator
                 // impersonation. Requiring that `local_peer` appear in
                 // `member_nodes` stops a malicious peer from fabricating a
-                // network on an unrelated victim node. The residual risk
-                // matches the Gossipsub ContentCreated trust model.
+                // network on an unrelated victim node. This mirrors the
+                // Gossipsub `ContentCreated` path, which binds the
+                // authenticated publisher to the creator it claims; the
+                // residual risk is the same — an authenticated creator can
+                // still declare a member set of its choosing.
                 if bs.creator_node_id != sender_peer {
                     return Err(format!(
                         "bootstrap creator_node_id {} does not match sender {}",
@@ -1148,7 +1279,7 @@ impl Libp2pNetwork {
                     };
                     let response = if channels.relay_tx.send(relay_req).await.is_ok() {
                         match reply_rx.await {
-                            Ok(Ok(())) => ContentResponse::UpdateResult {
+                            Ok(Ok(_)) => ContentResponse::UpdateResult {
                                 content_id,
                                 success: true,
                             },
@@ -1195,7 +1326,7 @@ impl Libp2pNetwork {
                     };
                     let response = if channels.relay_tx.send(relay_req).await.is_ok() {
                         match reply_rx.await {
-                            Ok(Ok(())) => ContentResponse::DeleteResult {
+                            Ok(Ok(_)) => ContentResponse::DeleteResult {
                                 content_id,
                                 success: true,
                             },
@@ -1242,12 +1373,123 @@ impl Libp2pNetwork {
                     };
                     let response = if channels.relay_tx.send(relay_req).await.is_ok() {
                         match reply_rx.await {
-                            Ok(Ok(())) => ContentResponse::InvalidateTokensResult {
+                            Ok(Ok(_)) => ContentResponse::InvalidateTokensResult {
                                 content_id,
                                 success: true,
                             },
                             Ok(Err(e)) => ContentResponse::Error {
                                 message: format!("Relay invalidate_tokens failed: {}", e),
+                            },
+                            Err(_) => ContentResponse::Error {
+                                message: "Relay handler dropped".to_string(),
+                            },
+                        }
+                    } else {
+                        ContentResponse::Error {
+                            message: "Relay channel closed".to_string(),
+                        }
+                    };
+                    let _ = channels
+                        .command_tx
+                        .send(SwarmCommand::SendRelayResponse { channel, response })
+                        .await;
+                });
+                return;
+            }
+            ContentRequest::ReadContent {
+                content_id,
+                version,
+                auth_token,
+                request_signature,
+                timestamp,
+            } => {
+                info!(
+                    "Received relayed ReadContent for {} from {}",
+                    content_id, peer
+                );
+                let channels = relay_channels.clone();
+                tokio::spawn(async move {
+                    let (reply_tx, reply_rx) = oneshot::channel();
+                    let relay_req = RelayRequest {
+                        kind: RelayRequestKind::ReadContent {
+                            content_id: content_id.clone(),
+                            version,
+                            auth_token,
+                            request_signature,
+                            timestamp,
+                        },
+                        reply: reply_tx,
+                    };
+                    let response = if channels.relay_tx.send(relay_req).await.is_ok() {
+                        match reply_rx.await {
+                            Ok(Ok(RelayOutcome::Data { data, version })) => {
+                                ContentResponse::ContentData {
+                                    content_id,
+                                    data,
+                                    version,
+                                }
+                            }
+                            Ok(Ok(_)) => ContentResponse::Error {
+                                message: "Unexpected relay outcome for ReadContent".to_string(),
+                            },
+                            Ok(Err(e)) => ContentResponse::ReadFailed {
+                                content_id,
+                                kind: relay_read_error_kind(&e),
+                                message: e.to_string(),
+                            },
+                            Err(_) => ContentResponse::Error {
+                                message: "Relay handler dropped".to_string(),
+                            },
+                        }
+                    } else {
+                        ContentResponse::Error {
+                            message: "Relay channel closed".to_string(),
+                        }
+                    };
+                    let _ = channels
+                        .command_tx
+                        .send(SwarmCommand::SendRelayResponse { channel, response })
+                        .await;
+                });
+                return;
+            }
+            ContentRequest::ReadHistory {
+                content_id,
+                auth_token,
+                request_signature,
+                timestamp,
+            } => {
+                info!(
+                    "Received relayed ReadHistory for {} from {}",
+                    content_id, peer
+                );
+                let channels = relay_channels.clone();
+                tokio::spawn(async move {
+                    let (reply_tx, reply_rx) = oneshot::channel();
+                    let relay_req = RelayRequest {
+                        kind: RelayRequestKind::ReadHistory {
+                            content_id: content_id.clone(),
+                            auth_token,
+                            request_signature,
+                            timestamp,
+                        },
+                        reply: reply_tx,
+                    };
+                    let response = if channels.relay_tx.send(relay_req).await.is_ok() {
+                        match reply_rx.await {
+                            Ok(Ok(RelayOutcome::History { versions })) => {
+                                ContentResponse::HistoryData {
+                                    content_id,
+                                    versions,
+                                }
+                            }
+                            Ok(Ok(_)) => ContentResponse::Error {
+                                message: "Unexpected relay outcome for ReadHistory".to_string(),
+                            },
+                            Ok(Err(e)) => ContentResponse::ReadFailed {
+                                content_id,
+                                kind: relay_read_error_kind(&e),
+                                message: e.to_string(),
                             },
                             Err(_) => ContentResponse::Error {
                                 message: "Relay handler dropped".to_string(),
@@ -1447,7 +1689,9 @@ impl Libp2pNetwork {
             // Relay variants already handled above and returned early
             ContentRequest::UpdateContent { .. }
             | ContentRequest::DeleteContent { .. }
-            | ContentRequest::InvalidateTokens { .. } => unreachable!(),
+            | ContentRequest::InvalidateTokens { .. }
+            | ContentRequest::ReadContent { .. }
+            | ContentRequest::ReadHistory { .. } => unreachable!(),
         };
 
         if let Err(e) = swarm
@@ -1591,6 +1835,62 @@ impl Libp2pNetwork {
                 }
                 _ => {
                     let _ = reply.send(Err(anyhow::anyhow!("Unexpected response type")));
+                }
+            }
+            return;
+        }
+
+        // Handle relay read (data) response
+        if let Some(reply) = pending.relay_read_queries.remove(&request_id) {
+            match response {
+                ContentResponse::ContentData { data, version, .. } => {
+                    let _ = reply.send(Ok((data, version)));
+                }
+                ContentResponse::ReadFailed { kind, message, .. } => {
+                    let _ = reply.send(Err(RelayReadError { kind, message }));
+                }
+                ContentResponse::NotFound { content_id } => {
+                    let _ = reply.send(Err(RelayReadError {
+                        kind: RelayReadErrorKind::NotFound,
+                        message: format!("Content not found: {}", content_id),
+                    }));
+                }
+                ContentResponse::Error { message } => {
+                    let _ = reply.send(Err(RelayReadError::other(format!(
+                        "Relay read error: {}",
+                        message
+                    ))));
+                }
+                _ => {
+                    let _ = reply.send(Err(RelayReadError::other("Unexpected response type")));
+                }
+            }
+            return;
+        }
+
+        // Handle relay read (history) response
+        if let Some(reply) = pending.relay_history_queries.remove(&request_id) {
+            match response {
+                ContentResponse::HistoryData { versions, .. } => {
+                    let _ = reply.send(Ok(versions));
+                }
+                ContentResponse::ReadFailed { kind, message, .. } => {
+                    let _ = reply.send(Err(RelayReadError { kind, message }));
+                }
+                ContentResponse::NotFound { content_id } => {
+                    let _ = reply.send(Err(RelayReadError {
+                        kind: RelayReadErrorKind::NotFound,
+                        message: format!("Content not found: {}", content_id),
+                    }));
+                }
+                ContentResponse::Error { message } => {
+                    let _ = reply.send(Err(RelayReadError::other(format!(
+                        "Relay read error: {}",
+                        message
+                    ))));
+                }
+                _ => {
+                    let _ = reply.send(Err(RelayReadError::other("Unexpected response type")));
                 }
             }
         }
@@ -2136,6 +2436,68 @@ impl PeerNetwork for Libp2pNetwork {
             .await
             .map_err(|_| anyhow::anyhow!("relay_invalidate_tokens timed out"))?
             .map_err(|_| anyhow::anyhow!("Failed to receive response"))?
+    }
+
+    async fn relay_read_content(
+        &self,
+        peer_id: &str,
+        content_id: &str,
+        version: Option<&str>,
+        auth_token: &str,
+        request_signature: &[u8],
+        timestamp: Option<u64>,
+    ) -> std::result::Result<(Vec<u8>, String), RelayReadError> {
+        let peer_id = PeerId::from_str(peer_id)
+            .map_err(|_| RelayReadError::other(format!("Invalid peer ID: {}", peer_id)))?;
+
+        let (tx, rx) = oneshot::channel();
+        self.command_tx
+            .send(SwarmCommand::RelayReadContent {
+                peer_id,
+                content_id: content_id.to_string(),
+                version: version.map(ToOwned::to_owned),
+                auth_token: auth_token.to_string(),
+                request_signature: request_signature.to_vec(),
+                timestamp,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| RelayReadError::other("Failed to send command"))?;
+
+        tokio::time::timeout(PEER_NETWORK_TIMEOUT, rx)
+            .await
+            .map_err(|_| RelayReadError::other("relay_read_content timed out"))?
+            .map_err(|_| RelayReadError::other("Failed to receive response"))?
+    }
+
+    async fn relay_read_history(
+        &self,
+        peer_id: &str,
+        content_id: &str,
+        auth_token: &str,
+        request_signature: &[u8],
+        timestamp: Option<u64>,
+    ) -> std::result::Result<Vec<String>, RelayReadError> {
+        let peer_id = PeerId::from_str(peer_id)
+            .map_err(|_| RelayReadError::other(format!("Invalid peer ID: {}", peer_id)))?;
+
+        let (tx, rx) = oneshot::channel();
+        self.command_tx
+            .send(SwarmCommand::RelayReadHistory {
+                peer_id,
+                content_id: content_id.to_string(),
+                auth_token: auth_token.to_string(),
+                request_signature: request_signature.to_vec(),
+                timestamp,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| RelayReadError::other("Failed to send command"))?;
+
+        tokio::time::timeout(PEER_NETWORK_TIMEOUT, rx)
+            .await
+            .map_err(|_| RelayReadError::other("relay_read_history timed out"))?
+            .map_err(|_| RelayReadError::other("Failed to receive response"))?
     }
 
     async fn connected_peer_count(&self) -> usize {

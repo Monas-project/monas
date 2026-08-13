@@ -306,7 +306,7 @@ log_step "全ノードから content データを即座に取得できるか確�
 
 IMMEDIATE_MEMBERS=0
 for port in 8080 8081 8082; do
-    generate_signature "$ACCOUNT1_PRIVATE_KEY" "read" "content"
+    generate_signature "$ACCOUNT1_PRIVATE_KEY" "read" "$CONTENT_ID"
     DATA_RESPONSE=$(curl -s "http://127.0.0.1:$port/content/$CONTENT_ID/data" \
         -H "Authorization: Bearer $ACCOUNT1_KEY_ID" \
         -H "X-Request-Signature: $LAST_SIGNATURE" \
@@ -445,7 +445,7 @@ echo ""
 updated_content_visible() {
     local p
     for p in 8080 8081 8082; do
-        generate_signature "$ACCOUNT1_PRIVATE_KEY" "read" "content"
+        generate_signature "$ACCOUNT1_PRIVATE_KEY" "read" "$CONTENT_ID"
         local resp
         resp=$(curl -s "http://127.0.0.1:$p/content/$CONTENT_ID/data" \
             -H "Authorization: Bearer $ACCOUNT1_KEY_ID" \
@@ -464,7 +464,7 @@ poll_until 15 1 updated_content_visible || log_warn "15秒以内に更新の伝�
 
 log_step "各ノードでcontentデータを取得し、更新が反映されていることを確認"
 for port in 8080 8081 8082; do
-    generate_signature "$ACCOUNT1_PRIVATE_KEY" "read" "content"
+    generate_signature "$ACCOUNT1_PRIVATE_KEY" "read" "$CONTENT_ID"
     DATA_RESPONSE=$(curl -s "http://127.0.0.1:$port/content/$CONTENT_ID/data" \
         -H "Authorization: Bearer $ACCOUNT1_KEY_ID" \
         -H "X-Request-Signature: $LAST_SIGNATURE" \
@@ -483,7 +483,7 @@ done
 log_test "少なくとも1つのノードで更新データが取得できること"
 VERIFIED=false
 for port in 8080 8081 8082; do
-    generate_signature "$ACCOUNT1_PRIVATE_KEY" "read" "content"
+    generate_signature "$ACCOUNT1_PRIVATE_KEY" "read" "$CONTENT_ID"
     DATA_RESPONSE=$(curl -s "http://127.0.0.1:$port/content/$CONTENT_ID/data" \
         -H "Authorization: Bearer $ACCOUNT1_KEY_ID" \
         -H "X-Request-Signature: $LAST_SIGNATURE" \

@@ -54,6 +54,12 @@ pub struct VerifyIntegrityInput {
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_version: Option<String>,
+    /// SDK ローカルの版ID。指定すると、State Node が返す暗号文をローカルに
+    /// 保存された暗号文とバイト比較して検証する（State Node は暗号文を保持
+    /// するため、平文である `content` とは直接比較できない）。未指定の場合は
+    /// 従来どおり `content` のバイト列と直接比較する。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_content_id: Option<String>,
 }
 
 /// 整合性検証レスポンス

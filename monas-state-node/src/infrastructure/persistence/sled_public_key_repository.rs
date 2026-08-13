@@ -302,9 +302,20 @@ mod tests {
             repo.flush().await.unwrap();
         }
 
-        // Open new repository instance and verify key persists
+        // Open new repository instance and verify key persists.
+        // sled releases its file lock asynchronously on Drop, so an immediate
+        // reopen can transiently fail with WouldBlock on slow CI runners —
+        // retry briefly instead of failing the test on that race.
         {
-            let repo = SledPublicKeyRepository::open(temp_dir.path()).unwrap();
+            let mut repo = SledPublicKeyRepository::open(temp_dir.path());
+            for _ in 0..20 {
+                if repo.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                repo = SledPublicKeyRepository::open(temp_dir.path());
+            }
+            let repo = repo.unwrap();
             let retrieved = repo.get_public_key(&node_id).await.unwrap();
             assert!(retrieved.is_some());
             assert_eq!(retrieved.unwrap(), public_key);

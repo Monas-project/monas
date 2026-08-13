@@ -613,66 +613,84 @@ async fn verify_read_access(
     let request_sig = extract_request_signature(headers);
     let timestamp = extract_request_timestamp(headers);
 
-    // Authenticate the caller
-    let identity = state
-        .authenticate_for_read(&token, request_sig.as_deref(), timestamp)
+    state
+        .authorize_read(&token, request_sig.as_deref(), timestamp, content_id)
         .await
-        .map_err(|e| {
-            (
-                StatusCode::UNAUTHORIZED,
-                Json(ErrorResponse {
-                    error: format!("Authentication failed: {}", e),
-                }),
-            )
-                .into_response()
-        })?;
+        .map_err(|e| e.into_response())
+}
 
-    // Check access policy for read permission
-    let crdt_repo = state.crdt_repo();
-    if let Ok(Some(policy)) = crdt_repo.get_access_policy(content_id).await {
-        // Owner always has access
-        if policy.is_owner(&identity) {
-            return Ok(());
-        }
-
-        // Non-owner: needs AuthToken-based authorization
-        // The Bearer token is used as-is for JWT-based auth
-        let request_signature = extract_request_signature(headers);
-        let authz_request = crate::port::authorization_service::AuthorizationRequest {
-            identity,
-            resource: crate::domain::value_objects::ContentId::new(content_id.to_string())
-                .map_err(|_| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        Json(ErrorResponse {
-                            error: "Invalid content ID".to_string(),
-                        }),
-                    )
-                        .into_response()
-                })?,
-            capability: crate::domain::auth_capability::AuthCapability::ReadContent,
-            token: Some(token),
-            request_signature,
-        };
-
-        if let Some(authz_service) = state.authz_service() {
-            match authz_service.authorize(&authz_request).await {
-                Ok(result) if result.is_granted() => return Ok(()),
-                _ => {}
-            }
-        }
-
-        return Err((
-            StatusCode::FORBIDDEN,
+/// Serve a read for content this node does not replicate by relaying it —
+/// auth material included — to a member node (bug #93 hardened read path).
+async fn relay_read_data_response(
+    state: &AppState,
+    headers: &HeaderMap,
+    content_id: &str,
+    version: Option<&str>,
+) -> Response {
+    let Some(token) = extract_auth_token(headers) else {
+        return (
+            StatusCode::UNAUTHORIZED,
             Json(ErrorResponse {
-                error: "Insufficient permissions: read access required".to_string(),
+                error: "Authorization header is required".to_string(),
             }),
         )
-            .into_response());
-    }
-    // If no policy exists, allow access (content may not have a policy yet)
+            .into_response();
+    };
+    let request_sig = extract_request_signature(headers);
+    let timestamp = extract_request_timestamp(headers);
 
-    Ok(())
+    match state
+        .relay_read_data(
+            content_id,
+            version,
+            &token,
+            request_sig.as_deref(),
+            timestamp,
+        )
+        .await
+    {
+        Ok((data, served_version)) => {
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&data);
+            Json(ContentDataResponse {
+                content_id: content_id.to_string(),
+                data: encoded,
+                version: Some(served_version),
+            })
+            .into_response()
+        }
+        Err(e) => e.into_response(),
+    }
+}
+
+/// History counterpart of [`relay_read_data_response`].
+async fn relay_read_history_response(
+    state: &AppState,
+    headers: &HeaderMap,
+    content_id: &str,
+) -> Response {
+    let Some(token) = extract_auth_token(headers) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "Authorization header is required".to_string(),
+            }),
+        )
+            .into_response();
+    };
+    let request_sig = extract_request_signature(headers);
+    let timestamp = extract_request_timestamp(headers);
+
+    match state
+        .relay_read_history(content_id, &token, request_sig.as_deref(), timestamp)
+        .await
+    {
+        Ok(versions) => Json(ContentHistoryResponse {
+            content_id: content_id.to_string(),
+            versions,
+        })
+        .into_response(),
+        Err(e) => e.into_response(),
+    }
 }
 
 /// Get content data from CRDT repository.
@@ -684,11 +702,14 @@ async fn get_content_data(
     headers: HeaderMap,
     Query(query): Query<VersionQuery>,
 ) -> impl IntoResponse {
-    // Bug #93: if this node holds no local state for the content (it is neither
-    // the creator nor a member), pull it from a member first so the read below
-    // and the access-policy check both see the real data. Best-effort: on
-    // failure we fall through to the normal local read (which 404s as before).
-    let _ = state.ensure_content_local(&content_id).await;
+    // Bug #93: this node may not replicate the content (it is neither the
+    // creator nor a member). Relay the read — auth material included — to a
+    // member node, which re-authenticates the caller against the real access
+    // policy and serves the data. Operations are never pulled to this node.
+    if !state.has_local_content(&content_id).await {
+        return relay_read_data_response(&state, &headers, &content_id, query.version.as_deref())
+            .await;
+    }
 
     if let Err(response) = verify_read_access(&state, &headers, &content_id).await {
         return response;
@@ -698,7 +719,7 @@ async fn get_content_data(
 
     // Get data based on version parameter
     let data_result = if let Some(version) = &query.version {
-        crdt_repo.get_version(version).await
+        crdt_repo.get_version(&content_id, version).await
     } else {
         crdt_repo.get_latest(&content_id).await
     };
@@ -741,8 +762,10 @@ async fn get_content_history(
     Path(content_id): Path<String>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    // Bug #93: pull content from a member if we hold none locally (best-effort).
-    let _ = state.ensure_content_local(&content_id).await;
+    // Bug #93: relay the read to a member when we don't replicate the content.
+    if !state.has_local_content(&content_id).await {
+        return relay_read_history_response(&state, &headers, &content_id).await;
+    }
 
     if let Err(response) = verify_read_access(&state, &headers, &content_id).await {
         return response;
@@ -777,8 +800,10 @@ async fn get_content_version(
     Path((content_id, version)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    // Bug #93: pull content from a member if we hold none locally (best-effort).
-    let _ = state.ensure_content_local(&content_id).await;
+    // Bug #93: relay the read to a member when we don't replicate the content.
+    if !state.has_local_content(&content_id).await {
+        return relay_read_data_response(&state, &headers, &content_id, Some(&version)).await;
+    }
 
     if let Err(response) = verify_read_access(&state, &headers, &content_id).await {
         return response;
@@ -786,7 +811,7 @@ async fn get_content_version(
 
     let crdt_repo = state.crdt_repo();
 
-    match crdt_repo.get_version(&version).await {
+    match crdt_repo.get_version(&content_id, &version).await {
         Ok(Some(data)) => {
             let encoded = base64::engine::general_purpose::STANDARD.encode(&data);
             Json(ContentDataResponse {

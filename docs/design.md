@@ -157,7 +157,7 @@ presentation/   Axum HTTP API (port: 4002)
 
 | 機能 | 実装 |
 |------|------|
-| コンテンツ暗号化 | AES-256-CTR（IVランダム生成） |
+| コンテンツ暗号化 | AES-256-GCM（AEAD、12バイトランダムnonce。保存形式は `nonce \|\| ciphertext \|\| tag`） |
 | 鍵生成・管理 | CEK（Content Encryption Key）の生成・保存・削除 |
 | コンテンツアドレッシング | SHA-256によるCID生成 |
 | 鍵共有 | HPKE（RFC 9180、DH-KEM P-256）によるCEKのラップ |
@@ -169,7 +169,7 @@ presentation/   Axum HTTP API (port: 4002)
 domain/         Content, ContentId, Share, Permission, KeyEnvelope
 application/    ContentService（CRUD + fetch + reencrypt）
                 ShareService（grant, revoke, unwrap_cek）
-infrastructure/ AES-256-CTR, HPKE, Sled, monas-filesync
+infrastructure/ AES-256-GCM, HPKE, Sled, monas-filesync
 presentation/   Axum HTTP API (port: 4001)
 ```
 
@@ -343,6 +343,41 @@ Token失効は`min_valid_issued_at`による時刻ベースで管理される。
 ### ビザンチン耐性
 
 ネットワークはビザンチン耐性を前提として設計されている。悪意のあるノードが参加してもコンテンツの暗号化によって内容の漏洩は防がれる。XOR距離によるランダムなノード選択が一定の保護を提供する。
+
+#### relay先の信頼度
+
+コンテンツを保持しないノードがリクエストを受けた場合、実際のmemberへrelayする。このときのrelay先候補には**由来の異なる2種類**があり、扱いを分ける必要がある。
+
+| 由来 | 内容 | 扱い |
+|---|---|---|
+| ローカルの`ContentNetwork`レコード | 自ノードをmemberとして名指しした`ContentCreated` / `ContentNetworkManagerAdded`イベント由来。**発行元は認証済みだが、member集合そのものは発行元の主張** | ローカルレコード |
+| DHTの近傍探索 | `sha256(content_id)`に近いというだけ。コンテンツとの関連は何も示されていない | 未証明 |
+
+ここで「ローカルレコード」は**owner署名によるattestationではない**。イベントにowner署名は無く、member集合は発行元の自己申告である。検証されているのは**発行元**の方で、Gossipsubを`MessageAuthenticity::Signed` + `ValidationMode::Strict`で運用しているため著者フィールドは必須かつ署名検証済みであり、これを次の2点に束縛している。
+
+- `ContentCreated`は、名乗っている`creator_node_id`本人からの発行でなければ拒否する
+- member集合を変える`ContentNetworkManagerAdded` / `ContentNetworkManagerRemoved`は、こちらが保持しているそのネットワークの既存memberからの発行でなければ拒否する
+- `ContentDeleted`は上記に加えて、名乗っている`deleted_by_node_id`本人からの発行であることも確認する。ただしこのイベントは発行元を*自分で*名乗るので、その照合だけでは「認証済みなら誰でも通る」ことにしかならない。ローカルレコードを消せるのは既存memberだけである
+- `ContentUpdated`は、名乗っている`updated_node_id`本人からの発行でなければ拒否する
+
+なお束縛に使うのはGossipsubの`Message::source`（**発行元**）であって`propagation_source`（直前の転送元）ではない。meshは多段転送するため、転送元で判定すると正規の多段配送を落としつつ偽装を通してしまう。
+
+**候補が返した401/403は、出自によらず早期打ち切りの根拠にはしない。** 権威にすると、DHTキーの近くにPeer IDを置いた1台が403を返すだけであらゆるread/writeを止められてしまう（可用性への攻撃）。また正規のmemberであっても、policyの複製が終わっていない部分同期状態なら403を返し得るため、健全なレプリカへのfailoverを潰さないためにも継続が必要である。ただし答えとしては保持し、他の候補から何も得られなければそれを返す。
+
+ローカルレコード由来のmemberについては、以前は「実policyに対する評価結果だから」として打ち切っていた。**これは撤回した。** レコード自体が最初の1通で植え付けられる（照合すべき既存membershipが無いため受理せざるを得ない）以上、その競争に勝った攻撃者は候補リストに載り、その403で正規callerのreadを恒久的に止められる — 未証明ピアについて防いでいるのと同じ攻撃が、ローカルレコード経路でも成立してしまう。早期打ち切りを戻せるのはowner署名付きmembership（#63）が入ってからである。継続のコストは「本当に拒否された場合に残り候補ぶんの往復が増える」ことに限られ、可用性側に倒すのが正しい方向である（callerはどのみち拒否され、それが少し遅くなるだけ）。
+
+一方で、**credentialは未証明の候補へ転送してよい。** relayはcallerのtokenとリクエスト署名をそのまま転送するが、これは設計どおりであり、認可判断はmember側が実policyに対して行う。転送しなければmember側で認可できない。
+
+これが安全なのは、認可が**Proof of Possession**だからである。tokenは自己完結型の鍵ID（公開鍵そのもの）か委譲JWTで、後者の`aud`（宛先）もまた自己完結型の鍵IDである。リクエスト署名は**その`aud`の鍵に対して**検証されるため、tokenと署名の両方を傍受した相手も、`aud`の秘密鍵を持たない以上、新しいリクエストを作れない。傍受した署名そのものも操作・リソース・body digest・timestampに束縛されており、mutationについてはさらに使い切りである。したがって未証明の候補へ渡っても、その相手ができるのは「同じreadを鮮度窓の内に再実行する」ことに限られる — readは冪等で、しかもその候補はrelay経由で既に暗号文を見ているため、新たに得られる情報はない。
+
+候補リストを未証明だからといって切り詰めることはしない。切り詰めれば正当なmemberへのfailoverが減って可用性が落ちる一方、DHT距離順で先頭に来る相手は上限があろうと credential を受け取るため、機密性は改善しないからである。
+
+残る課題は**member discoveryそのもの**である。発行元の認証によって「無関係なノードが勝手にレコードを植え付ける」ことは防げるが、次の2つの穴はプロトコル変更（owner署名付きmembership）でしか塞げず、未実装である。
+
+- そのcontentについて**最初の**レコードは、照合すべき既存membershipが無いため受け入れざるを得ない
+- 認証済みのmemberであれば、任意のmember集合を主張できる
+
+したがって「このノードが本当にこのcontentのmemberである」ことを暗号学的に確認する仕組みは依然として無く、ローカルレコード / 未証明の区別はそこへ至るまでの近似にとどまる。
 
 ---
 

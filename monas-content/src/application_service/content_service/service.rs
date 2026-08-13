@@ -237,6 +237,29 @@ where
         })
     }
 
+    /// ローカルに保存された「暗号化済み」バイト列を取得する。
+    ///
+    /// State Node 整合性検証用途：State Node が保持するのは SDK が送信した
+    /// 暗号文なので、復号せずローカル暗号文とバイト比較することで
+    /// 「State Node が改ざんされていない同一の暗号文を保持しているか」を
+    /// 確認できる。
+    pub fn fetch_encrypted(&self, content_id: ContentId) -> Result<Vec<u8>, FetchError> {
+        let content = self
+            .content_repository
+            .find_by_id(&content_id)
+            .map_err(FetchError::Repository)?
+            .ok_or(FetchError::NotFound)?;
+
+        if content.is_deleted() {
+            return Err(FetchError::Deleted);
+        }
+
+        content
+            .encrypted_content()
+            .cloned()
+            .ok_or(FetchError::NotFound)
+    }
+
     /// 外部でアンラップされた CEK と暗号化済みコンテンツを用いて復号するユースケース。
     ///
     /// - 共有フロー（Share）で KeyEnvelope から CEK を取り出した後の復号処理を想定。
@@ -1109,6 +1132,47 @@ mod tests {
             .expect("content should be stored");
         assert!(!stored.is_deleted());
         assert_eq!(stored.content_status(), &ContentStatus::Active);
+    }
+
+    #[test]
+    fn fetch_encrypted_returns_stored_ciphertext() {
+        let (repo, _storage) = TestContentRepository::new(false);
+        let (key_store, _key_storage) = TestKeyStore::new(false, false);
+        let service = build_service(repo, TestKeyGenerator, TestEncryptor, key_store);
+
+        let created = service
+            .create(CreateContentCommand {
+                name: "test".into(),
+                path: "path.txt".into(),
+                raw_content: b"hello".to_vec(),
+                provider: None,
+            })
+            .expect("create should succeed");
+
+        let encrypted = service
+            .fetch_encrypted(created.content_id.clone())
+            .expect("fetch_encrypted should succeed");
+        // Contract: exactly the ciphertext produced at create time — the same
+        // bytes create() sent to the state node, so the verify-integrity
+        // comparison holds. (The test encryptor may be identity, so comparing
+        // against the plaintext would be meaningless here.)
+        assert_eq!(encrypted, created.encrypted_content);
+
+        // Round-trip sanity: the plaintext fetch decrypts the same bytes.
+        let fetched = service
+            .fetch(created.content_id, None)
+            .expect("fetch should succeed");
+        assert_eq!(fetched.raw_content, b"hello".to_vec());
+    }
+
+    #[test]
+    fn fetch_encrypted_not_found_for_unknown_content() {
+        let (repo, _) = TestContentRepository::new(false);
+        let (key_store, _) = TestKeyStore::new(false, false);
+        let service = build_service(repo, TestKeyGenerator, TestEncryptor, key_store);
+
+        let result = service.fetch_encrypted(ContentId::new("missing".to_string()));
+        assert!(matches!(result, Err(FetchError::NotFound)));
     }
 
     #[test]

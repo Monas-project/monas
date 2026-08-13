@@ -335,7 +335,9 @@ impl StateNode {
             let service_for_relay = self.service.clone();
             let token_relay = token.clone();
             tokio::spawn(async move {
-                use crate::infrastructure::network::libp2p_network::RelayRequestKind;
+                use crate::infrastructure::network::libp2p_network::{
+                    RelayOutcome, RelayRequestKind,
+                };
                 use crate::port::auth_token::AuthToken;
                 tracing::info!("Started relay request handler");
                 loop {
@@ -364,7 +366,7 @@ impl StateNode {
                                             timestamp,
                                         )
                                         .await
-                                        .map(|_| ())
+                                        .map(|_| RelayOutcome::Done)
                                 }
                                 RelayRequestKind::DeleteContent {
                                     content_id,
@@ -381,7 +383,7 @@ impl StateNode {
                                             timestamp,
                                         )
                                         .await
-                                        .map(|_| ())
+                                        .map(|_| RelayOutcome::Done)
                                 }
                                 RelayRequestKind::InvalidateTokens {
                                     content_id,
@@ -398,12 +400,49 @@ impl StateNode {
                                             timestamp,
                                         )
                                         .await
-                                        .map(|_| ())
+                                        .map(|_| RelayOutcome::Done)
+                                }
+                                RelayRequestKind::ReadContent {
+                                    content_id,
+                                    version,
+                                    auth_token,
+                                    request_signature,
+                                    timestamp,
+                                } => {
+                                    let token = AuthToken::new(auth_token);
+                                    service_for_relay
+                                        .read_content_via_relay(
+                                            &content_id,
+                                            version.as_deref(),
+                                            &token,
+                                            Some(&request_signature),
+                                            timestamp,
+                                        )
+                                        .await
+                                        .map(|(data, version)| RelayOutcome::Data {
+                                            data,
+                                            version,
+                                        })
+                                }
+                                RelayRequestKind::ReadHistory {
+                                    content_id,
+                                    auth_token,
+                                    request_signature,
+                                    timestamp,
+                                } => {
+                                    let token = AuthToken::new(auth_token);
+                                    service_for_relay
+                                        .read_history_via_relay(
+                                            &content_id,
+                                            &token,
+                                            Some(&request_signature),
+                                            timestamp,
+                                        )
+                                        .await
+                                        .map(|versions| RelayOutcome::History { versions })
                                 }
                             };
-                            let _ = req
-                                .reply
-                                .send(result.map_err(|e| anyhow::anyhow!(e.to_string())));
+                            let _ = req.reply.send(result);
                         }
                     }
                 }
@@ -431,14 +470,15 @@ impl StateNode {
                         match result {
                             Ok(received) => {
                                 tracing::debug!(
-                                    "Received event from {}: {:?}",
+                                    "Received event from {:?}: {:?}",
                                     received.source,
                                     received.event.event_type()
                                 );
 
-                                // Forward to service for processing (with source PeerID for verification)
+                                // Forward to service for processing, with the
+                                // authenticated publisher PeerID for origin checks.
                                 match service
-                                    .handle_sync_event(&received.event, Some(&received.source))
+                                    .handle_sync_event(&received.event, received.source.as_deref())
                                     .await
                                 {
                                     Ok(outcome) => {

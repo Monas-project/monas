@@ -485,7 +485,11 @@ mod tests {
         ) -> Result<Option<(Vec<u8>, String)>> {
             unimplemented!()
         }
-        async fn get_version(&self, _version_cid: &str) -> Result<Option<Vec<u8>>> {
+        async fn get_version(
+            &self,
+            _genesis_cid: &str,
+            _version_cid: &str,
+        ) -> Result<Option<Vec<u8>>> {
             unimplemented!()
         }
         async fn get_history(&self, _genesis_cid: &str) -> Result<Vec<String>> {

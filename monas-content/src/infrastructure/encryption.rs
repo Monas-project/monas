@@ -3,12 +3,9 @@ use crate::domain::content::encryption::{
 };
 use crate::domain::content::ContentError;
 
-use aes::Aes256;
-use ctr::cipher::{KeyIvInit, StreamCipher};
-use ctr::Ctr128BE;
+use aes_gcm::aead::Aead;
+use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use rand_core::{OsRng, RngCore};
-
-type Aes256Ctr = Ctr128BE<Aes256>;
 
 /// Implementation for generating a CEK suitable for AES-256.
 ///
@@ -24,18 +21,23 @@ impl ContentEncryptionKeyGenerator for OsRngContentEncryptionKeyGenerator {
     }
 }
 
-/// Content encryption/decryption implementation using AES-256-CTR.
+/// Content encryption/decryption implementation using AES-256-GCM (AEAD).
 ///
-/// - Encryption: generates a 16-byte random IV and returns a byte sequence in the form `[iv || ciphertext]`.
-/// - Decryption: splits the first 16 bytes as the IV and uses the remaining bytes as the ciphertext for AES-CTR.
-/// - Provides confidentiality only; no integrity/authentication (no MAC or AEAD).
-///   In the future this may be replaced with an AEAD scheme such as AES-GCM to add integrity protection.
-pub struct Aes256CtrContentEncryption;
+/// - Encryption: generates a 12-byte random nonce and returns a byte sequence
+///   in the form `[nonce || ciphertext || tag]` (the 16-byte authentication
+///   tag is appended by AES-GCM).
+/// - Decryption: splits the first 12 bytes as the nonce and authenticates the
+///   remaining bytes before returning the plaintext. Any tampering with the
+///   ciphertext (including a forged payload substituted by an untrusted node)
+///   fails authentication and returns a `DecryptionError` instead of silently
+///   yielding corrupted plaintext.
+pub struct Aes256GcmContentEncryption;
 
-const IV_LEN: usize = 16;
+const NONCE_LEN: usize = 12;
+const TAG_LEN: usize = 16;
 const KEY_LEN: usize = 32;
 
-impl ContentEncryption for Aes256CtrContentEncryption {
+impl ContentEncryption for Aes256GcmContentEncryption {
     fn encrypt(
         &self,
         key: &ContentEncryptionKey,
@@ -48,21 +50,24 @@ impl ContentEncryption for Aes256CtrContentEncryption {
                 key.0.len()
             )));
         }
-        let mut iv = [0u8; IV_LEN];
-        let mut rng = OsRng;
-        rng.fill_bytes(&mut iv);
-
-        let mut buffer = plaintext.to_vec();
-        let mut cipher = Aes256Ctr::new_from_slices(key.0.as_slice(), &iv).map_err(|_| {
+        let cipher = Aes256Gcm::new_from_slice(key.0.as_slice()).map_err(|_| {
             ContentError::EncryptionError(
-                "Invalid key or IV length for AES-256-CTR (expected 32-byte key, 16-byte IV)"
-                    .into(),
+                "Invalid key length for AES-256-GCM (expected 32-byte key)".into(),
             )
         })?;
-        cipher.apply_keystream(&mut buffer);
-        let mut result = Vec::with_capacity(IV_LEN + buffer.len());
-        result.extend_from_slice(&iv);
-        result.extend_from_slice(&buffer);
+
+        let mut nonce_bytes = [0u8; NONCE_LEN];
+        let mut rng = OsRng;
+        rng.fill_bytes(&mut nonce_bytes);
+        let nonce = Nonce::from_slice(&nonce_bytes);
+
+        let ciphertext = cipher
+            .encrypt(nonce, plaintext)
+            .map_err(|_| ContentError::EncryptionError("AES-256-GCM encryption failed".into()))?;
+
+        let mut result = Vec::with_capacity(NONCE_LEN + ciphertext.len());
+        result.extend_from_slice(&nonce_bytes);
+        result.extend_from_slice(&ciphertext);
         Ok(result)
     }
 
@@ -75,26 +80,26 @@ impl ContentEncryption for Aes256CtrContentEncryption {
             )));
         }
 
-        if data.len() <= IV_LEN {
+        if data.len() < NONCE_LEN + TAG_LEN {
             return Err(ContentError::DecryptionError(
-                "Ciphertext is too short to contain IV and data (must be longer than IV only)"
-                    .into(),
+                "Ciphertext is too short to contain nonce and authentication tag".into(),
             ));
         }
 
-        let (iv_bytes, ciphertext) = data.split_at(IV_LEN);
-
-        let mut buffer = ciphertext.to_vec();
-
-        let mut cipher = Aes256Ctr::new_from_slices(key.0.as_slice(), iv_bytes).map_err(|_| {
+        let (nonce_bytes, ciphertext) = data.split_at(NONCE_LEN);
+        let cipher = Aes256Gcm::new_from_slice(key.0.as_slice()).map_err(|_| {
             ContentError::DecryptionError(
-                "Invalid key or IV length for AES-256-CTR (expected 32-byte key, 16-byte IV)"
-                    .into(),
+                "Invalid key length for AES-256-GCM (expected 32-byte key)".into(),
             )
         })?;
-        cipher.apply_keystream(&mut buffer);
 
-        Ok(buffer)
+        cipher
+            .decrypt(Nonce::from_slice(nonce_bytes), ciphertext)
+            .map_err(|_| {
+                ContentError::DecryptionError(
+                    "AES-256-GCM authentication failed: ciphertext is corrupted or tampered".into(),
+                )
+            })
     }
 }
 
@@ -105,7 +110,7 @@ mod tests {
     #[test]
     fn encrypt_then_decrypt_round_trip() {
         let key = ContentEncryptionKey(vec![42u8; 32]); // fixed key only for testing
-        let encryptor = Aes256CtrContentEncryption;
+        let encryptor = Aes256GcmContentEncryption;
         let plaintext = b"Monas content encryption test".to_vec();
 
         let ciphertext = encryptor
@@ -113,8 +118,7 @@ mod tests {
             .expect("encryption should succeed");
 
         assert_ne!(ciphertext, plaintext);
-        assert!(ciphertext.len() > plaintext.len());
-        assert!(ciphertext.len() >= IV_LEN);
+        assert_eq!(ciphertext.len(), NONCE_LEN + plaintext.len() + TAG_LEN);
 
         let decrypted = encryptor
             .decrypt(&key, &ciphertext)
@@ -126,7 +130,7 @@ mod tests {
     #[test]
     fn encrypt_fails_with_invalid_key_length() {
         let key = ContentEncryptionKey(vec![1u8; 16]);
-        let encryptor = Aes256CtrContentEncryption;
+        let encryptor = Aes256GcmContentEncryption;
         let plaintext = b"test".to_vec();
 
         let result = encryptor.encrypt(&key, &plaintext);
@@ -136,9 +140,9 @@ mod tests {
     #[test]
     fn decrypt_fails_with_invalid_key_length() {
         let key = ContentEncryptionKey(vec![1u8; 16]);
-        let encryptor = Aes256CtrContentEncryption;
+        let encryptor = Aes256GcmContentEncryption;
 
-        let dummy_ciphertext = vec![0u8; IV_LEN + 4];
+        let dummy_ciphertext = vec![0u8; NONCE_LEN + TAG_LEN + 4];
 
         let result = encryptor.decrypt(&key, &dummy_ciphertext);
         assert!(matches!(result, Err(ContentError::DecryptionError(_))));
@@ -147,21 +151,22 @@ mod tests {
     #[test]
     fn decrypt_fails_when_data_too_short() {
         let key = ContentEncryptionKey(vec![2u8; 32]);
-        let encryptor = Aes256CtrContentEncryption;
+        let encryptor = Aes256GcmContentEncryption;
 
-        let too_short = vec![0u8; IV_LEN]; // exactly IV length (no payload data)
+        // nonce + tag だけの長さ未満は即エラー
+        let too_short = vec![0u8; NONCE_LEN + TAG_LEN - 1];
         let result = encryptor.decrypt(&key, &too_short);
         assert!(matches!(result, Err(ContentError::DecryptionError(_))));
 
-        let even_shorter = vec![0u8; IV_LEN - 1];
+        let even_shorter = vec![0u8; NONCE_LEN];
         let result2 = encryptor.decrypt(&key, &even_shorter);
         assert!(matches!(result2, Err(ContentError::DecryptionError(_))));
     }
 
     #[test]
-    fn encrypt_produces_different_ciphertexts_due_to_random_iv() {
+    fn encrypt_produces_different_ciphertexts_due_to_random_nonce() {
         let key = ContentEncryptionKey(vec![99u8; 32]);
-        let encryptor = Aes256CtrContentEncryption;
+        let encryptor = Aes256GcmContentEncryption;
         let plaintext = b"same plaintext".to_vec();
 
         let c1 = encryptor
@@ -177,7 +182,7 @@ mod tests {
     #[test]
     fn encrypt_then_decrypt_round_trip_large_plaintext() {
         let key = ContentEncryptionKey(vec![7u8; 32]);
-        let encryptor = Aes256CtrContentEncryption;
+        let encryptor = Aes256GcmContentEncryption;
         let size = 1024 * 1024;
         let mut plaintext = Vec::with_capacity(size);
         for i in 0..size {
@@ -188,8 +193,7 @@ mod tests {
             .encrypt(&key, &plaintext)
             .expect("encryption should succeed for large plaintext");
 
-        assert!(ciphertext.len() > plaintext.len());
-        assert!(ciphertext.len() >= IV_LEN);
+        assert_eq!(ciphertext.len(), NONCE_LEN + plaintext.len() + TAG_LEN);
 
         let decrypted = encryptor
             .decrypt(&key, &ciphertext)
@@ -198,98 +202,88 @@ mod tests {
         assert_eq!(decrypted, plaintext);
     }
 
-    /// **Security vulnerability test**: This test passing demonstrates lack of integrity verification
+    /// **Integrity test**: AES-GCM detects any tampering of the ciphertext.
     ///
-    /// In AES-CTR mode, decryption succeeds even when ciphertext is tampered with.
-    /// Tampering goes undetected and incorrect data is returned.
-    ///
-    /// **Expected behavior (ideal)**: Tampered ciphertext should be detected and decryption should fail
-    /// **Current behavior (problem)**: Test passes = tampering undetected = security vulnerability
+    /// This is the counterpart of the old AES-CTR "vulnerability demo" test:
+    /// with CTR, a bit-flipped ciphertext decrypted "successfully" into
+    /// attacker-controlled plaintext. With GCM the authentication tag no
+    /// longer matches, so decryption MUST fail. This is what protects the SDK
+    /// from forged payloads returned by untrusted state nodes (PR #54 review).
     #[test]
-    fn tampered_ciphertext_decrypts_successfully_but_returns_wrong_data() {
+    fn tampered_ciphertext_fails_authentication() {
         let key = ContentEncryptionKey(vec![42u8; 32]);
-        let encryptor = Aes256CtrContentEncryption;
+        let encryptor = Aes256GcmContentEncryption;
         let plaintext = b"Secret message that should not be tampered with!";
 
-        println!("\n========== TEST 1: Tampered Ciphertext ==========");
-        println!(
-            "Original Plaintext: {:?}",
-            String::from_utf8_lossy(plaintext)
-        );
-        println!("Plaintext (hex):    {}", hex::encode(plaintext));
-        println!("Plaintext length:   {} bytes", plaintext.len());
-
-        // Encrypt normally
         let mut ciphertext = encryptor
             .encrypt(&key, plaintext)
             .expect("encryption should succeed");
 
-        println!("\n--- After Encryption ---");
-        println!(
-            "Ciphertext length:  {} bytes (IV: {} + data: {})",
-            ciphertext.len(),
-            IV_LEN,
-            ciphertext.len() - IV_LEN
-        );
-        println!(
-            "IV (first 16 bytes):       {}",
-            hex::encode(&ciphertext[0..IV_LEN])
-        );
-        println!(
-            "Encrypted data (hex):      {}",
-            hex::encode(&ciphertext[IV_LEN..])
+        // Flip one bit in the encrypted payload (right after the nonce)
+        ciphertext[NONCE_LEN] ^= 0x11;
+
+        let result = encryptor.decrypt(&key, &ciphertext);
+        assert!(
+            matches!(result, Err(ContentError::DecryptionError(_))),
+            "tampered ciphertext must fail GCM authentication"
         );
 
-        // Tamper with part of the ciphertext (modify the first byte after IV)
-        let original_byte = ciphertext[IV_LEN];
-        println!("\n--- Before Tampering ---");
-        println!("Byte at position [IV_LEN=16]: 0x{original_byte:02x} ({original_byte})");
-
-        ciphertext[IV_LEN] ^= 0x11; // Tampering by bit flipping
-        println!("\n--- After Tampering ---");
-        let _tampered_byte = ciphertext[IV_LEN];
-        println!(
-            "Byte at position [IV_LEN=16]: 0x{tampered:02x} ({tampered}) ← TAMPERED!",
-            tampered = ciphertext[IV_LEN]
-        );
-        println!(
-            "Modified ciphertext (hex):     {}",
-            hex::encode(&ciphertext[IV_LEN..])
-        );
-
-        // Problem: Decryption "succeeds" even with tampered ciphertext
-        let decrypted = encryptor
-            .decrypt(&key, &ciphertext)
-            .expect("decryption 'succeeds' even with tampered data - THIS IS THE PROBLEM!");
-
-        println!("\n--- Decryption of Tampered Data ---");
-        println!("WARNING: Decryption SUCCEEDED (this is the problem!)");
-        println!("Decrypted text:  {:?}", String::from_utf8_lossy(&decrypted));
-        println!("Decrypted (hex): {}", hex::encode(&decrypted));
-
-        // Due to tampering, the decrypted result differs from the original first byte
-        println!("\n--- Verification ---");
-        println!(
-            "Original 1st byte:  0x{:02x} ({})",
-            plaintext[0], plaintext[0] as char
-        );
-        println!(
-            "Decrypted 1st byte: 0x{:02x} ({})",
-            decrypted[0], decrypted[0] as char
-        );
-        assert_ne!(decrypted[0], plaintext[0]);
-        assert_ne!(&decrypted[..], &plaintext[..]);
-        println!("OK: Decrypted data DIFFERS from original (as expected from tampering)");
-
-        // Restoring the original byte allows correct decryption (proof that tampering was the cause)
-        println!("\n--- Restoring Original Ciphertext ---");
-        ciphertext[IV_LEN] = original_byte;
+        // Restoring the original byte makes decryption succeed again,
+        // proving the failure above was caused by the tampering.
+        ciphertext[NONCE_LEN] ^= 0x11;
         let restored = encryptor
             .decrypt(&key, &ciphertext)
-            .expect("should decrypt");
-        println!("Restored text: {:?}", String::from_utf8_lossy(&restored));
+            .expect("untampered ciphertext should decrypt");
         assert_eq!(&restored[..], &plaintext[..]);
-        println!("OK: After restoring byte, plaintext matches original");
-        println!("========== END TEST 1 ==========\n");
+    }
+
+    /// Tampering with the nonce is also detected (the tag authenticates the
+    /// nonce implicitly via the keystream).
+    #[test]
+    fn tampered_nonce_fails_authentication() {
+        let key = ContentEncryptionKey(vec![42u8; 32]);
+        let encryptor = Aes256GcmContentEncryption;
+        let plaintext = b"nonce integrity";
+
+        let mut ciphertext = encryptor
+            .encrypt(&key, plaintext)
+            .expect("encryption should succeed");
+        ciphertext[0] ^= 0x01;
+
+        let result = encryptor.decrypt(&key, &ciphertext);
+        assert!(matches!(result, Err(ContentError::DecryptionError(_))));
+    }
+
+    /// Tampering with the authentication tag itself is detected.
+    #[test]
+    fn tampered_tag_fails_authentication() {
+        let key = ContentEncryptionKey(vec![42u8; 32]);
+        let encryptor = Aes256GcmContentEncryption;
+        let plaintext = b"tag integrity";
+
+        let mut ciphertext = encryptor
+            .encrypt(&key, plaintext)
+            .expect("encryption should succeed");
+        let last = ciphertext.len() - 1;
+        ciphertext[last] ^= 0x80;
+
+        let result = encryptor.decrypt(&key, &ciphertext);
+        assert!(matches!(result, Err(ContentError::DecryptionError(_))));
+    }
+
+    /// Decrypting with a wrong key fails instead of returning garbage.
+    #[test]
+    fn wrong_key_fails_authentication() {
+        let key = ContentEncryptionKey(vec![42u8; 32]);
+        let wrong_key = ContentEncryptionKey(vec![43u8; 32]);
+        let encryptor = Aes256GcmContentEncryption;
+        let plaintext = b"key binding";
+
+        let ciphertext = encryptor
+            .encrypt(&key, plaintext)
+            .expect("encryption should succeed");
+
+        let result = encryptor.decrypt(&wrong_key, &ciphertext);
+        assert!(matches!(result, Err(ContentError::DecryptionError(_))));
     }
 }

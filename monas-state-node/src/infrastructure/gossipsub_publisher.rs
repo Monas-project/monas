@@ -136,6 +136,7 @@ impl<P: PeerNetwork + 'static> EventPublisher for GossipsubEventPublisher<P> {
 mod tests {
     use super::*;
     use crate::port::content_repository::SerializedOperation;
+    use crate::port::peer_network::{RelayReadError, RelayReadErrorKind};
     use std::collections::HashMap;
 
     /// Mock PeerNetwork for testing.
@@ -279,6 +280,35 @@ mod tests {
             _timestamp: Option<u64>,
         ) -> Result<bool> {
             Ok(true)
+        }
+
+        async fn relay_read_content(
+            &self,
+            _peer_id: &str,
+            content_id: &str,
+            _version: Option<&str>,
+            _auth_token: &str,
+            _request_signature: &[u8],
+            _timestamp: Option<u64>,
+        ) -> std::result::Result<(Vec<u8>, String), RelayReadError> {
+            Err(RelayReadError {
+                kind: RelayReadErrorKind::NotFound,
+                message: format!("Content not found: {}", content_id),
+            })
+        }
+
+        async fn relay_read_history(
+            &self,
+            _peer_id: &str,
+            content_id: &str,
+            _auth_token: &str,
+            _request_signature: &[u8],
+            _timestamp: Option<u64>,
+        ) -> std::result::Result<Vec<String>, RelayReadError> {
+            Err(RelayReadError {
+                kind: RelayReadErrorKind::NotFound,
+                message: format!("Content not found: {}", content_id),
+            })
         }
 
         async fn connected_peer_count(&self) -> usize {

@@ -18,11 +18,12 @@ use crate::port::authentication_service::AuthenticationService;
 use crate::port::authorization_service::{AuthorizationRequest, AuthorizationService};
 use crate::port::content_repository::ContentRepository;
 use crate::port::event_publisher::EventPublisher;
-use crate::port::peer_network::PeerNetwork;
+use crate::port::peer_network::{PeerNetwork, RelayReadError, RelayReadErrorKind};
 use crate::port::persistence::{
     PersistentAccessControlRepository, PersistentContentRepository, PersistentNodeRegistry,
 };
 use anyhow::Result;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 
 /// Result of applying an event.
@@ -92,6 +93,105 @@ where
     capacity_threshold_bytes: u64,
     /// Maximum number of members to add in a single add_member_to_content call.
     max_add_member_count: usize,
+}
+
+/// Where a relay candidate list came from, and therefore how much it can be
+/// trusted.
+///
+/// This distinction matters because a relay interprets what comes back from
+/// whoever is in the list. Trusting a *negative* answer is only safe from a
+/// peer we have some reason to believe actually holds the content.
+///
+/// It does not affect whether credentials may be forwarded — see
+/// [`ResolvedMembers::as_slice`] for why that is safe regardless of
+/// provenance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MemberProvenance {
+    /// The peers come from a local `ContentNetwork` record, built from a
+    /// `ContentCreated` / `ContentNetworkManagerAdded` event that named this
+    /// node as a member.
+    ///
+    /// This is **not** a cryptographic attestation by the content owner.
+    /// Events carry no owner signature, so the membership set inside the event
+    /// is the publisher's own claim. What is verified is the *publisher*:
+    /// gossipsub runs in `Signed` + `Strict` mode, so the author field is
+    /// authenticated, and `handle_sync_event` binds it — `ContentCreated` must
+    /// come from the creator it names, and a membership change must come from
+    /// a node already in the network it changes.
+    ///
+    /// Two gaps remain, both requiring a protocol change to close (tracked
+    /// separately): the very first record for a content is accepted without a
+    /// prior membership to check against, and an authenticated member can
+    /// still claim a member set of its choosing.
+    ///
+    /// It is nevertheless a far better basis than [`Self::DhtGuess`], where
+    /// nothing at all ties a peer to the content — so a 401/403 from a listed
+    /// member is treated as a real verdict.
+    LocalRecord,
+    /// The peers are just DHT neighbours of `sha256(content_id)`. Nothing ties
+    /// them to this content: anyone able to place a Peer ID near the key lands
+    /// in this list, so a denial from one of them carries no authority.
+    DhtGuess,
+}
+
+/// Relay candidates plus the provenance of the list.
+struct ResolvedMembers {
+    members: Vec<String>,
+    /// Kept for diagnostics and for #63: once membership is owner-signed,
+    /// `auth_verdict_is_authoritative` reads this again to restore the early
+    /// exit on a denial. Nothing branches on it today — see that method.
+    #[allow(dead_code)]
+    provenance: MemberProvenance,
+}
+
+impl ResolvedMembers {
+    /// The relay candidates.
+    ///
+    /// Every candidate is handed the caller's token and request signature, and
+    /// that is fine even for an unproven peer: the token is either a
+    /// self-contained key id (a public key) or a delegated JWT whose audience
+    /// is likewise a public key, and authorization is proof-of-possession — the
+    /// request signature is verified against the JWT's `aud` key. A peer that
+    /// captures both cannot mint a new request, because it does not hold that
+    /// private key, and the signature it did capture is bound to one operation,
+    /// resource, body and timestamp. Mutations are single-use on top of that.
+    ///
+    /// So the candidate list is not truncated for unproven peers. Doing so
+    /// would cut failover to legitimate members — a real availability cost —
+    /// in exchange for no confidentiality gain, since a peer that sits first in
+    /// DHT distance order receives the credentials regardless of any cap.
+    fn as_slice(&self) -> &[String] {
+        &self.members
+    }
+
+    /// Whether a negative authorization verdict from these peers may be treated
+    /// as final — i.e. may end the failover loop early.
+    ///
+    /// **Currently always false.** A denial is still kept and returned if no
+    /// candidate produces anything better; what this disables is *stopping* at
+    /// the first one.
+    ///
+    /// For [`MemberProvenance::DhtGuess`] the reason is direct: a single
+    /// hostile node squatting near the DHT key could otherwise deny every read
+    /// by answering 403 first, and even an honest but partially-synced replica
+    /// can answer 403 from a policy it has not finished replicating.
+    ///
+    /// [`MemberProvenance::LocalRecord`] used to return true here, on the
+    /// grounds that a listed member evaluated the caller against the real
+    /// policy. That does not hold while the record itself can be planted: the
+    /// first record for a content is accepted with no prior membership to check
+    /// against, so an attacker who wins that race lands in the list and its 403
+    /// would end the loop — a permanent denial of service against a legitimate
+    /// caller, which is exactly what the DhtGuess case is guarding against.
+    ///
+    /// Restoring the early exit needs owner-signed membership (#63). Until
+    /// then, the cost of always continuing is bounded: one extra round trip per
+    /// remaining candidate on a genuine denial, against an availability attack
+    /// that is otherwise unbounded. Erring toward availability is the right
+    /// direction — the caller is refused either way, just later.
+    fn auth_verdict_is_authoritative(&self) -> bool {
+        false
+    }
 }
 
 /// No-op access control repository for backward compatibility.
@@ -222,12 +322,18 @@ where
 
     /// Authenticate a caller for read operations.
     ///
+    /// The request signature is bound to the specific `content_id` (message
+    /// `read:{content_id}:{timestamp}`), so a signature captured by one node
+    /// cannot be replayed to read other content. Mirrors the delete path,
+    /// which already signs over the content id.
+    ///
     /// Returns the authenticated identity on success.
     pub async fn authenticate_for_read(
         &self,
         token: &AuthToken,
         request_signature: Option<&[u8]>,
         timestamp: Option<u64>,
+        content_id: &str,
     ) -> Result<Identity, StateNodeError> {
         let auth_service = self.auth_service.as_ref().ok_or_else(|| {
             StateNodeError::InvalidConfiguration("Authentication not configured".to_string())
@@ -249,7 +355,7 @@ where
             token,
             sig,
             "read",
-            "content",
+            content_id,
             timestamp,
             None,
         )
@@ -411,7 +517,7 @@ where
     /// since they indicate a real permission problem rather than a connectivity issue.
     async fn relay_with_failover<F, Fut>(
         &self,
-        members: &[String],
+        members: &ResolvedMembers,
         operation_name: &str,
         relay_fn: F,
     ) -> Result<(), StateNodeError>
@@ -419,7 +525,11 @@ where
         F: Fn(String) -> Fut,
         Fut: std::future::Future<Output = Result<bool, anyhow::Error>>,
     {
-        for (i, member) in members.iter().enumerate() {
+        let authoritative = members.auth_verdict_is_authoritative();
+        let candidates = members.as_slice();
+        let mut auth_error: Option<StateNodeError> = None;
+
+        for (i, member) in candidates.iter().enumerate() {
             match relay_fn(member.clone()).await {
                 Ok(true) => return Ok(()),
                 Ok(false) => {
@@ -428,29 +538,51 @@ where
                         operation_name,
                         member,
                         i + 1,
-                        members.len()
+                        candidates.len()
                     );
                 }
                 Err(e) => {
                     let err_msg = e.to_string();
-                    // Don't failover on auth errors — they'll fail on every member
                     if err_msg.contains("Authorization failed")
                         || err_msg.contains("Authentication failed")
                     {
-                        return Err(Self::classify_relay_error(err_msg));
+                        // An attested member evaluated the request against the
+                        // real policy, so every other member would answer the
+                        // same — stop here.
+                        if authoritative {
+                            return Err(Self::classify_relay_error(err_msg));
+                        }
+                        // Unproven candidate: its verdict proves nothing (it may
+                        // not hold the content at all), so it must not end the
+                        // loop — otherwise one hostile peer near the DHT key
+                        // could block every write with a single fabricated 403.
+                        // Remember it as the answer of last resort and continue.
+                        tracing::warn!(
+                            "Relay {} got an auth verdict from unproven candidate {} ({}/{}): {} \
+                             — continuing failover",
+                            operation_name,
+                            member,
+                            i + 1,
+                            candidates.len(),
+                            err_msg
+                        );
+                        auth_error.get_or_insert_with(|| Self::classify_relay_error(err_msg));
+                        continue;
                     }
                     tracing::warn!(
                         "Relay {} failed on member {} ({}/{}): {}",
                         operation_name,
                         member,
                         i + 1,
-                        members.len(),
+                        candidates.len(),
                         err_msg
                     );
                 }
             }
         }
-        Err(StateNodeError::NoAvailableMembers)
+        // Nothing succeeded. An auth verdict, even from an unproven candidate,
+        // is a more useful answer than "no members available".
+        Err(auth_error.unwrap_or(StateNodeError::NoAvailableMembers))
     }
 
     /// Resolve the member nodes that own a content, for relay/sync purposes.
@@ -465,7 +597,7 @@ where
     ///
     /// The local node is always excluded from the result. Returns
     /// `NoAvailableMembers` if no candidate remains.
-    async fn resolve_members(&self, content_id: &str) -> Result<Vec<String>, StateNodeError> {
+    async fn resolve_members(&self, content_id: &str) -> Result<ResolvedMembers, StateNodeError> {
         let local_record = self
             .content_repo
             .read()
@@ -474,19 +606,24 @@ where
             .await
             .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
 
-        let mut members: Vec<String> = match local_record {
-            Some(network) => network.member_nodes_as_strings(),
+        let (mut members, provenance) = match local_record {
+            Some(network) => (
+                network.member_nodes_as_strings(),
+                MemberProvenance::LocalRecord,
+            ),
             None => {
                 // No local record: discover the members via the DHT. Request
                 // `k + 1` candidates so that excluding ourselves still leaves
                 // up to `k`, mirroring create_content's placement.
                 let key = compute_dht_key(content_id);
-                self.peer_network
+                let peers = self
+                    .peer_network
                     .find_closest_peers(key, self.min_replication_factor + 1)
                     .await
                     .map_err(|e| {
                         StateNodeError::NetworkError(NetworkError::ConnectionFailed(e.to_string()))
-                    })?
+                    })?;
+                (peers, MemberProvenance::DhtGuess)
             }
         };
 
@@ -494,76 +631,336 @@ where
         if members.is_empty() {
             return Err(StateNodeError::NoAvailableMembers);
         }
-        Ok(members)
+        Ok(ResolvedMembers {
+            members,
+            provenance,
+        })
     }
 
-    /// Ensure the content's CRDT state is available locally, fetching it from
-    /// member nodes if necessary (bug #93, read side).
+    /// Whether this node actually replicates the content (holds its genesis
+    /// node in the local DAG).
     ///
-    /// Read endpoints (data / history / version) read straight from the local
-    /// `crdt_repo`. A node that holds no local state for a content — e.g. a
-    /// client pointed its gateway at a node that is neither the creator nor a
-    /// member — would otherwise 404. This pulls the operations from a member
-    /// (discovered via `resolve_members`) and applies them locally so the
-    /// existing read path works unchanged. Applying the operations also brings
-    /// in the access policy, so the subsequent `verify_read_access` check is
-    /// evaluated against the real policy rather than an empty one.
-    ///
-    /// No-op when we already have local history. Returns `ContentNotFound` if
-    /// no member could supply the operations.
-    ///
-    /// SECURITY NOTE: this reuses the unauthenticated `fetch_operations` RPC,
-    /// so a non-member can pull any content's operations. Acceptable for the
-    /// single-user demo; a hardened version should add a read-relay RPC with
-    /// member-side authorization. Tracked in bug #93 follow-up.
-    pub async fn ensure_content_local(&self, content_id: &str) -> Result<(), StateNodeError> {
-        // Fast path: we already hold local history for this content.
-        let has_local = self
-            .crdt_repo
-            .get_history(content_id)
+    /// NOTE: `get_history` cannot be used for this — crsl-lib's
+    /// `linear_history` returns `[genesis]` even when no node exists (phantom
+    /// history), which would make such a check always pass.
+    pub async fn has_local_content(&self, content_id: &str) -> bool {
+        self.crdt_repo
+            .has_genesis(content_id)
             .await
-            .map(|h| !h.is_empty())
-            .unwrap_or(false);
-        if has_local {
-            return Ok(());
+            .unwrap_or(false)
+    }
+
+    /// Authorize a read against the content's access policy (bug #93 hardened
+    /// read path).
+    ///
+    /// Authenticates the caller (token + request signature) and grants access
+    /// only when the caller is the content owner or the authorization service
+    /// grants `ReadContent`.
+    ///
+    /// Fail-closed in both directions: an error loading the policy denies, and
+    /// **a missing policy also denies**. A replica can legitimately hold a
+    /// genesis without its owner policy — the create operation carries
+    /// `access_policy: None` and the owner policy arrives as a separate
+    /// operation, and `apply_operations` tolerates partial application — so
+    /// treating "no policy" as public would expose ciphertext and history of
+    /// such content to any authenticated caller.
+    pub async fn authorize_read(
+        &self,
+        token: &AuthToken,
+        request_signature: Option<&[u8]>,
+        timestamp: Option<u64>,
+        content_id: &str,
+    ) -> Result<(), StateNodeError> {
+        let identity = self
+            .authenticate_for_read(token, request_signature, timestamp, content_id)
+            .await?;
+
+        // Fail closed: an error loading the policy must deny, not fall through
+        // to the "no policy" allow below.
+        let policy = self
+            .crdt_repo
+            .get_access_policy(content_id)
+            .await
+            .map_err(|e| {
+                StateNodeError::StorageError(format!(
+                    "failed to load access policy for {}: {}",
+                    content_id, e
+                ))
+            })?;
+
+        if let Some(policy) = policy {
+            if policy.is_owner(&identity) {
+                return Ok(());
+            }
+
+            let authz_request = crate::port::authorization_service::AuthorizationRequest {
+                identity,
+                resource: ContentId::new(content_id.to_string())?,
+                capability: crate::domain::auth_capability::AuthCapability::ReadContent,
+                token: Some(token.clone()),
+                request_signature: request_signature.map(|s| s.to_vec()),
+            };
+            if let Some(authz_service) = self.authz_service.as_ref() {
+                if let Ok(result) = authz_service.authorize(&authz_request).await {
+                    if result.is_granted() {
+                        return Ok(());
+                    }
+                }
+            }
+
+            return Err(StateNodeError::AuthorizationFailed(
+                "Insufficient permissions: read access required".to_string(),
+            ));
         }
 
-        // Discover the members (local record, or DHT fallback) and pull ops.
-        let members = self.resolve_members(content_id).await?;
-        let content_id_vo = ContentId::new(content_id.to_string())?;
+        // No policy on this replica. This is not proof that the content is
+        // public — it is indistinguishable from "the owner policy operation has
+        // not been applied here (yet)". Deny rather than serve ciphertext and
+        // history without an authorization contract.
+        Err(StateNodeError::AuthorizationFailed(format!(
+            "no access policy is available for {content_id} on this node: refusing the read \
+             (the policy may not have replicated here yet — retry, or read from a node that \
+             has it)"
+        )))
+    }
 
-        for member in &members {
+    /// Serve a relayed data read on a member node (bug #93 hardened read path).
+    ///
+    /// Called by the relay handler when a non-member node forwards a read.
+    /// Re-authenticates the original caller before touching the repository.
+    /// `version: None` serves the latest version. Returns `(data, version)`.
+    pub async fn read_content_via_relay(
+        &self,
+        content_id: &str,
+        version: Option<&str>,
+        token: &AuthToken,
+        request_signature: Option<&[u8]>,
+        timestamp: Option<u64>,
+    ) -> Result<(Vec<u8>, String), StateNodeError> {
+        self.authorize_read(token, request_signature, timestamp, content_id)
+            .await?;
+
+        let content_id_vo = ContentId::new(content_id.to_string())?;
+        match version {
+            Some(v) => {
+                let data = self
+                    .crdt_repo
+                    .get_version(content_id, v)
+                    .await
+                    .map_err(|e| StateNodeError::StorageError(e.to_string()))?
+                    .ok_or(StateNodeError::ContentNotFound(content_id_vo))?;
+                Ok((data, v.to_string()))
+            }
+            None => self
+                .crdt_repo
+                .get_latest_with_version(content_id)
+                .await
+                .map_err(|e| StateNodeError::StorageError(e.to_string()))?
+                .ok_or(StateNodeError::ContentNotFound(content_id_vo)),
+        }
+    }
+
+    /// Serve a relayed history read on a member node (bug #93 hardened read
+    /// path). Same authentication contract as `read_content_via_relay`.
+    pub async fn read_history_via_relay(
+        &self,
+        content_id: &str,
+        token: &AuthToken,
+        request_signature: Option<&[u8]>,
+        timestamp: Option<u64>,
+    ) -> Result<Vec<String>, StateNodeError> {
+        self.authorize_read(token, request_signature, timestamp, content_id)
+            .await?;
+
+        // Guard against crsl-lib's phantom `[genesis]` history for content we
+        // don't actually hold.
+        if !self.has_local_content(content_id).await {
+            return Err(StateNodeError::ContentNotFound(ContentId::new(
+                content_id.to_string(),
+            )?));
+        }
+
+        self.crdt_repo
+            .get_history(content_id)
+            .await
+            .map_err(|e| StateNodeError::StorageError(e.to_string()))
+    }
+
+    /// Relay a data read to the content's members (bug #93 hardened read path,
+    /// caller side).
+    ///
+    /// Used by read endpoints on a node that does not replicate the content.
+    /// The caller's auth material is forwarded verbatim so the member can
+    /// re-authenticate; operations are never pulled to this node.
+    pub async fn relay_read_data(
+        &self,
+        content_id: &str,
+        version: Option<&str>,
+        token: &AuthToken,
+        request_signature: Option<&[u8]>,
+        timestamp: Option<u64>,
+    ) -> Result<(Vec<u8>, String), StateNodeError> {
+        let members = self.resolve_members(content_id).await?;
+        let authoritative = members.auth_verdict_is_authoritative();
+        let sig: &[u8] = request_signature.unwrap_or(&[]);
+
+        let mut best: Option<RelayReadError> = None;
+        for member in members.as_slice() {
             match self
                 .peer_network
-                .fetch_operations(member, content_id, None)
+                .relay_read_content(member, content_id, version, token.as_str(), sig, timestamp)
                 .await
             {
-                Ok(ops) if !ops.is_empty() => match self.crdt_repo.apply_operations(&ops).await {
-                    Ok(_) => return Ok(()),
-                    Err(e) => {
-                        tracing::warn!(
-                            "ensure_content_local: failed to apply ops from {} for {}: {}",
-                            member,
-                            content_id,
-                            e
-                        );
-                    }
-                },
-                Ok(_) => {
-                    // Member returned no operations; try the next one.
-                }
+                Ok(result) => return Ok(result),
                 Err(e) => {
                     tracing::warn!(
-                        "ensure_content_local: failed to fetch ops from {} for {}: {}",
+                        "relay_read_data: member {} failed for {}: {}",
                         member,
                         content_id,
                         e
                     );
+                    match Self::record_relay_read_error(&mut best, e, authoritative) {
+                        // An auth verdict from an attested member is
+                        // authoritative — it DID evaluate the request against
+                        // the real policy. Do not let a later member's
+                        // transport failure overwrite it.
+                        ControlFlow::Break(final_err) => {
+                            return Err(Self::relay_read_error_to_state_error(
+                                content_id, final_err,
+                            ))
+                        }
+                        ControlFlow::Continue(()) => {}
+                    }
                 }
             }
         }
 
-        Err(StateNodeError::ContentNotFound(content_id_vo))
+        Err(Self::relay_read_error_to_state_error(
+            content_id,
+            best.unwrap_or_else(|| RelayReadError::other("no members responded")),
+        ))
+    }
+
+    /// Relay a history read to the content's members (bug #93 hardened read
+    /// path, caller side).
+    pub async fn relay_read_history(
+        &self,
+        content_id: &str,
+        token: &AuthToken,
+        request_signature: Option<&[u8]>,
+        timestamp: Option<u64>,
+    ) -> Result<Vec<String>, StateNodeError> {
+        let members = self.resolve_members(content_id).await?;
+        let authoritative = members.auth_verdict_is_authoritative();
+        let sig: &[u8] = request_signature.unwrap_or(&[]);
+
+        let mut best: Option<RelayReadError> = None;
+        for member in members.as_slice() {
+            match self
+                .peer_network
+                .relay_read_history(member, content_id, token.as_str(), sig, timestamp)
+                .await
+            {
+                Ok(versions) => return Ok(versions),
+                Err(e) => {
+                    tracing::warn!(
+                        "relay_read_history: member {} failed for {}: {}",
+                        member,
+                        content_id,
+                        e
+                    );
+                    match Self::record_relay_read_error(&mut best, e, authoritative) {
+                        ControlFlow::Break(final_err) => {
+                            return Err(Self::relay_read_error_to_state_error(
+                                content_id, final_err,
+                            ))
+                        }
+                        ControlFlow::Continue(()) => {}
+                    }
+                }
+            }
+        }
+
+        Err(Self::relay_read_error_to_state_error(
+            content_id,
+            best.unwrap_or_else(|| RelayReadError::other("no members responded")),
+        ))
+    }
+
+    /// Fold one member's relayed-read failure into the running best error.
+    ///
+    /// Auth verdicts (401/403) short-circuit the member loop **only when the
+    /// candidate list is attested** (`authoritative`): such a member evaluated
+    /// the caller against the real policy, so asking further members cannot
+    /// change the answer, and continuing would just leak that the content
+    /// exists to a caller who was already refused.
+    ///
+    /// When the list is a DHT guess, a 401/403 proves nothing — the responder
+    /// may not hold the content at all. Treating it as final would let one
+    /// hostile peer near the DHT key deny every read by answering 403 first,
+    /// and would also let an honest replica that has not finished replicating
+    /// the policy stop failover to a healthy one. So the verdict is remembered
+    /// (it is a better answer than a transport error, and is what the caller
+    /// sees if nothing better turns up) but the loop keeps going.
+    ///
+    /// NotFound is kept over transport errors but never short-circuits — a
+    /// lagging member may miss a version another member can still serve.
+    fn record_relay_read_error(
+        best: &mut Option<RelayReadError>,
+        err: RelayReadError,
+        authoritative: bool,
+    ) -> ControlFlow<RelayReadError> {
+        match err.kind {
+            RelayReadErrorKind::AuthenticationFailed | RelayReadErrorKind::AuthorizationFailed => {
+                if authoritative {
+                    return ControlFlow::Break(err);
+                }
+                // Unproven responder: keep the verdict as the best answer so
+                // far (it beats NotFound and transport errors), but let the
+                // remaining candidates have their say.
+                *best = Some(err);
+                ControlFlow::Continue(())
+            }
+            RelayReadErrorKind::NotFound => {
+                // Do not let a NotFound overwrite an auth verdict we are
+                // holding on to from an unproven peer: the verdict is the more
+                // specific answer.
+                if !matches!(
+                    best.as_ref().map(|b| b.kind),
+                    Some(RelayReadErrorKind::AuthenticationFailed)
+                        | Some(RelayReadErrorKind::AuthorizationFailed)
+                ) {
+                    *best = Some(err);
+                }
+                ControlFlow::Continue(())
+            }
+            RelayReadErrorKind::Other => {
+                if best.is_none() {
+                    *best = Some(err);
+                }
+                ControlFlow::Continue(())
+            }
+        }
+    }
+
+    /// Convert a member's typed relayed-read verdict into the service error
+    /// the HTTP layer maps to a status code.
+    fn relay_read_error_to_state_error(content_id: &str, err: RelayReadError) -> StateNodeError {
+        match err.kind {
+            RelayReadErrorKind::NotFound => match ContentId::new(content_id.to_string()) {
+                Ok(cid) => StateNodeError::ContentNotFound(cid),
+                Err(_) => StateNodeError::StorageError(err.message),
+            },
+            RelayReadErrorKind::AuthenticationFailed => {
+                StateNodeError::AuthenticationFailed(err.message)
+            }
+            RelayReadErrorKind::AuthorizationFailed => {
+                StateNodeError::AuthorizationFailed(err.message)
+            }
+            RelayReadErrorKind::Other => {
+                StateNodeError::NetworkError(NetworkError::ConnectionFailed(err.message))
+            }
+        }
     }
 
     /// Register a new node.
@@ -1751,10 +2148,56 @@ where
         Ok(())
     }
 
+    /// Verify that the publisher of a membership-changing event is itself a
+    /// member of the network it is changing.
+    ///
+    /// Returns `Ok(())` when we hold no local record for the content: there is
+    /// no membership to check against, and no existing record to overwrite.
+    /// Also returns `Ok(())` when `source_peer_id` is `None` (the event did not
+    /// arrive over an authenticated channel — see `handle_sync_event`).
+    async fn verify_source_is_existing_member(
+        &self,
+        source_peer_id: Option<&str>,
+        content_id: &str,
+    ) -> Result<(), StateNodeError> {
+        let Some(source) = source_peer_id else {
+            return Ok(());
+        };
+
+        let existing = self
+            .content_repo
+            .read()
+            .await
+            .get_content_network(content_id)
+            .await
+            .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
+
+        match existing {
+            Some(network) if !network.has_member_str(source) => {
+                tracing::warn!(
+                    "Rejecting membership change for {} from non-member {}",
+                    content_id,
+                    source
+                );
+                Err(StateNodeError::Internal(format!(
+                    "Publisher {} is not a member of content network {}",
+                    source, content_id
+                )))
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Handle a sync event from another node.
     ///
-    /// The `source_peer_id` parameter is used to verify that events claiming
-    /// to be from a particular node actually came from that peer's PeerID.
+    /// The `source_peer_id` parameter is the **authenticated publisher** of the
+    /// event (gossipsub `Message::source`, not the forwarding peer), used to
+    /// verify that events claiming to be from a particular node actually came
+    /// from that peer.
+    ///
+    /// `None` means the origin could not be established; origin-bound checks
+    /// are skipped in that case, so callers must pass the authenticated value
+    /// whenever one exists.
     ///
     /// Returns `ApplyOutcome::NeedsSync` when the caller should perform content
     /// synchronization (e.g., call `ContentSyncService::sync_from_peers`).
@@ -1818,6 +2261,18 @@ where
                     return Ok(ApplyOutcome::Ignored);
                 }
 
+                // Unlike `ContentCreated`, this event names no publisher —
+                // `added_node_id` is the node being added, which is usually us.
+                // The publisher is whichever node ran the redundancy check, so
+                // the check that fits is membership: only a node already in the
+                // network we remember may change that network's member set.
+                //
+                // If we hold no record, there is nothing to check against and
+                // nothing being overwritten, so the event is accepted as
+                // bootstrap — the same position `ContentCreated` is in.
+                self.verify_source_is_existing_member(source_peer_id, content_id)
+                    .await?;
+
                 // When handling sync events, we create network with NodeIds directly
                 let content_id_vo = ContentId::new(content_id.clone())?;
 
@@ -1848,6 +2303,14 @@ where
                 removed_node_id,
                 ..
             } => {
+                // Removal deletes or rewrites the record that decides whether a
+                // relay treats a peer's 403 as final, so the publisher must be
+                // a member of the network it is changing — otherwise any peer
+                // could evict us from our own record just by naming us as
+                // `removed_node_id`. Same rule as the Added arm.
+                self.verify_source_is_existing_member(source_peer_id, content_id)
+                    .await?;
+
                 // If we were removed, delete the local network metadata
                 if removed_node_id == &self.local_node_id {
                     tracing::info!(
@@ -1892,9 +2355,17 @@ where
 
             Event::ContentCreated {
                 content_id,
+                creator_node_id,
                 member_nodes,
                 ..
             } => {
+                // The event asserts a membership set that this node will store
+                // and later act on, so the publisher must at least be the
+                // creator it claims to be. `create_content` always publishes
+                // with `creator_node_id == self.local_node_id`, so this holds
+                // for every legitimate event.
+                Self::verify_source_peer_id(source_peer_id, creator_node_id)?;
+
                 // Only store network metadata if we're a member
                 if !member_nodes.contains(&self.local_node_id) {
                     return Ok(ApplyOutcome::Ignored);
@@ -1951,6 +2422,13 @@ where
             } => {
                 // Verify source PeerID matches claimed node ID
                 Self::verify_source_peer_id(source_peer_id, deleted_by_node_id)?;
+
+                // That alone only proves the publisher is who it says it is —
+                // it names *itself*, so any authenticated peer would satisfy
+                // it. Deleting our record requires being a member of the
+                // network being deleted.
+                self.verify_source_is_existing_member(source_peer_id, content_id)
+                    .await?;
 
                 // Skip if we initiated the deletion
                 if deleted_by_node_id == &self.local_node_id {
@@ -2756,28 +3234,17 @@ mod tests {
         );
     }
 
-    fn sample_operation(genesis_cid: &str) -> crate::port::content_repository::SerializedOperation {
-        crate::port::content_repository::SerializedOperation {
-            data: vec![0x01, 0x02],
-            genesis_cid: genesis_cid.to_string(),
-            author: "node-2".to_string(),
-            timestamp: 1,
-            node_timestamp: 1,
-        }
-    }
-
     #[tokio::test]
-    async fn test_ensure_content_local_pulls_from_discovered_member() {
-        // Bug #93 (read side): a node with no local state for the content must
-        // pull the operations from a DHT-discovered member and apply them
-        // locally so the read endpoints work instead of 404ing.
+    async fn test_relay_read_data_maps_member_not_found() {
+        // Bug #93 (hardened read side): a node with no local state relays the
+        // read to a DHT-discovered member. When every member reports the
+        // content missing, the caller gets a typed ContentNotFound back.
         let node_registry = MockNodeRegistry::new();
         let content_repo = Arc::new(RwLock::new(MockContentNetworkRepository::new()));
         let peer_network = Arc::new(
             MockPeerNetwork::new()
                 .with_local_peer_id("node-1")
-                .with_closest_peers(vec!["node-2".to_string()])
-                .with_fetched_operations(vec![sample_operation("content-1")]),
+                .with_closest_peers(vec!["node-2".to_string()]),
         );
         let event_publisher = MockEventPublisher::new();
         let crdt_repo = Arc::new(MockContentRepository::new());
@@ -2791,18 +3258,481 @@ mod tests {
             "node-1".to_string(),
         );
 
-        let result = service.ensure_content_local("content-1").await;
+        let result = service
+            .relay_read_data(
+                "content-1",
+                None,
+                &test_token(),
+                Some(&test_request_signature()),
+                None,
+            )
+            .await;
+        assert!(matches!(result, Err(StateNodeError::ContentNotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn test_relay_read_data_returns_member_payload() {
+        // Happy path: the member serves the read and the payload comes back.
+        let node_registry = MockNodeRegistry::new();
+        let content_repo = Arc::new(RwLock::new(MockContentNetworkRepository::new()));
+        let peer_network = Arc::new(
+            MockPeerNetwork::new()
+                .with_local_peer_id("node-1")
+                .with_closest_peers(vec!["node-2".to_string()])
+                .with_relay_read_data(b"cipher".to_vec(), "v1"),
+        );
+        let event_publisher = MockEventPublisher::new();
+        let crdt_repo = Arc::new(MockContentRepository::new());
+
+        let service: TestService = StateNodeService::new(
+            node_registry,
+            content_repo,
+            peer_network,
+            event_publisher,
+            crdt_repo,
+            "node-1".to_string(),
+        );
+
+        let result = service
+            .relay_read_data(
+                "content-1",
+                None,
+                &test_token(),
+                Some(&test_request_signature()),
+                None,
+            )
+            .await
+            .expect("relayed read should succeed");
+        assert_eq!(result, (b"cipher".to_vec(), "v1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_relay_read_data_returns_member_auth_verdict() {
+        // A member's 403 verdict must come back typed (not as a generic
+        // network error), so the HTTP layer returns the member's decision.
+        use crate::port::peer_network::{RelayReadError, RelayReadErrorKind};
+        let node_registry = MockNodeRegistry::new();
+        let content_repo = Arc::new(RwLock::new(MockContentNetworkRepository::new()));
+        let peer_network = Arc::new(
+            MockPeerNetwork::new()
+                .with_local_peer_id("node-1")
+                .with_closest_peers(vec!["node-2".to_string(), "node-3".to_string()])
+                .with_relay_read_error(RelayReadError {
+                    kind: RelayReadErrorKind::AuthorizationFailed,
+                    message: "Insufficient permissions: read access required".to_string(),
+                }),
+        );
+        let event_publisher = MockEventPublisher::new();
+        let crdt_repo = Arc::new(MockContentRepository::new());
+
+        let service: TestService = StateNodeService::new(
+            node_registry,
+            content_repo,
+            peer_network,
+            event_publisher,
+            crdt_repo,
+            "node-1".to_string(),
+        );
+
+        let result = service
+            .relay_read_data(
+                "content-1",
+                None,
+                &test_token(),
+                Some(&test_request_signature()),
+                None,
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(StateNodeError::AuthorizationFailed(_))
+        ));
+    }
+
+    /// 未証明の DHT 候補が返した 401/403 で member loop を打ち切ってはいけない。
+    /// 打ち切ると、DHT キーの近くに Peer ID を置いた 1 台が 403 を返すだけで
+    /// あらゆる read を止められる(可用性への攻撃)。正規 member でも policy の
+    /// 複製が終わっていなければ 403 を返し得るので、健全なレプリカへの failover
+    /// を潰さないためにも継続する必要がある。
+    #[test]
+    fn unproven_peer_auth_verdict_does_not_stop_failover() {
+        use crate::port::peer_network::{RelayReadError, RelayReadErrorKind};
+
+        let mut best = None;
+        let flow = StateNodeService::<
+            MockNodeRegistry,
+            MockContentNetworkRepository,
+            MockPeerNetwork,
+            MockEventPublisher,
+            MockContentRepository,
+        >::record_relay_read_error(
+            &mut best,
+            RelayReadError {
+                kind: RelayReadErrorKind::AuthorizationFailed,
+                message: "fabricated 403".to_string(),
+            },
+            false, // 未証明の候補
+        );
         assert!(
-            result.is_ok(),
-            "expected ops pull to succeed, got {result:?}"
+            matches!(flow, ControlFlow::Continue(())),
+            "an unproven peer's verdict must not end the loop"
+        );
+        // ただし答えとしては保持する(次の候補が何も返さなければこれを返す)
+        assert!(matches!(
+            best.as_ref().map(|b| b.kind),
+            Some(RelayReadErrorKind::AuthorizationFailed)
+        ));
+
+        // 後続候補の NotFound で auth verdict を上書きしない。
+        // 上書きすると「拒否された」が「存在しない」に化ける。
+        let flow = StateNodeService::<
+            MockNodeRegistry,
+            MockContentNetworkRepository,
+            MockPeerNetwork,
+            MockEventPublisher,
+            MockContentRepository,
+        >::record_relay_read_error(
+            &mut best,
+            RelayReadError {
+                kind: RelayReadErrorKind::NotFound,
+                message: "not here".to_string(),
+            },
+            false,
+        );
+        assert!(matches!(flow, ControlFlow::Continue(())));
+        assert!(matches!(
+            best.as_ref().map(|b| b.kind),
+            Some(RelayReadErrorKind::AuthorizationFailed)
+        ));
+    }
+
+    /// `record_relay_read_error` は「権威あり」と言われれば打ち切る。
+    ///
+    /// ただし現在この `true` を渡す呼び出し側は無い
+    /// ([`ResolvedMembers::auth_verdict_is_authoritative`] は常に false)。
+    /// レコード自体が最初の 1 通で植え付けられる間は、そこに載った peer の
+    /// 403 も最終判断にはできないためである。owner 署名付き membership
+    /// (#63)が入れば早期打ち切りを戻せるので、その配線だけは残してある。
+    #[test]
+    fn record_relay_read_error_breaks_when_told_the_verdict_is_authoritative() {
+        use crate::port::peer_network::{RelayReadError, RelayReadErrorKind};
+
+        let mut best = None;
+        let flow = StateNodeService::<
+            MockNodeRegistry,
+            MockContentNetworkRepository,
+            MockPeerNetwork,
+            MockEventPublisher,
+            MockContentRepository,
+        >::record_relay_read_error(
+            &mut best,
+            RelayReadError {
+                kind: RelayReadErrorKind::AuthorizationFailed,
+                message: "real verdict".to_string(),
+            },
+            true, // attested member
+        );
+        assert!(
+            matches!(flow, ControlFlow::Break(_)),
+            "an attested member's verdict is authoritative"
+        );
+    }
+
+    /// 出自は verdict の扱いだけを変え、候補リストそのものは削らない。
+    ///
+    /// credential は未証明の相手へ渡っても構わない。token は自己完結型 key id
+    /// (公開鍵)か委譲 JWT で、その JWT の `aud` もまた公開鍵であり、認可は
+    /// proof-of-possession だからである — リクエスト署名は `aud` の鍵に対して
+    /// 検証されるので、両方を傍受した相手も秘密鍵を持たない以上、新しい
+    /// リクエストを作れない。傍受した署名自体も操作・リソース・body・timestamp
+    /// に束縛され、mutation はさらに使い切りである。
+    ///
+    /// 逆に候補を削ると、正当な member への failover が減って可用性だけが
+    /// 落ちる。DHT 距離順で先頭に来る相手は上限があろうと credential を
+    /// 受け取るので、機密性は何も改善しない。
+    #[test]
+    fn candidate_list_is_not_truncated_by_provenance() {
+        let many: Vec<String> = (0..10).map(|i| format!("peer-{i}")).collect();
+
+        for provenance in [MemberProvenance::LocalRecord, MemberProvenance::DhtGuess] {
+            let resolved = ResolvedMembers {
+                members: many.clone(),
+                provenance,
+            };
+            assert_eq!(
+                resolved.as_slice().len(),
+                many.len(),
+                "failover must reach every candidate ({provenance:?})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_authorize_read_allows_owner() {
+        let service = create_test_service("node-1");
+        let owner = Identity::user("test-user".to_string()).unwrap();
+        let policy = crate::domain::access_policy::AccessPolicy::new(
+            ContentId::new("content-1".to_string()).unwrap(),
+            owner,
+        );
+        service
+            .crdt_repo
+            .access_policies
+            .lock()
+            .await
+            .insert("content-1".to_string(), policy);
+
+        let result = service
+            .authorize_read(
+                &test_token(),
+                Some(&test_request_signature()),
+                None,
+                "content-1",
+            )
+            .await;
+        assert!(result.is_ok(), "owner must be allowed: {result:?}");
+    }
+
+    /// policy が無いレプリカでの read は拒否する(fail-closed)。
+    ///
+    /// create genesis は `access_policy: None` で作られ owner policy は別
+    /// operation として届くため、「genesis はあるが policy が無い」状態は
+    /// 部分同期で実際に起こり得る。これを public 扱いにすると、認可契約の
+    /// 無いまま暗号文と履歴を任意の認証済み caller に渡してしまう。
+    #[tokio::test]
+    async fn test_authorize_read_denies_when_policy_is_missing() {
+        let service = create_test_service("node-1");
+        let result = service
+            .authorize_read(
+                &test_token(),
+                Some(&test_request_signature()),
+                None,
+                "content-1",
+            )
+            .await;
+        match result {
+            Err(StateNodeError::AuthorizationFailed(msg)) => {
+                assert!(msg.contains("no access policy"), "msg={msg}");
+            }
+            other => panic!("expected AuthorizationFailed, got: {other:?}"),
+        }
+    }
+
+    /// 「genesis はレプリカにあるが owner policy がまだ届いていない」状態を
+    /// 直接再現し、非 owner の read が拒否されることを確認する。
+    /// これが塞ぐ実シナリオ(create の Create payload は `access_policy: None`
+    /// で、owner policy は別 operation として届く)。
+    #[tokio::test]
+    async fn test_authorize_read_denies_on_genesis_only_replica() {
+        let service = create_test_service("node-1");
+
+        // genesis(コンテンツ本体)だけが存在し、access_policies は空のまま
+        service
+            .crdt_repo
+            .contents
+            .lock()
+            .await
+            .insert("content-genesis-only".to_string(), b"ciphertext".to_vec());
+        assert!(
+            service
+                .crdt_repo
+                .access_policies
+                .lock()
+                .await
+                .get("content-genesis-only")
+                .is_none(),
+            "precondition: replica must not have the owner policy yet"
+        );
+
+        let result = service
+            .authorize_read(
+                &test_token(),
+                Some(&test_request_signature()),
+                None,
+                "content-genesis-only",
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(StateNodeError::AuthorizationFailed(_))),
+            "genesis-only replica must not serve reads without a policy: {result:?}"
+        );
+    }
+
+    /// The read request signature must be verified against a message bound to
+    /// the specific content id (`read:{content_id}:{timestamp}`), not a
+    /// generic `read:content:{timestamp}`. This keeps a signature forwarded to
+    /// relay members (or leaked to a non-member node) from being replayed to
+    /// read other content (PR #54 review).
+    #[tokio::test]
+    async fn test_read_signature_message_is_bound_to_content_id() {
+        struct CapturingAuthService {
+            messages: Arc<std::sync::Mutex<Vec<String>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl AuthenticationService for CapturingAuthService {
+            async fn authenticate(
+                &self,
+                token: &AuthToken,
+                _context: Option<&crate::port::auth_token::AuthContext>,
+            ) -> Result<Identity> {
+                Identity::user(token.as_str().to_string())
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))
+            }
+
+            async fn is_valid(&self, token: &AuthToken) -> Result<bool> {
+                Ok(!token.is_empty())
+            }
+
+            async fn verify_request_signature(
+                &self,
+                _token: &AuthToken,
+                _signature: &[u8],
+                message: &str,
+                _timestamp: Option<u64>,
+            ) -> Result<()> {
+                self.messages.lock().unwrap().push(message.to_string());
+                Ok(())
+            }
+
+            async fn verify_jwt_signature(&self, _token: &AuthToken) -> Result<()> {
+                Ok(())
+            }
+
+            async fn get_issuer(&self, token: &AuthToken) -> Result<Option<Identity>> {
+                Ok(Some(
+                    Identity::user(token.as_str().to_string())
+                        .map_err(|e| anyhow::anyhow!(e.to_string()))?,
+                ))
+            }
+        }
+
+        let messages = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let node_registry = MockNodeRegistry::new();
+        let content_repo = Arc::new(RwLock::new(MockContentNetworkRepository::new()));
+        let peer_network = Arc::new(MockPeerNetwork::new().with_local_peer_id("node-1"));
+        let event_publisher = MockEventPublisher::new();
+        let crdt_repo = Arc::new(MockContentRepository::new());
+        let service: TestService = StateNodeService::new(
+            node_registry,
+            content_repo,
+            peer_network,
+            event_publisher,
+            crdt_repo,
+            "node-1".to_string(),
+        )
+        .with_authentication_service(CapturingAuthService {
+            messages: Arc::clone(&messages),
+        });
+
+        service
+            .authenticate_for_read(
+                &test_token(),
+                Some(&test_request_signature()),
+                Some(1234),
+                "content-abc",
+            )
+            .await
+            .expect("authentication should succeed");
+
+        let captured = messages.lock().unwrap();
+        assert_eq!(
+            captured.as_slice(),
+            ["read:content-abc:1234"],
+            "read signature message must include the content id"
         );
     }
 
     #[tokio::test]
-    async fn test_ensure_content_local_errors_when_no_member_has_data() {
-        // No discoverable members → cannot pull → ContentNotFound.
+    async fn test_authorize_read_denies_non_owner_when_authz_denies() {
+        struct DenyAllAuthorizationService;
+        #[async_trait::async_trait]
+        impl AuthorizationService for DenyAllAuthorizationService {
+            async fn authorize(
+                &self,
+                _request: &AuthorizationRequest,
+            ) -> Result<AuthorizationResult> {
+                Ok(AuthorizationResult::Denied {
+                    reason: "no".to_string(),
+                })
+            }
+        }
+
+        let node_registry = MockNodeRegistry::new();
+        let content_repo = Arc::new(RwLock::new(MockContentNetworkRepository::new()));
+        let peer_network = Arc::new(MockPeerNetwork::new().with_local_peer_id("node-1"));
+        let event_publisher = MockEventPublisher::new();
+        let crdt_repo = Arc::new(MockContentRepository::new());
+
+        let service: TestService = StateNodeService::new(
+            node_registry,
+            content_repo,
+            peer_network,
+            event_publisher,
+            crdt_repo,
+            "node-1".to_string(),
+        )
+        .with_authentication_service(TestAuthService)
+        .with_authorization_service(DenyAllAuthorizationService);
+
+        let owner = Identity::user("someone-else".to_string()).unwrap();
+        let policy = crate::domain::access_policy::AccessPolicy::new(
+            ContentId::new("content-1".to_string()).unwrap(),
+            owner,
+        );
+        service
+            .crdt_repo
+            .access_policies
+            .lock()
+            .await
+            .insert("content-1".to_string(), policy);
+
+        let result = service
+            .authorize_read(
+                &test_token(),
+                Some(&test_request_signature()),
+                None,
+                "content-1",
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(StateNodeError::AuthorizationFailed(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_authorize_read_fails_closed_on_policy_error() {
+        // A policy-store failure must deny, not fall through to the
+        // "no policy -> allow" branch.
         let service = create_test_service("node-1");
-        let result = service.ensure_content_local("content-1").await;
+        *service.crdt_repo.access_policy_error.lock().await = true;
+
+        let result = service
+            .authorize_read(
+                &test_token(),
+                Some(&test_request_signature()),
+                None,
+                "content-1",
+            )
+            .await;
+        assert!(matches!(result, Err(StateNodeError::StorageError(_))));
+    }
+
+    #[tokio::test]
+    async fn test_relay_read_data_errors_when_no_members() {
+        // No discoverable members → nothing to relay to → NoAvailableMembers.
+        let service = create_test_service("node-1");
+        let result = service
+            .relay_read_data(
+                "content-1",
+                None,
+                &test_token(),
+                Some(&test_request_signature()),
+                None,
+            )
+            .await;
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -2859,6 +3789,203 @@ mod tests {
             .unwrap();
         assert!(network.has_member_str("node-1"));
         assert!(network.has_member_str("node-2"));
+    }
+
+    /// A peer cannot plant a `ContentNetwork` record by publishing a
+    /// `ContentCreated` that names someone else as the creator.
+    ///
+    /// Without this check any node could name us in `member_nodes` for a
+    /// content of its choosing, and the record would read back as
+    /// `MemberProvenance::LocalRecord` — which decides whether a 403 from a
+    /// listed peer is treated as final.
+    #[tokio::test]
+    async fn content_created_from_a_peer_other_than_the_creator_is_rejected() {
+        let service = create_test_service("node-1");
+
+        let event = Event::ContentCreated {
+            content_id: "content-1".to_string(),
+            creator_node_id: "node-2".to_string(),
+            content_size: 100,
+            member_nodes: vec!["node-1".to_string(), "node-2".to_string()],
+            timestamp: 12345,
+        };
+
+        // Published by node-9, which is neither the claimed creator nor in the
+        // member set.
+        let result = service.handle_sync_event(&event, Some("node-9")).await;
+        assert!(result.is_err(), "unrelated publisher must be rejected");
+
+        let network = service
+            .get_content_network_for_test("content-1")
+            .await
+            .unwrap();
+        assert!(network.is_none(), "no record may be planted");
+    }
+
+    /// The legitimate path still works: `create_content` publishes with
+    /// `creator_node_id == local_node_id`, so the authenticated publisher
+    /// matches the claimed creator.
+    #[tokio::test]
+    async fn content_created_from_the_real_creator_is_accepted() {
+        let service = create_test_service("node-1");
+
+        let event = Event::ContentCreated {
+            content_id: "content-1".to_string(),
+            creator_node_id: "node-2".to_string(),
+            content_size: 100,
+            member_nodes: vec!["node-1".to_string(), "node-2".to_string()],
+            timestamp: 12345,
+        };
+
+        let outcome = service
+            .handle_sync_event(&event, Some("node-2"))
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            ApplyOutcome::NeedsSync {
+                content_id: "content-1".to_string()
+            }
+        );
+
+        let network = service
+            .get_content_network_for_test("content-1")
+            .await
+            .unwrap()
+            .expect("record stored");
+        assert!(network.has_member_str("node-2"));
+    }
+
+    /// A non-member cannot evict us from our own record by naming us as the
+    /// removed node.
+    ///
+    /// This arm had no publisher check at all, so a single event from any peer
+    /// deleted the `ContentNetwork` record — which is what decides whether a
+    /// relay treats a peer's 403 as final.
+    #[tokio::test]
+    async fn removal_from_a_non_member_cannot_delete_our_record() {
+        let content_repo = Arc::new(RwLock::new(
+            MockContentNetworkRepository::new()
+                .with_network(create_test_network("content-1", vec!["node-1", "node-2"])),
+        ));
+        let service: TestService = StateNodeService::new(
+            MockNodeRegistry::new(),
+            content_repo,
+            Arc::new(MockPeerNetwork::new().with_local_peer_id("node-1")),
+            MockEventPublisher::new(),
+            Arc::new(MockContentRepository::new()),
+            "node-1".to_string(),
+        )
+        .with_authentication_service(TestAuthService)
+        .with_authorization_service(AllowAllAuthorizationService);
+
+        let event = Event::ContentNetworkManagerRemoved {
+            content_id: "content-1".to_string(),
+            removed_node_id: "node-1".to_string(),
+            member_nodes: vec!["node-2".to_string()],
+            reason: "low_capacity".to_string(),
+            timestamp: 12345,
+        };
+
+        let result = service.handle_sync_event(&event, Some("node-9")).await;
+        assert!(result.is_err(), "non-member publisher must be rejected");
+
+        assert!(
+            service
+                .get_content_network_for_test("content-1")
+                .await
+                .unwrap()
+                .is_some(),
+            "our record must survive"
+        );
+    }
+
+    /// A non-member cannot delete our record with a `ContentDeleted` event.
+    ///
+    /// `verify_source_peer_id` alone does not help here: the event names its
+    /// own publisher, so any authenticated peer satisfies it.
+    #[tokio::test]
+    async fn content_deleted_from_a_non_member_cannot_delete_our_record() {
+        let content_repo = Arc::new(RwLock::new(
+            MockContentNetworkRepository::new()
+                .with_network(create_test_network("content-1", vec!["node-1", "node-2"])),
+        ));
+        let service: TestService = StateNodeService::new(
+            MockNodeRegistry::new(),
+            content_repo,
+            Arc::new(MockPeerNetwork::new().with_local_peer_id("node-1")),
+            MockEventPublisher::new(),
+            Arc::new(MockContentRepository::new()),
+            "node-1".to_string(),
+        )
+        .with_authentication_service(TestAuthService)
+        .with_authorization_service(AllowAllAuthorizationService);
+
+        // node-9 both publishes and names itself — the self-claim check passes.
+        let event = Event::ContentDeleted {
+            content_id: "content-1".to_string(),
+            deleted_by_node_id: "node-9".to_string(),
+            timestamp: 12345,
+        };
+
+        let result = service.handle_sync_event(&event, Some("node-9")).await;
+        assert!(result.is_err(), "non-member publisher must be rejected");
+
+        assert!(
+            service
+                .get_content_network_for_test("content-1")
+                .await
+                .unwrap()
+                .is_some(),
+            "our record must survive"
+        );
+    }
+
+    /// A non-member cannot rewrite the member set of a network we already hold.
+    #[tokio::test]
+    async fn membership_change_from_a_non_member_is_rejected() {
+        let node_registry = MockNodeRegistry::new();
+        let content_repo = Arc::new(RwLock::new(
+            MockContentNetworkRepository::new()
+                .with_network(create_test_network("content-1", vec!["node-1", "node-2"])),
+        ));
+        let peer_network = Arc::new(MockPeerNetwork::new().with_local_peer_id("node-1"));
+
+        let service: TestService = StateNodeService::new(
+            node_registry,
+            content_repo,
+            peer_network,
+            MockEventPublisher::new(),
+            Arc::new(MockContentRepository::new()),
+            "node-1".to_string(),
+        )
+        .with_authentication_service(TestAuthService)
+        .with_authorization_service(AllowAllAuthorizationService);
+
+        // node-9 is not in the network, but tries to add itself to it.
+        let event = Event::ContentNetworkManagerAdded {
+            content_id: "content-1".to_string(),
+            added_node_id: "node-9".to_string(),
+            member_nodes: vec![
+                "node-1".to_string(),
+                "node-2".to_string(),
+                "node-9".to_string(),
+            ],
+            timestamp: 12345,
+        };
+
+        let result = service.handle_sync_event(&event, Some("node-9")).await;
+        assert!(result.is_err(), "non-member publisher must be rejected");
+
+        let network = service
+            .get_content_network_for_test("content-1")
+            .await
+            .unwrap()
+            .expect("record still present");
+        assert!(
+            !network.has_member_str("node-9"),
+            "member set must be unchanged"
+        );
     }
 
     #[tokio::test]

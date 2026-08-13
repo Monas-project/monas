@@ -28,6 +28,43 @@ pub struct PushBootstrap {
     pub created_at: u64,
 }
 
+/// Machine-readable failure category of a relayed read, decided by the
+/// responding member.
+///
+/// Crosses the wire inside `ContentResponse::ReadFailed` so the relaying
+/// node can return the member's verdict (401/403/404) as a typed error
+/// instead of re-deriving it from error-message text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RelayReadErrorKind {
+    /// The member does not hold the content/version (404).
+    NotFound,
+    /// The member could not authenticate the forwarded caller (401).
+    AuthenticationFailed,
+    /// The member authenticated the caller but denied read access (403).
+    AuthorizationFailed,
+    /// Transport failures, timeouts, or unclassified member errors. Unlike
+    /// the verdict kinds above, this does not represent a member decision.
+    Other,
+}
+
+/// Failure of a relayed read: the member's verdict (`kind`) plus its
+/// human-readable message.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("{message}")]
+pub struct RelayReadError {
+    pub kind: RelayReadErrorKind,
+    pub message: String,
+}
+
+impl RelayReadError {
+    pub fn other(message: impl Into<String>) -> Self {
+        Self {
+            kind: RelayReadErrorKind::Other,
+            message: message.into(),
+        }
+    }
+}
+
 /// Abstract interface for peer-to-peer network operations.
 ///
 /// This trait provides methods for:
@@ -170,6 +207,34 @@ pub trait PeerNetwork: Send + Sync {
         request_signature: &[u8],
         timestamp: Option<u64>,
     ) -> Result<bool>;
+
+    /// Relay a content-data read to a member node.
+    ///
+    /// Used when a node that does not replicate the content receives a read
+    /// request. The member re-authenticates the original caller (token +
+    /// request signature) and enforces the access policy before serving.
+    /// `version: None` reads the latest version. Returns `(data, version)`.
+    async fn relay_read_content(
+        &self,
+        peer_id: &str,
+        content_id: &str,
+        version: Option<&str>,
+        auth_token: &str,
+        request_signature: &[u8],
+        timestamp: Option<u64>,
+    ) -> std::result::Result<(Vec<u8>, String), RelayReadError>;
+
+    /// Relay a version-history read to a member node.
+    ///
+    /// Same authentication contract as [`PeerNetwork::relay_read_content`].
+    async fn relay_read_history(
+        &self,
+        peer_id: &str,
+        content_id: &str,
+        auth_token: &str,
+        request_signature: &[u8],
+        timestamp: Option<u64>,
+    ) -> std::result::Result<Vec<String>, RelayReadError>;
 
     // ========== Monitoring Methods ==========
 

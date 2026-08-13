@@ -24,6 +24,29 @@ impl MonasController {
         None
     }
 
+    /// State Node の読み取り API 用の認証コンテキストを解決する。
+    ///
+    /// 呼び出し元が Authorization を明示していればそのまま透過する。
+    /// 無ければ書き込み系（create/update/delete）と同じく monas-account で
+    /// `read:<content_id>:<timestamp>` に署名し、`user:<hex(pubkey)>` トークンを組み立てる。
+    /// State Node 側は読み取り時にこの署名メッセージを検証する
+    /// （`verify_read_access` → `verify_caller_signature("read", content_id, ..)`）。
+    /// 署名を content_id にバインドすることで、relay 先ノード等に渡った署名を
+    /// 他コンテンツの読み取りに再利用されることを防ぐ。
+    fn resolve_state_read_auth<T>(
+        &self,
+        auth: Option<&StateNodeAuthContext>,
+        content_id: &str,
+        trace_id: &str,
+    ) -> Result<Option<StateNodeAuthContext>, ApiResponse<T>> {
+        match auth {
+            Some(ctx) if ctx.authorization.is_none() => {
+                self.prepare_state_node_metadata_auth(auth, "read", content_id, trace_id)
+            }
+            _ => Ok(auth.cloned()),
+        }
+    }
+
     fn state_node_get_string<T>(
         &self,
         url: &str,
@@ -118,9 +141,17 @@ impl MonasController {
             return response;
         }
 
+        let auth = match self.resolve_state_read_auth::<GetLatestVersionOutput>(
+            auth,
+            &input.content_id,
+            &trace_id,
+        ) {
+            Ok(resolved) => resolved,
+            Err(e) => return e,
+        };
         let history = match self.get_state_node_history::<GetLatestVersionOutput>(
             &input.content_id,
-            auth,
+            auth.as_ref(),
             trace_id.clone(),
         ) {
             Ok(h) => h,
@@ -158,9 +189,17 @@ impl MonasController {
             return response;
         }
 
+        let auth = match self.resolve_state_read_auth::<GetHistoryOutput>(
+            auth,
+            &input.content_id,
+            &trace_id,
+        ) {
+            Ok(resolved) => resolved,
+            Err(e) => return e,
+        };
         let history = match self.get_state_node_history::<GetHistoryOutput>(
             &input.content_id,
-            auth,
+            auth.as_ref(),
             trace_id.clone(),
         ) {
             Ok(h) => h,
@@ -209,6 +248,16 @@ impl MonasController {
                 trace_id,
             );
         }
+
+        let auth = match self.resolve_state_read_auth::<VerifyIntegrityOutput>(
+            auth,
+            &input.content_id,
+            &trace_id,
+        ) {
+            Ok(resolved) => resolved,
+            Err(e) => return e,
+        };
+        let auth = auth.as_ref();
 
         let content_bytes = match URL_SAFE_NO_PAD.decode(&input.content) {
             Ok(b) => b,
@@ -264,13 +313,44 @@ impl MonasController {
             }
         };
 
-        let valid = content_bytes == state_bytes;
-        let reason = if valid {
-            None
+        // State Node が保持するのは SDK が送信した「暗号文」なので、
+        // local_content_id があればローカルに保存された暗号文とバイト比較する。
+        // （平文 `content` と State Node のバイト列は一致し得ない。）
+        let (valid, reason) = if let Some(local_id) = input.local_content_id.as_deref() {
+            match self.content_service.fetch_encrypted(
+                monas_content::domain::content_id::ContentId::new(local_id.to_string()),
+            ) {
+                Ok(local_cipher) => {
+                    if local_cipher == state_bytes {
+                        (true, None)
+                    } else {
+                        (
+                            false,
+                            Some(format!(
+                                "state node ciphertext differs from local ciphertext (version={version_to_check})"
+                            )),
+                        )
+                    }
+                }
+                Err(e) => (
+                    false,
+                    Some(format!(
+                        "failed to load local ciphertext for {local_id}: {e}"
+                    )),
+                ),
+            }
         } else {
-            Some(format!(
-                "content mismatch with state node (version={version_to_check})"
-            ))
+            let valid = content_bytes == state_bytes;
+            (
+                valid,
+                if valid {
+                    None
+                } else {
+                    Some(format!(
+                        "content mismatch with state node (version={version_to_check})"
+                    ))
+                },
+            )
         };
 
         ApiResponse::success(

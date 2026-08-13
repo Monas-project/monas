@@ -262,7 +262,7 @@ if [ -n "$CONTENT_ID" ]; then
     echo ""
 
     # CRDTデータの取得（認証ヘッダー付き）
-    generate_signature "$TEST_PRIVATE_KEY" "read" "content"
+    generate_signature "$TEST_PRIVATE_KEY" "read" "$CONTENT_ID"
 
     log_test "CRDTデータの取得"
     DATA_RESPONSE=$(curl -s -X GET "$BASE_URL/content/$CONTENT_ID/data" \
@@ -282,7 +282,7 @@ if [ -n "$CONTENT_ID" ]; then
     fi
 
     # CRDT履歴の取得（認証ヘッダー付き）
-    generate_signature "$TEST_PRIVATE_KEY" "read" "content"
+    generate_signature "$TEST_PRIVATE_KEY" "read" "$CONTENT_ID"
 
     log_test "CRDT履歴の取得"
     HIST_RESPONSE=$(curl -s -X GET "$BASE_URL/content/$CONTENT_ID/history" \

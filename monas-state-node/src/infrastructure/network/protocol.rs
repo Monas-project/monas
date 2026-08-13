@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub use crate::port::peer_network::PushBootstrap;
+pub use crate::port::peer_network::{PushBootstrap, RelayReadErrorKind};
 
 /// Protocol name for capacity queries.
 pub const CAPACITY_PROTOCOL: &str = "/monas/capacity/1.0.0";
@@ -66,6 +66,30 @@ pub enum ContentRequest {
         request_signature: Vec<u8>,
         timestamp: Option<u64>,
     },
+    /// Relay a content-data read to a member node.
+    ///
+    /// Sent by a node that does not replicate the content (e.g. the
+    /// gateway-facing node) so a member can serve the read. The member
+    /// re-authenticates the original caller from `auth_token` /
+    /// `request_signature` and enforces the content's access policy before
+    /// returning any data.
+    ReadContent {
+        content_id: String,
+        /// `None` reads the latest version; `Some(v)` a specific version CID.
+        version: Option<String>,
+        auth_token: String,
+        request_signature: Vec<u8>,
+        timestamp: Option<u64>,
+    },
+    /// Relay a version-history read to a member node.
+    ///
+    /// Same authentication contract as [`ContentRequest::ReadContent`].
+    ReadHistory {
+        content_id: String,
+        auth_token: String,
+        request_signature: Vec<u8>,
+        timestamp: Option<u64>,
+    },
 }
 
 /// Response types for the content protocol.
@@ -101,6 +125,19 @@ pub enum ContentResponse {
     DeleteResult { content_id: String, success: bool },
     /// Response to relayed invalidate_tokens request.
     InvalidateTokensResult { content_id: String, success: bool },
+    /// Response to a relayed history read.
+    HistoryData {
+        content_id: String,
+        versions: Vec<String>,
+    },
+    /// Failure of a relayed read, carrying the member's typed verdict so the
+    /// relaying node can map it back to 401/403/404 without parsing message
+    /// text.
+    ReadFailed {
+        content_id: String,
+        kind: RelayReadErrorKind,
+        message: String,
+    },
     /// Content not found.
     NotFound { content_id: String },
     /// Error response.

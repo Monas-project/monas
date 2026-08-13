@@ -9,7 +9,7 @@ use crate::domain::events::Event;
 use crate::domain::state_node::NodeSnapshot;
 use crate::port::content_repository::{CommitResult, ContentRepository, SerializedOperation};
 use crate::port::event_publisher::EventPublisher;
-use crate::port::peer_network::PeerNetwork;
+use crate::port::peer_network::{PeerNetwork, RelayReadError, RelayReadErrorKind};
 use crate::port::persistence::{PersistentContentRepository, PersistentNodeRegistry};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -23,6 +23,9 @@ use tokio::sync::Mutex;
 
 /// Type alias for published events storage.
 pub type PublishedEvents = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+
+/// Configurable result of a mocked relayed data read: `(data, version)`.
+pub type MockRelayReadData = Arc<Mutex<Option<(Vec<u8>, String)>>>;
 
 /// Mock implementation of PeerNetwork for testing.
 #[derive(Default)]
@@ -47,6 +50,18 @@ pub struct MockPeerNetwork {
     pub relay_update_peers: Arc<Mutex<Vec<String>>>,
     pub relay_delete_peers: Arc<Mutex<Vec<String>>>,
     pub relay_invalidate_tokens_peers: Arc<Mutex<Vec<String>>>,
+    /// When `Some`, relayed data reads succeed with this payload; when `None`
+    /// they fail with a typed NotFound verdict (the common test default).
+    pub relay_read_data_result: MockRelayReadData,
+    /// Same, for relayed history reads.
+    pub relay_read_history_result: Arc<Mutex<Option<Vec<String>>>>,
+    /// When `Some`, relayed data reads fail with exactly this typed error
+    /// (takes precedence over `relay_read_data_result`).
+    pub relay_read_data_error: Arc<Mutex<Option<RelayReadError>>>,
+    /// `since_version` argument of each `fetch_operations` call, in order.
+    /// Lets tests assert whether a sync requested the full history
+    /// (`None`) or an incremental fetch (`Some(version)`).
+    pub fetch_operations_since: Arc<Mutex<Vec<Option<String>>>>,
 }
 
 impl MockPeerNetwork {
@@ -68,6 +83,31 @@ impl MockPeerNetwork {
             relay_update_peers: Arc::new(Mutex::new(Vec::new())),
             relay_delete_peers: Arc::new(Mutex::new(Vec::new())),
             relay_invalidate_tokens_peers: Arc::new(Mutex::new(Vec::new())),
+            relay_read_data_result: Arc::new(Mutex::new(None)),
+            relay_read_history_result: Arc::new(Mutex::new(None)),
+            relay_read_data_error: Arc::new(Mutex::new(None)),
+            fetch_operations_since: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    pub fn with_relay_read_error(self, error: RelayReadError) -> Self {
+        Self {
+            relay_read_data_error: Arc::new(Mutex::new(Some(error))),
+            ..self
+        }
+    }
+
+    pub fn with_relay_read_data(self, data: Vec<u8>, version: &str) -> Self {
+        Self {
+            relay_read_data_result: Arc::new(Mutex::new(Some((data, version.to_string())))),
+            ..self
+        }
+    }
+
+    pub fn with_relay_read_history(self, versions: Vec<String>) -> Self {
+        Self {
+            relay_read_history_result: Arc::new(Mutex::new(Some(versions))),
+            ..self
         }
     }
 
@@ -176,8 +216,12 @@ impl PeerNetwork for MockPeerNetwork {
         &self,
         _peer_id: &str,
         _genesis_cid: &str,
-        _since_version: Option<&str>,
+        since_version: Option<&str>,
     ) -> Result<Vec<SerializedOperation>> {
+        self.fetch_operations_since
+            .lock()
+            .await
+            .push(since_version.map(ToOwned::to_owned));
         Ok(self.fetched_operations.lock().await.clone())
     }
 
@@ -265,6 +309,44 @@ impl PeerNetwork for MockPeerNetwork {
             .unwrap_or(true))
     }
 
+    async fn relay_read_content(
+        &self,
+        _peer_id: &str,
+        content_id: &str,
+        _version: Option<&str>,
+        _auth_token: &str,
+        _request_signature: &[u8],
+        _timestamp: Option<u64>,
+    ) -> std::result::Result<(Vec<u8>, String), RelayReadError> {
+        if let Some(error) = self.relay_read_data_error.lock().await.clone() {
+            return Err(error);
+        }
+        match self.relay_read_data_result.lock().await.clone() {
+            Some(result) => Ok(result),
+            None => Err(RelayReadError {
+                kind: RelayReadErrorKind::NotFound,
+                message: format!("Content not found: {}", content_id),
+            }),
+        }
+    }
+
+    async fn relay_read_history(
+        &self,
+        _peer_id: &str,
+        content_id: &str,
+        _auth_token: &str,
+        _request_signature: &[u8],
+        _timestamp: Option<u64>,
+    ) -> std::result::Result<Vec<String>, RelayReadError> {
+        match self.relay_read_history_result.lock().await.clone() {
+            Some(versions) => Ok(versions),
+            None => Err(RelayReadError {
+                kind: RelayReadErrorKind::NotFound,
+                message: format!("Content not found: {}", content_id),
+            }),
+        }
+    }
+
     async fn connected_peer_count(&self) -> usize {
         0
     }
@@ -322,6 +404,9 @@ pub struct MockContentRepository {
     pub operations: Arc<Mutex<Vec<SerializedOperation>>>,
     pub next_cid: Arc<Mutex<u64>>,
     pub access_policies: Arc<Mutex<HashMap<String, AccessPolicy>>>,
+    /// When true, `get_access_policy` fails — used to test that read
+    /// authorization fails closed on policy-store errors.
+    pub access_policy_error: Arc<Mutex<bool>>,
 }
 
 impl MockContentRepository {
@@ -332,6 +417,7 @@ impl MockContentRepository {
             operations: Arc::new(Mutex::new(Vec::new())),
             next_cid: Arc::new(Mutex::new(1)),
             access_policies: Arc::new(Mutex::new(HashMap::new())),
+            access_policy_error: Arc::new(Mutex::new(false)),
         }
     }
 }
@@ -415,14 +501,12 @@ impl ContentRepository for MockContentRepository {
         }
     }
 
-    async fn get_version(&self, version_cid: &str) -> Result<Option<Vec<u8>>> {
-        // For simplicity, return the first content that matches
+    async fn get_version(&self, genesis_cid: &str, version_cid: &str) -> Result<Option<Vec<u8>>> {
+        // Scoped to the given series, mirroring the real implementation.
         let contents = self.contents.lock().await;
-        for genesis_cid in contents.keys() {
-            if let Some(history) = self.history.lock().await.get(genesis_cid) {
-                if history.contains(&version_cid.to_string()) {
-                    return Ok(contents.get(genesis_cid).cloned());
-                }
+        if let Some(history) = self.history.lock().await.get(genesis_cid) {
+            if history.contains(&version_cid.to_string()) {
+                return Ok(contents.get(genesis_cid).cloned());
             }
         }
         Ok(None)
@@ -467,6 +551,9 @@ impl ContentRepository for MockContentRepository {
     }
 
     async fn get_access_policy(&self, genesis_cid: &str) -> Result<Option<AccessPolicy>> {
+        if *self.access_policy_error.lock().await {
+            return Err(anyhow::anyhow!("policy store unavailable"));
+        }
         Ok(self.access_policies.lock().await.get(genesis_cid).cloned())
     }
 
