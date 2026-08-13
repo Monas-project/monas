@@ -317,23 +317,11 @@ impl MonasController {
             }
         };
 
-        // CID 再計算による改ざん検証。ここを通れば payload は要求した版 CID に
-        // 対して真正(復号は下の verify_and_decrypt_relay_read が再度行う)。
-        if let Err(e) = monas_content::infrastructure::node_verification::verify_and_extract(
-            &node_bytes,
-            &version,
-        ) {
-            {
-                return ApiResponse::error(
-                    ApiError::Internal(format!(
-                        "state node response failed CID verification (tampered response?): {e}"
-                    )),
-                    trace_id,
-                );
-            }
-        }
-
-        // CEK ロード + AES-GCM 復号 + plain CID 照合
+        // CID 再計算による改ざん検証 + CEK ロード + AES-GCM 復号 + plain CID 照合
+        //
+        // 検証は `verify_and_decrypt_relay_read` の中で必ず最初に走るので、
+        // ここで先に `verify_and_extract` を呼ぶ必要はない(同じ引数で 2 回
+        // 走らせていた)。検証は content 層の責務として一箇所に置く。
         //
         // CEK は「送信者ピンの権威レコード」を優先する。CEK ストアは、その
         // レコードから導出されるキャッシュに過ぎず、CAS 成功後の書き込み順が
