@@ -133,6 +133,7 @@ async fn spawn_test_node() -> TestNode {
         listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
         bootstrap_nodes: vec![],
         enable_mdns: false,
+        enable_nat_traversal: false,
         gossipsub_topics: vec!["test-events".to_string()],
         external_addrs: vec![],
     };

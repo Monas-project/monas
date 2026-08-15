@@ -57,6 +57,14 @@ struct Args {
     #[arg(long)]
     disable_mdns: bool,
 
+    /// Disable NAT traversal (AutoNAT v2, circuit relay v2, DCUtR).
+    ///
+    /// NAT traversal is what lets a node behind a home router or a NAT gateway
+    /// join at all. A deployment where every node is publicly reachable does
+    /// not need it and can turn the machinery off.
+    #[arg(long)]
+    disable_nat_traversal: bool,
+
     /// Log level (trace, debug, info, warn, error).
     #[arg(long, default_value = "info")]
     log_level: String,
@@ -83,8 +91,12 @@ async fn main() -> Result<()> {
             .parse::<Multiaddr>()
             .context("Failed to parse P2P listen address")?],
         enable_mdns: !args.disable_mdns,
+        enable_nat_traversal: !args.disable_nat_traversal,
         ..Default::default()
     };
+    if args.disable_nat_traversal {
+        tracing::info!("NAT traversal disabled; this node can only reach directly-dialable peers");
+    }
     if args.disable_mdns {
         tracing::info!(
             "mDNS disabled; discovery relies on bootstrap peers, Kademlia and the peer store"

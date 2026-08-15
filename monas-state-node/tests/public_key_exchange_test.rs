@@ -111,6 +111,7 @@ mod tests {
             listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
             bootstrap_nodes: vec![],
             enable_mdns: false,
+            enable_nat_traversal: false,
             gossipsub_topics: vec!["test".to_string()],
             external_addrs: vec![],
         };
@@ -119,6 +120,7 @@ mod tests {
             listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".parse().unwrap()],
             bootstrap_nodes: vec![],
             enable_mdns: false,
+            enable_nat_traversal: false,
             gossipsub_topics: vec!["test".to_string()],
             external_addrs: vec![],
         };
