@@ -181,7 +181,7 @@ presentation/   Axum HTTP API (port: 4001)
 
 | 機能 | 実装 |
 |------|------|
-| P2Pネットワーク | libp2p（Kademlia DHT / Gossipsub / RequestResponse / mDNS） |
+| P2Pネットワーク | libp2p（Kademlia DHT / Gossipsub / RequestResponse / mDNS / AutoNAT v2 / circuit relay v2 / DCUtR） |
 | CRDT状態管理 | crsl-lib（CIDネイティブDAG CRDT） |
 | コンテンツ配置 | sha256(content_id)によるDHTキー空間への決定論的配置 |
 | 認証 | P-256 ECDSA、自己完結型鍵ID |
@@ -320,7 +320,18 @@ XOR距離によるノード選択には以下の特性がある：
 | Gossipsub | イベント伝播（ContentCreated, ContentUpdated等） |
 | RequestResponse | ノード間の直接通信（CRDT操作の同期） |
 | mDNS | ローカルネットワークでのピア探索 |
+| AutoNAT v2 | 自ノードが外から到達可能かを**実測**で判定（自己申告ではない） |
+| circuit relay v2 | NAT 配下のノードへの接続を中継。提供側は opt-in（`--relay-service`） |
+| DCUtR | relay 経由の接続を hole punching で直接接続へ昇格させる |
 | TCP / QUIC / WebRTC | トランスポート |
+
+#### NAT traversal と 2 つの「relay」
+
+この表の **circuit relay v2 は接続層**の仕組みで、本書が[relay先の信頼度](#relay先の信頼度)以下で論じる **Monas relay（application 層のリクエスト転送）とは別物**である。前者は「そもそも TCP 接続を張れない相手にどう繋ぐか」、後者は「コンテンツを持たないノードが受けたリクエストをどう member へ渡すか」を扱う。両者は独立しており、circuit relay を無効にしても Monas relay は動く。
+
+**役割は測定から従属的に決まる。** AutoNAT v2 は自ノードのアドレスを他ノードに dial back させ、**実際に到達できたアドレスについてのみ**肯定を返す。到達不能なノードが自分を到達可能と誤認すれば、提供できない relay サービスを広告してしまうため、ここは自己申告であってはならない。
+
+ただし**中継する側になることは opt-in** である。NAT を越えたいこと（client 側）と、見知らぬ相手のトラフィックを運ぶ用意があること（server 側）は別の判断なので、後者は `--relay-service`（`--external-address` 必須）でのみ有効になる。既定では、NAT traversal が有効でも中継役は担わない。
 
 ---
 

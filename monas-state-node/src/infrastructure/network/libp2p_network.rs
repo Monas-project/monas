@@ -92,15 +92,70 @@ enum Reachability {
     Private,
 }
 
+/// Where a reservation attempt has got to.
+///
+/// `listen_on` returning `Ok` only means the transport accepted the address
+/// shape; the reservation is negotiated afterwards and the relay may still
+/// refuse. Recording the attempt as if it were the reservation is what would
+/// let a refusal occupy one of `TARGET_RELAY_RESERVATIONS` forever — the same
+/// "the call is not the effect" mistake as releasing a reservation by logging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReservationState {
+    /// `listen_on` accepted the address; the relay has not answered yet.
+    Pending,
+    /// The relay sent `ReservationReqAccepted`.
+    Confirmed,
+}
+
+/// A reservation attempt against one relay.
+struct Reservation {
+    /// Kept because releasing a reservation means removing its listener, and
+    /// `Swarm::listeners()` only yields addresses — there is no way back to
+    /// the id from those.
+    listener_id: libp2p::core::transport::ListenerId,
+    state: ReservationState,
+}
+
 /// Tracks reachability and the relay reservations that follow from it.
 #[derive(Default)]
 struct NatState {
+    /// Per-address AutoNAT verdicts.
+    ///
+    /// AutoNAT v2 tests *one address at a time* and reports the result for
+    /// that address, so a single event is not a verdict about the node. A
+    /// multi-homed node legitimately gets a failure for its LAN address and a
+    /// success for its public one; collapsing those into one last-event-wins
+    /// boolean makes the node flip between Public and Private and churn
+    /// reservations against other people's relays. The node-level answer is
+    /// the aggregate: reachable if *any* address is.
+    address_reachability: HashMap<Multiaddr, bool>,
     reachability: Reachability,
-    /// Relays we currently listen through, with the listener that holds each
-    /// reservation. The `ListenerId` is kept because releasing a reservation
-    /// means removing its listener, and `Swarm::listeners()` only yields
-    /// addresses — there is no way back to the id from those.
-    reserved_with: HashMap<PeerId, libp2p::core::transport::ListenerId>,
+    reserved_with: HashMap<PeerId, Reservation>,
+}
+
+impl NatState {
+    /// Fold the per-address verdicts into a node-level one.
+    ///
+    /// One reachable address is enough to be reachable. Only once every
+    /// address we have heard about has failed do we conclude we are private.
+    fn aggregate_reachability(&self) -> Reachability {
+        if self.address_reachability.is_empty() {
+            return Reachability::Unknown;
+        }
+        if self.address_reachability.values().any(|ok| *ok) {
+            Reachability::Public
+        } else {
+            Reachability::Private
+        }
+    }
+
+    /// Reservations that are still worth counting towards the target.
+    ///
+    /// Both pending and confirmed count, so a node does not open a third
+    /// circuit while two are still being negotiated.
+    fn active_reservations(&self) -> usize {
+        self.reserved_with.len()
+    }
 }
 
 /// A relay request received from a remote peer via P2P protocol.
@@ -204,6 +259,9 @@ pub struct Libp2pNetworkConfig {
     /// Enable NAT traversal (AutoNAT v2 + circuit relay v2 + DCUtR), which is
     /// what lets a node behind NAT participate at all.
     pub enable_nat_traversal: bool,
+    /// Offer circuit relay service to other nodes. Off by default; see
+    /// `BehaviourConfig::enable_relay_service`.
+    pub enable_relay_service: bool,
     /// Gossipsub topics to subscribe to.
     pub gossipsub_topics: Vec<String>,
     /// Externally reachable addresses to advertise to peers (e.g. a public
@@ -228,6 +286,7 @@ impl Default for Libp2pNetworkConfig {
             bootstrap_nodes: vec![],
             enable_mdns: true,
             enable_nat_traversal: true,
+            enable_relay_service: false,
             gossipsub_topics: vec!["monas-events".to_string()],
             external_addrs: vec![],
         }
@@ -563,6 +622,7 @@ impl Libp2pNetwork {
             BehaviourConfig {
                 enable_mdns: config.enable_mdns,
                 enable_nat_traversal: config.enable_nat_traversal,
+                enable_relay_service: config.enable_relay_service,
                 ..BehaviourConfig::default()
             },
             relay_client,
@@ -800,6 +860,16 @@ impl Libp2pNetwork {
                 // Periodic reconnection / re-bootstrap
                 _ = peer_maintenance.tick() => {
                     Self::maintain_connectivity(&mut swarm, &connected_peers, &bootstrap_nodes, &peer_store).await;
+                    // Top relay reservations back up to the target.
+                    //
+                    // Reconciled here rather than only on the AutoNAT
+                    // transition: a relay can refuse, expire or vanish at any
+                    // time, and a private node that reacted only to the edge
+                    // would stay unreachable for the life of the process. This
+                    // is the same reason `maintain_connectivity` exists.
+                    if nat_state.reachability == Reachability::Private {
+                        Self::ensure_relay_reservations(&mut swarm, &connected_peers, &mut nat_state).await;
+                    }
                     // Flush at most once per tick rather than on every new
                     // address, so a busy node does not rewrite the file
                     // constantly.
@@ -829,29 +899,37 @@ impl Libp2pNetwork {
         nat_state: &mut NatState,
         event: libp2p::autonat::v2::client::Event,
     ) {
-        let observed = if event.result.is_ok() {
-            Reachability::Public
-        } else {
-            Reachability::Private
-        };
+        // Record the verdict for *this address*. The node-level answer is the
+        // aggregate over every address we have heard about; see
+        // `NatState::aggregate_reachability`.
+        //
+        // The address itself needs no handling here: on success the AutoNAT
+        // client behaviour already emits `ExternalAddrConfirmed`, so the swarm
+        // has recorded it. Calling `add_external_address` as well would put it
+        // in the swarm's *manual* set, which is never expired — the node would
+        // keep advertising an address long after it stopped working.
+        nat_state
+            .address_reachability
+            .insert(event.tested_addr.clone(), event.result.is_ok());
 
+        let observed = nat_state.aggregate_reachability();
         if nat_state.reachability == observed {
             return;
         }
 
         info!(
-            "AutoNAT: reachability {:?} -> {:?} (tested {})",
-            nat_state.reachability, observed, event.tested_addr
+            "AutoNAT: reachability {:?} -> {:?} (last tested {}, {} address(es) known)",
+            nat_state.reachability,
+            observed,
+            event.tested_addr,
+            nat_state.address_reachability.len()
         );
         nat_state.reachability = observed;
 
         match observed {
-            Reachability::Public => {
-                // We can be dialled, so the address is worth announcing and
-                // there is no reason to occupy someone else's relay slot.
-                swarm.add_external_address(event.tested_addr.clone());
-                Self::release_relay_reservations(swarm, nat_state);
-            }
+            // No reason to occupy someone else's relay slot once we can be
+            // dialled directly.
+            Reachability::Public => Self::release_relay_reservations(swarm, nat_state),
             Reachability::Private => {
                 Self::ensure_relay_reservations(swarm, connected_peers, nat_state).await
             }
@@ -874,6 +952,10 @@ impl Libp2pNetwork {
             return;
         }
 
+        if nat_state.active_reservations() >= TARGET_RELAY_RESERVATIONS {
+            return;
+        }
+
         // A circuit address must carry the relay's *dialable* address, not
         // just its peer id: the client transport rejects `/p2p/<id>/p2p-circuit`
         // with `MissingRelayAddr`, because it has to know where to open the
@@ -893,22 +975,107 @@ impl Libp2pNetwork {
             .collect();
 
         for (peer, addr) in candidates {
-            if nat_state.reserved_with.len() >= TARGET_RELAY_RESERVATIONS {
+            if nat_state.active_reservations() >= TARGET_RELAY_RESERVATIONS {
                 break;
             }
-            // Listening on a circuit address is what actually requests the
-            // reservation; the relay accepts or refuses, and a refusal simply
-            // means this peer will not be one of our relays.
-            let circuit = addr
-                .with(libp2p::multiaddr::Protocol::P2p(peer))
-                .with(libp2p::multiaddr::Protocol::P2pCircuit);
+            let circuit = Self::circuit_addr_via(&addr, peer);
+            // `listen_on` only accepts the address shape; the relay answers
+            // later with `ReservationReqAccepted` or by closing the listener.
+            // So this is recorded as `Pending` and confirmed on that event —
+            // recording it as held here is what would let a refusal occupy a
+            // slot for the life of the process.
             match swarm.listen_on(circuit.clone()) {
                 Ok(listener_id) => {
                     info!("Requesting relay reservation via {}", circuit);
-                    nat_state.reserved_with.insert(peer, listener_id);
+                    nat_state.reserved_with.insert(
+                        peer,
+                        Reservation {
+                            listener_id,
+                            state: ReservationState::Pending,
+                        },
+                    );
                 }
-                Err(e) => debug!("Cannot listen via relay {}: {}", peer, e),
+                // Not `debug!`: a node that cannot open any circuit is
+                // unreachable, and burying that is exactly how the
+                // private-node path stayed silently dead before.
+                Err(e) => warn!("Cannot listen via relay {}: {}", peer, e),
             }
+        }
+    }
+
+    /// Build the circuit address that reserves a slot on `relay`.
+    ///
+    /// Any `/p2p/` already in the address is dropped before the relay's own is
+    /// appended. The connection table stores addresses as they were dialled,
+    /// and the conventional bootstrap form already ends in `/p2p/<id>`, so
+    /// appending blindly yields `/p2p/<id>/p2p/<id>/p2p-circuit`, which
+    /// `listen_on` rejects as a malformed multiaddr. `bootstrap.rs` strips the
+    /// same way for the same reason.
+    fn circuit_addr_via(addr: &Multiaddr, relay: PeerId) -> Multiaddr {
+        use libp2p::multiaddr::Protocol;
+        addr.iter()
+            .filter(|p| !matches!(p, Protocol::P2p(_)))
+            .collect::<Multiaddr>()
+            .with(Protocol::P2p(relay))
+            .with(Protocol::P2pCircuit)
+    }
+
+    /// Note that a relay accepted our reservation.
+    ///
+    /// Until this arrives the entry is `Pending`: `listen_on` succeeding says
+    /// nothing about whether the relay agreed.
+    fn confirm_relay_reservation(nat_state: &mut NatState, relay_peer_id: PeerId, renewal: bool) {
+        match nat_state.reserved_with.get_mut(&relay_peer_id) {
+            Some(reservation) => {
+                reservation.state = ReservationState::Confirmed;
+                if !renewal {
+                    info!(
+                        "Relay reservation accepted by {}; reachable through it now",
+                        relay_peer_id
+                    );
+                }
+            }
+            // A reservation we are not tracking (e.g. taken before a restart
+            // of the bookkeeping). Nothing to confirm, but worth knowing.
+            None => debug!(
+                "Relay reservation accepted by untracked relay {}",
+                relay_peer_id
+            ),
+        }
+    }
+
+    /// Forget a reservation whose listener has gone away.
+    ///
+    /// A relay that refuses, expires or disconnects closes the circuit
+    /// listener. Without this the entry would sit in `reserved_with` forever,
+    /// counting towards the target and blocking that peer from being retried —
+    /// so two refusals would leave the node permanently unreachable.
+    fn forget_closed_reservation(
+        nat_state: &mut NatState,
+        listener_id: libp2p::core::transport::ListenerId,
+    ) {
+        let Some(peer) = nat_state
+            .reserved_with
+            .iter()
+            .find(|(_, r)| r.listener_id == listener_id)
+            .map(|(p, _)| *p)
+        else {
+            return;
+        };
+        let was = nat_state.reserved_with.remove(&peer).map(|r| r.state);
+        match was {
+            Some(ReservationState::Confirmed) => {
+                info!(
+                    "Relay reservation with {} ended; will look for another",
+                    peer
+                )
+            }
+            // Never confirmed: the relay refused, or the circuit could not be
+            // opened. Retried from the maintenance tick.
+            _ => info!(
+                "Relay {} did not grant a reservation; will try another",
+                peer
+            ),
         }
     }
 
@@ -948,8 +1115,8 @@ impl Libp2pNetwork {
         );
         // Removing the circuit listener is what actually drops the
         // reservation, freeing the slot on a relay for a node that needs it.
-        for (peer, listener_id) in nat_state.reserved_with.drain() {
-            if swarm.remove_listener(listener_id) {
+        for (peer, reservation) in nat_state.reserved_with.drain() {
+            if swarm.remove_listener(reservation.listener_id) {
                 debug!("Released relay reservation with {}", peer);
             }
         }
@@ -1303,12 +1470,19 @@ impl Libp2pNetwork {
                 }
             }
             SwarmEvent::Behaviour(NodeBehaviourEvent::RelayClient(
-                libp2p::relay::client::Event::ReservationReqAccepted { relay_peer_id, .. },
+                libp2p::relay::client::Event::ReservationReqAccepted {
+                    relay_peer_id,
+                    renewal,
+                    ..
+                },
             )) => {
-                info!(
-                    "Relay reservation accepted by {}; reachable through it now",
-                    relay_peer_id
-                );
+                Self::confirm_relay_reservation(nat_state, relay_peer_id, renewal);
+            }
+            // A circuit listener closing is how a refused, expired or lost
+            // reservation reports itself; drop the entry so the relay can be
+            // replaced on the next maintenance tick.
+            SwarmEvent::ListenerClosed { listener_id, .. } => {
+                Self::forget_closed_reservation(nat_state, listener_id);
             }
             #[cfg(not(target_arch = "wasm32"))]
             SwarmEvent::Behaviour(NodeBehaviourEvent::Mdns(mdns_event)) => {
@@ -3072,7 +3246,13 @@ mod tests {
             .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
             .unwrap();
         let circuit = swarm.listen_on(circuit_addr(relay_peer)).unwrap();
-        nat_state.reserved_with.insert(relay_peer, circuit);
+        nat_state.reserved_with.insert(
+            relay_peer,
+            Reservation {
+                listener_id: circuit,
+                state: ReservationState::Confirmed,
+            },
+        );
         nat_state.reachability = Reachability::Private;
 
         Libp2pNetwork::release_relay_reservations(&mut swarm, &mut nat_state);
@@ -3084,6 +3264,169 @@ mod tests {
         assert!(
             swarm.remove_listener(plain),
             "a non-circuit listener must survive the release"
+        );
+    }
+
+    /// Releasing must actually tear the listener down, not just forget it.
+    ///
+    /// The bookkeeping assertion above cannot tell "removed" from "never
+    /// removed" — which is exactly the bug this PR fixed, and exactly what
+    /// that test would not have caught. `remove_listener` is observable
+    /// though: the swarm reports `ListenerClosed` for the listener it closed.
+    /// Reverting `release_relay_reservations` to a log-only implementation
+    /// turns this test red.
+    #[tokio::test]
+    async fn releasing_actually_closes_the_circuit_listener() {
+        use futures::StreamExt;
+
+        let mut swarm = nat_swarm();
+        let mut nat_state = NatState::default();
+        let relay_peer = PeerId::random();
+
+        let circuit = swarm.listen_on(circuit_addr(relay_peer)).unwrap();
+        nat_state.reserved_with.insert(
+            relay_peer,
+            Reservation {
+                listener_id: circuit,
+                state: ReservationState::Confirmed,
+            },
+        );
+        nat_state.reachability = Reachability::Private;
+
+        Libp2pNetwork::release_relay_reservations(&mut swarm, &mut nat_state);
+
+        let closed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let SwarmEvent::ListenerClosed { listener_id, .. } =
+                    swarm.select_next_some().await
+                {
+                    return listener_id;
+                }
+            }
+        })
+        .await
+        .expect("releasing a reservation must close its listener");
+
+        assert_eq!(
+            closed, circuit,
+            "the closed listener must be the circuit we reserved through"
+        );
+    }
+
+    /// A reservation is only "held" once the relay says so.
+    ///
+    /// `listen_on` returning `Ok` means the address parsed, nothing more.
+    /// Recording it as held is how a refused reservation would occupy a slot
+    /// for the life of the process.
+    #[tokio::test]
+    async fn a_reservation_is_pending_until_the_relay_accepts_it() {
+        let mut swarm = nat_swarm();
+        let mut nat_state = NatState::default();
+        let relay = PeerId::random();
+        let connected = Arc::new(RwLock::new(HashMap::from([(
+            relay,
+            vec!["/ip4/198.51.100.7/tcp/9001".parse::<Multiaddr>().unwrap()],
+        )])));
+
+        Libp2pNetwork::ensure_relay_reservations(&mut swarm, &connected, &mut nat_state).await;
+        assert_eq!(
+            nat_state.reserved_with.get(&relay).map(|r| r.state),
+            Some(ReservationState::Pending),
+            "listen_on succeeding is not the relay agreeing"
+        );
+
+        Libp2pNetwork::confirm_relay_reservation(&mut nat_state, relay, false);
+        assert_eq!(
+            nat_state.reserved_with.get(&relay).map(|r| r.state),
+            Some(ReservationState::Confirmed)
+        );
+    }
+
+    /// A refused or lost reservation must free its slot and allow a retry.
+    ///
+    /// Without this the entry sits in `reserved_with` forever, counting
+    /// towards the target and filtering that peer out of the candidate list —
+    /// so two refusals would leave the node permanently unreachable.
+    #[tokio::test]
+    async fn a_closed_listener_frees_the_reservation_slot() {
+        let mut swarm = nat_swarm();
+        let mut nat_state = NatState::default();
+        let relay = PeerId::random();
+        let connected = Arc::new(RwLock::new(HashMap::from([(
+            relay,
+            vec!["/ip4/198.51.100.7/tcp/9001".parse::<Multiaddr>().unwrap()],
+        )])));
+
+        Libp2pNetwork::ensure_relay_reservations(&mut swarm, &connected, &mut nat_state).await;
+        let listener = nat_state.reserved_with[&relay].listener_id;
+        assert_eq!(nat_state.active_reservations(), 1);
+
+        Libp2pNetwork::forget_closed_reservation(&mut nat_state, listener);
+
+        assert!(
+            nat_state.reserved_with.is_empty(),
+            "a closed circuit listener must free its slot, or we never retry"
+        );
+    }
+
+    /// The circuit address must survive a relay address that already carries
+    /// its own `/p2p/`.
+    ///
+    /// The connection table stores addresses as they were dialled, and the
+    /// conventional bootstrap form ends in `/p2p/<id>`. Appending blindly
+    /// yields `/p2p/<id>/p2p/<id>/p2p-circuit`, which `listen_on` rejects as
+    /// malformed — so every reservation via such a peer would fail.
+    #[tokio::test]
+    async fn a_relay_address_carrying_its_own_p2p_still_yields_a_valid_circuit() {
+        let mut swarm = nat_swarm();
+        let relay = PeerId::random();
+        let with_p2p: Multiaddr = format!("/ip4/198.51.100.7/tcp/9001/p2p/{relay}")
+            .parse()
+            .unwrap();
+
+        let circuit = Libp2pNetwork::circuit_addr_via(&with_p2p, relay);
+
+        assert_eq!(
+            circuit
+                .iter()
+                .filter(|p| matches!(p, libp2p::multiaddr::Protocol::P2p(_)))
+                .count(),
+            1,
+            "the relay's peer id must appear exactly once: {circuit}"
+        );
+        assert!(
+            swarm.listen_on(circuit.clone()).is_ok(),
+            "circuit built from a bootstrap-form address must be dialable: {circuit}"
+        );
+    }
+
+    /// Reachability is the aggregate over addresses, not the last event.
+    ///
+    /// AutoNAT tests one address at a time, so a multi-homed node gets a
+    /// failure for its LAN address and a success for its public one. Treating
+    /// each event as a verdict makes the node flip Public/Private and churn
+    /// reservations against other people's relays.
+    #[test]
+    fn one_reachable_address_is_enough_to_be_public() {
+        let mut nat_state = NatState::default();
+        assert_eq!(nat_state.aggregate_reachability(), Reachability::Unknown);
+
+        let lan: Multiaddr = "/ip4/10.0.0.5/tcp/9001".parse().unwrap();
+        let public: Multiaddr = "/ip4/198.51.100.7/tcp/9001".parse().unwrap();
+
+        nat_state.address_reachability.insert(lan.clone(), false);
+        assert_eq!(nat_state.aggregate_reachability(), Reachability::Private);
+
+        // The public address succeeding must win, whatever order it arrives in.
+        nat_state.address_reachability.insert(public, true);
+        assert_eq!(nat_state.aggregate_reachability(), Reachability::Public);
+
+        // A later failure for the LAN address must not undo it.
+        nat_state.address_reachability.insert(lan, false);
+        assert_eq!(
+            nat_state.aggregate_reachability(),
+            Reachability::Public,
+            "a failing address must not override a reachable one"
         );
     }
 
@@ -3118,6 +3461,7 @@ mod tests {
             bootstrap_nodes: vec![],
             enable_mdns: false,
             enable_nat_traversal: false,
+            enable_relay_service: false,
             gossipsub_topics: vec!["test".to_string()],
             external_addrs: vec![],
         };

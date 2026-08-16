@@ -151,6 +151,7 @@ async fn create_test_service() -> (Arc<TestService>, Arc<CrslCrdtRepository>, Te
         bootstrap_nodes: vec![],
         enable_mdns: false, // Disable mDNS for isolated tests
         enable_nat_traversal: false,
+        enable_relay_service: false,
         gossipsub_topics: vec!["test-events".to_string()],
         external_addrs: vec![],
     };
@@ -542,6 +543,7 @@ async fn create_test_service_with_ac() -> (Arc<TestServiceWithAC>, Arc<CrslCrdtR
         bootstrap_nodes: vec![],
         enable_mdns: false,
         enable_nat_traversal: false,
+        enable_relay_service: false,
         gossipsub_topics: vec!["test-events".to_string()],
         external_addrs: vec![],
     };
@@ -1436,6 +1438,7 @@ async fn create_test_service_deny_authz() -> (Arc<TestService>, Arc<CrslCrdtRepo
         bootstrap_nodes: vec![],
         enable_mdns: false,
         enable_nat_traversal: false,
+        enable_relay_service: false,
         gossipsub_topics: vec!["test-events".to_string()],
         external_addrs: vec![],
     };

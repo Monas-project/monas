@@ -180,6 +180,13 @@ pub struct BehaviourConfig {
     /// deliberately separable so a deployment of publicly reachable nodes —
     /// which needs none of it — can leave the machinery off.
     pub enable_nat_traversal: bool,
+    /// Offer circuit relay service to other nodes.
+    ///
+    /// Separate from `enable_nat_traversal`, and off by default: needing a
+    /// relay oneself is not the same as being willing to carry strangers'
+    /// traffic. Only a node that is genuinely publicly reachable can serve,
+    /// so this is gated on the operator also declaring an external address.
+    pub enable_relay_service: bool,
 }
 
 impl Default for BehaviourConfig {
@@ -189,6 +196,8 @@ impl Default for BehaviourConfig {
             agent_version: format!("monas-state-node/{}", env!("CARGO_PKG_VERSION")),
             enable_mdns: true,
             enable_nat_traversal: true,
+            // Off by default: carrying other people's traffic is opt-in.
+            enable_relay_service: false,
         }
     }
 }
@@ -276,33 +285,47 @@ impl NodeBehaviour {
         // know in advance which side it will be on, and a network where only
         // some nodes answer probes degrades for everyone: reachability is a
         // service peers provide to each other, like relaying.
-        //
-        // The relay *server* is created here but only ever used once AutoNAT
-        // reports us as reachable (see libp2p_network.rs). Relaying from
-        // behind NAT would not work anyway, and advertising it would waste
-        // other nodes' reservation attempts.
-        let (autonat_client, autonat_server, relay_server, dcutr) = if config.enable_nat_traversal {
+        let (autonat_client, autonat_server, dcutr) = if config.enable_nat_traversal {
             (
                 Some(autonat::v2::client::Behaviour::new(
                     rand::rngs::OsRng,
                     autonat::v2::client::Config::default(),
                 )),
                 Some(autonat::v2::server::Behaviour::new(rand::rngs::OsRng)),
-                Some(relay::Behaviour::new(
-                    local_peer_id,
-                    // Bound what a relay will carry. Relaying is done for
-                    // strangers, so the limits are what stop it from becoming
-                    // free bandwidth for anyone who asks.
-                    relay::Config {
-                        max_reservations: MAX_RELAY_RESERVATIONS,
-                        max_circuits: MAX_RELAY_CIRCUITS,
-                        ..Default::default()
-                    },
-                )),
                 Some(dcutr::Behaviour::new(local_peer_id)),
             )
         } else {
-            (None, None, None, None)
+            (None, None, None)
+        };
+
+        // The relay *server* is separate, and off unless asked for.
+        //
+        // Serving as a relay means carrying traffic for peers we know nothing
+        // about, so it is not something to switch on as a side effect of
+        // wanting NAT traversal for ourselves — a node behind NAT needs the
+        // client half and cannot usefully provide the server half anyway.
+        //
+        // It cannot be decided from AutoNAT at runtime: `Toggle` has no way to
+        // enable a behaviour after the swarm is built, and `relay::Behaviour`
+        // has no runtime mute. So the decision is made here, from an operator
+        // assertion (`--relay-service`, which requires `--external-address`),
+        // rather than being claimed in a comment and never implemented.
+        let relay_server = if config.enable_relay_service {
+            Some(relay::Behaviour::new(
+                local_peer_id,
+                // Bound what a relay will carry. Relaying is done for
+                // strangers, so the limits are what stop it from becoming
+                // free bandwidth for anyone who asks. The per-peer limits
+                // left at their defaults (4 reservations / 4 circuits) are
+                // what stop a single peer taking everything.
+                relay::Config {
+                    max_reservations: MAX_RELAY_RESERVATIONS,
+                    max_circuits: MAX_RELAY_CIRCUITS,
+                    ..Default::default()
+                },
+            ))
+        } else {
+            None
         };
 
         // The client half is only meaningful when its transport half was built
@@ -422,6 +445,7 @@ mod tests {
             agent_version: "custom-agent/1.0.0".to_string(),
             enable_mdns: true,
             enable_nat_traversal: false,
+            enable_relay_service: false,
         };
 
         let cloned = config.clone();
@@ -531,8 +555,50 @@ mod tests {
         .unwrap();
         assert!(on.autonat_client.as_ref().is_some());
         assert!(on.autonat_server.as_ref().is_some());
-        assert!(on.relay_server.as_ref().is_some());
         assert!(on.dcutr.as_ref().is_some());
+        // The relay *server* is not part of this flag: see below.
+        assert!(on.relay_server.as_ref().is_none());
+    }
+
+    /// Serving as a relay is opt-in and independent of NAT traversal.
+    ///
+    /// Wanting to traverse NAT oneself is not the same as volunteering to
+    /// carry strangers' traffic. Tying the two together is what would turn
+    /// every publicly reachable node into an open relay by default.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn relay_service_is_opt_in_and_independent_of_nat_traversal() {
+        let keypair = Keypair::generate_ed25519();
+        let local_peer_id = keypair.public().to_peer_id();
+
+        let nat_only = NodeBehaviour::new(
+            local_peer_id,
+            &keypair,
+            BehaviourConfig {
+                enable_nat_traversal: true,
+                enable_relay_service: false,
+                ..BehaviourConfig::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert!(
+            nat_only.relay_server.as_ref().is_none(),
+            "NAT traversal alone must not make this node a relay for others"
+        );
+
+        let serving = NodeBehaviour::new(
+            local_peer_id,
+            &keypair,
+            BehaviourConfig {
+                enable_nat_traversal: true,
+                enable_relay_service: true,
+                ..BehaviourConfig::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert!(serving.relay_server.as_ref().is_some());
     }
 
     /// The relay client only exists when its transport half was built too.
@@ -614,6 +680,7 @@ mod tests {
             agent_version: "test-agent/0.1.0".to_string(),
             enable_mdns: true,
             enable_nat_traversal: false,
+            enable_relay_service: false,
         };
 
         let result = NodeBehaviour::new(local_peer_id, &keypair, config, None);

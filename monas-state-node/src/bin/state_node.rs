@@ -65,6 +65,16 @@ struct Args {
     #[arg(long)]
     disable_nat_traversal: bool,
 
+    /// Offer circuit relay service to other nodes.
+    ///
+    /// A relay carries traffic for peers it knows nothing about, so this is
+    /// opt-in and separate from `--disable-nat-traversal`: needing a relay
+    /// oneself is not the same as being willing to be one. Only a node that
+    /// is actually reachable from outside can serve, so this requires
+    /// `--external-address`.
+    #[arg(long)]
+    relay_service: bool,
+
     /// Log level (trace, debug, info, warn, error).
     #[arg(long, default_value = "info")]
     log_level: String,
@@ -139,6 +149,26 @@ async fn main() -> Result<()> {
             }
             Err(e) => tracing::warn!("Failed to parse external address {}: {}", addr_str, e),
         }
+    }
+
+    // Relay service is only meaningful on a node that is actually reachable
+    // from outside. Refusing here rather than starting a relay nobody can
+    // reach keeps the "advertise only what you can provide" rule honest.
+    if args.relay_service {
+        if network_config.external_addrs.is_empty() {
+            anyhow::bail!(
+                "--relay-service requires at least one --external-address: a node that \
+                 cannot be reached from outside cannot relay for anyone"
+            );
+        }
+        if args.disable_nat_traversal {
+            anyhow::bail!("--relay-service cannot be used with --disable-nat-traversal");
+        }
+        network_config.enable_relay_service = true;
+        tracing::info!(
+            "Relay service enabled; this node will carry circuits for other peers \
+             (up to 128 reservations / 32 circuits)"
+        );
     }
 
     let config = StateNodeConfig {

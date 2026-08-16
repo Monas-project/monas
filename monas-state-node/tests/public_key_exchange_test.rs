@@ -112,6 +112,7 @@ mod tests {
             bootstrap_nodes: vec![],
             enable_mdns: false,
             enable_nat_traversal: false,
+            enable_relay_service: false,
             gossipsub_topics: vec!["test".to_string()],
             external_addrs: vec![],
         };
@@ -121,6 +122,7 @@ mod tests {
             bootstrap_nodes: vec![],
             enable_mdns: false,
             enable_nat_traversal: false,
+            enable_relay_service: false,
             gossipsub_topics: vec!["test".to_string()],
             external_addrs: vec![],
         };
