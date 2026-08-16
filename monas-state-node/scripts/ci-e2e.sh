@@ -74,9 +74,13 @@ rm -rf data/node1 data/node2 data/node3 data/node4
 mkdir -p data/node1 data/node2 data/node3 data/node4
 
 # --- bootstrap ノード(node1)-------------------------------------------------
+# mDNS は必ず切る。有効なままだと、ブートストラップや Kademlia による探索が
+# 壊れていてもブロードキャストで相手を再発見してしまい、テストが通る。VPC に
+# その経路は存在しないため、本番で全断した障害をローカルでは再現できていな
+# かった。--disable-mdns により、本番と同じ探索経路だけを検証する。
 log "node1 (bootstrap) を :${HTTP_PORTS[0]} / p2p :${P2P_PORTS[0]} で起動..."
 "$BIN" --data-dir ./data/node1 -l "127.0.0.1:${HTTP_PORTS[0]}" \
-    --p2p-port "${P2P_PORTS[0]}" --log-level info > "$LOG_DIR/node1.log" 2>&1 &
+    --p2p-port "${P2P_PORTS[0]}" --disable-mdns --log-level info > "$LOG_DIR/node1.log" 2>&1 &
 PIDS+=($!)
 
 if ! wait_for_health "${HTTP_PORTS[0]}"; then
@@ -97,7 +101,7 @@ for i in 1 2 3; do
     n=$((i + 1))
     log "node$n を :${HTTP_PORTS[$i]} / p2p :${P2P_PORTS[$i]} で起動 (-> bootstrap)..."
     "$BIN" --data-dir "./data/node$n" -l "127.0.0.1:${HTTP_PORTS[$i]}" \
-        --p2p-port "${P2P_PORTS[$i]}" -b "$BOOTSTRAP" --log-level info \
+        --p2p-port "${P2P_PORTS[$i]}" -b "$BOOTSTRAP" --disable-mdns --log-level info \
         > "$LOG_DIR/node$n.log" 2>&1 &
     PIDS+=($!)
     if ! wait_for_health "${HTTP_PORTS[$i]}"; then

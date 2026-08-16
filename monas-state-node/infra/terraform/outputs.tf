@@ -4,8 +4,8 @@ output "endpoint_url" {
 }
 
 output "service_discovery_name" {
-  description = "Internal DNS name for P2P communication within VPC"
-  value       = "${aws_service_discovery_service.node.name}.${var.service_discovery_namespace_id}"
+  description = "Internal DNS name for P2P communication within VPC. Pass this as bootstrap_dns on member nodes."
+  value       = "${aws_service_discovery_service.node.name}.${var.service_discovery_namespace_name}"
 }
 
 output "efs_access_point_id" {

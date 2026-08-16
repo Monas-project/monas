@@ -31,7 +31,14 @@ variable "node_role" {
 }
 
 variable "bootstrap_addr" {
-  description = "Bootstrap node multiaddr (e.g., /ip4/10.0.10.5/tcp/9001/p2p/12D3KooW...). Optional, use bootstrap_dns instead for dynamic resolution."
+  description = <<-EOT
+    Bootstrap node multiaddr, comma-separated for multiple entry points
+    (e.g., /dns4/node1.monas.local/tcp/9001/p2p/12D3KooW...).
+
+    Prefer bootstrap_dns + bootstrap_peer_id. A literal /ip4/ address is frozen
+    at process start: if that node is recreated on a new IP, every other node
+    dials the old one forever. Takes precedence over bootstrap_dns when set.
+  EOT
   type        = string
   default     = ""
 }
@@ -123,9 +130,30 @@ variable "efs_filesystem_id" {
 
 # --- Service Discovery ---
 
+variable "disable_mdns" {
+  description = <<-EOT
+    Disable mDNS peer discovery. mDNS cannot cross a VPC, so it is inert in a
+    real deployment; it is defaulted to true here so the deployed configuration
+    states plainly that discovery depends on bootstrap peers, Kademlia and the
+    peer store.
+  EOT
+  type        = bool
+  default     = true
+}
+
 variable "service_discovery_namespace_id" {
   description = "Cloud Map namespace ID for internal DNS"
   type        = string
+}
+
+variable "service_discovery_namespace_name" {
+  description = <<-EOT
+    Cloud Map namespace DNS name (e.g., monas.local). This is what a
+    bootstrap_dns value is built from: "<node_name>.<namespace_name>". The
+    namespace *ID* (ns-xxx) is not a resolvable name and must not be used here.
+  EOT
+  type        = string
+  default     = "monas.local"
 }
 
 # --- Tags ---

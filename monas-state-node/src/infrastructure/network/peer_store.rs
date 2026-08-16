@@ -153,11 +153,20 @@ impl PeerStore {
 }
 
 /// Whether an address is worth telling a future self about.
+///
+/// Rejects addresses that cannot get us back to the peer from a fresh process:
+/// loopback, link-local and unspecified addresses, and relayed
+/// (`/p2p-circuit`) addresses — a circuit is only valid while that particular
+/// relay connection lives, so persisting one just means re-dialling a dead
+/// path every maintenance tick.
 fn is_shareable(addr: &Multiaddr) -> bool {
     use libp2p::multiaddr::Protocol;
     !addr.iter().any(|p| match p {
         Protocol::Ip4(ip) => ip.is_loopback() || ip.is_link_local() || ip.is_unspecified(),
-        Protocol::Ip6(ip) => ip.is_loopback() || ip.is_unspecified(),
+        Protocol::Ip6(ip) => {
+            ip.is_loopback() || ip.is_unspecified() || (ip.segments()[0] & 0xffc0) == 0xfe80
+        }
+        Protocol::P2pCircuit => true,
         _ => false,
     })
 }
@@ -212,6 +221,31 @@ mod tests {
         assert!(!store.record(p, addr("/ip4/127.0.0.1/tcp/9001")));
         assert!(!store.record(p, addr("/ip4/0.0.0.0/tcp/9001")));
         assert!(!store.record(p, addr("/ip6/::1/tcp/9001")));
+        assert!(store.is_empty());
+    }
+
+    /// IPv6 link-local is as useless as the IPv4 kind; the two arms used to
+    /// disagree, so `fe80::/10` was persisted while `169.254.0.0/16` was not.
+    #[test]
+    fn skips_ipv6_link_local_addresses() {
+        let mut store = PeerStore::default();
+        let p = peer(1);
+        assert!(!store.record(p, addr("/ip6/fe80::1/tcp/9001")));
+        assert!(!store.record(p, addr("/ip4/169.254.1.1/tcp/9001")));
+        assert!(store.is_empty());
+    }
+
+    /// A relayed address is only good while that relay connection lives.
+    /// Persisting one means re-dialling a dead circuit on every tick — the
+    /// same "frozen address" class this store exists to escape.
+    #[test]
+    fn skips_relayed_circuit_addresses() {
+        let mut store = PeerStore::default();
+        let p = peer(1);
+        assert!(!store.record(
+            p,
+            addr("/ip4/10.0.1.60/tcp/9001/p2p/12D3KooWH17aFKSgbVAJRZ7Tk8sG7khB9y5xte83LnqcnA16W2aD/p2p-circuit")
+        ));
         assert!(store.is_empty());
     }
 

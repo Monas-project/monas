@@ -22,6 +22,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures::StreamExt;
 use libp2p::{
+    core::ConnectedPoint,
     gossipsub::{self, IdentTopic},
     identify, kad,
     request_response::{self, OutboundRequestId, ResponseChannel},
@@ -52,6 +53,22 @@ const PEER_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(30);
 /// This is about *connectivity*, not replication: it only decides when to
 /// re-dial, and is deliberately independent of `min_replication_factor`.
 const HEALTHY_PEER_COUNT: usize = 3;
+
+/// The address of a freshly established connection, if it is one we could dial
+/// again later.
+///
+/// Only outbound connections qualify. On an inbound connection the remote
+/// address is `send_back_addr`, which carries the peer's *ephemeral source
+/// port* rather than the port it listens on: dialling it from a later process
+/// can never succeed. Storing those is worse than storing nothing, because
+/// addresses are capped FIFO per peer (`MAX_ADDRS_PER_PEER`), so a handful of
+/// inbound reconnects would push out the one address that actually works.
+fn reusable_addr(endpoint: &ConnectedPoint) -> Option<&Multiaddr> {
+    match endpoint {
+        ConnectedPoint::Dialer { address, .. } => Some(address),
+        ConnectedPoint::Listener { .. } => None,
+    }
+}
 
 /// A relay request received from a remote peer via P2P protocol.
 /// The swarm loop sends these through a channel to the application layer (node.rs),
@@ -711,8 +728,10 @@ impl Libp2pNetwork {
                     // Remember peers we actually reached, before the event is
                     // consumed by the handler below.
                     if let SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } = &event {
-                        if peer_store.record(*peer_id, endpoint.get_remote_address().clone()) {
-                            peer_store_dirty = true;
+                        if let Some(addr) = reusable_addr(endpoint) {
+                            if peer_store.record(*peer_id, addr.clone()) {
+                                peer_store_dirty = true;
+                            }
                         }
                     }
                     Self::handle_swarm_event(&mut swarm, &mut pending, &connected_peers, &event_tx, &crdt_repo, &data_dir, &p256_signing_key, &relay_channels, &content_network_repo, event).await;
@@ -2653,6 +2672,35 @@ mod tests {
     use super::*;
     use crate::infrastructure::crdt_repository::CrslCrdtRepository;
     use tempfile::tempdir;
+
+    /// An inbound connection must never be remembered.
+    ///
+    /// `send_back_addr` is the peer's ephemeral source port, not its listen
+    /// port — measured on a real pair of swarms, a node listening on
+    /// `/tcp/62417` sees its peer as `/tcp/62418`. Recording that fills the
+    /// store with addresses nothing can dial, and evicts the good one.
+    #[test]
+    fn only_outbound_connections_yield_a_reusable_address() {
+        let listen: Multiaddr = "/ip4/10.0.1.60/tcp/9001".parse().unwrap();
+        let ephemeral: Multiaddr = "/ip4/10.0.1.60/tcp/62418".parse().unwrap();
+
+        let outbound = ConnectedPoint::Dialer {
+            address: listen.clone(),
+            role_override: libp2p::core::Endpoint::Dialer,
+            port_use: libp2p::core::transport::PortUse::Reuse,
+        };
+        assert_eq!(reusable_addr(&outbound), Some(&listen));
+
+        let inbound = ConnectedPoint::Listener {
+            local_addr: "/ip4/10.0.1.61/tcp/9001".parse().unwrap(),
+            send_back_addr: ephemeral,
+        };
+        assert_eq!(
+            reusable_addr(&inbound),
+            None,
+            "inbound send_back_addr is an ephemeral port and must not be stored"
+        );
+    }
 
     #[tokio::test]
     async fn test_network_creation() {

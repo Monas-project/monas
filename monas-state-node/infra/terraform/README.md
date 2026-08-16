@@ -61,7 +61,8 @@ terraform apply \
   -var="node_name=node2" \
   -var="node_role=member" \
   -var="domain=node2.monas.example.com" \
-  -var="bootstrap_addr=/ip4/<NODE1_PRIVATE_IP>/tcp/9001/p2p/<PEER_ID>" \
+  -var="bootstrap_dns=node1.monas.local" \
+  -var="bootstrap_peer_id=<PEER_ID>" \
   -var="vpc_id=vpc-xxx" \
   -var="subnet_ids=[\"subnet-aaa\",\"subnet-bbb\"]" \
   -var="alb_listener_arn=arn:aws:elasticloadbalancing:..." \
@@ -73,6 +74,17 @@ terraform apply \
 ```
 
 > `efs_filesystem_id` を指定すると、既存のEFSを共有します（ノードごとに別のアクセスポイントが作成されます）。
+
+> **`bootstrap_addr` にリテラル IP を渡さないこと。**
+> Fargate タスクは再作成のたびに新しい ENI/IP を取得します。`/ip4/...` は
+> プロセス起動時の値のまま凍結され、ブートストラップノードが別 IP で
+> 復帰すると全ノードが旧 IP を叩き続けて再収束できません（実際に 4 ノード
+> 全断を起こしています）。`bootstrap_dns` + `bootstrap_peer_id` を使うと
+> `/dns4/` 形式になり、libp2p がダイヤル毎に再解決します。
+>
+> `bootstrap_addr` と `bootstrap_dns` の両方が設定されている場合は
+> **`bootstrap_addr` が優先される**ため、DNS 方式へ移行する際は
+> 既存 workspace の `bootstrap_addr` が空であることを確認してください。
 
 ## Local Testing with Docker Compose
 

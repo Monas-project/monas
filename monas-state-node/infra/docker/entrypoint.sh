@@ -9,6 +9,7 @@ NODE_ROLE="${NODE_ROLE:-member}"
 BOOTSTRAP_ADDR="${BOOTSTRAP_ADDR:-}"
 BOOTSTRAP_DNS="${BOOTSTRAP_DNS:-}"
 BOOTSTRAP_PEER_ID="${BOOTSTRAP_PEER_ID:-}"
+DISABLE_MDNS="${DISABLE_MDNS:-}"
 
 ARGS=(
     --data-dir "$DATA_DIR"
@@ -16,6 +17,14 @@ ARGS=(
     --p2p-port "$P2P_PORT"
     --log-level "$LOG_LEVEL"
 )
+
+# mDNS only reaches a broadcast domain, so it never works in a VPC. It does
+# work locally, well enough to hide a broken bootstrap/Kademlia path — which is
+# how a local run "passed" while the deployment could not reconverge. Set
+# DISABLE_MDNS=true to run a local cluster under production-like conditions.
+case "$DISABLE_MDNS" in
+    1|true|TRUE|yes|YES) ARGS+=(--disable-mdns) ;;
+esac
 
 # Bootstrap addresses.
 #
