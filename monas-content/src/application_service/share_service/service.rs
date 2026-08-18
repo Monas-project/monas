@@ -28,13 +28,16 @@ where
     KD: PublicKeyDirectory,
     KW: KeyWrapping,
 {
+    #[allow(clippy::too_many_arguments)]
     fn build_envelope_for_recipient(
         &self,
         content_id: &crate::domain::content_id::ContentId,
         sender_key_id: &crate::domain::share::KeyId,
+        sender_private_key: &[u8],
         recipient_key_id: &crate::domain::share::KeyId,
         cek: &crate::domain::content::encryption::ContentEncryptionKey,
         ciphertext: &[u8],
+        key_epoch: u64,
     ) -> Result<KeyEnvelope, ShareApplicationError> {
         let recipient_public_key = self
             .public_key_directory
@@ -42,9 +45,14 @@ where
             .map_err(ShareApplicationError::PublicKeyDirectory)?
             .ok_or(ShareApplicationError::MissingPublicKey)?;
 
+        let aad = crate::domain::share::encryption::EnvelopeAad {
+            content_id,
+            recipient_key_id,
+            key_epoch,
+        };
         let (enc, wrapped_cek) = self
             .key_wrapper
-            .wrap_cek(cek, &recipient_public_key, content_id)
+            .wrap_cek(cek, &recipient_public_key, sender_private_key, &aad)
             .map_err(|e| ShareApplicationError::KeyWrapping(format!("{e:?}")))?;
 
         let wrapped_recipient = crate::domain::share::WrappedRecipientKey::new(
@@ -59,6 +67,7 @@ where
             sender_key_id.clone(),
             wrapped_recipient,
             ciphertext.to_vec(),
+            key_epoch,
         ))
     }
 
@@ -124,11 +133,17 @@ where
 
         let _ = event;
 
-        // 6. CEK をラップ
+        // 6. CEK をラップ(HPKE Auth: 送信者秘密鍵で送信者認証、AAD で宛先と鍵世代を束縛)
+        let key_epoch = share.key_epoch();
+        let aad = crate::domain::share::encryption::EnvelopeAad {
+            content_id: &cmd.content_id,
+            recipient_key_id: &recipient_key_id,
+            key_epoch,
+        };
         let recipient_public_key = &cmd.recipient_public_key;
         let (enc, wrapped_cek) = self
             .key_wrapper
-            .wrap_cek(&cek, recipient_public_key, &cmd.content_id)
+            .wrap_cek(&cek, recipient_public_key, &cmd.sender_private_key, &aad)
             .map_err(|e| ShareApplicationError::KeyWrapping(format!("{e:?}")))?;
 
         // 7. 公開鍵を登録
@@ -157,6 +172,7 @@ where
             cmd.sender_key_id.clone(),
             wrapped_recipient,
             ciphertext,
+            key_epoch,
         );
 
         Ok(GrantShareResult {
@@ -195,7 +211,8 @@ where
             .map_err(ShareApplicationError::ContentEncryptionKeyStore)?
             .ok_or(ShareApplicationError::MissingContentEncryptionKey)?;
 
-        // 3. Share をロードして ACL を更新
+        // 3. Share をロードして ACL を更新。CEK は rotation 済み(呼び出し側が
+        //    reencrypt を先に実行している)なので鍵世代も進める。
         let mut share = self
             .share_repository
             .load(&cmd.content_id)
@@ -205,12 +222,13 @@ where
         share
             .revoke(&cmd.recipient_key_id)
             .map_err(ShareApplicationError::Share)?;
+        share.bump_key_epoch();
 
         self.share_repository
             .save(&share)
             .map_err(ShareApplicationError::ShareRepository)?;
 
-        // 4. 取り消し後に残っている受信者向けに KeyEnvelope を再発行
+        // 4. 取り消し後に残っている受信者向けに、新しい鍵世代で KeyEnvelope を再発行
         let mut recipient_key_ids: Vec<_> = share.recipients().keys().cloned().collect();
         recipient_key_ids.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
 
@@ -219,9 +237,11 @@ where
             let env = self.build_envelope_for_recipient(
                 &cmd.content_id,
                 &cmd.sender_key_id,
+                &cmd.sender_private_key,
                 &recipient_key_id,
                 &cek,
                 &ciphertext,
+                share.key_epoch(),
             )?;
             envelopes.push(env);
         }
@@ -236,21 +256,30 @@ where
     /// KeyEnvelope と受信者の秘密鍵バイト列から CEK を復号（アンラップ）する。
     ///
     /// - monas-account など別サービスが秘密鍵を管理し、このサービスにはバイト列として渡ってくる前提。
+    /// - `sender_public_key` は受信者が期待する送信者の公開鍵(TOFU でピン留めした鍵)。
+    ///   HPKE Auth モードのため、unwrap 成功はこの鍵の持ち主が envelope を作った証明になる。
     /// - 現時点では HpkeV1 のみをサポートする。
     pub fn unwrap_cek_from_envelope(
         &self,
         envelope: &KeyEnvelope,
         recipient_private_key: &[u8],
+        sender_public_key: &[u8],
     ) -> Result<ContentEncryptionKey, ShareApplicationError> {
         match envelope.key_wrap_algorithm() {
             KeyWrapAlgorithm::HpkeV1 => {
                 let recipient = envelope.recipient();
+                let aad = crate::domain::share::encryption::EnvelopeAad {
+                    content_id: envelope.content_id(),
+                    recipient_key_id: recipient.key_id(),
+                    key_epoch: envelope.key_epoch(),
+                };
                 self.key_wrapper
                     .unwrap_cek(
                         recipient.enc(),
                         recipient.wrapped_cek(),
                         recipient_private_key,
-                        envelope.content_id(),
+                        sender_public_key,
+                        &aad,
                     )
                     .map_err(|e| ShareApplicationError::KeyWrapping(format!("{e:?}")))
             }
@@ -470,7 +499,8 @@ mod tests {
             &self,
             _cek: &ContentEncryptionKey,
             _recipient_public_key: &[u8],
-            _content_id: &ContentId,
+            _sender_private_key: &[u8],
+            _aad: &crate::domain::share::encryption::EnvelopeAad<'_>,
         ) -> Result<(Vec<u8>, Vec<u8>), crate::domain::share::encryption::KeyWrappingError>
         {
             Ok((vec![0xAA, 0xBB], vec![0x11, 0x22, 0x33]))
@@ -481,7 +511,8 @@ mod tests {
             _enc: &[u8],
             wrapped_cek: &[u8],
             _recipient_private_key: &[u8],
-            _content_id: &ContentId,
+            _sender_public_key: &[u8],
+            _aad: &crate::domain::share::encryption::EnvelopeAad<'_>,
         ) -> Result<ContentEncryptionKey, crate::domain::share::encryption::KeyWrappingError>
         {
             Ok(ContentEncryptionKey(wrapped_cek.to_vec()))
@@ -496,7 +527,8 @@ mod tests {
             &self,
             _cek: &ContentEncryptionKey,
             _recipient_public_key: &[u8],
-            _content_id: &ContentId,
+            _sender_private_key: &[u8],
+            _aad: &crate::domain::share::encryption::EnvelopeAad<'_>,
         ) -> Result<(Vec<u8>, Vec<u8>), crate::domain::share::encryption::KeyWrappingError>
         {
             Err(crate::domain::share::encryption::KeyWrappingError::Other(
@@ -509,7 +541,8 @@ mod tests {
             _enc: &[u8],
             _wrapped_cek: &[u8],
             _recipient_private_key: &[u8],
-            _content_id: &ContentId,
+            _sender_public_key: &[u8],
+            _aad: &crate::domain::share::encryption::EnvelopeAad<'_>,
         ) -> Result<ContentEncryptionKey, crate::domain::share::encryption::KeyWrappingError>
         {
             Err(crate::domain::share::encryption::KeyWrappingError::Other(
@@ -619,12 +652,13 @@ mod tests {
             sender_key_id(),
             recipient,
             encrypted(),
+            0,
         );
 
         let recipient_private_key = vec![0x99, 0x88];
 
         let result = service
-            .unwrap_cek_from_envelope(&envelope, &recipient_private_key)
+            .unwrap_cek_from_envelope(&envelope, &recipient_private_key, &[0x04; 65])
             .expect("unwrap_cek_from_envelope should succeed");
 
         assert_eq!(result.0, wrapped_cek_bytes);
@@ -656,12 +690,13 @@ mod tests {
             sender_key_id(),
             recipient,
             encrypted(),
+            0,
         );
 
         let recipient_private_key = vec![0x99, 0x88];
 
         let err = service
-            .unwrap_cek_from_envelope(&envelope, &recipient_private_key)
+            .unwrap_cek_from_envelope(&envelope, &recipient_private_key, &[0x04; 65])
             .expect_err("unwrap_cek_from_envelope should propagate key wrapper error");
 
         assert!(matches!(err, ShareApplicationError::KeyWrapping(_)));
@@ -697,6 +732,7 @@ mod tests {
         let cmd = GrantShareCommand {
             content_id: cid.clone(),
             sender_key_id: sender_key_id(),
+            sender_private_key: vec![0x55; 32],
             recipient_public_key: vec![1, 2, 3, 4],
             permission: Permission::Read,
         };
@@ -753,6 +789,7 @@ mod tests {
         let cmd = GrantShareCommand {
             content_id: cid.clone(),
             sender_key_id: sender_key_id(),
+            sender_private_key: vec![0x55; 32],
             recipient_public_key: vec![1, 2, 3, 4],
             permission: Permission::Write,
         };
@@ -793,6 +830,7 @@ mod tests {
         let cmd = GrantShareCommand {
             content_id: cid(),
             sender_key_id: sender_key_id(),
+            sender_private_key: vec![0x55; 32],
             recipient_public_key: vec![1, 2, 3],
             permission: Permission::Read,
         };
@@ -829,6 +867,7 @@ mod tests {
         let cmd = GrantShareCommand {
             content_id: cid,
             sender_key_id: sender_key_id(),
+            sender_private_key: vec![0x55; 32],
             recipient_public_key: vec![1, 2, 3],
             permission: Permission::Read,
         };
@@ -865,6 +904,7 @@ mod tests {
         let cmd = GrantShareCommand {
             content_id: cid,
             sender_key_id: sender_key_id(),
+            sender_private_key: vec![0x55; 32],
             recipient_public_key: vec![1, 2, 3],
             permission: Permission::Read,
         };
@@ -904,6 +944,7 @@ mod tests {
         let cmd = GrantShareCommand {
             content_id: cid,
             sender_key_id: sender_key_id(),
+            sender_private_key: vec![0x55; 32],
             recipient_public_key: vec![1, 2, 3],
             permission: Permission::Read,
         };
@@ -957,6 +998,7 @@ mod tests {
         let cmd = GrantShareCommand {
             content_id: cid,
             sender_key_id: sender_key_id(),
+            sender_private_key: vec![0x55; 32],
             recipient_public_key: vec![9, 9, 9],
             permission: Permission::Read,
         };
@@ -1000,6 +1042,7 @@ mod tests {
         let cmd = GrantShareCommand {
             content_id: cid,
             sender_key_id: sender_key_id(),
+            sender_private_key: vec![0x55; 32],
             recipient_public_key: vec![1, 2, 3],
             permission: Permission::Read,
         };
@@ -1040,6 +1083,7 @@ mod tests {
         let cmd = GrantShareCommand {
             content_id: cid,
             sender_key_id: sender_key_id(),
+            sender_private_key: vec![0x55; 32],
             recipient_public_key: vec![1, 2, 3, 4],
             permission: Permission::Read,
         };
@@ -1121,6 +1165,7 @@ mod tests {
         let cmd = RevokeShareCommand {
             content_id: content_id.clone(),
             sender_key_id: sender.clone(),
+            sender_private_key: vec![0x55; 32],
             recipient_key_id: revoked_kid.clone(),
         };
 
@@ -1177,6 +1222,7 @@ mod tests {
         let cmd = RevokeShareCommand {
             content_id: cid.clone(),
             sender_key_id: sender_key_id(),
+            sender_private_key: vec![0x55; 32],
             recipient_key_id: KeyId::new(vec![1]),
         };
 

@@ -123,6 +123,28 @@ pub trait ContentRepository: Send + Sync {
     /// exist or belongs to a different content series.
     async fn get_version(&self, genesis_cid: &str, version_cid: &str) -> Result<Option<Vec<u8>>>;
 
+    /// Get the latest version as a serialized crsl-lib `Node` (CBOR), with its
+    /// version CID, for the verified relay-read path.
+    ///
+    /// Unlike [`get_latest_with_version`], this returns the whole Node (CBOR)
+    /// rather than just the payload bytes, so a client can recompute the CID
+    /// and verify the response was not tampered with — no signature needed.
+    /// See `docs/design.md` §10「read応答の完全性検証」.
+    async fn get_latest_node_bytes_with_version(
+        &self,
+        genesis_cid: &str,
+    ) -> Result<Option<(Vec<u8>, String)>>;
+
+    /// Get a specific version as a serialized crsl-lib `Node` (CBOR) for the
+    /// verified relay-read path. Same series-scoping guarantee as
+    /// [`get_version`]. Returns the Node CBOR, or None if the version does not
+    /// exist / belongs to a different series.
+    async fn get_version_node_bytes(
+        &self,
+        genesis_cid: &str,
+        version_cid: &str,
+    ) -> Result<Option<Vec<u8>>>;
+
     /// Get the version history of content.
     ///
     /// # Arguments

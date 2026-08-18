@@ -9,13 +9,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// Access control state for a single content.
 ///
 /// State Nodes maintain this for each content they manage.
-/// When verifying a AuthToken, the token's `iat` must be >= `min_valid_issued_at`.
+/// When verifying an AuthToken, the token's `iat` must be **strictly greater**
+/// than `min_valid_issued_at` (see `is_token_valid`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContentAccessControl {
     /// The content ID this access control applies to.
     content_id: String,
     /// Minimum valid issued_at timestamp.
-    /// Tokens with iat < min_valid_issued_at are considered invalidated.
+    /// Tokens with iat <= min_valid_issued_at are considered invalidated
+    /// (`0` means nothing has been revoked yet).
     min_valid_issued_at: u64,
     /// Version number for CRDT conflict resolution.
     /// Higher version wins in case of concurrent updates.
@@ -78,8 +80,14 @@ impl ContentAccessControl {
     }
 
     /// Check if a token with the given issued_at is valid.
+    ///
+    /// The cutoff is **exclusive** — see `AccessPolicy::is_token_valid` for the
+    /// reasoning. In short: both values have one-second resolution, so an
+    /// inclusive cutoff lets a token issued in the same second as the revoke
+    /// survive it, and revoke is defined as invalidating everything issued
+    /// before it. `0` still means "never revoked".
     pub fn is_token_valid(&self, issued_at: u64) -> bool {
-        issued_at >= self.min_valid_issued_at
+        self.min_valid_issued_at == 0 || issued_at > self.min_valid_issued_at
     }
 
     /// Invalidate all tokens issued before the given timestamp.
@@ -161,6 +169,11 @@ pub enum AccessControlError {
     ContentNotFound,
     /// Signature verification failed.
     InvalidSignature,
+    /// The signature verified, but this exact signed request was already
+    /// applied. Kept distinct from [`Self::InvalidSignature`] because the two
+    /// mean opposite things to an operator: a forged request versus a genuine
+    /// one arriving twice.
+    AlreadyApplied,
     /// The signer is not authorized to update access control.
     NotAuthorized,
 }
@@ -177,6 +190,10 @@ impl std::fmt::Display for AccessControlError {
             }
             AccessControlError::ContentNotFound => write!(f, "Content not found"),
             AccessControlError::InvalidSignature => write!(f, "Invalid signature"),
+            AccessControlError::AlreadyApplied => write!(
+                f,
+                "this signed request has already been applied (mutations are single-use)"
+            ),
             AccessControlError::NotAuthorized => write!(f, "Not authorized"),
         }
     }
@@ -300,8 +317,42 @@ mod tests {
 
         assert!(!ac.is_token_valid(0));
         assert!(!ac.is_token_valid(999));
-        assert!(ac.is_token_valid(1000));
+        // Exclusive cutoff: a token issued in the same second as the revoke is
+        // rejected, because it might have been issued just before it.
+        assert!(!ac.is_token_valid(1000));
         assert!(ac.is_token_valid(1001));
+    }
+
+    /// revoke と同じ秒に発行された Token も失効する。
+    ///
+    /// 両者とも秒精度なので、`iat == cutoff` の Token が revoke の前に
+    /// 発行されたのか後なのかは区別できない。等値を valid 扱いにすると、
+    /// 取り消したはずの相手の Token がそのまま生き残る
+    /// (「それ以前に発行されたすべての Token を失効」という revoke の定義への
+    /// 直接の反例)。
+    #[test]
+    fn a_token_issued_in_the_same_second_as_the_revoke_is_invalidated() {
+        let mut ac = ContentAccessControl::new("content-1".to_string());
+        let cutoff = 1_700_000_000;
+
+        ac.invalidate_before(cutoff).expect("Should succeed");
+
+        assert!(!ac.is_token_valid(cutoff - 1), "before the revoke");
+        assert!(
+            !ac.is_token_valid(cutoff),
+            "same second as the revoke: cannot be proven to postdate it"
+        );
+        assert!(ac.is_token_valid(cutoff + 1), "strictly after the revoke");
+    }
+
+    /// 一度も revoke していない状態(cutoff = 0)は全 Token を受理する。
+    /// 排他にしたことで `iat = 0` まで弾いてしまうと、意味のない挙動変更になる。
+    #[test]
+    fn an_untouched_policy_accepts_every_token() {
+        let ac = ContentAccessControl::new("content-1".to_string());
+        assert_eq!(ac.min_valid_issued_at(), 0);
+        assert!(ac.is_token_valid(0));
+        assert!(ac.is_token_valid(u64::MAX));
     }
 
     #[test]

@@ -67,10 +67,14 @@ generate_signature() {
     local operation="$2"
     local resource="$3"
     local body_b64="$4"
+    local add_members_count="$5"
 
     local sign_args="sign-request --private-key $private_key --operation $operation --resource $resource"
     if [ -n "$body_b64" ]; then
         sign_args="$sign_args --body $body_b64"
+    fi
+    if [ -n "$add_members_count" ]; then
+        sign_args="$sign_args --add-members-count $add_members_count"
     fi
 
     local output
@@ -84,7 +88,7 @@ check_nodes_running() {
     log_info "ノードの起動状態を確認しています..."
 
     local all_running=true
-    for port in 8080 8081 8082; do
+    for port in 8080 8081 8082 8083; do
         if curl -s "http://127.0.0.1:$port/health" > /dev/null 2>&1; then
             log_success "ノード (ポート $port) は起動しています"
         else
@@ -97,7 +101,8 @@ check_nodes_running() {
         log_warn "一部のノードが起動していません。最低1つのノードで動作確認を行います"
         if ! curl -s "http://127.0.0.1:8080/health" > /dev/null 2>&1 && \
            ! curl -s "http://127.0.0.1:8081/health" > /dev/null 2>&1 && \
-           ! curl -s "http://127.0.0.1:8082/health" > /dev/null 2>&1; then
+           ! curl -s "http://127.0.0.1:8082/health" > /dev/null 2>&1 && \
+           ! curl -s "http://127.0.0.1:8083/health" > /dev/null 2>&1; then
             log_error "ノードが1つも起動していません。先に ./scripts/start-local-nodes.sh を実行してください"
             exit 1
         fi
@@ -124,6 +129,8 @@ if ! curl -s "http://127.0.0.1:8080/health" > /dev/null 2>&1; then
         TEST_PORT=8081
     elif curl -s "http://127.0.0.1:8082/health" > /dev/null 2>&1; then
         TEST_PORT=8082
+    elif curl -s "http://127.0.0.1:8083/health" > /dev/null 2>&1; then
+        TEST_PORT=8083
     fi
 fi
 
@@ -190,12 +197,12 @@ response_body=$(echo "$CONTENT_RESPONSE" | sed '$d')
 
 if [ "$status_code" = "201" ]; then
     log_success "新しいコンテンツを作成 (HTTP 201)"
-    ((TESTS_PASSED++))
+    TESTS_PASSED=$((TESTS_PASSED + 1))
     echo "$response_body" | jq -C '.' 2>/dev/null || echo "$response_body"
     CONTENT_ID=$(echo "$response_body" | jq -r '.content_id // empty' 2>/dev/null)
 else
     log_fail "新しいコンテンツを作成 (期待: HTTP 201, 実際: HTTP $status_code)"
-    ((TESTS_FAILED++))
+    TESTS_FAILED=$((TESTS_FAILED + 1))
     echo "$response_body"
     CONTENT_ID=""
 fi
@@ -224,15 +231,38 @@ if [ -n "$CONTENT_ID" ]; then
     UPDATE_BODY=$(echo "$UPDATE_RESPONSE" | sed '$d')
     if [ "$UPDATE_STATUS" = "200" ]; then
         log_success "コンテンツを更新 (HTTP 200)"
-        ((TESTS_PASSED++))
+        TESTS_PASSED=$((TESTS_PASSED + 1))
     else
         log_fail "コンテンツを更新 (期待: HTTP 200, 実際: HTTP $UPDATE_STATUS)"
-        ((TESTS_FAILED++))
+        TESTS_FAILED=$((TESTS_FAILED + 1))
         echo "$UPDATE_BODY"
     fi
 
+    # 直前の更新とまったく同じ署名・timestamp・body を再送する。
+    # 鮮度チェックだけなら 5 分窓の中なので通ってしまうが、mutation の署名は
+    # 使い切りなので 409 で拒否される。通してしまうと、攻撃者が署名済みの
+    # 旧 ciphertext 更新を後から再送して最新版を巻き戻せる。
+    log_test "同じ署名での更新の再送を拒否"
+    REPLAY_RESPONSE=$(curl -s -X PUT "$BASE_URL/content/$CONTENT_ID" \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer $TEST_KEY_ID" \
+        -H "X-Request-Signature: $LAST_SIGNATURE" \
+        -H "X-Request-Timestamp: $LAST_TIMESTAMP" \
+        -d "{\"data\": \"$UPDATED_B64\"}" \
+        -w "\n%{http_code}" 2>/dev/null)
+    REPLAY_STATUS=$(echo "$REPLAY_RESPONSE" | tail -n1)
+    if [ "$REPLAY_STATUS" = "409" ]; then
+        log_success "更新の再送を拒否 (HTTP 409)"
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+    else
+        log_fail "更新の再送を拒否 (期待: HTTP 409, 実際: HTTP $REPLAY_STATUS)"
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        echo "$REPLAY_RESPONSE" | sed '$d'
+    fi
+
     # メンバー追加（count形式）
-    generate_signature "$TEST_PRIVATE_KEY" "manage" "$CONTENT_ID"
+    # count は署名対象。body を差し替えると署名検証で落ちる
+    generate_signature "$TEST_PRIVATE_KEY" "manage" "$CONTENT_ID" "" "1"
 
     log_test "コンテンツネットワークにメンバーを追加"
     MEMBER_RESPONSE=$(curl -s -X POST "$BASE_URL/content/$CONTENT_ID/members" \
@@ -244,16 +274,26 @@ if [ -n "$CONTENT_ID" ]; then
         -w "\n%{http_code}" 2>/dev/null)
     MEMBER_STATUS=$(echo "$MEMBER_RESPONSE" | tail -n1)
     MEMBER_BODY=$(echo "$MEMBER_RESPONSE" | sed '$d')
-    if [ "$MEMBER_STATUS" = "200" ]; then
+    # このスクリプトはコンテンツを作成したノードへ直接送る。作成ノードは
+    # 自分自身を member にしないので(relay 役)、add_members は member 判定で
+    # 403 になるのが正常系。200/503 はこのノードが member だった場合。
+    #
+    # count が署名に束縛されていることの検証は、この 403 が member 判定で
+    # 起きる以上ここでは行えない。ユニットテスト
+    # (`test_add_members_count_cannot_be_substituted`)が担当する。
+    if [ "$MEMBER_STATUS" = "403" ]; then
+        log_success "メンバー追加: 作成ノードは非memberなので拒否 (HTTP 403 - 想定内)"
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+    elif [ "$MEMBER_STATUS" = "200" ]; then
         log_success "メンバー追加成功 (HTTP 200)"
-        ((TESTS_PASSED++))
+        TESTS_PASSED=$((TESTS_PASSED + 1))
         echo "$MEMBER_BODY" | jq -C '.' 2>/dev/null || echo "$MEMBER_BODY"
     elif [ "$MEMBER_STATUS" = "503" ]; then
         log_warn "メンバー追加: DHT peer discovery で利用可能ノードが見つかりません (HTTP 503 - 小規模クラスタでは想定内)"
-        ((TESTS_PASSED++))
+        TESTS_PASSED=$((TESTS_PASSED + 1))
     else
-        log_fail "メンバー追加 (期待: HTTP 200 or 503, 実際: HTTP $MEMBER_STATUS)"
-        ((TESTS_FAILED++))
+        log_fail "メンバー追加 (期待: HTTP 403, 200 or 503, 実際: HTTP $MEMBER_STATUS)"
+        TESTS_FAILED=$((TESTS_FAILED + 1))
         echo "$MEMBER_BODY"
     fi
 
@@ -274,10 +314,10 @@ if [ -n "$CONTENT_ID" ]; then
     DATA_BODY=$(echo "$DATA_RESPONSE" | sed '$d')
     if [ "$DATA_STATUS" = "200" ]; then
         log_success "CRDTデータの取得 (HTTP 200)"
-        ((TESTS_PASSED++))
+        TESTS_PASSED=$((TESTS_PASSED + 1))
     else
         log_fail "CRDTデータの取得 (期待: HTTP 200, 実際: HTTP $DATA_STATUS)"
-        ((TESTS_FAILED++))
+        TESTS_FAILED=$((TESTS_FAILED + 1))
         echo "$DATA_BODY"
     fi
 
@@ -294,10 +334,10 @@ if [ -n "$CONTENT_ID" ]; then
     HIST_BODY=$(echo "$HIST_RESPONSE" | sed '$d')
     if [ "$HIST_STATUS" = "200" ]; then
         log_success "CRDT履歴の取得 (HTTP 200)"
-        ((TESTS_PASSED++))
+        TESTS_PASSED=$((TESTS_PASSED + 1))
     else
         log_fail "CRDT履歴の取得 (期待: HTTP 200, 実際: HTTP $HIST_STATUS)"
-        ((TESTS_FAILED++))
+        TESTS_FAILED=$((TESTS_FAILED + 1))
         echo "$HIST_BODY"
     fi
 
@@ -318,10 +358,10 @@ if [ -n "$CONTENT_ID" ]; then
     DEL_BODY=$(echo "$DEL_RESPONSE" | sed '$d')
     if [ "$DEL_STATUS" = "200" ]; then
         log_success "コンテンツを削除 (HTTP 200)"
-        ((TESTS_PASSED++))
+        TESTS_PASSED=$((TESTS_PASSED + 1))
     else
         log_fail "コンテンツを削除 (期待: HTTP 200, 実際: HTTP $DEL_STATUS)"
-        ((TESTS_FAILED++))
+        TESTS_FAILED=$((TESTS_FAILED + 1))
         echo "$DEL_BODY"
     fi
 fi
@@ -361,14 +401,14 @@ if curl -s "http://127.0.0.1:8080/health" > /dev/null 2>&1 && \
 
         # 各ノードでコンテンツを確認
         log_test "各ノードでコンテンツリストを確認"
-        for port in 8080 8081 8082; do
+        for port in 8080 8081 8082 8083; do
             count=$(curl -s "http://127.0.0.1:$port/contents" | jq '. | length' 2>/dev/null || echo "0")
             log_info "ノード (ポート $port): $count 個のコンテンツ"
         done
     fi
 else
     log_error "すべてのノードが起動していないため、同期テストを実行できません"
-    ((TESTS_FAILED++))
+    TESTS_FAILED=$((TESTS_FAILED + 1))
 fi
 
 # ============================================================================
@@ -393,10 +433,10 @@ response=$(curl -s -X POST "$BASE_URL/content" \
 status_code=$(echo "$response" | tail -n1)
 if [ "$status_code" = "401" ]; then
     log_success "無効なトークンが正しく拒否されました"
-    ((TESTS_PASSED++))
+    TESTS_PASSED=$((TESTS_PASSED + 1))
 else
     log_fail "無効なトークンが拒否されませんでした (HTTP $status_code)"
-    ((TESTS_FAILED++))
+    TESTS_FAILED=$((TESTS_FAILED + 1))
 fi
 
 # 署名なしのリクエスト
@@ -410,10 +450,10 @@ response=$(curl -s -X POST "$BASE_URL/content" \
 status_code=$(echo "$response" | tail -n1)
 if [ "$status_code" = "401" ]; then
     log_success "署名なしリクエストが正しく拒否されました"
-    ((TESTS_PASSED++))
+    TESTS_PASSED=$((TESTS_PASSED + 1))
 else
     log_fail "署名なしリクエストが拒否されませんでした (HTTP $status_code)"
-    ((TESTS_FAILED++))
+    TESTS_FAILED=$((TESTS_FAILED + 1))
 fi
 
 # ============================================================================

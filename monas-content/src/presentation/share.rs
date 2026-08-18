@@ -22,6 +22,8 @@ use super::{decode_base64, decode_key_id_base64, AppState};
 pub struct GrantShareRequest {
     pub content_id: String,
     pub sender_key_id_base64: String,
+    /// 送信者の秘密鍵(base64)。HPKE Auth モードの wrap(送信者認証)に用いる。
+    pub sender_private_key_base64: String,
     pub recipient_public_key_base64: String,
     pub permission: String,
 }
@@ -35,17 +37,23 @@ pub struct GrantShareResponse {
     pub enc_base64: String,
     pub wrapped_cek_base64: String,
     pub ciphertext_base64: String,
+    pub key_epoch: u64,
 }
 
 #[derive(Deserialize)]
 pub struct UnwrapCekRequest {
     pub content_id: String,
     pub sender_key_id_base64: String,
+    /// 送信者の公開鍵(base64)。HPKE Auth モードの unwrap(送信者検証)に用いる。
+    pub sender_public_key_base64: String,
     pub recipient_key_id_base64: String,
     pub enc_base64: String,
     pub wrapped_cek_base64: String,
     pub ciphertext_base64: String,
     pub recipient_private_key_base64: String,
+    /// envelope の CEK 鍵世代。wrap 時の AAD と一致しなければ復号は失敗する。
+    #[serde(default)]
+    pub key_epoch: u64,
 }
 
 #[derive(Serialize)]
@@ -68,11 +76,14 @@ pub struct KeyEnvelopeResponse {
     pub enc_base64: String,
     pub wrapped_cek_base64: String,
     pub ciphertext_base64: String,
+    pub key_epoch: u64,
 }
 
 #[derive(Deserialize)]
 pub struct RevokeShareQuery {
     pub sender_key_id_base64: String,
+    /// 送信者の秘密鍵(base64)。残存受信者向け envelope 再発行の wrap に用いる。
+    pub sender_private_key_base64: String,
 }
 
 #[derive(Serialize)]
@@ -106,6 +117,9 @@ async fn grant_share(
 
     let sender_key_id = decode_key_id_base64(&req.sender_key_id_base64, "sender_key_id_base64")?;
 
+    let sender_private_key =
+        decode_base64(&req.sender_private_key_base64, "sender_private_key_base64")?;
+
     let recipient_pubkey = decode_base64(
         &req.recipient_public_key_base64,
         "recipient_public_key_base64",
@@ -126,6 +140,7 @@ async fn grant_share(
     let cmd = GrantShareCommand {
         content_id,
         sender_key_id,
+        sender_private_key,
         recipient_public_key: recipient_pubkey,
         permission,
     };
@@ -151,6 +166,7 @@ async fn grant_share(
         enc_base64: enc_b64,
         wrapped_cek_base64: wrapped_cek_b64,
         ciphertext_base64: ciphertext_b64,
+        key_epoch: env.key_epoch(),
     }))
 }
 
@@ -173,6 +189,9 @@ async fn unwrap_cek(
         "recipient_private_key_base64",
     )?;
 
+    let sender_public_key =
+        decode_base64(&req.sender_public_key_base64, "sender_public_key_base64")?;
+
     let recipient = WrappedRecipientKey::new(recipient_key_id, enc, wrapped_cek);
     let envelope = KeyEnvelope::new(
         content_id,
@@ -180,11 +199,12 @@ async fn unwrap_cek(
         sender_key_id,
         recipient,
         ciphertext,
+        req.key_epoch,
     );
 
     let cek = state
         .share_service
-        .unwrap_cek_from_envelope(&envelope, &recipient_private_key)
+        .unwrap_cek_from_envelope(&envelope, &recipient_private_key, &sender_public_key)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     let cek_base64 = BASE64_STANDARD.encode(&cek.0);
 
@@ -199,6 +219,8 @@ async fn revoke_share(
     let content_id = ContentId::new(content_id_str.clone());
 
     let sender_key_id = decode_key_id_base64(&q.sender_key_id_base64, "sender_key_id_base64")?;
+    let sender_private_key =
+        decode_base64(&q.sender_private_key_base64, "sender_private_key_base64")?;
 
     let recipient_key_id =
         decode_key_id_base64(&recipient_key_id_b64, "recipient_key_id (base64)")?;
@@ -206,6 +228,7 @@ async fn revoke_share(
     let cmd = RevokeShareCommand {
         content_id,
         sender_key_id,
+        sender_private_key,
         recipient_key_id,
     };
 
@@ -226,6 +249,7 @@ async fn revoke_share(
                 enc_base64: BASE64_STANDARD.encode(recipient.enc()),
                 wrapped_cek_base64: BASE64_STANDARD.encode(recipient.wrapped_cek()),
                 ciphertext_base64: BASE64_STANDARD.encode(env.ciphertext()),
+                key_epoch: env.key_epoch(),
             }
         })
         .collect();

@@ -41,6 +41,13 @@ pub enum StateNodeError {
     #[error("Authentication failed: {0}")]
     AuthenticationFailed(String),
 
+    /// The signature verified, but this exact signed request was already
+    /// applied. Distinct from [`Self::AuthenticationFailed`] because the two
+    /// mean opposite things to an operator: a forged or expired request versus
+    /// a genuine one arriving twice.
+    #[error("Request already applied: {0}")]
+    RequestAlreadyApplied(String),
+
     #[error("Authorization failed: {0}")]
     AuthorizationFailed(String),
 
@@ -110,6 +117,9 @@ impl StateNodeError {
             StateNodeError::PermissionDenied(_) => StatusCode::FORBIDDEN,
             StateNodeError::InvalidUcanToken(_) => StatusCode::UNAUTHORIZED,
             StateNodeError::AuthenticationFailed(_) => StatusCode::UNAUTHORIZED,
+            // 409: the request was well-formed and authentic, but conflicts
+            // with state that already exists (it was applied once already).
+            StateNodeError::RequestAlreadyApplied(_) => StatusCode::CONFLICT,
             StateNodeError::AuthorizationFailed(_) => StatusCode::FORBIDDEN,
             StateNodeError::InsufficientCapacity { .. } => StatusCode::INSUFFICIENT_STORAGE,
             StateNodeError::NoAvailableMembers => StatusCode::SERVICE_UNAVAILABLE,
