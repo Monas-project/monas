@@ -8,7 +8,9 @@
 //! - WebRTC and TCP transports
 
 pub mod behaviour;
+pub mod bootstrap;
 pub mod libp2p_network;
+pub mod peer_store;
 pub mod protocol;
 pub mod public_key_protocol;
 pub mod transport;

@@ -8,6 +8,7 @@
 //! - WebRTC and TCP transports
 
 use super::behaviour::{BehaviourConfig, NodeBehaviour, NodeBehaviourEvent};
+use super::peer_store::PeerStore;
 use super::protocol::{ContentRequest, ContentResponse, PushBootstrap};
 use super::public_key_protocol::{NodePublicKey, PublicKeyRequest, PublicKeyResponse};
 use super::transport;
@@ -21,13 +22,14 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use futures::StreamExt;
 use libp2p::{
+    core::ConnectedPoint,
     gossipsub::{self, IdentTopic},
     identify, kad,
     request_response::{self, OutboundRequestId, ResponseChannel},
     swarm::SwarmEvent,
     Multiaddr, PeerId, Swarm,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -37,6 +39,36 @@ use tracing::{debug, error, info, warn};
 
 /// Default timeout for PeerNetwork operations (30 seconds).
 const PEER_NETWORK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How often to check connectivity and re-dial bootstrap peers.
+///
+/// Short enough that a node which lost its peers rejoins within a minute,
+/// long enough that a genuinely unreachable bootstrap is not hammered. Dials
+/// are skipped entirely while the node is healthy, so the steady-state cost is
+/// one comparison per tick.
+const PEER_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Connected-peer count at or above which no maintenance dialling happens.
+///
+/// This is about *connectivity*, not replication: it only decides when to
+/// re-dial, and is deliberately independent of `min_replication_factor`.
+const HEALTHY_PEER_COUNT: usize = 3;
+
+/// The address of a freshly established connection, if it is one we could dial
+/// again later.
+///
+/// Only outbound connections qualify. On an inbound connection the remote
+/// address is `send_back_addr`, which carries the peer's *ephemeral source
+/// port* rather than the port it listens on: dialling it from a later process
+/// can never succeed. Storing those is worse than storing nothing, because
+/// addresses are capped FIFO per peer (`MAX_ADDRS_PER_PEER`), so a handful of
+/// inbound reconnects would push out the one address that actually works.
+fn reusable_addr(endpoint: &ConnectedPoint) -> Option<&Multiaddr> {
+    match endpoint {
+        ConnectedPoint::Dialer { address, .. } => Some(address),
+        ConnectedPoint::Listener { .. } => None,
+    }
+}
 
 /// A relay request received from a remote peer via P2P protocol.
 /// The swarm loop sends these through a channel to the application layer (node.rs),
@@ -467,7 +499,18 @@ impl Libp2pNetwork {
             transport::build_transport(&keypair).context("Failed to build transport")?;
 
         // Build behaviour
-        let behaviour = NodeBehaviour::new(local_peer_id, &keypair, BehaviourConfig::default())?;
+        // `enable_mdns` used to be ignored here: mDNS was always on, so a local
+        // cluster could rediscover a moved peer by broadcast even when the
+        // paths production relies on were broken. Honour the flag so local
+        // runs can reproduce a deployment where mDNS does not exist.
+        let behaviour = NodeBehaviour::new(
+            local_peer_id,
+            &keypair,
+            BehaviourConfig {
+                enable_mdns: config.enable_mdns,
+                ..BehaviourConfig::default()
+            },
+        )?;
 
         // Create swarm with connection limits to prevent FD/memory exhaustion (M-3).
         // idle_connection_timeout is set higher than the default sync_interval (30s)
@@ -550,6 +593,7 @@ impl Libp2pNetwork {
             command_tx: command_tx.clone(),
         };
         let content_network_repo_clone = content_network_repo.clone();
+        let bootstrap_nodes_clone = config.bootstrap_nodes.clone();
         tokio::spawn(Self::run_swarm_loop(
             swarm,
             command_rx,
@@ -560,6 +604,7 @@ impl Libp2pNetwork {
             p256_signing_key_clone,
             relay_channels,
             content_network_repo_clone,
+            bootstrap_nodes_clone,
         ));
 
         Ok(Self {
@@ -636,10 +681,41 @@ impl Libp2pNetwork {
         content_network_repo: Option<
             Arc<RwLock<dyn crate::port::persistence::PersistentContentRepository + Send + Sync>>,
         >,
+        bootstrap_nodes: Vec<(PeerId, Multiaddr)>,
     ) {
         let mut pending = PendingRequests::default();
         let mut cleanup_interval = tokio::time::interval(Duration::from_secs(60));
         cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        // Peers we have previously reached. Dialling these alongside the
+        // configured bootstrap peers means the node can rejoin even when every
+        // bootstrap address is down or has moved — the bootstrap list is an
+        // entry point, not a dependency.
+        let mut peer_store = PeerStore::load(&data_dir);
+        if !peer_store.is_empty() {
+            info!("Loaded {} known peer(s) from disk", peer_store.len());
+            for (peer_id, addrs) in peer_store.iter() {
+                for addr in addrs {
+                    swarm
+                        .behaviour_mut()
+                        .kademlia
+                        .add_address(peer_id, addr.clone());
+                    swarm.add_peer_address(*peer_id, addr.clone());
+                }
+            }
+        }
+        let mut peer_store_dirty = false;
+
+        // Periodically re-establish connectivity. Without this a node that
+        // loses every connection stays isolated forever: `ConnectionClosed`
+        // only forgets the peer, nothing ever dials again, and Kademlia is
+        // only bootstrapped at startup and on identify. Combined with a
+        // bootstrap address that had been frozen to a stale IP, that is what
+        // left a whole deployment unable to reconverge.
+        let mut peer_maintenance = tokio::time::interval(PEER_MAINTENANCE_INTERVAL);
+        peer_maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // The first tick fires immediately; the startup dial already happened.
+        peer_maintenance.tick().await;
 
         loop {
             tokio::select! {
@@ -649,13 +725,99 @@ impl Libp2pNetwork {
                 }
                 // Handle swarm events
                 event = swarm.select_next_some() => {
+                    // Remember peers we actually reached, before the event is
+                    // consumed by the handler below.
+                    if let SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } = &event {
+                        if let Some(addr) = reusable_addr(endpoint) {
+                            if peer_store.record(*peer_id, addr.clone()) {
+                                peer_store_dirty = true;
+                            }
+                        }
+                    }
                     Self::handle_swarm_event(&mut swarm, &mut pending, &connected_peers, &event_tx, &crdt_repo, &data_dir, &p256_signing_key, &relay_channels, &content_network_repo, event).await;
                 }
                 // Periodic cleanup of stale pending requests
                 _ = cleanup_interval.tick() => {
                     pending.cleanup_stale();
                 }
+                // Periodic reconnection / re-bootstrap
+                _ = peer_maintenance.tick() => {
+                    Self::maintain_connectivity(&mut swarm, &connected_peers, &bootstrap_nodes, &peer_store).await;
+                    // Flush at most once per tick rather than on every new
+                    // address, so a busy node does not rewrite the file
+                    // constantly.
+                    if peer_store_dirty {
+                        if let Err(e) = peer_store.save(&data_dir) {
+                            warn!("Failed to persist peer store: {}", e);
+                        } else {
+                            peer_store_dirty = false;
+                        }
+                    }
+                }
             }
+        }
+    }
+
+    /// Re-dial bootstrap peers and re-run the Kademlia bootstrap when we are
+    /// short on connections.
+    ///
+    /// Dialling a `/dns4/` bootstrap address re-resolves it, so a peer that
+    /// came back at a different IP is picked up here. Dial errors are expected
+    /// and harmless — the peer may simply still be down — so they are logged
+    /// at debug level and retried on the next tick.
+    async fn maintain_connectivity(
+        swarm: &mut Swarm<NodeBehaviour>,
+        connected_peers: &Arc<RwLock<HashMap<PeerId, Vec<Multiaddr>>>>,
+        bootstrap_nodes: &[(PeerId, Multiaddr)],
+        peer_store: &PeerStore,
+    ) {
+        let connected: HashSet<PeerId> = connected_peers.read().await.keys().copied().collect();
+
+        if connected.len() >= HEALTHY_PEER_COUNT {
+            return;
+        }
+
+        debug!(
+            "Connectivity maintenance: {} peer(s) connected, below {}",
+            connected.len(),
+            HEALTHY_PEER_COUNT
+        );
+
+        // Configured entry points first, then peers we have met before. The
+        // latter is what lets a node recover when every bootstrap is down.
+        let candidates = bootstrap_nodes.iter().map(|(p, a)| (p, a)).chain(
+            peer_store
+                .iter()
+                .flat_map(|(p, addrs)| addrs.iter().map(move |a| (p, a))),
+        );
+
+        let mut dialled: HashSet<PeerId> = HashSet::new();
+        for (peer_id, addr) in candidates {
+            if swarm.local_peer_id() == peer_id
+                || connected.contains(peer_id)
+                || !dialled.insert(*peer_id)
+            {
+                continue;
+            }
+            // Refresh the address book first: for a DNS address this is what
+            // lets a later dial pick up a changed IP.
+            swarm
+                .behaviour_mut()
+                .kademlia
+                .add_address(peer_id, addr.clone());
+            swarm.add_peer_address(*peer_id, addr.clone());
+
+            match swarm.dial(addr.clone()) {
+                Ok(()) => info!("Re-dialling peer {} at {}", peer_id, addr),
+                Err(e) => debug!("Re-dial of {} at {} failed: {:?}", peer_id, addr, e),
+            }
+        }
+
+        // Re-run the DHT bootstrap so routing buckets refill once a dial lands.
+        // Errors here mean "no known peers to bootstrap from", which the dials
+        // above are in the process of fixing.
+        if let Err(e) = swarm.behaviour_mut().kademlia.bootstrap() {
+            debug!("Kademlia bootstrap during maintenance: {:?}", e);
         }
     }
 
@@ -2510,6 +2672,35 @@ mod tests {
     use super::*;
     use crate::infrastructure::crdt_repository::CrslCrdtRepository;
     use tempfile::tempdir;
+
+    /// An inbound connection must never be remembered.
+    ///
+    /// `send_back_addr` is the peer's ephemeral source port, not its listen
+    /// port — measured on a real pair of swarms, a node listening on
+    /// `/tcp/62417` sees its peer as `/tcp/62418`. Recording that fills the
+    /// store with addresses nothing can dial, and evicts the good one.
+    #[test]
+    fn only_outbound_connections_yield_a_reusable_address() {
+        let listen: Multiaddr = "/ip4/10.0.1.60/tcp/9001".parse().unwrap();
+        let ephemeral: Multiaddr = "/ip4/10.0.1.60/tcp/62418".parse().unwrap();
+
+        let outbound = ConnectedPoint::Dialer {
+            address: listen.clone(),
+            role_override: libp2p::core::Endpoint::Dialer,
+            port_use: libp2p::core::transport::PortUse::Reuse,
+        };
+        assert_eq!(reusable_addr(&outbound), Some(&listen));
+
+        let inbound = ConnectedPoint::Listener {
+            local_addr: "/ip4/10.0.1.61/tcp/9001".parse().unwrap(),
+            send_back_addr: ephemeral,
+        };
+        assert_eq!(
+            reusable_addr(&inbound),
+            None,
+            "inbound send_back_addr is an ephemeral port and must not be stored"
+        );
+    }
 
     #[tokio::test]
     async fn test_network_creation() {

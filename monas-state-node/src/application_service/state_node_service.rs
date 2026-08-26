@@ -2257,8 +2257,19 @@ where
             })?;
 
         // 3. Identify low-capacity nodes
+        //
+        // A node counts as low-capacity only when it actually *told* us it is
+        // low. An absent entry means the capacity query did not come back —
+        // the peer may be restarting, or unreachable — and that is not the
+        // same as having no space. Treating the two alike is dangerous in both
+        // directions: it under-counts healthy members (triggering pointless
+        // member additions), and it feeds `low_capacity_nodes`, which is used
+        // below to *remove members*. During a network partition that would
+        // evict perfectly good replicas for being unreachable, which is
+        // exactly when we can least afford to lose them.
         let mut low_capacity_nodes: Vec<String> = Vec::new();
         let mut healthy_count = 0usize;
+        let mut unreachable_count = 0usize;
 
         for node_id in &member_list {
             // We are healthy from our own perspective (see above) — never flag
@@ -2267,18 +2278,35 @@ where
                 healthy_count += 1;
                 continue;
             }
-            let available = capacities.get(node_id).cloned().unwrap_or(0);
-            if available < self.capacity_threshold_bytes {
-                low_capacity_nodes.push(node_id.clone());
-                tracing::info!(
-                    "Node {} has low capacity ({} bytes < {} threshold)",
-                    node_id,
-                    available,
-                    self.capacity_threshold_bytes
-                );
-            } else {
-                healthy_count += 1;
+            match capacities.get(node_id) {
+                Some(&available) if available < self.capacity_threshold_bytes => {
+                    low_capacity_nodes.push(node_id.clone());
+                    tracing::info!(
+                        "Node {} has low capacity ({} bytes < {} threshold)",
+                        node_id,
+                        available,
+                        self.capacity_threshold_bytes
+                    );
+                }
+                Some(_) => healthy_count += 1,
+                None => {
+                    // Unknown, not empty. Not counted as healthy (we cannot
+                    // vouch for a replica we cannot reach) but never removed.
+                    unreachable_count += 1;
+                    tracing::debug!(
+                        "No capacity response from {} — treating as unknown, not as low capacity",
+                        node_id
+                    );
+                }
             }
+        }
+
+        if unreachable_count > 0 {
+            tracing::info!(
+                "Content {}: {} member(s) did not answer the capacity query",
+                content_id,
+                unreachable_count
+            );
         }
 
         // 4. Add new members if needed
@@ -5038,5 +5066,85 @@ mod tests {
 
         let result = service.get_node("nonexistent").await.unwrap();
         assert!(result.is_none());
+    }
+
+    /// Build a 4-member network on `local` and run the redundancy check with
+    /// the given capacity responses. Returns the members left afterwards.
+    async fn members_after_redundancy_check(
+        local: &str,
+        capacities: HashMap<String, u64>,
+    ) -> Vec<String> {
+        // No spare peers to promote: this isolates removal behaviour, which is
+        // what the capacity verdict actually drives.
+        let service = create_service_with_peers(local, vec![], capacities);
+
+        let members: Vec<String> = ["node-1", "node-2", "node-3", "node-4"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let event = Event::ContentNetworkManagerAdded {
+            content_id: "content-1".to_string(),
+            added_node_id: "node-4".to_string(),
+            member_nodes: members,
+            timestamp: 12345,
+        };
+        service.handle_sync_event(&event, None).await.unwrap();
+
+        service
+            .check_and_maintain_redundancy("content-1")
+            .await
+            .unwrap();
+
+        let network = service
+            .get_content_network_for_test("content-1")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut left = network.member_nodes_as_strings();
+        left.sort();
+        left
+    }
+
+    /// A member that does not answer the capacity query is unknown, not empty.
+    ///
+    /// Regression guard: the verdict used to be
+    /// `capacities.get(id).unwrap_or(0)`, so an unanswered query read as
+    /// "0 bytes available" and put the peer on the removal list. During a
+    /// partition that evicts healthy replicas precisely when they are hardest
+    /// to replace — and it also produced the misleading
+    /// "has low capacity (0 bytes)" line that sent us chasing a disk-space
+    /// problem that did not exist.
+    #[tokio::test]
+    async fn unreachable_member_is_not_treated_as_low_capacity() {
+        let mut capacities = HashMap::new();
+        // node-2 answers with plenty of room; node-3 and node-4 stay silent.
+        capacities.insert("node-2".to_string(), 100 * 1024 * 1024 * 1024);
+
+        let left = members_after_redundancy_check("node-1", capacities).await;
+
+        assert_eq!(
+            left,
+            vec!["node-1", "node-2", "node-3", "node-4"],
+            "silent members must be kept: no response is not the same as no space"
+        );
+    }
+
+    /// The flip side: a node that genuinely reports low capacity is still
+    /// removed, so the fix above did not just disable the feature.
+    #[tokio::test]
+    async fn member_reporting_low_capacity_is_still_removed() {
+        let plenty = 100 * 1024 * 1024 * 1024;
+        let mut capacities = HashMap::new();
+        capacities.insert("node-2".to_string(), plenty);
+        capacities.insert("node-3".to_string(), plenty);
+        // Explicitly reports almost nothing left.
+        capacities.insert("node-4".to_string(), 1);
+
+        let left = members_after_redundancy_check("node-1", capacities).await;
+
+        assert!(
+            !left.contains(&"node-4".to_string()),
+            "a member that reports low capacity should be removed, got {left:?}"
+        );
     }
 }

@@ -38,6 +38,11 @@ output "service_discovery_namespace_id" {
   value       = aws_service_discovery_private_dns_namespace.main.id
 }
 
+output "service_discovery_namespace_name" {
+  description = "Cloud Map namespace DNS name. bootstrap_dns is \"<node_name>.<this>\"."
+  value       = aws_service_discovery_private_dns_namespace.main.name
+}
+
 output "efs_filesystem_id" {
   description = "Shared EFS filesystem ID"
   value       = aws_efs_file_system.main.id
@@ -52,13 +57,14 @@ output "node_endpoints" {
 output "node_terraform_vars" {
   description = "Variables to pass to per-node terraform (copy-paste ready)"
   value       = <<-EOT
-    vpc_id                         = "${aws_vpc.main.id}"
-    subnet_ids                     = ${jsonencode(aws_subnet.public[*].id)}
-    alb_listener_arn               = "${aws_lb_listener.https.arn}"
-    alb_security_group_id          = "${aws_security_group.alb.id}"
-    ecr_image_uri                  = "${aws_ecr_repository.state_node.repository_url}:latest"
-    ecs_cluster_arn                = "${aws_ecs_cluster.main.arn}"
-    service_discovery_namespace_id = "${aws_service_discovery_private_dns_namespace.main.id}"
-    efs_filesystem_id              = "${aws_efs_file_system.main.id}"
+    vpc_id                           = "${aws_vpc.main.id}"
+    subnet_ids                       = ${jsonencode(aws_subnet.public[*].id)}
+    alb_listener_arn                 = "${aws_lb_listener.https.arn}"
+    alb_security_group_id            = "${aws_security_group.alb.id}"
+    ecr_image_uri                    = "${aws_ecr_repository.state_node.repository_url}:latest"
+    ecs_cluster_arn                  = "${aws_ecs_cluster.main.arn}"
+    service_discovery_namespace_id   = "${aws_service_discovery_private_dns_namespace.main.id}"
+    service_discovery_namespace_name = "${aws_service_discovery_private_dns_namespace.main.name}"
+    efs_filesystem_id                = "${aws_efs_file_system.main.id}"
   EOT
 }

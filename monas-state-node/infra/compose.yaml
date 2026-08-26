@@ -9,6 +9,8 @@ services:
       - P2P_PORT=9001
       - DATA_DIR=/data
       - LOG_LEVEL=info
+      # 本番同等の条件で検証するため mDNS を切る(VPC に mDNS は存在しない)。
+      - DISABLE_MDNS=true
     ports:
       - "8081:8080"
     volumes:
@@ -41,6 +43,11 @@ services:
     depends_on:
       node1:
         condition: service_healthy
+    # /dns4/ を使うこと。Docker の埋め込み DNS がダイヤル毎に node1 を再解決
+    # するため、node1 が別 IP で復帰しても再収束する。ここで IP に解決して
+    # しまうと本番で全断した「凍結アドレス」をそのまま再現してしまい、この
+    # ハーネスは修正を検証できない。--disable-mdns も同じ理由(mDNS が壊れた
+    # 探索経路を隠してしまう)。
     entrypoint: ["/bin/bash", "-c"]
     command:
       - |
@@ -51,7 +58,8 @@ services:
           --listen 0.0.0.0:8080 \
           --p2p-port 9001 \
           --log-level info \
-          --bootstrap "/ip4/$$(getent hosts node1 | awk '{print $$1}')/tcp/9001/p2p/$$PEER_ID"
+          --disable-mdns \
+          --bootstrap "/dns4/node1/tcp/9001/p2p/$$PEER_ID"
 
   node3:
     build:
@@ -72,6 +80,11 @@ services:
     depends_on:
       node1:
         condition: service_healthy
+    # /dns4/ を使うこと。Docker の埋め込み DNS がダイヤル毎に node1 を再解決
+    # するため、node1 が別 IP で復帰しても再収束する。ここで IP に解決して
+    # しまうと本番で全断した「凍結アドレス」をそのまま再現してしまい、この
+    # ハーネスは修正を検証できない。--disable-mdns も同じ理由(mDNS が壊れた
+    # 探索経路を隠してしまう)。
     entrypoint: ["/bin/bash", "-c"]
     command:
       - |
@@ -82,7 +95,8 @@ services:
           --listen 0.0.0.0:8080 \
           --p2p-port 9001 \
           --log-level info \
-          --bootstrap "/ip4/$$(getent hosts node1 | awk '{print $$1}')/tcp/9001/p2p/$$PEER_ID"
+          --disable-mdns \
+          --bootstrap "/dns4/node1/tcp/9001/p2p/$$PEER_ID"
 
 volumes:
   node1-data:
