@@ -607,19 +607,24 @@ async fn list_contents(State(state): State<AppState>) -> impl IntoResponse {
 /// Extracts a Bearer token from the Authorization header, then checks:
 /// - If the caller is the content owner, access is granted immediately
 /// - Otherwise, the caller must provide a valid AuthToken (JWT) as the Bearer token
+///
+/// The error is boxed because an axum `Response` is large (>128 bytes) and the
+/// happy path should not pay for carrying it by value (clippy: result_large_err).
 async fn verify_read_access(
     state: &AppState,
     headers: &HeaderMap,
     content_id: &str,
-) -> Result<(), Response> {
+) -> Result<(), Box<Response>> {
     let token = extract_auth_token(headers).ok_or_else(|| {
-        (
-            StatusCode::UNAUTHORIZED,
-            Json(ErrorResponse {
-                error: "Authorization header is required".to_string(),
-            }),
+        Box::new(
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(ErrorResponse {
+                    error: "Authorization header is required".to_string(),
+                }),
+            )
+                .into_response(),
         )
-            .into_response()
     })?;
 
     let request_sig = extract_request_signature(headers);
@@ -628,7 +633,7 @@ async fn verify_read_access(
     state
         .authorize_read(&token, request_sig.as_deref(), timestamp, content_id)
         .await
-        .map_err(|e| e.into_response())
+        .map_err(|e| Box::new(e.into_response()))
 }
 
 /// Serve a read for content this node does not replicate by relaying it —
@@ -724,7 +729,7 @@ async fn get_content_data(
     }
 
     if let Err(response) = verify_read_access(&state, &headers, &content_id).await {
-        return response;
+        return *response;
     }
 
     let crdt_repo = state.crdt_repo();
@@ -788,7 +793,7 @@ async fn get_content_history(
     }
 
     if let Err(response) = verify_read_access(&state, &headers, &content_id).await {
-        return response;
+        return *response;
     }
 
     let crdt_repo = state.crdt_repo();
@@ -826,7 +831,7 @@ async fn get_content_version(
     }
 
     if let Err(response) = verify_read_access(&state, &headers, &content_id).await {
-        return response;
+        return *response;
     }
 
     let crdt_repo = state.crdt_repo();
