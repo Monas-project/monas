@@ -10,12 +10,12 @@ use crate::domain::events::{current_timestamp, Event};
 use crate::domain::identity::Identity;
 use crate::domain::state_node::{self, NodeSnapshot};
 use crate::domain::value_objects::ContentId;
-use crate::infrastructure::auth::auth_token::AuthToken as InfraAuthToken;
 use crate::infrastructure::crypto::verify_p256_signature;
 use crate::infrastructure::placement::compute_dht_key;
 use crate::port::auth_token::{AuthToken, RequestMetadata};
 use crate::port::authentication_service::AuthenticationService;
 use crate::port::authorization_service::{AuthorizationRequest, AuthorizationService};
+use crate::port::consumed_request_store::{ConsumedRequestStore, InMemoryConsumedRequestStore};
 use crate::port::content_repository::ContentRepository;
 use crate::port::event_publisher::EventPublisher;
 use crate::port::peer_network::{PeerNetwork, RelayReadError, RelayReadErrorKind};
@@ -93,6 +93,9 @@ where
     capacity_threshold_bytes: u64,
     /// Maximum number of members to add in a single add_member_to_content call.
     max_add_member_count: usize,
+    /// Records mutation requests that have already been accepted, so a captured
+    /// signature cannot be replayed inside its freshness window.
+    consumed_requests: Arc<dyn ConsumedRequestStore>,
 }
 
 /// Where a relay candidate list came from, and therefore how much it can be
@@ -272,7 +275,19 @@ where
             min_replication_factor: config.min_replication_factor,
             capacity_threshold_bytes: config.capacity_threshold_bytes,
             max_add_member_count: config.max_add_member_count,
+            consumed_requests: Arc::new(InMemoryConsumedRequestStore::default()),
         }
+    }
+
+    /// Replace the consumed-request store (builder pattern).
+    ///
+    /// The default is process-local and volatile, which is sound because records
+    /// only need to outlive the signature freshness window. Deployments that
+    /// want replay protection to survive a restart can inject a persistent
+    /// implementation here.
+    pub fn with_consumed_request_store(mut self, store: Arc<dyn ConsumedRequestStore>) -> Self {
+        self.consumed_requests = store;
+        self
     }
 
     /// Set the access control repository (builder pattern).
@@ -344,9 +359,9 @@ where
             .await
             .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))?;
 
-        // Verify caller signature for all token types.
-        // JWT: proof-of-possession via "{iss}:{aud}:{jti}" request signature
-        // type:id: metadata/body based request signature
+        // Verify caller signature for all token types. The signed message is
+        // `read:{content_id}:{timestamp}` regardless of token kind; JWT tokens
+        // additionally have their own owner signature verified.
         let sig = request_signature.ok_or_else(|| {
             StateNodeError::AuthenticationFailed("Request signature is required".to_string())
         })?;
@@ -366,15 +381,108 @@ where
 
     /// Verify the caller's request signature.
     ///
-    /// For JWT tokens (containing `.`), verifies the JWT's own P-256 signature
-    /// via `AuthenticationService::verify_jwt_signature`, and enforces
-    /// caller proof-of-possession by verifying request signature over
-    /// "{iss}:{aud}:{jti}" using the audience key.
+    /// The signed message is identical for every token type (issue #61) and is
+    /// built by [`Self::build_signing_message`]:
+    /// `monas-request-v1:<len>:<op>:<len>:<resource>:<timestamp>:<len>:<digest>`
+    /// where `digest` is `hex(sha256(body))` when a body is present and empty
+    /// otherwise. Every field is length-prefixed, so no two distinct requests
+    /// can produce the same message by shifting a boundary.
     ///
-    /// For `type:id` tokens (e.g., `user:alice`), constructs a signing message
-    /// and delegates to `AuthenticationService::verify_request_signature`:
-    /// - If `request_body` is `Some(body)`: signs `hex(sha256(body + timestamp_be_bytes))`
-    /// - If `request_body` is `None`: signs `{operation}:{resource}:{timestamp}`
+    /// The timestamp *inside* the signed message is checked for freshness by the
+    /// auth service, so `timestamp` is mandatory — there is no server-clock
+    /// fallback. A token can therefore be reused for many requests within its
+    /// TTL.
+    ///
+    /// Freshness alone is **not** replay protection: within the window the same
+    /// signature can be presented any number of times. That is acceptable for
+    /// reads, which are idempotent. Mutations must go through
+    /// [`Self::verify_and_consume_mutation_signature`] instead, which also
+    /// consumes the signature.
+    ///
+    /// For JWT tokens (containing `.`), the JWT's own P-256 signature is
+    /// verified first via `AuthenticationService::verify_jwt_signature`
+    /// (over the received wire bytes), and the request signature is then
+    /// verified against the audience (`aud`) key.
+    /// Build the canonical message a request signature commits to.
+    ///
+    /// Single source of truth for both verification and the replay-consumption
+    /// identity, so the two can never drift apart.
+    fn build_signing_message(
+        operation: &str,
+        resource: &str,
+        timestamp: u64,
+        request_body: Option<&[u8]>,
+    ) -> String {
+        let metadata = RequestMetadata {
+            timestamp,
+            operation: operation.to_string(),
+            resource: resource.to_string(),
+        };
+        match request_body {
+            Some(body) => {
+                use sha2::{Digest, Sha256};
+                let digest = hex::encode(Sha256::digest(body));
+                metadata.signing_message_with_body_digest(&digest)
+            }
+            None => metadata.signing_message(),
+        }
+    }
+
+    /// The canonical identity of whoever must hold the private key for this
+    /// request — the key the request signature is verified against.
+    ///
+    /// For a self-contained key id the token *is* that key. For a delegated JWT
+    /// it is the `aud` claim, which is likewise a self-contained key id; this
+    /// mirrors `verify_request_signature`, which verifies the request signature
+    /// against exactly that key.
+    ///
+    /// Deliberately **not** the raw token string. A JWT ends in an ECDSA
+    /// signature over its own header and payload, and ECDSA is malleable, so
+    /// the same JWT — same claims, same `aud`, still passing verification —
+    /// has more than one byte representation. Feeding raw token bytes into the
+    /// request identity would therefore hand one authorized request two
+    /// identities, which is the very bypass the identity is meant to prevent.
+    ///
+    /// A malformed JWT falls back to the whole token: such a token cannot
+    /// authenticate anyway, so the value only has to be deterministic.
+    fn canonical_principal(token: &AuthToken) -> String {
+        let raw = token.as_str();
+        if !raw.contains('.') {
+            return format!("key:{}", raw);
+        }
+        match crate::infrastructure::auth::auth_token::AuthToken::from_jwt(raw) {
+            Ok(parsed) => format!("aud:{}", parsed.payload.aud),
+            Err(_) => format!("raw:{}", raw),
+        }
+    }
+
+    /// Identity of a mutation request, for the single-use record.
+    ///
+    /// Derived from the **signed message plus the canonical signer identity**,
+    /// never from any signature bytes. ECDSA signatures are malleable: for a
+    /// valid `(r, s)` the value `(r, n - s)` verifies against the same message
+    /// and key. That applies to *both* signatures in play here — the request
+    /// signature and the JWT's own signature — so neither may reach this hash.
+    /// Otherwise one authorized request gets two identities, and re-sending the
+    /// converted form slips past the consumption record and re-commits the
+    /// mutation.
+    ///
+    /// The message already binds operation, resource, timestamp and body
+    /// digest. The principal is mixed in so two different callers cannot
+    /// collide on one identity, which would let one of them consume the
+    /// other's request.
+    fn mutation_request_id(token: &AuthToken, signing_message: &str) -> Vec<u8> {
+        use sha2::{Digest, Sha256};
+        let principal = Self::canonical_principal(token);
+        let mut hasher = Sha256::new();
+        // Length-prefixed so a principal ending in the message's leading bytes
+        // cannot be re-split into a different (principal, message) pair.
+        hasher.update((principal.len() as u64).to_be_bytes());
+        hasher.update(principal.as_bytes());
+        hasher.update(signing_message.as_bytes());
+        hasher.finalize().to_vec()
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn verify_caller_signature(
         &self,
@@ -386,7 +494,8 @@ where
         timestamp: Option<u64>,
         request_body: Option<&[u8]>,
     ) -> Result<(), StateNodeError> {
-        // JWT tokens: verify JWT signature + request proof-of-possession.
+        // JWT tokens: the token itself is a signed capability — verify the
+        // owner's signature before trusting any of its claims.
         if token.as_str().contains('.') {
             auth_service
                 .verify_jwt_signature(token)
@@ -397,55 +506,22 @@ where
                         e
                     ))
                 })?;
-
-            let parsed = InfraAuthToken::from_jwt(token.as_str()).map_err(|e| {
-                StateNodeError::AuthenticationFailed(format!(
-                    "Failed to parse JWT for request signature verification: {}",
-                    e
-                ))
-            })?;
-
-            let pop_message = format!(
-                "{}:{}:{}",
-                parsed.payload.iss, parsed.payload.aud, parsed.payload.jti
-            );
-            auth_service
-                .verify_request_signature(token, signature, &pop_message, timestamp)
-                .await
-                .map_err(|e| {
-                    StateNodeError::AuthenticationFailed(format!(
-                        "JWT request signature verification failed: {}",
-                        e
-                    ))
-                })?;
-
-            return Ok(());
         }
 
-        // non-JWT tokens: verify request signature
-        let ts = timestamp.unwrap_or_else(|| {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
-        });
+        // Freshness is part of the signed message. Falling back to the server
+        // clock would let a caller omit the timestamp and bypass the max-age
+        // check entirely, so a missing timestamp is an authentication error.
+        let ts = timestamp.ok_or_else(|| {
+            StateNodeError::AuthenticationFailed(
+                "X-Request-Timestamp is required for request signature verification".to_string(),
+            )
+        })?;
 
-        let message = if let Some(body) = request_body {
-            // Body-based signing: hex(sha256(body + timestamp_be_bytes))
-            use sha2::{Digest, Sha256};
-            let mut hasher = Sha256::new();
-            hasher.update(body);
-            hasher.update(ts.to_be_bytes());
-            hex::encode(hasher.finalize())
-        } else {
-            // Metadata-based signing: {operation}:{resource}:{timestamp}
-            let metadata = RequestMetadata {
-                timestamp: ts,
-                operation: operation.to_string(),
-                resource: resource.to_string(),
-            };
-            metadata.signing_message()
-        };
+        // 署名対象は body の有無・トークン種別によらず同一構造で、
+        // operation と resource に必ず束縛される。body がある場合はその digest も
+        // 含める。これがないと、ある content 向けに取得した update の
+        // body+署名を別 content や create へ転用できてしまう。
+        let message = Self::build_signing_message(operation, resource, ts, request_body);
 
         auth_service
             .verify_request_signature(token, signature, &message, timestamp)
@@ -456,6 +532,169 @@ where
                     e
                 ))
             })
+    }
+
+    /// Verify a signature for a **mutation**, and consume it so the same signed
+    /// request cannot be applied twice.
+    ///
+    /// The freshness check inside signature verification only bounds how long a
+    /// captured signature stays usable — within that window it can be presented
+    /// any number of times. Reads tolerate that, but `update`, `delete`,
+    /// `invalidate` and `manage` are not idempotent, so a replay is not a
+    /// duplicate: it is a state rollback. Replaying a signed update of old
+    /// ciphertext after a legitimate update commits the old bytes as a *new*
+    /// version whose parent is the current head, so the stale content becomes
+    /// the latest version.
+    ///
+    /// The request identity comes from the **signed message and the canonical
+    /// signer identity**, never from signature bytes of any kind — see
+    /// [`Self::mutation_request_id`]. The message already commits to operation,
+    /// resource, timestamp and body digest, so no new field has to be added to
+    /// the wire format to carry a nonce, and no re-encoding of either the
+    /// request signature or the token's own signature can masquerade as a
+    /// second request.
+    ///
+    /// Consumption happens after verification (an invalid signature must not be
+    /// able to burn a legitimate request's identity) and before any state is
+    /// committed.
+    #[allow(clippy::too_many_arguments)]
+    async fn verify_and_consume_mutation_signature(
+        &self,
+        auth_service: &dyn AuthenticationService,
+        token: &AuthToken,
+        signature: &[u8],
+        operation: &str,
+        resource: &str,
+        timestamp: Option<u64>,
+        request_body: Option<&[u8]>,
+    ) -> Result<(), StateNodeError> {
+        self.verify_caller_signature(
+            auth_service,
+            token,
+            signature,
+            operation,
+            resource,
+            timestamp,
+            request_body,
+        )
+        .await?;
+
+        // Freshness already established that `timestamp` is present.
+        let ts = timestamp.ok_or_else(|| {
+            StateNodeError::AuthenticationFailed(
+                "X-Request-Timestamp is required for request signature verification".to_string(),
+            )
+        })?;
+        let signing_message = Self::build_signing_message(operation, resource, ts, request_body);
+        let request_id = Self::mutation_request_id(token, &signing_message);
+
+        // Retention is measured on *our* clock, not the caller's. Using the
+        // signed timestamp would let a caller inside the allowed skew present a
+        // future-dated request to evict entries that are still live, then
+        // re-present an older signature whose record had just been dropped.
+        let first_time = self
+            .consumed_requests
+            .record_if_absent(&request_id, current_timestamp())
+            .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
+
+        if !first_time {
+            return Err(StateNodeError::RequestAlreadyApplied(format!(
+                "this signed {operation} request for {resource} has already been applied. \
+                 Mutations are single-use: re-sign the request with a fresh timestamp instead \
+                 of resending the previous signature."
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Consume a mutation signature on the **relay** path.
+    ///
+    /// A relay holds no access policy, so it forwards the caller's credentials
+    /// to a member and lets the member decide. That means the member is the only
+    /// one that consumes the signature — and a caller who keeps re-sending to the
+    /// relay gets the request applied again every time the relay happens to pick
+    /// a member that has not seen it yet. The replay the consumption record is
+    /// supposed to stop therefore still succeeds through a relay.
+    ///
+    /// So the relay records the signature too, and refuses to forward one it has
+    /// already forwarded. This is not a substitute for the member-side check
+    /// (a caller can always talk to a different relay); it closes the specific
+    /// hole where the *same* relay launders the *same* signature repeatedly.
+    ///
+    /// **The signature is verified before anything is recorded.** The relay can
+    /// do this without a policy: `verify_caller_signature` is purely
+    /// cryptographic — the token's own signature, then the request signature
+    /// against the key the token designates. Only *authorization* needs the
+    /// policy, and that stays with the member.
+    ///
+    /// Verifying first is load-bearing, not defence in depth. The request id is
+    /// derived from the signed message and the principal — operation, resource,
+    /// timestamp, body digest, `aud` — every part of which is public. Recording
+    /// it before verification would let anyone burn a legitimate caller's id
+    /// with a garbage signature: send a `delete` for their content stamped with
+    /// the current second (no body, so the message is fully predictable) and
+    /// their real request comes back `RequestAlreadyApplied`. Repeat each second
+    /// and the target can never mutate anything through this relay.
+    ///
+    /// An earlier revision recorded first and argued the cost was bounded
+    /// because the id was "a digest the attacker already has". That was true
+    /// while the id *was* the signature digest; it stopped being true when the
+    /// id moved to the signed message, and this is the correction.
+    async fn consume_relayed_mutation_signature(
+        &self,
+        token: &AuthToken,
+        signature: &[u8],
+        operation: &str,
+        resource: &str,
+        timestamp: Option<u64>,
+        request_body: Option<&[u8]>,
+    ) -> Result<(), StateNodeError> {
+        let auth_service = self.auth_service.as_ref().ok_or_else(|| {
+            StateNodeError::AuthenticationFailed(
+                "Authentication service is not configured".to_string(),
+            )
+        })?;
+
+        // Cryptographic verification only — authorization is the member's job.
+        // A forged or replayed-with-a-bad-signature request must not be able to
+        // reach the store at all.
+        self.verify_caller_signature(
+            auth_service.as_ref(),
+            token,
+            signature,
+            operation,
+            resource,
+            timestamp,
+            request_body,
+        )
+        .await?;
+
+        // Same identity the verifying member will derive, so a request consumed
+        // here is the same request there. Derived from the signed message, never
+        // from the signature bytes — see `mutation_request_id`.
+        let ts = timestamp.ok_or_else(|| {
+            StateNodeError::AuthenticationFailed(
+                "X-Request-Timestamp is required for request signature verification".to_string(),
+            )
+        })?;
+        let signing_message = Self::build_signing_message(operation, resource, ts, request_body);
+        let request_id = Self::mutation_request_id(token, &signing_message);
+
+        let first_time = self
+            .consumed_requests
+            .record_if_absent(&request_id, current_timestamp())
+            .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
+
+        if !first_time {
+            return Err(StateNodeError::RequestAlreadyApplied(format!(
+                "this signed {operation} request for {resource} was already relayed by this node. \
+                 Mutations are single-use: re-sign the request with a fresh timestamp instead \
+                 of resending the previous signature."
+            )));
+        }
+
+        Ok(())
     }
 
     /// Get the local node ID.
@@ -741,19 +980,22 @@ where
             .await?;
 
         let content_id_vo = ContentId::new(content_id.to_string())?;
+        // Return the whole crsl-lib Node (CBOR), not just the payload, so the
+        // client can recompute the CID and verify the response was not
+        // tampered with (docs/design.md §10「read応答の完全性検証」).
         match version {
             Some(v) => {
-                let data = self
+                let node_bytes = self
                     .crdt_repo
-                    .get_version(content_id, v)
+                    .get_version_node_bytes(content_id, v)
                     .await
                     .map_err(|e| StateNodeError::StorageError(e.to_string()))?
                     .ok_or(StateNodeError::ContentNotFound(content_id_vo))?;
-                Ok((data, v.to_string()))
+                Ok((node_bytes, v.to_string()))
             }
             None => self
                 .crdt_repo
-                .get_latest_with_version(content_id)
+                .get_latest_node_bytes_with_version(content_id)
                 .await
                 .map_err(|e| StateNodeError::StorageError(e.to_string()))?
                 .ok_or(StateNodeError::ContentNotFound(content_id_vo)),
@@ -1022,7 +1264,7 @@ where
             .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))?;
 
         // 1.5. Verify request signature
-        self.verify_caller_signature(
+        self.verify_and_consume_mutation_signature(
             auth_service.as_ref(),
             token,
             request_signature,
@@ -1263,7 +1505,7 @@ where
                 .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))?;
 
             // Verify request signature
-            self.verify_caller_signature(
+            self.verify_and_consume_mutation_signature(
                 auth_service.as_ref(),
                 token,
                 request_signature,
@@ -1329,6 +1571,19 @@ where
             if from_relay {
                 return Err(StateNodeError::ContentNotFound(content_id_vo.clone()));
             }
+
+            // 転送前にこのノードでも署名を消費する。member 側だけで消費すると、
+            // 同じ署名を relay へ送り直すたびに「まだ見ていない member」へ
+            // 振り分けられて再適用できてしまう。
+            self.consume_relayed_mutation_signature(
+                token,
+                request_signature,
+                "delete",
+                content_id,
+                timestamp,
+                None,
+            )
+            .await?;
 
             // Resolve members from our local record, or via DHT discovery when
             // we hold no record (bug #93), then relay with failover.
@@ -1433,7 +1688,7 @@ where
                 .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))?;
 
             // Verify request signature
-            self.verify_caller_signature(
+            self.verify_and_consume_mutation_signature(
                 auth_service.as_ref(),
                 token,
                 request_signature,
@@ -1503,6 +1758,19 @@ where
             if from_relay {
                 return Err(StateNodeError::ContentNotFound(content_id_vo.clone()));
             }
+
+            // 転送前にこのノードでも署名を消費する。member 側だけで消費すると、
+            // 同じ署名を relay へ送り直すたびに「まだ見ていない member」へ
+            // 振り分けられて再適用できてしまう。
+            self.consume_relayed_mutation_signature(
+                token,
+                request_signature,
+                "update",
+                content_id,
+                timestamp,
+                Some(data),
+            )
+            .await?;
 
             // Resolve members from our local record, or via DHT discovery when
             // we hold no record (bug #93), then relay with failover.
@@ -1604,7 +1872,7 @@ where
         let sig = request_signature.ok_or_else(|| {
             StateNodeError::AuthenticationFailed("Request signature is required".to_string())
         })?;
-        self.verify_caller_signature(
+        self.verify_and_consume_mutation_signature(
             auth_service.as_ref(),
             token,
             sig,
@@ -1725,6 +1993,11 @@ where
                 return Err(StateNodeError::ContentNotFound(content_id_vo.clone()));
             }
 
+            // NOTE: invalidate は local / relay の分岐より前に
+            // `verify_and_consume_mutation_signature` を通しているので、
+            // ここで改めて消費する必要はない(するとこのノード自身の
+            // 1 回目の転送が 409 になる)。
+            //
             // Resolve members from our local record, or via DHT discovery when
             // we hold no record (bug #93), then relay with failover.
             let members = self.resolve_members(content_id).await?;
@@ -1803,15 +2076,18 @@ where
             .await
             .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))?;
 
-        // Verify request signature
-        self.verify_caller_signature(
+        // Verify request signature. `count` comes from the HTTP body and
+        // decides how many members get added, so it is signed too — see
+        // `add_members_signing_body` for why the canonical encoding is used
+        // instead of the raw JSON bytes.
+        self.verify_and_consume_mutation_signature(
             auth_service.as_ref(),
             token,
             request_signature,
             "manage",
             content_id,
             timestamp,
-            None,
+            Some(&crate::port::auth_token::add_members_signing_body(count)),
         )
         .await?;
 
@@ -1981,8 +2257,19 @@ where
             })?;
 
         // 3. Identify low-capacity nodes
+        //
+        // A node counts as low-capacity only when it actually *told* us it is
+        // low. An absent entry means the capacity query did not come back —
+        // the peer may be restarting, or unreachable — and that is not the
+        // same as having no space. Treating the two alike is dangerous in both
+        // directions: it under-counts healthy members (triggering pointless
+        // member additions), and it feeds `low_capacity_nodes`, which is used
+        // below to *remove members*. During a network partition that would
+        // evict perfectly good replicas for being unreachable, which is
+        // exactly when we can least afford to lose them.
         let mut low_capacity_nodes: Vec<String> = Vec::new();
         let mut healthy_count = 0usize;
+        let mut unreachable_count = 0usize;
 
         for node_id in &member_list {
             // We are healthy from our own perspective (see above) — never flag
@@ -1991,18 +2278,35 @@ where
                 healthy_count += 1;
                 continue;
             }
-            let available = capacities.get(node_id).cloned().unwrap_or(0);
-            if available < self.capacity_threshold_bytes {
-                low_capacity_nodes.push(node_id.clone());
-                tracing::info!(
-                    "Node {} has low capacity ({} bytes < {} threshold)",
-                    node_id,
-                    available,
-                    self.capacity_threshold_bytes
-                );
-            } else {
-                healthy_count += 1;
+            match capacities.get(node_id) {
+                Some(&available) if available < self.capacity_threshold_bytes => {
+                    low_capacity_nodes.push(node_id.clone());
+                    tracing::info!(
+                        "Node {} has low capacity ({} bytes < {} threshold)",
+                        node_id,
+                        available,
+                        self.capacity_threshold_bytes
+                    );
+                }
+                Some(_) => healthy_count += 1,
+                None => {
+                    // Unknown, not empty. Not counted as healthy (we cannot
+                    // vouch for a replica we cannot reach) but never removed.
+                    unreachable_count += 1;
+                    tracing::debug!(
+                        "No capacity response from {} — treating as unknown, not as low capacity",
+                        node_id
+                    );
+                }
             }
+        }
+
+        if unreachable_count > 0 {
+            tracing::info!(
+                "Content {}: {} member(s) did not answer the capacity query",
+                content_id,
+                unreachable_count
+            );
         }
 
         // 4. Add new members if needed
@@ -2628,17 +2932,26 @@ where
             .map_err(|_| AccessControlError::NotAuthorized)?;
 
         // Verify request signature
-        self.verify_caller_signature(
+        self.verify_and_consume_mutation_signature(
             auth_service.as_ref(),
             token,
             request_signature,
             "revoke",
             &update.content_id,
             timestamp,
-            None,
+            // `new_min_valid_issued_at` decides *which* tokens get revoked, so
+            // it has to be inside the signature — same reason `add-members`
+            // signs its `count`. `signing_message()` is the canonical encoding
+            // the owner already signs, so reusing it keeps one definition.
+            Some(&update.signing_message()),
         )
         .await
-        .map_err(|_| AccessControlError::InvalidSignature)?;
+        // 再送の拒否は偽造の拒否と区別する。潰してしまうと、運用者は
+        // 「攻撃された」のか「正規リクエストが二重に届いた」のか判断できない。
+        .map_err(|e| match e {
+            StateNodeError::RequestAlreadyApplied(_) => AccessControlError::AlreadyApplied,
+            _ => AccessControlError::InvalidSignature,
+        })?;
 
         let content_id_vo = ContentId::new(update.content_id.clone())
             .map_err(|_| AccessControlError::NotAuthorized)?;
@@ -2774,6 +3087,17 @@ mod tests {
         vec![0x01]
     }
 
+    /// timestamp は署名検証で構造的に必須(issue #61)。mock 認証でも
+    /// 存在チェックは実コードを通るため、現在時刻を渡す。
+    fn test_timestamp() -> Option<u64> {
+        Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+    }
+
     type TestService = StateNodeService<
         MockNodeRegistry,
         MockContentNetworkRepository,
@@ -2875,6 +3199,32 @@ mod tests {
         }
     }
 
+    /// timestamp が無いリクエストは署名検証に到達する前に拒否される
+    /// (issue #61: freshness は署名内 timestamp が担うため、欠如は
+    /// サーバ時刻へのフォールバックではなく認証エラー)。
+    #[tokio::test]
+    async fn test_create_content_requires_timestamp() {
+        let mut capacities = HashMap::new();
+        capacities.insert("peer-1".to_string(), 500);
+        let service = create_service_with_peers("node-1", vec!["peer-1".to_string()], capacities);
+
+        let result = service
+            .create_content(
+                b"test data",
+                Some(&test_token()),
+                Some(&test_request_signature()),
+                None,
+            )
+            .await;
+
+        match result {
+            Err(StateNodeError::AuthenticationFailed(msg)) => {
+                assert!(msg.contains("X-Request-Timestamp"), "msg={msg}");
+            }
+            other => panic!("expected AuthenticationFailed, got: {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn test_create_content_with_peers() {
         let mut capacities = HashMap::new();
@@ -2897,7 +3247,7 @@ mod tests {
                 b"test data",
                 Some(&test_token()),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
             )
             .await
             .unwrap();
@@ -2943,7 +3293,7 @@ mod tests {
                 b"test data",
                 Some(&test_token()),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
             )
             .await
             .unwrap();
@@ -2980,7 +3330,7 @@ mod tests {
                 b"test data",
                 Some(&test_token()),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
             )
             .await;
 
@@ -3000,7 +3350,7 @@ mod tests {
                 b"test data",
                 Some(&test_token()),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
             )
             .await;
 
@@ -3046,7 +3396,7 @@ mod tests {
                 b"new data",
                 Some(&test_token()),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
             )
             .await
             .unwrap();
@@ -3093,7 +3443,7 @@ mod tests {
                 b"new data",
                 Some(&test_token()),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
             )
             .await;
 
@@ -3126,7 +3476,7 @@ mod tests {
                 b"data",
                 Some(&test_token()),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
             )
             .await;
 
@@ -3153,7 +3503,7 @@ mod tests {
                 b"data",
                 Some(&test_token()),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
             )
             .await;
 
@@ -3185,7 +3535,7 @@ mod tests {
                 "content-1",
                 Some(&test_token()),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
             )
             .await;
 
@@ -3220,7 +3570,7 @@ mod tests {
                 b"data",
                 Some(&test_token()),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
             )
             .await;
 
@@ -3264,7 +3614,7 @@ mod tests {
                 None,
                 &test_token(),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
             )
             .await;
         assert!(matches!(result, Err(StateNodeError::ContentNotFound(_))));
@@ -3299,7 +3649,7 @@ mod tests {
                 None,
                 &test_token(),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
             )
             .await
             .expect("relayed read should succeed");
@@ -3340,7 +3690,7 @@ mod tests {
                 None,
                 &test_token(),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
             )
             .await;
         assert!(matches!(
@@ -3467,6 +3817,302 @@ mod tests {
         }
     }
 
+    /// 署名を検証しない認証サービス以外は全部通す mock。
+    /// `bad` と完全一致する署名だけを拒否する。
+    struct RejectsOneSignature {
+        bad: Vec<u8>,
+    }
+
+    #[async_trait::async_trait]
+    impl AuthenticationService for RejectsOneSignature {
+        async fn authenticate(
+            &self,
+            token: &AuthToken,
+            _context: Option<&crate::port::auth_token::AuthContext>,
+        ) -> Result<Identity> {
+            Identity::user(token.as_str().to_string()).map_err(|e| anyhow::anyhow!(e.to_string()))
+        }
+
+        async fn is_valid(&self, token: &AuthToken) -> Result<bool> {
+            Ok(!token.is_empty())
+        }
+
+        async fn verify_request_signature(
+            &self,
+            _token: &AuthToken,
+            signature: &[u8],
+            _message: &str,
+            _timestamp: Option<u64>,
+        ) -> Result<()> {
+            if signature == self.bad.as_slice() {
+                anyhow::bail!("invalid signature");
+            }
+            Ok(())
+        }
+
+        async fn verify_jwt_signature(&self, _token: &AuthToken) -> Result<()> {
+            Ok(())
+        }
+
+        async fn get_issuer(&self, token: &AuthToken) -> Result<Option<Identity>> {
+            Ok(Some(
+                Identity::user(token.as_str().to_string())
+                    .map_err(|e| anyhow::anyhow!(e.to_string()))?,
+            ))
+        }
+    }
+
+    /// relay は**署名を検証してから**消費記録を書く。
+    ///
+    /// request id は署名対象メッセージと principal から導かれ、その構成要素
+    /// (操作・リソース・timestamp・body digest・`aud`)は**すべて公開情報**である。
+    /// 検証前に記録すると、鍵も有効な署名も持たない第三者が、対象ユーザーの
+    /// 正規リクエストの id をゴミ署名で先に焼き潰せてしまう —
+    /// body の無い `delete` は現在秒を入れるだけでメッセージが完全に予測でき、
+    /// 毎秒繰り返せばそのユーザーはこの relay 経由で何も更新できなくなる。
+    #[tokio::test]
+    async fn an_invalid_signature_cannot_burn_a_legitimate_request_id() {
+        let token = AuthToken::new("user:04aaaa".to_string());
+        let forged: Vec<u8> = vec![0xDE, 0xAD, 0xBE, 0xEF];
+        let genuine: Vec<u8> = vec![0x01, 0x02, 0x03];
+
+        let service: TestService = StateNodeService::new(
+            MockNodeRegistry::new(),
+            Arc::new(RwLock::new(MockContentNetworkRepository::new())),
+            Arc::new(MockPeerNetwork::new().with_local_peer_id("node-1")),
+            MockEventPublisher::new(),
+            Arc::new(MockContentRepository::new()),
+            "node-1".to_string(),
+        )
+        .with_authentication_service(RejectsOneSignature {
+            bad: forged.clone(),
+        })
+        .with_authorization_service(AllowAllAuthorizationService);
+
+        // 攻撃者が、被害者の principal・対象 content・現在秒で `delete` を
+        // 先回りして送る。署名は持っていないので出鱈目。
+        let attack = service
+            .consume_relayed_mutation_signature(
+                &token,
+                &forged,
+                "delete",
+                "content-1",
+                Some(1_700_000_000),
+                None,
+            )
+            .await;
+        assert!(attack.is_err(), "無効な署名は拒否されなければならない");
+
+        // 同じ principal・同じメッセージの正規リクエストが、まだ通ること。
+        // ここが Err になるなら記録が先に書かれている＝ DoS が成立している。
+        service
+            .consume_relayed_mutation_signature(
+                &token,
+                &genuine,
+                "delete",
+                "content-1",
+                Some(1_700_000_000),
+                None,
+            )
+            .await
+            .expect("正規リクエストが先取りで潰されてはならない");
+
+        // 使い切りそのものは維持されている(2 度目は拒否)。
+        let replay = service
+            .consume_relayed_mutation_signature(
+                &token,
+                &genuine,
+                "delete",
+                "content-1",
+                Some(1_700_000_000),
+                None,
+            )
+            .await;
+        assert!(
+            matches!(replay, Err(StateNodeError::RequestAlreadyApplied(_))),
+            "同じ署名済みリクエストの 2 度目は拒否されなければならない"
+        );
+    }
+
+    /// 委譲 JWT **自身の署名**も malleable である。生のトークン文字列を ID の
+    /// 入力にすると、claims も `aud` も request signature も変えずに `s` を
+    /// 反転するだけで別 ID を作れてしまい、同一ノードでも再適用できる。
+    ///
+    /// ID は検証後の canonical principal(`aud` の鍵 ID)から導くので、
+    /// JWT のバイト列が変わっても ID は動かない。
+    #[test]
+    fn mutation_request_id_ignores_the_jwt_signature_encoding() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+        use p256::ecdsa::{signature::Signer, Signature, SigningKey};
+
+        // 実物と同じ形の JWT を組み立てる(header.payload を P-256 で署名)。
+        let key = SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
+        let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"ES256","typ":"JWT","ver":"1.0"}"#);
+        let payload = URL_SAFE_NO_PAD.encode(
+            br#"{"iss":"monas:user:alice","aud":"monas:user:bob","jti":"j1","iat":1700000000,"exp":1700003600,"att":[]}"#,
+        );
+        let signing_input = format!("{}.{}", header, payload);
+        let sig: Signature = key.sign(signing_input.as_bytes());
+
+        // 同じ鍵・同じメッセージに対して有効な、もう一方の表現。
+        let alt = Signature::from_scalars(*sig.r(), -*sig.s()).unwrap();
+
+        let jwt_a = format!("{}.{}", signing_input, URL_SAFE_NO_PAD.encode(sig.to_vec()));
+        let jwt_b = format!("{}.{}", signing_input, URL_SAFE_NO_PAD.encode(alt.to_vec()));
+        assert_ne!(
+            jwt_a, jwt_b,
+            "2 つの表現が同じでは、このテストは何も証明しない"
+        );
+        // 実際に JWT として解釈できることを確かめる。ここが失敗すると
+        // `canonical_principal` が raw フォールバックに落ち、両者が別 ID に
+        // なるのを「malleability を防げていない」と誤読してしまう。
+        assert!(
+            crate::infrastructure::auth::auth_token::AuthToken::from_jwt(&jwt_a).is_ok(),
+            "テスト用 JWT が本物のスキーマを満たしていない"
+        );
+
+        let msg = StateNodeService::<
+            MockNodeRegistry,
+            MockContentNetworkRepository,
+            MockPeerNetwork,
+            MockEventPublisher,
+            MockContentRepository,
+        >::build_signing_message(
+            "update", "content-1", 1_700_000_000, Some(b"payload")
+        );
+
+        let id_of = |t: &str| {
+            StateNodeService::<
+                MockNodeRegistry,
+                MockContentNetworkRepository,
+                MockPeerNetwork,
+                MockEventPublisher,
+                MockContentRepository,
+            >::mutation_request_id(&AuthToken::new(t.to_string()), &msg)
+        };
+
+        assert_eq!(
+            id_of(&jwt_a),
+            id_of(&jwt_b),
+            "JWT の署名表現を変えても同じリクエストとして識別されなければならない"
+        );
+
+        // 別の aud(＝別の principal)なら当然 ID は変わる。
+        let other_payload = URL_SAFE_NO_PAD.encode(
+            br#"{"iss":"monas:user:alice","aud":"monas:user:carol","jti":"j1","iat":1700000000,"exp":1700003600,"att":[]}"#,
+        );
+        let other_input = format!("{}.{}", header, other_payload);
+        let other_sig: Signature = key.sign(other_input.as_bytes());
+        let jwt_c = format!(
+            "{}.{}",
+            other_input,
+            URL_SAFE_NO_PAD.encode(other_sig.to_vec())
+        );
+        assert_ne!(
+            id_of(&jwt_a),
+            id_of(&jwt_c),
+            "aud が違えば別 principal なので ID も別でなければならない"
+        );
+    }
+
+    /// mutation の同一性は「署名バイト列」ではなく「署名対象メッセージ + signer」
+    /// から導く。ECDSA は malleable なので、署名の digest を ID にすると、
+    /// 1 つの承認済みリクエストが 2 つの ID を持ってしまい、`s` を反転した
+    /// 署名を送り直すだけで消費記録をすり抜けて再適用できてしまう。
+    #[test]
+    fn mutation_request_id_ignores_the_signature_encoding() {
+        let token = AuthToken::new("user:04aaaa".to_string());
+        let msg = StateNodeService::<
+            MockNodeRegistry,
+            MockContentNetworkRepository,
+            MockPeerNetwork,
+            MockEventPublisher,
+            MockContentRepository,
+        >::build_signing_message(
+            "update", "content-1", 1_700_000_000, Some(b"payload")
+        );
+
+        let id_of = |t: &AuthToken, m: &str| {
+            StateNodeService::<
+                MockNodeRegistry,
+                MockContentNetworkRepository,
+                MockPeerNetwork,
+                MockEventPublisher,
+                MockContentRepository,
+            >::mutation_request_id(t, m)
+        };
+
+        // 同じ (token, message) は常に同じ ID。署名は一切入力に含まれないので、
+        // その表現がどうであれ ID は動かない。
+        assert_eq!(id_of(&token, &msg), id_of(&token, &msg));
+
+        // 署名対象が 1 ビットでも違えば別 ID
+        for other in [
+            StateNodeService::<
+                MockNodeRegistry,
+                MockContentNetworkRepository,
+                MockPeerNetwork,
+                MockEventPublisher,
+                MockContentRepository,
+            >::build_signing_message(
+                "update", "content-2", 1_700_000_000, Some(b"payload")
+            ),
+            StateNodeService::<
+                MockNodeRegistry,
+                MockContentNetworkRepository,
+                MockPeerNetwork,
+                MockEventPublisher,
+                MockContentRepository,
+            >::build_signing_message(
+                "delete", "content-1", 1_700_000_000, Some(b"payload")
+            ),
+            StateNodeService::<
+                MockNodeRegistry,
+                MockContentNetworkRepository,
+                MockPeerNetwork,
+                MockEventPublisher,
+                MockContentRepository,
+            >::build_signing_message(
+                "update", "content-1", 1_700_000_001, Some(b"payload")
+            ),
+            StateNodeService::<
+                MockNodeRegistry,
+                MockContentNetworkRepository,
+                MockPeerNetwork,
+                MockEventPublisher,
+                MockContentRepository,
+            >::build_signing_message(
+                "update", "content-1", 1_700_000_000, Some(b"tampered")
+            ),
+        ] {
+            assert_ne!(id_of(&token, &msg), id_of(&token, &other));
+        }
+
+        // 別の caller は別 ID。同じにすると、一方が他方のリクエストを
+        // 先に消費してしまう。
+        let other_token = AuthToken::new("user:04bbbb".to_string());
+        assert_ne!(id_of(&token, &msg), id_of(&other_token, &msg));
+    }
+
+    /// token と message の境界が曖昧だと、片方の末尾ともう片方の先頭を
+    /// 付け替えた別の組み合わせが同じ ID になり得る。長さ前置でそれを防ぐ。
+    #[test]
+    fn mutation_request_id_separates_token_from_message() {
+        let id_of = |t: &str, m: &str| {
+            StateNodeService::<
+                MockNodeRegistry,
+                MockContentNetworkRepository,
+                MockPeerNetwork,
+                MockEventPublisher,
+                MockContentRepository,
+            >::mutation_request_id(&AuthToken::new(t.to_string()), m)
+        };
+        assert_ne!(
+            id_of("user:04ab", "cd-message"),
+            id_of("user:04", "abcd-message")
+        );
+    }
+
     #[tokio::test]
     async fn test_authorize_read_allows_owner() {
         let service = create_test_service("node-1");
@@ -3486,7 +4132,7 @@ mod tests {
             .authorize_read(
                 &test_token(),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
                 "content-1",
             )
             .await;
@@ -3506,7 +4152,7 @@ mod tests {
             .authorize_read(
                 &test_token(),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
                 "content-1",
             )
             .await;
@@ -3548,7 +4194,7 @@ mod tests {
             .authorize_read(
                 &test_token(),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
                 "content-genesis-only",
             )
             .await;
@@ -3637,10 +4283,26 @@ mod tests {
             .expect("authentication should succeed");
 
         let captured = messages.lock().unwrap();
+        assert_eq!(captured.len(), 1, "exactly one signature check expected");
+        let message = &captured[0];
+
+        // 署名対象は domain-separated かつ operation / resource / timestamp に
+        // 束縛される。content id が入っていないと、ある content 向けの署名を
+        // 別 content の read に再利用できてしまう。
         assert_eq!(
-            captured.as_slice(),
-            ["read:content-abc:1234"],
-            "read signature message must include the content id"
+            message,
+            &RequestMetadata {
+                timestamp: 1234,
+                operation: "read".to_string(),
+                resource: "content-abc".to_string(),
+            }
+            .signing_message(),
+            "read signature message must bind operation, content id and timestamp"
+        );
+        assert!(message.contains("content-abc"), "message={message}");
+        assert!(
+            message.starts_with("monas-request-v1:"),
+            "message={message}"
         );
     }
 
@@ -3692,7 +4354,7 @@ mod tests {
             .authorize_read(
                 &test_token(),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
                 "content-1",
             )
             .await;
@@ -3713,7 +4375,7 @@ mod tests {
             .authorize_read(
                 &test_token(),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
                 "content-1",
             )
             .await;
@@ -3730,7 +4392,7 @@ mod tests {
                 None,
                 &test_token(),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
             )
             .await;
         assert!(result.is_err());
@@ -4290,7 +4952,7 @@ mod tests {
                 b"new data",
                 Some(&test_token()),
                 Some(&test_request_signature()),
-                None,
+                test_timestamp(),
             )
             .await;
 
@@ -4404,5 +5066,85 @@ mod tests {
 
         let result = service.get_node("nonexistent").await.unwrap();
         assert!(result.is_none());
+    }
+
+    /// Build a 4-member network on `local` and run the redundancy check with
+    /// the given capacity responses. Returns the members left afterwards.
+    async fn members_after_redundancy_check(
+        local: &str,
+        capacities: HashMap<String, u64>,
+    ) -> Vec<String> {
+        // No spare peers to promote: this isolates removal behaviour, which is
+        // what the capacity verdict actually drives.
+        let service = create_service_with_peers(local, vec![], capacities);
+
+        let members: Vec<String> = ["node-1", "node-2", "node-3", "node-4"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let event = Event::ContentNetworkManagerAdded {
+            content_id: "content-1".to_string(),
+            added_node_id: "node-4".to_string(),
+            member_nodes: members,
+            timestamp: 12345,
+        };
+        service.handle_sync_event(&event, None).await.unwrap();
+
+        service
+            .check_and_maintain_redundancy("content-1")
+            .await
+            .unwrap();
+
+        let network = service
+            .get_content_network_for_test("content-1")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut left = network.member_nodes_as_strings();
+        left.sort();
+        left
+    }
+
+    /// A member that does not answer the capacity query is unknown, not empty.
+    ///
+    /// Regression guard: the verdict used to be
+    /// `capacities.get(id).unwrap_or(0)`, so an unanswered query read as
+    /// "0 bytes available" and put the peer on the removal list. During a
+    /// partition that evicts healthy replicas precisely when they are hardest
+    /// to replace — and it also produced the misleading
+    /// "has low capacity (0 bytes)" line that sent us chasing a disk-space
+    /// problem that did not exist.
+    #[tokio::test]
+    async fn unreachable_member_is_not_treated_as_low_capacity() {
+        let mut capacities = HashMap::new();
+        // node-2 answers with plenty of room; node-3 and node-4 stay silent.
+        capacities.insert("node-2".to_string(), 100 * 1024 * 1024 * 1024);
+
+        let left = members_after_redundancy_check("node-1", capacities).await;
+
+        assert_eq!(
+            left,
+            vec!["node-1", "node-2", "node-3", "node-4"],
+            "silent members must be kept: no response is not the same as no space"
+        );
+    }
+
+    /// The flip side: a node that genuinely reports low capacity is still
+    /// removed, so the fix above did not just disable the feature.
+    #[tokio::test]
+    async fn member_reporting_low_capacity_is_still_removed() {
+        let plenty = 100 * 1024 * 1024 * 1024;
+        let mut capacities = HashMap::new();
+        capacities.insert("node-2".to_string(), plenty);
+        capacities.insert("node-3".to_string(), plenty);
+        // Explicitly reports almost nothing left.
+        capacities.insert("node-4".to_string(), 1);
+
+        let left = members_after_redundancy_check("node-1", capacities).await;
+
+        assert!(
+            !left.contains(&"node-4".to_string()),
+            "a member that reports low capacity should be removed, got {left:?}"
+        );
     }
 }

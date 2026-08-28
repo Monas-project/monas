@@ -254,11 +254,25 @@ async fn verify_integrity_returns_api_error_when_version_cannot_be_fetched() {
 async fn verify_integrity_keeps_false_only_for_actual_content_mismatch() {
     let _guard = acquire_test_lock();
     let mut server = Server::new_async().await;
+
+    // State Node は Node CBOR を返す。CID 検証は通し、payload("world")と
+    // 引数の content("hello")の不一致だけで valid=false になることを確認する。
+    let node_bytes = support::node_mirror::make_node_bytes(b"world", vec![], None);
+    let version_cid =
+        monas_content::infrastructure::node_verification::recompute_node_cid(&node_bytes).unwrap();
+    let body = serde_json::json!({
+        "content_id": "test-content",
+        "data": base64::engine::general_purpose::STANDARD.encode(&node_bytes),
+        "version": version_cid,
+    });
     let version_mock = server
-        .mock("GET", "/content/test-content/version/v1")
+        .mock(
+            "GET",
+            format!("/content/test-content/version/{version_cid}").as_str(),
+        )
         .with_status(200)
         .with_header("content-type", "application/json")
-        .with_body(r#"{"content_id":"test-content","data":"d29ybGQ=","version":"v1"}"#)
+        .with_body(body.to_string())
         .create_async()
         .await;
 
@@ -267,7 +281,7 @@ async fn verify_integrity_keeps_false_only_for_actual_content_mismatch() {
         VerifyIntegrityInput {
             content_id: "test-content".into(),
             content: URL_SAFE_NO_PAD.encode(b"hello"),
-            expected_version: Some("v1".into()),
+            expected_version: Some(version_cid.clone()),
             local_content_id: None,
         },
         None,
@@ -286,6 +300,71 @@ async fn verify_integrity_keeps_false_only_for_actual_content_mismatch() {
             .as_deref()
             .is_some_and(|reason| reason.contains("content mismatch")),
         "reason should explain mismatch"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn verify_integrity_rejects_forged_node_with_self_reported_version() {
+    let _guard = acquire_test_lock();
+    let mut server = Server::new_async().await;
+
+    // 攻撃シナリオ: クライアントは version V の検証を要求しているのに、
+    // state node(攻撃者)は「クライアントの content と一致する偽 Node」と
+    // その偽 Node 自身の CID を version フィールドに詰めて返す。
+    // 応答内の自己申告 version に対して CID 照合すると必ず通ってしまうため、
+    // 照合はクライアントが選択した version に束縛されなければならない。
+    let real_node_bytes = support::node_mirror::make_node_bytes(b"secret-original", vec![], None);
+    let real_version =
+        monas_content::infrastructure::node_verification::recompute_node_cid(&real_node_bytes)
+            .unwrap();
+
+    let forged_node_bytes = support::node_mirror::make_node_bytes(b"hello", vec![], None);
+    let forged_cid =
+        monas_content::infrastructure::node_verification::recompute_node_cid(&forged_node_bytes)
+            .unwrap();
+    assert_ne!(real_version, forged_cid);
+
+    let body = serde_json::json!({
+        "content_id": "test-content",
+        "data": base64::engine::general_purpose::STANDARD.encode(&forged_node_bytes),
+        "version": forged_cid,
+    });
+    let version_mock = server
+        .mock(
+            "GET",
+            format!("/content/test-content/version/{real_version}").as_str(),
+        )
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(body.to_string())
+        .create_async()
+        .await;
+
+    let controller = MonasController::with_state_node_url(server.url());
+    let response = controller.verify_integrity(
+        VerifyIntegrityInput {
+            content_id: "test-content".into(),
+            content: URL_SAFE_NO_PAD.encode(b"hello"),
+            expected_version: Some(real_version.clone()),
+            local_content_id: None,
+        },
+        None,
+    );
+
+    assert!(response.success, "verification itself should complete");
+    version_mock.assert();
+    let output = response.data.expect("verify_integrity should return data");
+    assert!(
+        !output.valid,
+        "forged node must fail verification against the client-selected version"
+    );
+    assert!(
+        output
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("CID verification")),
+        "reason should point at CID verification failure: {:?}",
+        output.reason
     );
 }
 

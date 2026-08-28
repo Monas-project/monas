@@ -4,10 +4,13 @@ use base64::{
 };
 use sha2::{Digest, Sha256};
 
-use crate::common::{generate_trace_id, ApiError, ApiResponse, StateNodeAuthContext};
+use crate::common::{
+    encode_base64url, generate_trace_id, ApiError, ApiResponse, StateNodeAuthContext,
+};
 use crate::models::state::{
     GetHistoryInput, GetHistoryOutput, GetLatestVersionInput, GetLatestVersionOutput,
-    VerifyIntegrityInput, VerifyIntegrityOutput,
+    ReadContentFromStateNodeInput, ReadContentFromStateNodeOutput, VerifyIntegrityInput,
+    VerifyIntegrityOutput,
 };
 use crate::models::state_node::{StateNodeContentDataResponse, StateNodeContentHistoryResponse};
 
@@ -222,6 +225,191 @@ impl MonasController {
         )
     }
 
+    /// State Node から content を読み、検証・復号して平文を返す(検証付き read)。
+    ///
+    /// `docs/design.md` §10「read応答の完全性検証」の実 read 経路。処理フロー:
+    /// 1. `read:{content_id}:{timestamp}` 署名の認証コンテキストを解決
+    /// 2. 版を決定(`input.version` 指定があればその版、無ければ履歴の最新)
+    /// 3. Node CBOR を取得し、CID 再計算で改ざん検証
+    /// 4. ローカル cek_store から CEK を引き、AES-GCM 復号 + plain CID 照合
+    ///
+    /// CEK は「自分が作成した content」または「share の KeyEnvelope を処理済みの
+    /// content」(`decrypt_shared_content` が保存する)についてローカルに存在する。
+    ///
+    /// **保証範囲**: 検証できるのは「返された Node の payload が、要求した版 CID に
+    /// 対して真正であること」まで。「その版が本当に最新か」「正規の writer が書いた
+    /// 版か」は保証しない — 版メタデータ(parents 等)に真正性が無く、観測済みの
+    /// 正規暗号文を任意の parents で包み直した Node は CID 検証を通過するため。
+    /// 版の真正性とロールバック耐性には owner 署名等の trust anchor が必要
+    /// (issue #59)。分散システムである以上、sync 遅延による stale read は
+    /// 正常な挙動であり、それと攻撃を応答単体で区別することはできない。
+    pub fn read_content_from_state_node(
+        &self,
+        input: ReadContentFromStateNodeInput,
+        auth: Option<&StateNodeAuthContext>,
+    ) -> ApiResponse<ReadContentFromStateNodeOutput> {
+        let trace_id = generate_trace_id();
+
+        if let Some(response) = Self::validate_state_content_id(&input.content_id, trace_id.clone())
+        {
+            return response;
+        }
+        if input.local_content_id.is_empty() {
+            return ApiResponse::error(
+                ApiError::Validation("local_content_id must not be empty".into()),
+                trace_id,
+            );
+        }
+
+        let auth = match self.resolve_state_read_auth::<ReadContentFromStateNodeOutput>(
+            auth,
+            &input.content_id,
+            &trace_id,
+        ) {
+            Ok(resolved) => resolved,
+            Err(e) => return e,
+        };
+        let auth = auth.as_ref();
+
+        // 版の決定。明示指定が無ければ履歴の最新を読む。
+        // 履歴は署名も系列検証も無いため「どの版を読むか」の選択にしか使えない。
+        // 選ばれた版の payload は下の CID 検証が守るが、その版が最新である
+        // ことは保証されない(上記「保証範囲」を参照)。
+        let version = match input.version.clone() {
+            Some(v) => v,
+            None => {
+                let history = match self.get_state_node_history::<ReadContentFromStateNodeOutput>(
+                    &input.content_id,
+                    auth,
+                    trace_id.clone(),
+                ) {
+                    Ok(h) => h,
+                    Err(e) => return e,
+                };
+                let latest = history
+                    .versions
+                    .last()
+                    .cloned()
+                    .unwrap_or_else(|| input.content_id.clone());
+                latest
+            }
+        };
+
+        // Node CBOR の取得 + CID 検証(A)
+        let state_node_data = match self
+            .get_state_node_version_data::<ReadContentFromStateNodeOutput>(
+                &input.content_id,
+                &version,
+                auth,
+                trace_id.clone(),
+            ) {
+            Ok(d) => d,
+            Err(e) => return e,
+        };
+
+        let node_bytes = match BASE64_STANDARD.decode(&state_node_data.data) {
+            Ok(b) => b,
+            Err(e) => {
+                return ApiResponse::error(
+                    ApiError::Internal(format!("invalid base64 data from state node: {e}")),
+                    trace_id,
+                );
+            }
+        };
+
+        // CID 再計算による改ざん検証 + CEK ロード + AES-GCM 復号 + plain CID 照合
+        //
+        // 検証は `verify_and_decrypt_relay_read` の中で必ず最初に走るので、
+        // ここで先に `verify_and_extract` を呼ぶ必要はない(同じ引数で 2 回
+        // 走らせていた)。検証は content 層の責務として一箇所に置く。
+        //
+        // CEK は「送信者ピンの権威レコード」を優先する。CEK ストアは、その
+        // レコードから導出されるキャッシュに過ぎず、CAS 成功後の書き込み順が
+        // 入れ替わると古い世代へ巻き戻り得る(世代 N の handler が CAS 後に
+        // 停止し、その間に N+1 が権威レコードとキャッシュを進め、その後 N が
+        // 再開してキャッシュだけを N に戻す)。権威レコードから直接引けば、
+        // その巻き戻りは read に影響しない。
+        //
+        // 自分で作成した content には送信者ピンが存在しないので、その場合は
+        // 従来どおりストアを引く。
+        let local_content_id =
+            monas_content::domain::content_id::ContentId::new(input.local_content_id.clone());
+        let pinned_cek = match self.sender_pin_store.load(&input.local_content_id) {
+            Ok(pin) => pin
+                .and_then(|p| p.cek)
+                .map(monas_content::domain::content::ContentEncryptionKey),
+            Err(e) => {
+                return ApiResponse::error(
+                    ApiError::Internal(format!("sender key pin store error: {e}")),
+                    trace_id,
+                );
+            }
+        };
+        let plaintext = match self.content_service.verify_and_decrypt_relay_read(
+            &node_bytes,
+            &version,
+            local_content_id,
+            pinned_cek,
+        ) {
+            Ok(read) => read.plaintext,
+            Err(e) => {
+                return ApiResponse::error(
+                    Self::map_verified_read_error(e, &input.local_content_id),
+                    trace_id,
+                );
+            }
+        };
+
+        ApiResponse::success(
+            ReadContentFromStateNodeOutput {
+                content_id: input.content_id,
+                local_content_id: input.local_content_id,
+                version,
+                content: encode_base64url(&plaintext),
+            },
+            trace_id,
+        )
+    }
+
+    /// `verify_and_decrypt_relay_read` のエラーを、呼び出し側が対処を判断できる
+    /// `ApiError` へ写像する。特に「CEK が無い」「CEK が合わない」は
+    /// share / rotation / revoke のどの状況かをメッセージで区別する。
+    fn map_verified_read_error(
+        e: monas_content::application_service::content_service::VerifiedReadError,
+        local_content_id: &str,
+    ) -> ApiError {
+        use monas_content::application_service::content_service::{
+            DecryptWithCekError, VerifiedReadError,
+        };
+        match e {
+            VerifiedReadError::NodeVerification(err) => ApiError::Internal(format!(
+                "state node response failed CID verification (tampered response?): {err}"
+            )),
+            VerifiedReadError::KeyStore(err) => {
+                ApiError::Internal(format!("CEK store error: {err:?}"))
+            }
+            VerifiedReadError::MissingKey => ApiError::NotFound(format!(
+                "no content encryption key for local content {local_content_id} on this device: \
+                 the content was neither created here nor received via share on this device. \
+                 Process its share KeyEnvelope (POST /share/decrypt) first."
+            )),
+            VerifiedReadError::Decrypt(DecryptWithCekError::Domain(_)) => ApiError::Forbidden(
+                "decryption failed with the locally stored CEK: the key may be stale after a CEK \
+                 rotation, or your access may have been revoked. If you still have access, \
+                 re-process the latest share KeyEnvelope to refresh the stored CEK."
+                    .to_string(),
+            ),
+            VerifiedReadError::Decrypt(DecryptWithCekError::ContentIdMismatch {
+                expected,
+                actual,
+            }) => ApiError::Conflict(format!(
+                "decrypted content does not match local_content_id (expected {expected}, got \
+                 {actual}): the content has likely been updated — pass the local content id that \
+                 corresponds to the version being read"
+            )),
+        }
+    }
+
     /// 取得したコンテンツの整合性を検証する。
     ///
     /// `auth` は State Node の履歴・バージ取得 API に転送する認証ヘッダ。本番では `Some` が必要。
@@ -303,11 +491,33 @@ impl MonasController {
             Err(e) => return e,
         };
 
-        let state_bytes = match BASE64_STANDARD.decode(&state_node_data.data) {
+        let node_bytes = match BASE64_STANDARD.decode(&state_node_data.data) {
             Ok(b) => b,
             Err(e) => {
                 return ApiResponse::error(
                     ApiError::Internal(format!("invalid base64 data from state node: {e}")),
+                    trace_id,
+                );
+            }
+        };
+
+        // State Node は read 応答として「Node 全体(CBOR)」を返す。まず CID を
+        // 再計算して version と一致することを検証し(改ざん検知)、その上で
+        // payload の暗号文を取り出す(§8.1)。照合先はクライアントが選択した
+        // version に固定する。応答内の version は自己申告なので、それに対して
+        // 照合すると任意の Node + その CID を返すだけで検証が通ってしまう。
+        let state_bytes = match monas_content::infrastructure::node_verification::verify_and_extract(
+            &node_bytes,
+            &version_to_check,
+        ) {
+            Ok(verified) => verified.ciphertext,
+            Err(e) => {
+                return ApiResponse::success(
+                    VerifyIntegrityOutput {
+                        valid: false,
+                        computed_hash,
+                        reason: Some(format!("state node response failed CID verification: {e}")),
+                    },
                     trace_id,
                 );
             }

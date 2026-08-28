@@ -9,7 +9,9 @@ use monas_sdk::models::content::{
 };
 use monas_sdk::models::keypair::GenerateKeypairInput;
 use monas_sdk::models::share::{DecryptSharedContentInput, RevokeShareInput, ShareContentInput};
-use monas_sdk::models::state::{GetHistoryInput, GetLatestVersionInput, VerifyIntegrityInput};
+use monas_sdk::models::state::{
+    GetHistoryInput, GetLatestVersionInput, ReadContentFromStateNodeInput, VerifyIntegrityInput,
+};
 use monas_sdk::{
     generate_trace_id, ApiError, ApiResponse, MonasConfig, MonasController, StateNodeAuthContext,
 };
@@ -57,6 +59,7 @@ async fn main() {
         // state
         .route("/state/latest-version", post(get_latest_version))
         .route("/state/history", post(get_history))
+        .route("/state/read", post(read_content_from_state_node))
         .route("/state/verify-integrity", post(verify_integrity))
         .with_state(app_state);
 
@@ -245,6 +248,25 @@ async fn get_history(
     api_json(
         Arc::clone(&state.controller)
             .get_history_async(input, Some(auth))
+            .await,
+    )
+}
+
+async fn read_content_from_state_node(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<ReadContentFromStateNodeInput>,
+) -> (
+    StatusCode,
+    Json<ApiResponse<monas_sdk::models::state::ReadContentFromStateNodeOutput>>,
+) {
+    let auth = match build_state_node_auth_context(&headers) {
+        Ok(auth) => auth,
+        Err(error) => return auth_error_json(error),
+    };
+    api_json(
+        Arc::clone(&state.controller)
+            .read_content_from_state_node_async(input, Some(auth))
             .await,
     )
 }

@@ -512,6 +512,23 @@ impl ContentRepository for MockContentRepository {
         Ok(None)
     }
 
+    async fn get_latest_node_bytes_with_version(
+        &self,
+        genesis_cid: &str,
+    ) -> Result<Option<(Vec<u8>, String)>> {
+        // Mock returns the stored bytes as-is (tests that need real Node CBOR
+        // build it explicitly). Mirrors get_latest_with_version.
+        self.get_latest_with_version(genesis_cid).await
+    }
+
+    async fn get_version_node_bytes(
+        &self,
+        genesis_cid: &str,
+        version_cid: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        self.get_version(genesis_cid, version_cid).await
+    }
+
     async fn get_history(&self, genesis_cid: &str) -> Result<Vec<String>> {
         Ok(self
             .history

@@ -39,6 +39,16 @@ pub struct StateNodeDeleteContentResponse {
     pub deleted: bool,
 }
 
+/// State Nodeからのトークン失効レスポンス（`POST /content/:id/access/invalidate`）
+#[derive(Debug, Deserialize)]
+pub struct StateNodeInvalidateTokensResponse {
+    #[serde(default)]
+    pub content_id: String,
+    /// この時刻より前に発行されたTokenはすべて無効になる
+    #[serde(default)]
+    pub new_min_valid_issued_at: u64,
+}
+
 /// State Nodeからのコンテンツ履歴レスポンス
 #[derive(Debug, Deserialize)]
 pub struct StateNodeContentHistoryResponse {

@@ -28,6 +28,7 @@ resource "aws_ecs_task_definition" "node" {
         { name = "P2P_PORT", value = tostring(var.p2p_port) },
         { name = "DATA_DIR", value = "/data" },
         { name = "LOG_LEVEL", value = var.log_level },
+        { name = "DISABLE_MDNS", value = tostring(var.disable_mdns) },
       ]
 
       portMappings = [

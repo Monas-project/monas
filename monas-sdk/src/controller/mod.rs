@@ -67,6 +67,121 @@ pub struct MonasController {
     content_service: ContentServiceInstance,
     /// ShareService
     share_service: ShareServiceInstance,
+    /// share 受信者側の送信者公開鍵ピン(TOFU)と受理済み CEK 鍵世代の記録
+    /// (KeyEnvelope の送信者認証と rotation 巻き戻し replay 防止)
+    sender_pin_store: DynSenderPinStore,
+    /// content 単位の revoke 直列化ロック。
+    content_revoke_locks: ContentLocks,
+}
+
+/// SDK が使う送信者鍵ピンストアの動的型。
+///
+/// 参照するのは application 層のポートで、実装(In-memory / Sled)がある
+/// infrastructure 層ではない。SDK が特定の保存先実装に依存しないようにする。
+pub(super) type DynSenderPinStore =
+    std::sync::Arc<dyn monas_content::application_service::share_service::SenderKeyPinStore>;
+
+/// content id ごとの相互排他ロック。
+///
+/// revoke は「ACL・CEK・ローカル ciphertext・state node の状態」を
+/// load-modify-save で更新する複合操作で、そのどれにも version CAS が無い。
+/// `MonasController` は gateway 等で `Arc` 共有され複数リクエストから同時に
+/// 呼ばれるため、同じ content への revoke が並行すると次が起こる:
+///
+/// - 双方が同じ Share を読み、後勝ちで save → 片方の受信者削除が消える
+///   (lost update)
+/// - 異なる CEK が同じ key_epoch として配られる
+/// - ローカル ACL/CEK と state node の ciphertext が別リクエスト由来になる
+///
+/// 根本解決は Share・CEK・ciphertext を1つの transactional CAS にまとめる
+/// ことだが、3ストア + リモート更新にまたがるため、まず content 単位の
+/// 直列化で「並行 revoke が状態を分岐させない」ことを保証する。
+/// ロックはプロセス内のみで、複数 gateway プロセスからの並行 revoke は
+/// カバーしない(その場合は state node 側の CAS が必要)。
+#[derive(Default)]
+struct ContentLocksState {
+    /// 現在 revoke 中の content id。エントリが無い = 誰も触っていない。
+    held: std::collections::HashSet<String>,
+}
+
+#[derive(Clone, Default)]
+pub(super) struct ContentLocks {
+    inner: Arc<(std::sync::Mutex<ContentLocksState>, std::sync::Condvar)>,
+}
+
+impl ContentLocks {
+    /// `content_id` の revoke 権を取り、保持している間だけ他を待たせるガードを
+    /// 返す。同じ id への revoke は直列化され、異なる id は互いに待たない。
+    ///
+    /// ガードを drop するとエントリが表から消える(待っている者がいれば、その
+    /// 相手が起きて自分のエントリを立て直す)。**表は revoke 中の content 数
+    /// までしか伸びない** — 詳細は [`ContentLockGuard`]。
+    pub(super) fn lock(&self, content_id: &str) -> ContentLockGuard {
+        let (mutex, condvar) = &*self.inner;
+        let mut state = mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        // 既に誰かが持っているなら空くまで待つ。`wait` は mutex を手放すので、
+        // 待っている間に解放側が入れる。
+        while state.held.contains(content_id) {
+            state = condvar
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+
+        // 空いていた: 自分が保持者になる。
+        state.held.insert(content_id.to_string());
+        drop(state);
+
+        ContentLockGuard {
+            locks: self.inner.clone(),
+            content_id: content_id.to_string(),
+        }
+    }
+
+    /// 現在このレジストリが保持しているエントリ数(テスト用)。
+    #[cfg(test)]
+    pub(super) fn tracked_len(&self) -> usize {
+        let (mutex, _) = &*self.inner;
+        mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .held
+            .len()
+    }
+}
+
+/// 保持している間だけ、その content の revoke が直列化される。
+///
+/// drop 時にエントリを表から取り除き、待っている者を起こす。取り除かないと、
+/// revoke した content の数だけ表が伸び続けて二度と縮まない — gateway は
+/// 動かしっぱなしなので、稼働時間と扱った content 数に比例してメモリを食う。
+/// 1 件あたりは数十バイトだが上限が無いのが問題で、PR #56 のレビューで
+/// 指摘された。
+///
+/// エントリの有無そのものが「保持者がいるか」を表すので、drop では常に消す。
+/// 待っている者はこの削除を見て初めて自分が保持者になれる(`lock` の while は
+/// `contains_key` が false になるまで回る)。判定も削除も同じ mutex の下で
+/// 行うため、起きた側が保持者になるまでに別のリクエストが割り込む隙は無い。
+/// 結果として、**表のサイズは同時に revoke 中の content 数**で頭打ちになる。
+pub(super) struct ContentLockGuard {
+    locks: Arc<(std::sync::Mutex<ContentLocksState>, std::sync::Condvar)>,
+    content_id: String,
+}
+
+impl Drop for ContentLockGuard {
+    fn drop(&mut self) {
+        let (mutex, condvar) = &*self.locks;
+        let mut state = mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        // エントリを落とすことが「解放」そのもの。これが無いと表が伸び続ける。
+        state.held.remove(&self.content_id);
+        drop(state);
+        condvar.notify_all();
+    }
 }
 
 impl MonasController {
@@ -159,7 +274,7 @@ impl MonasController {
         // stateless thin client and push CEK / share ownership to State Node,
         // or (b) define an explicit pluggable port for CEK ownership semantics.
         let content_repository = Self::create_content_repository();
-        let (cek_store, share_repository, public_key_directory) =
+        let (cek_store, share_repository, public_key_directory, sender_pin_store) =
             Self::create_persistence(&config.persistence)?;
         let agent = Self::build_agent(&config);
 
@@ -178,6 +293,8 @@ impl MonasController {
                 share_repository,
                 public_key_directory,
             ),
+            sender_pin_store,
+            content_revoke_locks: ContentLocks::default(),
         })
     }
 
@@ -210,13 +327,22 @@ impl MonasController {
     /// CEK / Share / Public key directory の 3 ストアに共有させる。sled は path 単位で
     /// 排他 flock を取るため、同じディレクトリを 2 度 open すると 2 個目が
     /// 失敗する (`MONAS_PERSISTENCE_DIR` 設定時の本番経路で必ず再現)。
-    /// キー空間は `cek:` / `share:` / `pubkey:` プレフィックスで分離されている。
+    /// キー空間は `cek:` / `share:` / `pubkey:` / `sender_pin:` プレフィックスで分離されている。
     fn create_persistence(
         persistence: &PersistenceConfig,
-    ) -> Result<(DynCekStore, DynShareRepository, DynPublicKeyDirectory), ApiError> {
+    ) -> Result<
+        (
+            DynCekStore,
+            DynShareRepository,
+            DynPublicKeyDirectory,
+            DynSenderPinStore,
+        ),
+        ApiError,
+    > {
         use monas_content::infrastructure::{
             key_store::{InMemoryContentEncryptionKeyStore, SledContentEncryptionKeyStore},
             public_key_directory::{InMemoryPublicKeyDirectory, SledPublicKeyDirectory},
+            sender_key_pin_store::{InMemorySenderKeyPinStore, SledSenderKeyPinStore},
             share_repository::{InMemoryShareRepository, SledShareRepository},
         };
 
@@ -230,7 +356,8 @@ impl MonasController {
                 let cek: DynCekStore = Arc::new(InMemoryContentEncryptionKeyStore::default());
                 let share: DynShareRepository = Arc::new(InMemoryShareRepository::default());
                 let pkd: DynPublicKeyDirectory = Arc::new(InMemoryPublicKeyDirectory::default());
-                Ok((cek, share, pkd))
+                let sender_pin: DynSenderPinStore = Arc::new(InMemorySenderKeyPinStore::default());
+                Ok((cek, share, pkd, sender_pin))
             }
             PersistenceConfig::Sled { dir } => {
                 if let Err(e) = std::fs::create_dir_all(dir) {
@@ -239,17 +366,19 @@ impl MonasController {
                     )));
                 }
                 // sled は path 単位で flock を取るので 1 度だけ開く。
-                // `sled::Db` は Arc ベースで Clone 可能なので、3 つのストアに同じ Db を渡す。
+                // `sled::Db` は Arc ベースで Clone 可能なので、4 つのストアに同じ Db を渡す。
                 let db = sled::open(dir).map_err(|e| {
                     ApiError::Internal(format!("failed to open sled DB at {dir:?}: {e}"))
                 })?;
                 let cek = SledContentEncryptionKeyStore::with_db(db.clone());
                 let share = SledShareRepository::with_db(db.clone());
-                let pkd = SledPublicKeyDirectory::with_db(db);
+                let pkd = SledPublicKeyDirectory::with_db(db.clone());
+                let sender_pin = SledSenderKeyPinStore::with_db(db);
                 let cek: DynCekStore = Arc::new(cek);
                 let share: DynShareRepository = Arc::new(share);
                 let pkd: DynPublicKeyDirectory = Arc::new(pkd);
-                Ok((cek, share, pkd))
+                let sender_pin: DynSenderPinStore = Arc::new(sender_pin);
+                Ok((cek, share, pkd, sender_pin))
             }
         }
     }
@@ -297,6 +426,78 @@ impl MonasController {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ロックを手放したら、その content のエントリはレジストリから消える。
+    ///
+    /// 消さないと revoke した content の数だけ表が伸び続け、gateway は
+    /// 動かしっぱなしなので稼働時間に比例してメモリを食う(PR #56 レビュー指摘)。
+    #[test]
+    fn releasing_a_content_lock_drops_its_registry_entry() {
+        let locks = ContentLocks::default();
+        assert_eq!(locks.tracked_len(), 0);
+
+        {
+            let _guard = locks.lock("content-1");
+            assert_eq!(locks.tracked_len(), 1, "保持中はエントリがある");
+        }
+        assert_eq!(locks.tracked_len(), 0, "解放したら消える");
+
+        // 別々の content を順に触っても溜まらない。
+        for i in 0..100 {
+            let _guard = locks.lock(&format!("content-{i}"));
+        }
+        assert_eq!(
+            locks.tracked_len(),
+            0,
+            "順に revoke しただけでエントリが溜まってはならない"
+        );
+    }
+
+    /// 表が縮んでも、同じ content への同時 revoke は直列化されたままである。
+    /// (エントリ削除で相互排他まで壊していないことの確認)
+    #[test]
+    fn same_content_locks_are_still_mutually_exclusive() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let locks = ContentLocks::default();
+        let inside = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let locks = locks.clone();
+                let inside = inside.clone();
+                let max_seen = max_seen.clone();
+                scope.spawn(move || {
+                    for _ in 0..50 {
+                        let _guard = locks.lock("same-content");
+                        let now = inside.fetch_add(1, Ordering::SeqCst) + 1;
+                        max_seen.fetch_max(now, Ordering::SeqCst);
+                        std::thread::yield_now();
+                        inside.fetch_sub(1, Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+
+        assert_eq!(
+            max_seen.load(Ordering::SeqCst),
+            1,
+            "同じ content のクリティカルセクションに同時に 2 つ入ってはならない"
+        );
+        assert_eq!(locks.tracked_len(), 0, "全部終われば空になる");
+    }
+
+    /// 異なる content は互いに待たない(id ごとに分けている意味の確認)。
+    #[test]
+    fn different_contents_do_not_block_each_other() {
+        let locks = ContentLocks::default();
+        let _held = locks.lock("content-a");
+        // content-a を保持したまま content-b を取れる。ここで固まるなら
+        // レジストリ全体を 1 本のロックで守ってしまっている。
+        let _other = locks.lock("content-b");
+        assert_eq!(locks.tracked_len(), 2);
+    }
 
     /// `combine_rollback_failure` は `primary` の variant を保ち、message に
     /// rollback 情報を suffix として追加する。

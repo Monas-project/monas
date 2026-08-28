@@ -8,6 +8,9 @@ use crate::domain::share::{KeyEnvelope, KeyId, Permission};
 pub struct GrantShareCommand {
     pub content_id: ContentId,
     pub sender_key_id: KeyId,
+    /// 送信者の秘密鍵バイト列。HPKE Auth モードの wrap(送信者認証)に用いる。
+    /// 保存はされず、この呼び出しの間だけ使われる。
+    pub sender_private_key: Vec<u8>,
     pub recipient_public_key: Vec<u8>,
     pub permission: Permission,
 }
@@ -24,6 +27,9 @@ pub struct GrantShareResult {
 pub struct RevokeShareCommand {
     pub content_id: ContentId,
     pub sender_key_id: KeyId,
+    /// 送信者の秘密鍵バイト列。残存受信者向け KeyEnvelope 再発行の
+    /// HPKE Auth モード wrap(送信者認証)に用いる。
+    pub sender_private_key: Vec<u8>,
     pub recipient_key_id: KeyId,
 }
 

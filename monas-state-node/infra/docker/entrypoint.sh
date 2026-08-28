@@ -9,6 +9,7 @@ NODE_ROLE="${NODE_ROLE:-member}"
 BOOTSTRAP_ADDR="${BOOTSTRAP_ADDR:-}"
 BOOTSTRAP_DNS="${BOOTSTRAP_DNS:-}"
 BOOTSTRAP_PEER_ID="${BOOTSTRAP_PEER_ID:-}"
+DISABLE_MDNS="${DISABLE_MDNS:-}"
 
 ARGS=(
     --data-dir "$DATA_DIR"
@@ -17,22 +18,39 @@ ARGS=(
     --log-level "$LOG_LEVEL"
 )
 
-# For member nodes, resolve bootstrap address dynamically if DNS is provided
+# mDNS only reaches a broadcast domain, so it never works in a VPC. It does
+# work locally, well enough to hide a broken bootstrap/Kademlia path — which is
+# how a local run "passed" while the deployment could not reconverge. Set
+# DISABLE_MDNS=true to run a local cluster under production-like conditions.
+case "$DISABLE_MDNS" in
+    1|true|TRUE|yes|YES) ARGS+=(--disable-mdns) ;;
+esac
+
+# Bootstrap addresses.
+#
+# BOOTSTRAP_ADDR accepts a comma-separated list of full multiaddrs, so a node
+# can be given several entry points and still join when one of them is down.
+#
+# BOOTSTRAP_DNS is turned into a `/dns4/` multiaddr rather than being resolved
+# to an IP here. Resolving once at startup baked a fixed IP into the process:
+# when the bootstrap node was recreated with a new address, every other node
+# kept dialling the old one forever (DialFailure), and nothing re-resolved it.
+# libp2p resolves `/dns4/` on every dial, so an address change now heals by
+# itself. The transport wraps TCP in a DNS resolver (see transport.rs).
 if [ "$NODE_ROLE" != "bootstrap" ]; then
     if [ -n "$BOOTSTRAP_ADDR" ]; then
-        ARGS+=(--bootstrap "$BOOTSTRAP_ADDR")
+        IFS=',' read -ra ADDRS <<< "$BOOTSTRAP_ADDR"
+        for a in "${ADDRS[@]}"; do
+            a="$(echo "$a" | tr -d '[:space:]')"
+            [ -n "$a" ] && ARGS+=(--bootstrap "$a")
+        done
     elif [ -n "$BOOTSTRAP_DNS" ] && [ -n "$BOOTSTRAP_PEER_ID" ]; then
-        # Resolve DNS to IP and wait for bootstrap node
-        echo "Resolving bootstrap node: $BOOTSTRAP_DNS"
-        for i in $(seq 1 30); do
-            BOOTSTRAP_IP=$(getent hosts "$BOOTSTRAP_DNS" 2>/dev/null | awk '{print $1}' | head -1) || true
-            if [ -n "$BOOTSTRAP_IP" ]; then
-                echo "Resolved $BOOTSTRAP_DNS -> $BOOTSTRAP_IP"
-                ARGS+=(--bootstrap "/ip4/${BOOTSTRAP_IP}/tcp/${P2P_PORT}/p2p/${BOOTSTRAP_PEER_ID}")
-                break
-            fi
-            echo "Waiting for bootstrap DNS resolution (attempt $i)..."
-            sleep 5
+        IFS=',' read -ra HOSTS <<< "$BOOTSTRAP_DNS"
+        for h in "${HOSTS[@]}"; do
+            h="$(echo "$h" | tr -d '[:space:]')"
+            [ -z "$h" ] && continue
+            echo "Bootstrap peer: /dns4/${h}/tcp/${P2P_PORT}/p2p/${BOOTSTRAP_PEER_ID}"
+            ARGS+=(--bootstrap "/dns4/${h}/tcp/${P2P_PORT}/p2p/${BOOTSTRAP_PEER_ID}")
         done
     fi
 fi
