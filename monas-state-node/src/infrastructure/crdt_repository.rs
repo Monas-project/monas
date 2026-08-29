@@ -851,6 +851,40 @@ mod tests {
         );
     }
 
+    /// The production failure mode, at the scale it actually happened.
+    ///
+    /// A member is asked to re-apply the same operations on every sync round
+    /// and from every provider. node1 logged 1048 such failures in 25 minutes
+    /// while pinning a core; each one is a full commit attempt that walks the
+    /// DAG before failing. Repeated delivery must stay cheap and quiet.
+    #[tokio::test]
+    async fn repeated_delivery_never_errors() {
+        let (creator, _creator_tmp, genesis_cid) = creator_with_three_versions().await;
+        let ops = creator.get_operations(&genesis_cid, None).await.unwrap();
+
+        let receiver_tmp = tempdir().unwrap();
+        let receiver = CrslCrdtRepository::open(receiver_tmp.path().join("crdt")).unwrap();
+
+        // 20 sync rounds × 2 providers, the shape of a steady-state cluster.
+        for _ in 0..20 {
+            for _ in 0..2 {
+                let applied = receiver.apply_operations(&ops).await.unwrap();
+                assert_eq!(
+                    applied,
+                    ops.len(),
+                    "every round must account for all operations; a shortfall is \
+                     an operation that failed to apply"
+                );
+            }
+        }
+
+        assert_eq!(
+            receiver.get_history(&genesis_cid).await.unwrap(),
+            creator.get_history(&genesis_cid).await.unwrap(),
+            "40 redeliveries must leave the history identical to the sender's"
+        );
+    }
+
     #[tokio::test]
     async fn test_prepare_create_operations_is_deterministic_across_repos() {
         // Creator prepares operations without persisting to its own store.
