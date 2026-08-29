@@ -107,9 +107,11 @@ function Row({
                 <Pencil size={15} /> Edit contents
               </button>
             )}
-            <button onClick={() => onAction("rename", entry)}>
-              <Pencil size={15} /> Rename
-            </button>
+            {!isFile && (
+              <button onClick={() => onAction("rename", entry)}>
+                <Pencil size={15} /> Rename
+              </button>
+            )}
             {isFile && (
               <button onClick={() => onAction("share", entry)}>
                 <Share size={15} /> Share

@@ -9,14 +9,12 @@ import {
   removeIdentity,
 } from "../store/identity";
 import { pushToast } from "./Toast";
-import type { KeyType } from "../types";
 
 export function IdentityModal({ onClose }: { onClose: () => void }) {
   const { identities, activeLabel } = useIdentities();
   const hasSigningAccount = identities.some((i) => i.isSigningAccount);
 
   const [label, setLabel] = useState("");
-  const [keyType, setKeyType] = useState<KeyType>("secp256r1");
   const [asSigning, setAsSigning] = useState(!hasSigningAccount);
   const [busy, setBusy] = useState(false);
 
@@ -24,9 +22,12 @@ export function IdentityModal({ onClose }: { onClose: () => void }) {
     const name = label.trim() || `account-${identities.length + 1}`;
     setBusy(true);
     try {
+      // Always P-256: signing requires it, and the HPKE share envelopes are
+      // DHKEM(P-256) — any other curve would mint a key that cannot receive
+      // a share, a dead end this dialog should not offer.
       const res = asSigning
-        ? await createSigningAccount(keyType)
-        : await generateKeypair(keyType);
+        ? await createSigningAccount("secp256r1")
+        : await generateKeypair("secp256r1");
       addIdentity(
         {
           label: name,
@@ -116,25 +117,6 @@ export function IdentityModal({ onClose }: { onClose: () => void }) {
         />
       </div>
       <div className="field">
-        <label>Key type</label>
-        <div className="seg">
-          <button
-            className={keyType === "secp256r1" ? "on" : ""}
-            onClick={() => setKeyType("secp256r1")}
-          >
-            secp256r1 / P-256 (recommended)
-          </button>
-          <button
-            className={keyType === "secp256k1" ? "on" : ""}
-            onClick={() => setKeyType("secp256k1")}
-            disabled={asSigning}
-            title={asSigning ? "Signing account must be P-256" : undefined}
-          >
-            secp256k1
-          </button>
-        </div>
-      </div>
-      <div className="field">
         <label
           style={{
             display: "flex",
@@ -148,10 +130,7 @@ export function IdentityModal({ onClose }: { onClose: () => void }) {
           <input
             type="checkbox"
             checked={asSigning}
-            onChange={(e) => {
-              setAsSigning(e.target.checked);
-              if (e.target.checked) setKeyType("secp256r1");
-            }}
+            onChange={(e) => setAsSigning(e.target.checked)}
           />
           Register as signing account (P-256) — enables create / edit / delete
         </label>

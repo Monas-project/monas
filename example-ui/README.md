@@ -2,7 +2,7 @@
 
 A minimal, Google-Drive-like web UI for the Monas protocol, built on the
 **monas-sdk** via the **monas-gateway** HTTP API. It lets you **create, open,
-edit, rename, share, revoke and delete** files and folders, and surfaces the
+edit, share, revoke and delete** files and folders, and surfaces the
 encryption + state-node work behind every action in a live **Protocol activity**
 panel (CEK → AES-256-GCM → SHA-256 CID → storage → state-node → HPKE).
 
@@ -52,29 +52,36 @@ send permissive CORS headers.
 ## Tests
 
 ```bash
-npm test                 # Playwright suite (tests/) — ~22s
+npm test                 # UI suite (tests/) — ~22s
 npm run test:ui          # same, in the Playwright UI runner
-npm run test:e2e-stack   # the full protocol happy path (e2e-verify.mjs)
+npm run test:e2e         # real-stack journeys (tests-e2e/) — minutes
 ```
 
 Both need a running stack. `npm test` only needs vite + gateway + account;
-`test:e2e-stack` additionally exercises the state-node round trip, so it wants
-the 4-node cluster (`monas-state-node/scripts/start-local-nodes.sh` — 4 nodes,
-because `create_content` excludes the creator from the member set).
+`test:e2e` additionally exercises the state-node round trip, so the gateway's
+`MONAS_STATE_NODE_URL` must point at a node that is up — a local cluster
+(`monas-state-node/scripts/start-local-nodes.sh`) or a hosted node.
 
 Two suites, deliberately split by what they cost and what they prove:
 
-| | `tests/` (`npm test`) | `e2e-verify.mjs` |
+| | `tests/` (`npm test`) | `tests-e2e/` (`npm run test:e2e`) |
 | --- | --- | --- |
-| Proves | the **UI** behaves — every control does what it claims | the **protocol** works end to end |
-| Content mutations | none (seeds `localStorage` directly) | many, against 4 real nodes |
+| Proves | the **UI** behaves — every control does what it claims | a fresh user can run every journey against **real nodes** |
+| Content mutations | none (seeds `localStorage` directly) | many — create/edit/share/revoke/delete on the network |
 | Runtime | ~22s | minutes |
 
 `tests/` avoids content mutations on purpose: a create is a real crypto +
-4-node round trip, so a suite that made one per scenario would take minutes and
-mostly re-test the protocol that `e2e-verify.mjs` already covers. Where a
+state-node round trip, so a suite that made one per scenario would take minutes
+and mostly re-test the protocol that the journeys already cover. Where a
 scenario needs a file to exist, it writes a registry entry into `localStorage`
 and reloads.
+
+`tests-e2e/full-stack.spec.ts` holds three independent journeys: the content
+lifecycle (create → preview → verify integrity → verified read → edit →
+old-version read → reload → delete), the sharing lifecycle (share to a local
+identity with the HPKE round-trip proof, share to a pasted external key,
+revoke with envelope reissue), and folders + binary upload + filter views +
+cascade delete.
 
 Modal structure is asserted with **ARIA snapshots** (`toMatchAriaSnapshot`)
 rather than CSS selectors, so the whole control set of a dialog is checked in

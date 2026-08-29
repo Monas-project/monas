@@ -10,7 +10,7 @@
     "preview": "vite preview",
     "test": "playwright test",
     "test:ui": "playwright test --ui",
-    "test:e2e-stack": "node e2e-verify.mjs"
+    "test:e2e": "playwright test -c playwright.e2e.config.ts"
   },
   "dependencies": {
     "react": "^18.3.1",

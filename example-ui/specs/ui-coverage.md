@@ -1,15 +1,16 @@
 # Monas Drive example UI — coverage test plan
 
-Playwright scenarios for the interactive surface that `e2e-verify.mjs` does **not**
-touch. The existing e2e performs ~30 interactions along one happy path
-(create account → folder → file → preview → edit → share → revoke → delete).
-The UI exposes ~84 interactive controls, so most of the surface below has never
-been clicked by any automated test.
+Playwright scenarios for the interactive surface that the real-stack journeys
+(`tests-e2e/full-stack.spec.ts`) do **not** need to touch. The journeys walk
+the protocol paths (create account → folder → file → preview → verify → edit →
+share → revoke → delete) against real nodes; the scenarios below cover the
+rest of the interactive surface cheaply, without content mutations.
 
 ## Preconditions & house rules
 
-- The full stack must be running: vite `:5174`, gateway `127.0.0.1:3000`,
-  monas-account `127.0.0.1:4002`, state nodes `127.0.0.1:18080-18083`.
+- The stack must be running: vite `:5174`, gateway `127.0.0.1:3000`,
+  monas-account `127.0.0.1:4002`; for `tests-e2e/` the gateway's
+  `MONAS_STATE_NODE_URL` must point at a live state node.
 - `tests/seed.spec.ts` runs first. It clears `localStorage`, waits for the
   gateway health dot, and creates the **signing account** `agent-main`.
   Without a signing account every content operation is refused (see S-14).
@@ -90,7 +91,7 @@ per version, `.state-history .ver` (current one also carries `.current` and the
 text ` · latest`), `.preview-box`, `.kv` rows keyed
 `local content_id` / `Content Network` / `seriesId` / `versions` / `latest version`.
 
-**FileBrowser row menu** — `Open / preview`, `Edit contents`, `Rename`,
+**FileBrowser row menu** — `Open / preview`, `Edit contents`,
 `Share`, `Delete` (`.danger`). Folder rows show `Open folder` instead of
 `Open / preview` and have no `Edit contents` / `Share`.
 Badges: `.badge.enc` "enc", `.badge.synced` "synced", `.badge.local` "local",
@@ -301,8 +302,10 @@ filter list.
 ### E-22 · Row menu opens, closes, and offers the right items — P0 **[fixture]**
 Verified manually. No mutation.
 1. Click the row's `.row-menu-wrap .icon-btn`.
-2. Expect a `.menu` with exactly: `Open / preview`, `Edit contents`, `Rename`,
-   `Share`, `Delete` (last has class `danger`).
+2. Expect a `.menu` with exactly: `Open / preview`, `Edit contents`,
+   `Share`, `Delete` (last has class `danger`). There is **no** `Rename` on a
+   file row — a file's name only reaches the SDK through an update, so the
+   rename path is the name field in `Edit contents`.
 3. Click elsewhere in `.scroll`; expect the menu closes.
 4. Expect opening a second row's menu closes the first (single `openMenu` id).
 
@@ -341,13 +344,13 @@ Cheap and high-risk (`renameFolder` rewrites `parentPath` by string prefix).
    both — tests must use `.first()`/`.nth()` or an id-based selector.
    Flag as a UX defect if duplicates should be rejected.
 
-### E-27 · Rename a file is local-only — P1 **[fixture]**
-`handleRename` for a file only calls `updateEntry` — no pipeline run.
-1. Row menu → `Rename`, set a new name, confirm.
-2. Expect toast `"Renamed"`.
-3. Expect the row name updates **and no new `.run` appears** in the pipeline
-   panel (this is the documented behaviour — the rename is not pushed to the
-   state-node until the next edit).
+### E-27 · Files have no Rename action — P1 **[fixture]**
+A local-only rename used to exist and never reached the protocol; it was
+removed. Renaming a file is done through `Edit contents`, whose name field is
+carried to the SDK by the update flow.
+1. Open a file row's menu; expect **no** `Rename` item.
+2. Open a folder row's menu; expect `Rename` **is** offered (folders are local
+   organization only).
 
 ### E-28 · Double-click opens the right action per row kind — P1 **[fixture]**
 1. Double-click a **file** row; expect the preview modal (an `Open` run
@@ -375,7 +378,7 @@ Verified manually: works (`valid = name.trim().length > 0`).
 4. Type `docs`; expect enabled.
 
 ### F-31 · Cancel and X and Escape all dismiss without side effects — P0
-For each of `New file`, `New folder`, `Rename`, `Delete`:
+For each of `New file`, `New folder`, `Rename` (folder row), `Delete`:
 1. Open the modal, fill a value.
 2. Dismiss three ways in separate runs: `Cancel` button, the header `.icon-btn`
    X, and `Escape`.
@@ -540,15 +543,12 @@ by the edit flow, so it does not track what the Content Network actually holds.
 2. Expect toast `"Create an identity first"` and the Identity modal, **not**
    the Share modal.
 
-### I-47 · Identity modal: signing checkbox drives key type and button label — P1
-Verified manually: works.
+### I-47 · Identity modal: signing checkbox drives the button label — P1
+All keys are P-256 (signing requires it, and the HPKE share envelopes are
+DHKEM(P-256)); there is no key-type selector.
 1. Open the identity modal with no signing account; expect the checkbox
-   **checked**, the `secp256k1` button **disabled** with
-   `title="Signing account must be P-256"`, and the primary button reading
-   `Create account`.
-2. Uncheck it; expect `secp256k1` becomes **enabled** and the button relabels to
-   `Create identity`.
-3. Re-check it; expect the key type snaps back to `secp256r1`.
+   **checked** and the primary button reading `Create account`.
+2. Uncheck it; expect the button relabels to `Create identity`.
 
 ### I-48 · Switching the active identity — P1
 1. With two identities, click `Use` on the non-active one.
@@ -610,9 +610,6 @@ Controls found **broken or inert** while clicking through the running app:
 - **A11Y-5** — Settings/Share/Editor `<label>`s are **siblings** of their
   inputs with no `for`/`id`, so `getByLabel()` does not work; tests must fall
   back to placeholders, CSS, or positional selectors.
-- **A11Y-6** — the disabled `secp256k1` button exposes its **tooltip**
-  (`"Signing account must be P-256"`) as its accessible name instead of its
-  visible label.
 
 # Suggested file layout
 

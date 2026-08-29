@@ -1,12 +1,13 @@
 import { test, expect, type Page } from "@playwright/test";
-import { freshApp, seedFileEntry, rowMenuButton } from "./helpers";
+import { freshApp, seedFileEntry } from "./helpers";
 
 /**
  * Group F — ActionModals (F-29, F-30, F-31).
  *
  * All assertions land *before* anything is committed, so no scenario here
- * costs a crypto round trip. F-31 seeds a registry entry directly rather than
- * creating a real file — it only needs a row to open Rename/Delete from.
+ * costs a crypto round trip. F-31 seeds registry entries directly rather than
+ * creating real content — it only needs rows to open Rename (folder) and
+ * Delete (file) from.
  */
 
 test.beforeEach(async ({ page }) => {
@@ -91,9 +92,21 @@ test("F-30: New folder — submit disabled until a real name is typed", async ({
 test("F-31: Cancel, X, Escape and backdrop all dismiss without side effects", async ({
   page,
 }) => {
-  // A seeded row gives us Rename and Delete without a crypto round trip.
+  // Seeded rows give us Rename and Delete without a crypto round trip.
+  // Rename is folder-only, so seed a folder next to the file.
   await seedFileEntry(page);
-  await expect(page.locator(".row")).toHaveCount(1);
+  await seedFileEntry(page, {
+    id: "seeded-folder-1",
+    kind: "folder",
+    name: "docs",
+    sizeBytes: 0,
+    mimeType: null,
+    localContentId: null,
+    remoteContentId: null,
+    syncedToStateNode: false,
+    versionCount: 0,
+  });
+  await expect(page.locator(".row")).toHaveCount(2);
 
   /** Open one of the four modals under test. */
   const openers: Record<string, () => Promise<void>> = {
@@ -104,11 +117,17 @@ test("F-31: Cancel, X, Escape and backdrop all dismiss without side effects", as
       await page.getByRole("button", { name: "New folder" }).click();
     },
     Rename: async () => {
-      await rowMenuButton(page).click();
+      await page
+        .locator(".row", { hasText: "docs" })
+        .locator(".row-menu-wrap .icon-btn")
+        .click();
       await page.locator(".menu button", { hasText: "Rename" }).click();
     },
     Delete: async () => {
-      await rowMenuButton(page).click();
+      await page
+        .locator(".row", { hasText: "probe.txt" })
+        .locator(".row-menu-wrap .icon-btn")
+        .click();
       await page.locator(".menu button.danger", { hasText: "Delete" }).click();
     },
   };
@@ -159,9 +178,14 @@ test("F-31: Cancel, X, Escape and backdrop all dismiss without side effects", as
       // No toast — a dismissal is not an action.
       await expect(page.locator(".toast")).toHaveCount(0);
 
-      // Registry unchanged: still exactly the one seeded row.
-      await expect(page.locator(".row")).toHaveCount(1);
-      await expect(page.locator(".row .fname")).toHaveText("probe.txt");
+      // Registry unchanged: still exactly the two seeded rows.
+      await expect(page.locator(".row")).toHaveCount(2);
+      await expect(
+        page.locator(".row .fname", { hasText: "probe.txt" }),
+      ).toHaveCount(1);
+      await expect(
+        page.locator(".row .fname", { hasText: "docs" }),
+      ).toHaveCount(1);
     }
   }
 });

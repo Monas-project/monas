@@ -416,18 +416,14 @@ export default function App() {
     }
   }
 
+  // Folders are purely local organization, so renaming one never touches the
+  // protocol. Files deliberately have no Rename action: a file's name reaches
+  // the SDK only through an update, so the honest rename path is the name
+  // field in "Edit contents".
   const handleRename = async (entry: Entry, newName: string) => {
     setModal({ type: "none" });
-    if (entry.kind === "folder") {
-      renameFolder(entry, newName);
-      pushToast("Folder renamed", "success");
-      return;
-    }
-    // A content rename is a metadata update; reuse the update flow with the
-    // current content unchanged is not possible without bytes, so we just
-    // rename locally and let the next edit carry the new name to the SDK.
-    updateEntry(entry.id, { name: newName });
-    pushToast("Renamed", "success");
+    renameFolder(entry, newName);
+    pushToast("Folder renamed", "success");
   };
 
   // ---- dispatch from row menu ----------------------------------------
@@ -510,7 +506,7 @@ export default function App() {
       )}
       {modal.type === "rename" && (
         <TextPromptModal
-          title={`Rename ${modal.entry.kind}`}
+          title="Rename folder"
           label="New name"
           initial={modal.entry.name}
           confirmLabel="Rename"
