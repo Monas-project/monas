@@ -40,6 +40,14 @@ use tracing::{debug, error, info, warn};
 /// Default timeout for PeerNetwork operations (30 seconds).
 const PEER_NETWORK_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long to wait for a placement candidate to report its capacity.
+///
+/// Much shorter than `PEER_NETWORK_TIMEOUT` because silence here is cheap to
+/// act on: the peer is left out of the candidate set and another is used.
+/// Waiting the full network timeout for that answer holds up the client
+/// request that triggered it, for no gain.
+const CAPACITY_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// How often to check connectivity and re-dial bootstrap peers.
 ///
 /// Short enough that a node which lost its peers rejoins within a minute,
@@ -2278,32 +2286,38 @@ impl PeerNetwork for Libp2pNetwork {
         Ok(peers.into_iter().map(|p| p.to_string()).collect())
     }
 
+    /// Ask every candidate for its capacity at once.
+    ///
+    /// The queries are independent, so they are dispatched together and
+    /// awaited together: the batch costs one timeout, not one per unreachable
+    /// peer. Asking in sequence made a caller wait `PEER_NETWORK_TIMEOUT × N`
+    /// — long enough, with two silent peers, that the node stopped answering
+    /// its health check and was replaced mid-request.
+    ///
+    /// A peer that does not answer is simply absent from the result. Callers
+    /// treat "no capacity reported" as "not a placement candidate", which is
+    /// the right reading of silence.
     async fn query_node_capacity_batch(&self, peer_ids: &[String]) -> Result<HashMap<String, u64>> {
-        let mut results = HashMap::new();
+        let queries = peer_ids.iter().filter_map(|peer_id_str| {
+            let peer_id = PeerId::from_str(peer_id_str).ok()?;
+            Some(async move {
+                let (tx, rx) = oneshot::channel();
+                self.command_tx
+                    .send(SwarmCommand::QueryCapacity { peer_id, reply: tx })
+                    .await
+                    .ok()?;
+                match tokio::time::timeout(CAPACITY_QUERY_TIMEOUT, rx).await {
+                    Ok(Ok(Ok((_, available)))) => Some((peer_id_str.clone(), available)),
+                    _ => None,
+                }
+            })
+        });
 
-        for peer_id_str in peer_ids {
-            let peer_id = match PeerId::from_str(peer_id_str) {
-                Ok(id) => id,
-                Err(_) => continue,
-            };
-
-            let (tx, rx) = oneshot::channel();
-            if self
-                .command_tx
-                .send(SwarmCommand::QueryCapacity { peer_id, reply: tx })
-                .await
-                .is_err()
-            {
-                continue;
-            }
-
-            if let Ok(Ok(Ok((_, available)))) = tokio::time::timeout(PEER_NETWORK_TIMEOUT, rx).await
-            {
-                results.insert(peer_id_str.clone(), available);
-            }
-        }
-
-        Ok(results)
+        Ok(futures::future::join_all(queries)
+            .await
+            .into_iter()
+            .flatten()
+            .collect())
     }
 
     async fn query_node_public_keys_batch(
@@ -2331,33 +2345,42 @@ impl PeerNetwork for Libp2pNetwork {
         // In a real system, we'd have a DHT mapping NodeId -> PeerId
         // For now, we'll use a broadcast-like approach
 
-        for node_id_str in peer_ids {
-            // Try to parse as PeerId first (for testing)
-            if let Ok(peer_id) = PeerId::from_str(node_id_str) {
+        // Dispatched together for the same reason as the capacity batch: these
+        // queries are independent, so one unreachable peer must not delay the
+        // peers behind it in the list.
+        let queries = peer_ids.iter().filter_map(|node_id_str| {
+            let peer_id = PeerId::from_str(node_id_str).ok()?;
+            Some(async move {
                 let (tx, rx) = oneshot::channel();
-                if self
-                    .command_tx
+                self.command_tx
                     .send(SwarmCommand::QueryPublicKeys {
                         peer_id,
                         node_ids: vec![node_id_str.clone()],
                         reply: tx,
                     })
                     .await
-                    .is_ok()
-                {
-                    if let Ok(Ok(Ok(keys))) = tokio::time::timeout(PEER_NETWORK_TIMEOUT, rx).await {
-                        // The returned key might have a different node_id (e.g., the actual NodeId)
-                        // than what we requested (e.g., a PeerId), but we should still store it
-                        // indexed by what was requested
-                        if !keys.is_empty() {
-                            // Take the first matching key (there should only be one for a specific peer)
-                            results.insert(node_id_str.clone(), keys[0].public_key.clone());
-                        }
+                    .ok()?;
+                match tokio::time::timeout(PEER_NETWORK_TIMEOUT, rx).await {
+                    // The returned key may carry a different node_id (the
+                    // actual NodeId) than the one we asked with (a PeerId), so
+                    // index it by what was requested.
+                    Ok(Ok(Ok(keys))) if !keys.is_empty() => {
+                        Some((node_id_str.clone(), keys[0].public_key.clone()))
                     }
+                    _ => None,
                 }
-            }
+            })
+        });
 
-            // If we didn't get a key, skip it
+        for (node_id, key) in futures::future::join_all(queries)
+            .await
+            .into_iter()
+            .flatten()
+        {
+            results.insert(node_id, key);
+        }
+
+        for node_id_str in peer_ids {
             if !results.contains_key(node_id_str) {
                 warn!("Could not query public key for {}", node_id_str);
             }
@@ -2672,6 +2695,148 @@ mod tests {
     use super::*;
     use crate::infrastructure::crdt_repository::CrslCrdtRepository;
     use tempfile::tempdir;
+
+    /// Builds a `Libp2pNetwork` whose swarm loop is replaced by a stub, so
+    /// the batch helpers can be driven without a real network. The returned
+    /// receiver stands in for the swarm loop: whatever it chooses to answer
+    /// (or ignore) is what the helper sees.
+    fn network_with_stub_swarm(
+        data_dir: &std::path::Path,
+    ) -> (Libp2pNetwork, mpsc::Receiver<SwarmCommand>) {
+        let (command_tx, command_rx) = mpsc::channel(64);
+        let (event_tx, _) = broadcast::channel(16);
+        let (_relay_tx, relay_rx) = mpsc::channel(16);
+        let crdt_repo: Arc<dyn ContentRepository> =
+            Arc::new(CrslCrdtRepository::open(data_dir.join("crdt")).unwrap());
+
+        let network = Libp2pNetwork {
+            local_peer_id: PeerId::random(),
+            command_tx,
+            connected_peers: Arc::new(RwLock::new(HashMap::new())),
+            event_rx: event_tx,
+            crdt_repo,
+            data_dir: data_dir.to_path_buf(),
+            p256_public_key: Vec::new(),
+            relay_request_rx: tokio::sync::Mutex::new(Some(relay_rx)),
+            content_network_repo: None,
+        };
+        (network, command_rx)
+    }
+
+    /// Capacity queries must not be paid for one after another.
+    ///
+    /// `create` asks every placement candidate for its capacity. Querying them
+    /// in sequence means each unreachable peer costs a full timeout before the
+    /// next is even asked, so the caller waits timeout × N. Deployed node1 sat
+    /// silent for 30.4s and then 61.0s — one and two timeouts — with
+    /// "member(s) did not answer the capacity query" logged right after, long
+    /// enough for the ALB health check to fail and ECS to cycle the task.
+    ///
+    /// Three peers, none of which ever answers: the whole batch must still
+    /// cost about one timeout, not three.
+    #[tokio::test(start_paused = true)]
+    async fn capacity_queries_do_not_serialise_their_timeouts() {
+        let dir = tempdir().unwrap();
+        let (network, mut command_rx) = network_with_stub_swarm(dir.path());
+
+        // A swarm loop that accepts every query and answers none, which is how
+        // an unreachable peer behaves.
+        tokio::spawn(async move {
+            let mut _held = Vec::new();
+            while let Some(cmd) = command_rx.recv().await {
+                _held.push(cmd); // keep the reply channels open, never reply
+            }
+        });
+
+        let peers: Vec<String> = (0..3).map(|_| PeerId::random().to_string()).collect();
+
+        let start = tokio::time::Instant::now();
+        let caps = network.query_node_capacity_batch(&peers).await.unwrap();
+        let elapsed = start.elapsed();
+
+        assert!(caps.is_empty(), "no peer answered, so no capacity is known");
+        assert!(
+            elapsed < CAPACITY_QUERY_TIMEOUT * 2,
+            "querying {} unreachable peers took {:?}; timeouts are being paid \
+             one after another instead of concurrently",
+            peers.len(),
+            elapsed
+        );
+    }
+
+    /// The same defect in the public-key batch: one unreachable peer must not
+    /// delay the peers behind it in the list.
+    #[tokio::test(start_paused = true)]
+    async fn public_key_queries_do_not_serialise_their_timeouts() {
+        let dir = tempdir().unwrap();
+        let (network, mut command_rx) = network_with_stub_swarm(dir.path());
+
+        tokio::spawn(async move {
+            let mut _held = Vec::new();
+            while let Some(cmd) = command_rx.recv().await {
+                _held.push(cmd);
+            }
+        });
+
+        let peers: Vec<String> = (0..3).map(|_| PeerId::random().to_string()).collect();
+
+        let start = tokio::time::Instant::now();
+        let keys = network.query_node_public_keys_batch(&peers).await.unwrap();
+        let elapsed = start.elapsed();
+
+        assert!(keys.is_empty());
+        assert!(
+            elapsed < PEER_NETWORK_TIMEOUT * 2,
+            "querying {} unreachable peers took {:?}; one timeout is expected, \
+             {:?} would mean they were paid in sequence",
+            peers.len(),
+            elapsed,
+            PEER_NETWORK_TIMEOUT * peers.len() as u32
+        );
+    }
+
+    /// An answering peer must still be reported, and must not be made to wait
+    /// for the unreachable ones in the same batch.
+    #[tokio::test(start_paused = true)]
+    async fn a_responsive_peer_is_not_held_up_by_silent_ones() {
+        let dir = tempdir().unwrap();
+        let (network, mut command_rx) = network_with_stub_swarm(dir.path());
+
+        let good = PeerId::random();
+        tokio::spawn(async move {
+            let mut _held = Vec::new();
+            while let Some(cmd) = command_rx.recv().await {
+                match cmd {
+                    SwarmCommand::QueryCapacity { peer_id, reply } if peer_id == good => {
+                        let _ = reply.send(Ok((100, 42)));
+                    }
+                    other => _held.push(other),
+                }
+            }
+        });
+
+        let peers = vec![
+            PeerId::random().to_string(),
+            good.to_string(),
+            PeerId::random().to_string(),
+        ];
+
+        let start = tokio::time::Instant::now();
+        let caps = network.query_node_capacity_batch(&peers).await.unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(
+            caps.get(&good.to_string()),
+            Some(&42),
+            "the peer that answered must be in the result"
+        );
+        // The answering peer replies at once; the batch must not linger on
+        // the silent ones any longer than a single capacity timeout.
+        assert!(
+            elapsed < CAPACITY_QUERY_TIMEOUT * 2,
+            "batch took {elapsed:?}"
+        );
+    }
 
     /// An inbound connection must never be remembered.
     ///
