@@ -59,9 +59,6 @@ export function PreviewModal({
   const [history, setHistory] = useState<AsyncState<GetHistoryOutput>>({ status: "idle" });
   const [verify, setVerify] = useState<AsyncState<VerifyIntegrityOutput>>({ status: "idle" });
   const [read, setRead] = useState<AsyncState<ReadFromStateNodeOutput>>({ status: "idle" });
-  // Which version the verified read should fetch. "" = whatever the state node
-  // currently reports as newest.
-  const [readVersion, setReadVersion] = useState("");
 
   // Auto-load latest + history on open, but only for synced files (local-only
   // files have no Content Network and the calls would just fail).
@@ -72,7 +69,6 @@ export function PreviewModal({
     setHistory({ status: "loading" });
     setVerify({ status: "idle" });
     setRead({ status: "idle" });
-    setReadVersion("");
     getLatestVersion(cid)
       .then((d) => !cancelled && setLatest({ status: "ok", data: d }))
       .catch((e) => !cancelled && setLatest({ status: "error", message: errMsg(e) }));
@@ -115,13 +111,17 @@ export function PreviewModal({
   // store), this pulls the version off the state node — relayed to a member if
   // the contacted node isn't one — and only yields plaintext once the CID has
   // been recomputed and the AES-GCM decryption re-addresses to the local id.
+  // Only the newest version can be verified here. The check re-derives the
+  // plaintext and compares it against `local_content_id`, and each version has
+  // its own — the registry keeps just the current one, so asking for an older
+  // version would always fail the comparison it is meant to prove. Offering
+  // that choice made the control look broken rather than honest.
   const runRead = () => {
     if (!cid || !entry.localContentId) return;
     setRead({ status: "loading" });
     readFromStateNode({
       contentId: cid,
       localContentId: entry.localContentId,
-      version: readVersion || undefined,
     })
       .then((d) => setRead({ status: "ok", data: d }))
       .catch((e) => setRead({ status: "error", message: errMsg(e) }));
@@ -280,26 +280,12 @@ export function PreviewModal({
             <label>verified read</label>
             <div className="muted" style={{ fontSize: 11.5, marginBottom: 8 }}>
               The preview above came from the gateway's own store. This reads the
-              version back from the state node — relayed to a member node if the
-              one we contacted isn't one — and only shows plaintext after the
-              Node CID is recomputed, the CEK decrypts it (AES-GCM), and the
+              newest version back from the state node — relayed to a member node
+              if the one we contacted isn't one — and only shows plaintext after
+              the Node CID is recomputed, the CEK decrypts it (AES-GCM), and the
               plaintext re-addresses to the local id. A relay cannot forge this.
             </div>
             <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-              <select
-                className="select"
-                style={{ maxWidth: 260 }}
-                value={readVersion}
-                onChange={(e) => setReadVersion(e.target.value)}
-              >
-                <option value="">latest version</option>
-                {history.status === "ok" &&
-                  history.data.versions.map((v, i) => (
-                    <option key={`${v}-${i}`} value={v}>
-                      {short(v)}
-                    </option>
-                  ))}
-              </select>
               <button className="btn sm" disabled={read.status === "loading"} onClick={runRead}>
                 {read.status === "loading" ? <span className="spinner" /> : <Network size={13} />}{" "}
                 Read from state-node

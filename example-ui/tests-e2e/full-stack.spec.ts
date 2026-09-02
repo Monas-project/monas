@@ -86,9 +86,12 @@ test("J-1: a fresh user can create, read, verify, edit and delete content on the
     await rowAction(page, name, "Open / preview");
     const modal = page.locator(".modal");
     await expect(modal.locator(".preview-box").first()).toHaveText(v1);
-    // Auto-loaded from the state node on open:
+    // Auto-loaded from the state node on open. A create writes two versions,
+    // not one: the content itself, then the owner's access policy. The suite
+    // used to expect one because versions written in the same second collapsed
+    // onto a single CID — the sync bug fixed in #70.
     await expect(modal).toContainText("latest version");
-    await expect(modal.locator(".state-history .ver")).toHaveCount(1, {
+    await expect(modal.locator(".state-history .ver")).toHaveCount(2, {
       timeout: 60_000,
     });
     await expect(modal.locator(".state-history .ver.current")).toHaveCount(1);
@@ -126,28 +129,25 @@ test("J-1: a fresh user can create, read, verify, edit and delete content on the
     await expectLastRunComplete(page);
   });
 
-  let oldVersion = "";
-  await test.step("history now has two versions; the old one is still readable", async () => {
+  await test.step("the edit adds a version, and the head still verifies", async () => {
     await rowAction(page, name, "Open / preview");
     const modal = page.locator(".modal");
     await expect(modal.locator(".preview-box").first()).toHaveText(v2);
-    await expect(modal.locator(".state-history .ver")).toHaveCount(2, {
+    // Two from the create, plus this edit.
+    await expect(modal.locator(".state-history .ver")).toHaveCount(3, {
       timeout: 60_000,
     });
+    await expect(modal.locator(".state-history .ver.current")).toHaveCount(1);
 
-    // The non-current entry's text is the previous version id.
-    oldVersion = (
-      await modal.locator(".state-history .ver:not(.current)").innerText()
-    ).trim();
-    expect(oldVersion.length).toBeGreaterThan(0);
-
-    await modal.locator("select.select").last().selectOption(oldVersion);
+    // The verified read covers the newest version only: the check re-derives
+    // the plaintext and compares it against the local content id, and the
+    // registry holds only the current one. Reading an older version here would
+    // fail the very comparison the control exists to demonstrate.
     await modal.getByRole("button", { name: "Read from state-node" }).click();
     await expect(modal.locator(".badge.synced", { hasText: "verified" })).toBeVisible({
       timeout: 120_000,
     });
-    // Reading the previous version yields the previous plaintext.
-    await expect(modal.locator(".preview-box").nth(1)).toHaveText(v1);
+    await expect(modal.locator(".preview-box").nth(1)).toHaveText(v2);
     await page.keyboard.press("Escape");
     await expect(page.locator(".overlay")).toHaveCount(0);
   });
@@ -224,7 +224,12 @@ test("J-2: sharing, external-key sharing, and revoke with envelope reissue", asy
         body: JSON.stringify({ key_type: "secp256r1" }),
       });
       if (!res.ok) throw new Error(`keypair failed: ${res.status}`);
-      return (await res.json()).public_key as string;
+      // The gateway wraps every reply in the SDK envelope
+      // ({ success, data, trace_id }); the key lives under `data`.
+      const body = (await res.json()) as { data?: { public_key?: string } };
+      const key = body.data?.public_key;
+      if (!key) throw new Error(`keypair reply had no public_key: ${JSON.stringify(body)}`);
+      return key;
     });
 
     const modal = page.locator(".modal");
