@@ -35,7 +35,12 @@ export function ShareModal({
   const [pubKey, setPubKey] = useState("");
   const [label, setLabel] = useState("");
   const [canWrite, setCanWrite] = useState(false);
-  const [verify, setVerify] = useState(true);
+  // Off by default: proving access decrypts as the recipient, and the SDK
+  // stores the CEK it recovers under this content id — the same slot the owner
+  // reads from. After a revoke rotates the CEK, the owner is then left holding
+  // the recipient's stale copy and can no longer read their own file. Useful to
+  // demonstrate the HPKE round trip, but it is not free.
+  const [verify, setVerify] = useState(false);
 
   const permissions: Permission[] = canWrite ? ["read", "write"] : ["read"];
 
@@ -171,6 +176,12 @@ export function ShareModal({
             <input type="checkbox" checked={verify} onChange={(e) => setVerify(e.target.checked)} />
             Prove access: unwrap CEK & decrypt as the recipient
           </label>
+          <div className="hint">
+            Decrypts as the recipient to show the HPKE round trip really works.
+            It also replaces the locally stored CEK for this content with the
+            recipient's copy, so a later revoke — which rotates the CEK — leaves
+            you unable to read your own file until you share it again.
+          </div>
         </div>
       ) : (
         <>

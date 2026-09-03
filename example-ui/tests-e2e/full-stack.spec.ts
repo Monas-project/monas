@@ -203,7 +203,12 @@ test("J-2: sharing, external-key sharing, and revoke with envelope reissue", asy
     await rowAction(page, name, "Share");
     const modal = page.locator(".modal");
     await modal.locator("select.select").selectOption({ label: "bob · secp256r1" });
-    await expect(modal.locator('input[type="checkbox"]')).toBeChecked(); // "Prove access"
+    // "Prove access" is off by default, and this journey leaves it off: it
+    // decrypts as the recipient, which replaces the stored CEK for this content
+    // with the recipient's copy. The revoke later in this journey rotates the
+    // CEK, and the owner would then be holding a stale one. The HPKE round trip
+    // itself is covered by the pasted-key step below.
+    await expect(modal.locator('input[type="checkbox"]')).not.toBeChecked();
     await modal.getByRole("button", { name: "Wrap CEK & share" }).click();
     await expectToast(page, "Shared with bob");
     await expectLastRunComplete(page);
