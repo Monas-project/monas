@@ -60,9 +60,13 @@ pub struct StateNodeConfig {
     /// Node ID (optional, generated if not provided).
     pub node_id: Option<String>,
     /// Sync interval in seconds (default: 30).
+    /// Can be set via SYNC_INTERVAL_SECS environment variable.
     pub sync_interval_secs: u64,
     /// Outbox retry interval in seconds (default: 10).
     pub outbox_retry_interval_secs: u64,
+    /// Redundancy check interval in seconds (default: 300).
+    /// Can be set via REDUNDANCY_INTERVAL_SECS environment variable.
+    pub redundancy_interval_secs: u64,
     /// Minimum replication factor for content networks (default: 3).
     /// Can be set via MIN_REPLICATION_FACTOR environment variable.
     pub min_replication_factor: usize,
@@ -79,8 +83,15 @@ impl Default for StateNodeConfig {
             http_addr: "127.0.0.1:8080".parse().unwrap(),
             network_config: Libp2pNetworkConfig::default(),
             node_id: None,
-            sync_interval_secs: 30,
+            sync_interval_secs: std::env::var("SYNC_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30),
             outbox_retry_interval_secs: 10,
+            redundancy_interval_secs: std::env::var("REDUNDANCY_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(300),
             min_replication_factor: std::env::var("MIN_REPLICATION_FACTOR")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -569,11 +580,15 @@ impl StateNode {
             }
         });
 
-        // Spawn periodic redundancy check task (5 minute interval)
+        // Spawn periodic redundancy check task
+        let redundancy_interval = Duration::from_secs(self.config.redundancy_interval_secs);
         let token_redundancy = token.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(300));
-            tracing::info!("Started periodic redundancy check task (interval: 300s)");
+            let mut interval = tokio::time::interval(redundancy_interval);
+            tracing::info!(
+                "Started periodic redundancy check task (interval: {}s)",
+                redundancy_interval.as_secs()
+            );
             loop {
                 tokio::select! {
                     _ = token_redundancy.cancelled() => {
@@ -679,6 +694,7 @@ mod tests {
         assert!(config.node_id.is_none());
         assert_eq!(config.sync_interval_secs, 30);
         assert_eq!(config.outbox_retry_interval_secs, 10);
+        assert_eq!(config.redundancy_interval_secs, 300);
         assert_eq!(config.min_replication_factor, 3);
         assert_eq!(config.capacity_threshold_bytes, 1_073_741_824);
     }
