@@ -156,17 +156,18 @@ impl PeerStore {
 ///
 /// Rejects addresses that cannot get us back to the peer from a fresh process:
 /// loopback, link-local and unspecified addresses, and relayed
-/// (`/p2p-circuit`) addresses — a circuit is only valid while that particular
-/// relay connection lives, so persisting one just means re-dialling a dead
-/// path every maintenance tick.
+/// (`/p2p-circuit`) addresses — a circuit is only meaningful while that relay
+/// is up and still holds a reservation for that peer, so persisting one just
+/// means re-dialling a dead path every maintenance tick. The address we want
+/// to remember is where the peer itself lives.
 fn is_shareable(addr: &Multiaddr) -> bool {
     use libp2p::multiaddr::Protocol;
     !addr.iter().any(|p| match p {
+        Protocol::P2pCircuit => true,
         Protocol::Ip4(ip) => ip.is_loopback() || ip.is_link_local() || ip.is_unspecified(),
         Protocol::Ip6(ip) => {
             ip.is_loopback() || ip.is_unspecified() || (ip.segments()[0] & 0xffc0) == 0xfe80
         }
-        Protocol::P2pCircuit => true,
         _ => false,
     })
 }
@@ -237,7 +238,8 @@ mod tests {
 
     /// A relayed address is only good while that relay connection lives.
     /// Persisting one means re-dialling a dead circuit on every tick — the
-    /// same "frozen address" class this store exists to escape.
+    /// same "frozen address" class this store exists to escape. Covers the
+    /// relay-side suffix shape (…/p2p/<relay>/p2p-circuit).
     #[test]
     fn skips_relayed_circuit_addresses() {
         let mut store = PeerStore::default();
@@ -245,6 +247,24 @@ mod tests {
         assert!(!store.record(
             p,
             addr("/ip4/10.0.1.60/tcp/9001/p2p/12D3KooWH17aFKSgbVAJRZ7Tk8sG7khB9y5xte83LnqcnA16W2aD/p2p-circuit")
+        ));
+        assert!(store.is_empty());
+    }
+
+    /// A circuit address says where a peer could be reached *through a relay
+    /// right now*, not where it lives. Persisting one would have a restart
+    /// dial a circuit through a relay that no longer holds the reservation.
+    /// Covers the full-circuit shape (…/p2p-circuit/p2p/<target>).
+    #[test]
+    fn skips_circuit_addresses() {
+        let mut store = PeerStore::default();
+        let p = peer(1);
+        assert!(!store.record(
+            p,
+            addr(
+                "/ip4/198.51.100.7/tcp/9001/p2p-circuit/p2p/12D3KooWA8EXV3KjBxEU5EnsPfneLx84vMWA\
+                  Gyid2iykpFYbdcVN"
+            )
         ));
         assert!(store.is_empty());
     }
