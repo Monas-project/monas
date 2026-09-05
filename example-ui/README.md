@@ -83,6 +83,20 @@ identity with the HPKE round-trip proof, share to a pasted external key,
 revoke with envelope reissue), and folders + binary upload + filter views +
 cascade delete.
 
+`tests-e2e/cross-device.spec.ts` (J-4) is the two-device share: two browser
+contexts, each bound to its **own gateway + monas-account pair**, exchange only
+what people would paste into a chat — a public key one way, a share package
+the other — and the recipient reads the plaintext, re-imports a re-wrapped
+package after a revoke, and is refused the stale one. It needs the second pair
+running:
+
+```bash
+MONAS_STATE_NODE_URL=https://node1.monas-demo.net ./scripts/second-device.sh   # :3001 / :4003
+```
+
+vite proxies `/api2` and `/account-api2` to it (`VITE_GATEWAY2_TARGET` /
+`VITE_ACCOUNT2_TARGET` to override).
+
 Modal structure is asserted with **ARIA snapshots** (`toMatchAriaSnapshot`)
 rather than CSS selectors, so the whole control set of a dialog is checked in
 one assertion and the tests survive styling changes.
@@ -195,6 +209,38 @@ key. So:
 Sharing (`/share`, `/share/decrypt`, `/share/revoke`) only uses the keypairs the
 UI holds, so a recipient identity doesn't need to be a signing account.
 
+## Sharing with someone on another device
+
+Monas does not carry key envelopes between people — that is deliberately left
+to whatever channel the two of you already have. The UI makes both ends a
+copy-paste:
+
+1. **Recipient**: identity chip → **Copy public key** on the identity you want
+   to receive with, and send it to the owner.
+2. **Owner**: row menu → **Share** → *Paste public key* → **Wrap CEK & share**.
+   The dialog shows the **share package** for that recipient (also **Copy
+   package** on the row). Send it over chat, mail, anything.
+3. **Recipient**: sidebar **Import shared** → paste → **Unwrap & add to my
+   Drive**. The gateway unwraps the content key with your identity (HPKE Auth,
+   so it also proves the package came from that sender and pins their key)
+   and decrypts. The file appears with a *shared with me* badge; **Open**
+   unwraps it again from the kept envelope.
+
+The package is one JSON document (`kind: "monas-share"`, `v: 1`): the file's
+name/type/size, the owner's content id and Content Network id, both public
+keys, the recipient KeyId, permissions, the `KeyEnvelope` and the delegated
+token. It is not secret — the key inside is wrapped to the recipient only —
+but it is a capability, so treat it like a link to the file.
+
+What it does **not** do yet: read newer versions from the state node. The
+envelope carries the ciphertext of the version that was shared, so after the
+owner edits, the recipient needs a fresh package. Reading as a recipient
+directly from the state node needs the delegated token combined with a request
+signed by the recipient's key; the SDK issues the token for the owner-side
+content id and does not yet sign delegated reads, so that is SDK work, not
+UI work. After a revoke of *another* recipient the owner's dialog shows the
+re-wrapped package; the pre-rotation one is refused as stale on import.
+
 ## What's real vs. illustrative
 
 A single gateway call does the whole orchestration server-side, so the Protocol
@@ -211,7 +257,7 @@ that narrate the protocol and read ids out of the response:
 
 - **Folders are logical** (path prefixes). The gateway has no folder/listing
   concept, so the UI keeps its own file registry in `localStorage`
-  (`monas.registry.v2`). Identities and the endpoint live there too. Clearing
+  (`monas.registry.v3`). Identities and the endpoint live there too. Clearing
   site data resets the demo.
 - **Rename** of a file is local-only here (the SDK applies a new name on the
   next content edit); folder rename re-paths its descendants locally.

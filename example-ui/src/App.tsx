@@ -616,13 +616,15 @@ export default function App() {
       )}
       {modal.type === "delete" && (
         <ConfirmModal
-          title={`Delete ${modal.entry.kind}`}
+          title={modal.entry.receivedShare ? "Remove from my Drive" : `Delete ${modal.entry.kind}`}
           message={
-            modal.entry.kind === "folder"
-              ? `Delete “${modal.entry.name}” and everything inside it? Encrypted blobs are removed and the Content Networks are tombstoned.`
-              : `Delete “${modal.entry.name}”? This removes the encrypted blob and tombstones its Content Network on the state-node.`
+            modal.entry.receivedShare
+              ? `Remove “${modal.entry.name}” from your Drive? It was shared with you; the owner's file and its Content Network are untouched, and you can import the package again later.`
+              : modal.entry.kind === "folder"
+                ? `Delete “${modal.entry.name}” and everything inside it? Encrypted blobs are removed and the Content Networks are tombstoned.`
+                : `Delete “${modal.entry.name}”? This removes the encrypted blob and tombstones its Content Network on the state-node.`
           }
-          confirmLabel="Delete"
+          confirmLabel={modal.entry.receivedShare ? "Remove" : "Delete"}
           onConfirm={() => handleDelete(modal.entry)}
           onClose={() => setModal({ type: "none" })}
         />

@@ -239,7 +239,9 @@ test("J-2: sharing, external-key sharing, and revoke with envelope reissue", asy
 
     const modal = page.locator(".modal");
     await modal.locator(".seg button", { hasText: "Paste public key" }).click();
-    await modal.locator("textarea.input").fill(pubKey);
+    // Not `textarea.input`: with bob's grant in place the dialog also shows
+    // his share package in a textarea.
+    await modal.locator(".field", { hasText: "Recipient public key" }).locator("textarea").fill(pubKey);
     await modal.locator(".field", { hasText: "Label (optional)" }).locator("input.input").fill("carol-ext");
     await modal.getByRole("button", { name: "Wrap CEK & share" }).click();
     await expectToast(page, "Shared with carol-ext");
