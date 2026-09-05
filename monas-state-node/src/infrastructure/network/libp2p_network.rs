@@ -742,6 +742,20 @@ impl Libp2pNetwork {
                             }
                         }
                     }
+                    // A peer's own announcement of where it listens supersedes
+                    // whatever we remembered. This is the only path that
+                    // refreshes a peer that connected *to us* after moving —
+                    // `ConnectionEstablished` records nothing for inbound
+                    // connections, since a remote's ephemeral port is not
+                    // dialable.
+                    if let SwarmEvent::Behaviour(NodeBehaviourEvent::Identify(ev)) = &event {
+                        if let identify::Event::Received { peer_id, info, .. } = &**ev {
+                            if peer_store.replace(*peer_id, info.listen_addrs.iter().cloned()) {
+                                peer_store_dirty = true;
+                                debug!("Peer store refreshed for {} from Identify", peer_id);
+                            }
+                        }
+                    }
                     Self::handle_swarm_event(&mut swarm, &mut pending, &connected_peers, &event_tx, &crdt_repo, &data_dir, &p256_signing_key, &relay_channels, &content_network_repo, event).await;
                 }
                 // Periodic cleanup of stale pending requests
@@ -806,31 +820,56 @@ impl Libp2pNetwork {
 
         // Configured entry points first, then peers we have met before. The
         // latter is what lets a node recover when every bootstrap is down.
-        let candidates = bootstrap_nodes.iter().map(|(p, a)| (p, a)).chain(
+        // Every address we hold for a peer goes into one dial: a peer that
+        // moved leaves a stale entry behind, and dialling only the first entry
+        // meant trying that dead address on every tick while the fresh one
+        // sat unused.
+        let mut per_peer: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
+        let mut order: Vec<PeerId> = Vec::new();
+        for (peer_id, addr) in bootstrap_nodes.iter().map(|(p, a)| (p, a)).chain(
             peer_store
                 .iter()
                 .flat_map(|(p, addrs)| addrs.iter().map(move |a| (p, a))),
-        );
-
-        let mut dialled: HashSet<PeerId> = HashSet::new();
-        for (peer_id, addr) in candidates {
-            if swarm.local_peer_id() == peer_id
-                || connected.contains(peer_id)
-                || !dialled.insert(*peer_id)
-            {
+        ) {
+            if swarm.local_peer_id() == peer_id || connected.contains(peer_id) {
                 continue;
             }
+            let entry = per_peer.entry(*peer_id).or_insert_with(|| {
+                order.push(*peer_id);
+                Vec::new()
+            });
+            if !entry.contains(addr) {
+                entry.push(addr.clone());
+            }
+        }
+
+        for peer_id in order {
+            let addrs = per_peer.remove(&peer_id).unwrap_or_default();
             // Refresh the address book first: for a DNS address this is what
             // lets a later dial pick up a changed IP.
-            swarm
-                .behaviour_mut()
-                .kademlia
-                .add_address(peer_id, addr.clone());
-            swarm.add_peer_address(*peer_id, addr.clone());
+            for addr in &addrs {
+                swarm
+                    .behaviour_mut()
+                    .kademlia
+                    .add_address(&peer_id, addr.clone());
+                swarm.add_peer_address(peer_id, addr.clone());
+            }
 
-            match swarm.dial(addr.clone()) {
-                Ok(()) => info!("Re-dialling peer {} at {}", peer_id, addr),
-                Err(e) => debug!("Re-dial of {} at {} failed: {:?}", peer_id, addr, e),
+            let opts = libp2p::swarm::dial_opts::DialOpts::peer_id(peer_id)
+                .addresses(addrs.clone())
+                .build();
+            match swarm.dial(opts) {
+                Ok(()) => info!(
+                    "Re-dialling peer {} at {} address(es): {}",
+                    peer_id,
+                    addrs.len(),
+                    addrs
+                        .iter()
+                        .map(|a| a.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                Err(e) => debug!("Re-dial of {} failed: {:?}", peer_id, e),
             }
         }
 

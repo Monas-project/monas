@@ -135,6 +135,43 @@ impl PeerStore {
         true
     }
 
+    /// Replace everything we know about a peer with the addresses it just
+    /// announced. Returns true if this changed anything.
+    ///
+    /// `record` only learns the address *we* dialled, so a peer that connected
+    /// to us — which is how every member reaches the bootstrap node, and how
+    /// any node reaches a peer that has just moved — never updated its entry.
+    /// After an ECS restart gives a peer a new IP, the store kept the old one
+    /// and `maintain_connectivity` re-dialled it forever. Identify carries the
+    /// peer's own listen addresses, which is the freshest information there
+    /// is; it wins over anything remembered.
+    pub fn replace(&mut self, peer: PeerId, addrs: impl IntoIterator<Item = Multiaddr>) -> bool {
+        let mut fresh: Vec<Multiaddr> = Vec::new();
+        for a in addrs {
+            if is_shareable(&a) && !fresh.contains(&a) {
+                fresh.push(a);
+            }
+        }
+        // A peer that announces nothing usable tells us nothing; keep what we had.
+        if fresh.is_empty() {
+            return false;
+        }
+        fresh.truncate(MAX_ADDRS_PER_PEER);
+
+        if self.peers.get(&peer) == Some(&fresh) {
+            return false;
+        }
+        if !self.peers.contains_key(&peer) {
+            self.order.push(peer);
+        }
+        self.peers.insert(peer, fresh);
+        if self.order.len() > MAX_PEERS {
+            let oldest = self.order.remove(0);
+            self.peers.remove(&oldest);
+        }
+        true
+    }
+
     pub fn addrs(&self, peer: &PeerId) -> Option<&Vec<Multiaddr>> {
         self.peers.get(peer)
     }
@@ -186,6 +223,72 @@ mod tests {
 
     fn addr(s: &str) -> Multiaddr {
         Multiaddr::from_str(s).unwrap()
+    }
+
+    /// The production failure: a peer restarts on a new IP, connects to us,
+    /// and Identify announces the new address. The stale one must be gone —
+    /// with it still first in the list, every maintenance tick re-dialled a
+    /// dead address.
+    #[test]
+    fn identify_replaces_a_stale_address_with_the_announced_one() {
+        let mut store = PeerStore::default();
+        let p = peer(1);
+        assert!(store.record(p, addr("/ip4/10.0.1.196/tcp/9001")));
+
+        // Identify announces the peer's own listen addresses: the new private
+        // IP plus the loopback and link-local ones every node also binds.
+        assert!(store.replace(
+            p,
+            [
+                addr("/ip4/127.0.0.1/tcp/9001"),
+                addr("/ip4/169.254.172.2/tcp/9001"),
+                addr("/ip4/10.0.1.111/tcp/9001"),
+            ]
+        ));
+        assert_eq!(
+            store.addrs(&p).unwrap(),
+            &[addr("/ip4/10.0.1.111/tcp/9001")]
+        );
+    }
+
+    #[test]
+    fn replace_with_the_same_addresses_is_a_no_op() {
+        let mut store = PeerStore::default();
+        let p = peer(1);
+        assert!(store.replace(p, [addr("/ip4/10.0.1.111/tcp/9001")]));
+        assert!(!store.replace(p, [addr("/ip4/10.0.1.111/tcp/9001")]));
+        assert_eq!(store.len(), 1);
+    }
+
+    /// A peer that announces only loopback or link-local addresses has told
+    /// us nothing we can use from a fresh process; what we had stays.
+    #[test]
+    fn replace_with_nothing_shareable_keeps_the_old_entry() {
+        let mut store = PeerStore::default();
+        let p = peer(1);
+        assert!(store.record(p, addr("/ip4/10.0.1.196/tcp/9001")));
+        assert!(!store.replace(
+            p,
+            [
+                addr("/ip4/127.0.0.1/tcp/9001"),
+                addr("/ip4/169.254.1.1/tcp/9001")
+            ]
+        ));
+        assert_eq!(
+            store.addrs(&p).unwrap(),
+            &[addr("/ip4/10.0.1.196/tcp/9001")]
+        );
+    }
+
+    #[test]
+    fn replace_caps_addresses_per_peer() {
+        let mut store = PeerStore::default();
+        let p = peer(1);
+        let many: Vec<Multiaddr> = (0..10)
+            .map(|i| addr(&format!("/ip4/10.0.2.{i}/tcp/9001")))
+            .collect();
+        assert!(store.replace(p, many));
+        assert_eq!(store.addrs(&p).unwrap().len(), MAX_ADDRS_PER_PEER);
     }
 
     #[test]
