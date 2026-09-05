@@ -26,7 +26,7 @@ use libp2p::{
     gossipsub::{self, IdentTopic},
     identify, kad,
     request_response::{self, OutboundRequestId, ResponseChannel},
-    swarm::SwarmEvent,
+    swarm::{DialError, SwarmEvent},
     Multiaddr, PeerId, Swarm,
 };
 use std::collections::{HashMap, HashSet};
@@ -76,6 +76,15 @@ fn reusable_addr(endpoint: &ConnectedPoint) -> Option<&Multiaddr> {
         ConnectedPoint::Dialer { address, .. } => Some(address),
         ConnectedPoint::Listener { .. } => None,
     }
+}
+
+/// Addresses as a single log field.
+fn join_addrs(addrs: &[Multiaddr]) -> String {
+    addrs
+        .iter()
+        .map(|a| a.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// A relay request received from a remote peer via P2P protocol.
@@ -752,8 +761,41 @@ impl Libp2pNetwork {
                         if let identify::Event::Received { peer_id, info, .. } = &**ev {
                             if peer_store.replace(*peer_id, info.listen_addrs.iter().cloned()) {
                                 peer_store_dirty = true;
-                                debug!("Peer store refreshed for {} from Identify", peer_id);
+                                info!(
+                                    "Peer store refreshed for {} from Identify: {}",
+                                    peer_id,
+                                    join_addrs(peer_store.addrs(peer_id).map(Vec::as_slice).unwrap_or_default())
+                                );
                             }
+                        }
+                    }
+                    // An address that just failed to connect is not worth
+                    // keeping: on Fargate a peer's old IP never comes back, and
+                    // as long as we hold it every dial to that peer burns the
+                    // transport timeout on it before anything else gets a turn.
+                    if let SwarmEvent::OutgoingConnectionError {
+                        peer_id: Some(peer_id),
+                        error,
+                        ..
+                    } = &event
+                    {
+                        let failed: Vec<Multiaddr> = match error {
+                            // Every address tried was dead.
+                            DialError::Transport(failed) => {
+                                failed.iter().map(|(a, _)| a.clone()).collect()
+                            }
+                            // Someone answered, but not the peer we remembered
+                            // there: the IP has been handed to another task.
+                            DialError::WrongPeerId { address, .. } => vec![address.clone()],
+                            _ => Vec::new(),
+                        };
+                        if peer_store.forget(*peer_id, failed.iter().cloned()) {
+                            peer_store_dirty = true;
+                            info!(
+                                "Peer store forgot unreachable address(es) of {}: {}",
+                                peer_id,
+                                join_addrs(&failed)
+                            );
                         }
                     }
                     Self::handle_swarm_event(&mut swarm, &mut pending, &connected_peers, &event_tx, &crdt_repo, &data_dir, &p256_signing_key, &relay_channels, &content_network_repo, event).await;
@@ -863,11 +905,7 @@ impl Libp2pNetwork {
                     "Re-dialling peer {} at {} address(es): {}",
                     peer_id,
                     addrs.len(),
-                    addrs
-                        .iter()
-                        .map(|a| a.to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                    join_addrs(&addrs)
                 ),
                 Err(e) => debug!("Re-dial of {} failed: {:?}", peer_id, e),
             }
