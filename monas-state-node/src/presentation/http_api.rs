@@ -21,6 +21,9 @@ use axum::{
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tower_governor::governor::GovernorConfigBuilder;
+use tower_governor::key_extractor::{GlobalKeyExtractor, SmartIpKeyExtractor};
+use tower_governor::GovernorLayer;
 
 /// Application state shared across handlers.
 pub type AppState = Arc<
@@ -34,28 +37,51 @@ pub type AppState = Arc<
     >,
 >;
 
-/// Create the API router.
-pub fn create_router(state: AppState) -> Router {
-    use std::sync::Arc;
-    use tower_governor::governor::GovernorConfigBuilder;
-    use tower_governor::key_extractor::SmartIpKeyExtractor;
-    use tower_governor::GovernorLayer;
+/// Requests per second the whole node accepts, and the burst it absorbs.
+pub const GLOBAL_RATE_PER_SEC: u64 = 100;
+pub const GLOBAL_BURST: u32 = 200;
+/// Requests per second one client IP may make, and the burst it absorbs.
+pub const PER_IP_RATE_PER_SEC: u64 = 20;
+pub const PER_IP_BURST: u32 = 40;
 
-    // Global rate limit: 100 requests/sec, burst up to 200
-    let governor_config = GovernorConfigBuilder::default()
-        .per_second(100)
-        .burst_size(200)
-        .finish()
-        .unwrap();
-
-    // Per-IP rate limit: 20 requests/sec, burst up to 40
-    let per_ip_config = GovernorConfigBuilder::default()
-        .per_second(20)
-        .burst_size(40)
+/// Wrap `routes` in the node's two rate limiters: per client IP inside,
+/// node-wide outside.
+///
+/// tower_governor's `per_second(n)` is the replenish *interval* — one permit
+/// every n seconds — not a rate. Written as `per_second(20)`, the per-IP
+/// limiter allowed one request every 20 seconds once the burst was spent,
+/// which throttled any client doing more than a handful of operations for
+/// minutes. `per_millisecond(1000 / rate)` is the interval that means "rate
+/// per second".
+///
+/// The node-wide limiter needs `GlobalKeyExtractor` to be node-wide: the
+/// builder's default keys on the TCP peer, which behind the load balancer is
+/// the balancer itself, so every client would have shared one bucket. The
+/// per-IP limiter reads `X-Forwarded-For` for the same reason.
+fn with_rate_limits<S: Clone + Send + Sync + 'static>(routes: Router<S>) -> Router<S> {
+    let per_ip = GovernorConfigBuilder::default()
+        .per_millisecond(1000 / PER_IP_RATE_PER_SEC)
+        .burst_size(PER_IP_BURST)
         .key_extractor(SmartIpKeyExtractor)
         .finish()
-        .unwrap();
+        .expect("rate limit interval and burst are non-zero");
+    let global = GovernorConfigBuilder::default()
+        .per_millisecond(1000 / GLOBAL_RATE_PER_SEC)
+        .burst_size(GLOBAL_BURST)
+        .key_extractor(GlobalKeyExtractor)
+        .finish()
+        .expect("rate limit interval and burst are non-zero");
+    routes
+        .layer(GovernorLayer {
+            config: Arc::new(per_ip),
+        })
+        .layer(GovernorLayer {
+            config: Arc::new(global),
+        })
+}
 
+/// Create the API router.
+pub fn create_router(state: AppState) -> Router {
     // Health check endpoints - exempt from rate limiting for ALB health checks
     let health_routes = Router::new()
         .route("/health", get(health_check))
@@ -84,18 +110,10 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/content/:id/access/invalidate",
             post(invalidate_tokens_handler),
-        )
-        // Per-IP rate limit (inner layer, applied first)
-        .layer(GovernorLayer {
-            config: Arc::new(per_ip_config),
-        })
-        // Global rate limit (outer layer)
-        .layer(GovernorLayer {
-            config: Arc::new(governor_config),
-        });
+        );
 
     health_routes
-        .merge(api_routes)
+        .merge(with_rate_limits(api_routes))
         // Request body size limit: 16 MiB
         .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
         .with_state(state)
@@ -913,6 +931,50 @@ async fn invalidate_tokens_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fire `n` requests from one client at a trivial rate-limited route and
+    /// return the statuses.
+    async fn statuses(router: &Router, n: usize) -> Vec<StatusCode> {
+        use tower::ServiceExt;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            let req = axum::http::Request::builder()
+                .uri("/")
+                .header("x-forwarded-for", "203.0.113.7")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            out.push(router.clone().oneshot(req).await.unwrap().status());
+        }
+        out
+    }
+
+    /// The limiter must replenish at the configured *rate*, not one permit per
+    /// `rate` seconds. With `per_second(20)` the bucket refilled once every 20
+    /// seconds, so a client that used its burst waited minutes for the next
+    /// handful of requests — which is what turned every second e2e run into
+    /// "Too Many Requests".
+    #[tokio::test]
+    async fn rate_limit_replenishes_at_the_configured_rate() {
+        let router = with_rate_limits(Router::new().route("/", get(|| async { "ok" })));
+
+        // Spend the whole per-IP burst.
+        let first = statuses(&router, PER_IP_BURST as usize + 5).await;
+        let first_ok = first.iter().filter(|s| **s == StatusCode::OK).count();
+        assert_eq!(
+            first_ok, PER_IP_BURST as usize,
+            "exactly the burst should pass immediately"
+        );
+
+        // At 20/s, 150ms replenishes three permits. At one per 20s it
+        // replenishes none, and this assertion is what fails.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let after = statuses(&router, 10).await;
+        let after_ok = after.iter().filter(|s| **s == StatusCode::OK).count();
+        assert!(
+            after_ok >= 2,
+            "expected permits to replenish within 150ms at {PER_IP_RATE_PER_SEC}/s, got {after_ok}: {after:?}"
+        );
+    }
 
     #[test]
     fn test_register_node_request_deserialization() {
