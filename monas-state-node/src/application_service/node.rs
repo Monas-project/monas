@@ -558,7 +558,13 @@ impl StateNode {
                 "Started periodic sync task (interval: {}s)",
                 sync_interval.as_secs()
             );
+            // A sync that overran its interval (a peer that would not answer
+            // for hours took each run to 600s) must not be followed by a
+            // back-to-back burst of every tick it missed: node3 ran ~70 syncs
+            // in a row the moment its peer came back. Delay: one run, then
+            // resume the cadence.
             let mut interval = tokio::time::interval(sync_interval);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! {
                     _ = token_sync.cancelled() => {
@@ -593,6 +599,7 @@ impl StateNode {
         let token_redundancy = token.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(redundancy_interval);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             tracing::info!(
                 "Started periodic redundancy check task (interval: {}s)",
                 redundancy_interval.as_secs()
@@ -633,6 +640,7 @@ impl StateNode {
                 retry_interval.as_secs()
             );
             let mut interval = tokio::time::interval(retry_interval);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! {
                     _ = token_outbox.cancelled() => {
@@ -669,6 +677,9 @@ impl StateNode {
         // a single worker, so one blocking task starves every other one. If
         // this line stops while CPU is high, the runtime is starved. If it
         // keeps going, whatever is stuck is blocked on a lock instead.
+        // Deliberately left on the default Burst behaviour: after a stall the
+        // missed beats fire together, and that burst is the signature we look
+        // for in the logs.
         let token_heartbeat = token.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(10));
