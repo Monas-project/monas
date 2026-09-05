@@ -97,6 +97,7 @@ features = ["tokio"]
 
 [dev-dependencies]
 tempfile = "3.8"
+tower = { version = "0.5", features = ["util"] }
 
 # ============================================================
 # WASM Support (Future)

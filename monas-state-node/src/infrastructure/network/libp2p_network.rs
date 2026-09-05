@@ -26,7 +26,7 @@ use libp2p::{
     gossipsub::{self, IdentTopic},
     identify, kad,
     request_response::{self, OutboundRequestId, ResponseChannel},
-    swarm::SwarmEvent,
+    swarm::{DialError, SwarmEvent},
     Multiaddr, PeerId, Swarm,
 };
 use std::collections::{HashMap, HashSet};
@@ -76,6 +76,15 @@ fn reusable_addr(endpoint: &ConnectedPoint) -> Option<&Multiaddr> {
         ConnectedPoint::Dialer { address, .. } => Some(address),
         ConnectedPoint::Listener { .. } => None,
     }
+}
+
+/// Addresses as a single log field.
+fn join_addrs(addrs: &[Multiaddr]) -> String {
+    addrs
+        .iter()
+        .map(|a| a.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// A relay request received from a remote peer via P2P protocol.
@@ -742,6 +751,54 @@ impl Libp2pNetwork {
                             }
                         }
                     }
+                    // A peer's own announcement of where it listens supersedes
+                    // whatever we remembered. This is the only path that
+                    // refreshes a peer that connected *to us* after moving —
+                    // `ConnectionEstablished` records nothing for inbound
+                    // connections, since a remote's ephemeral port is not
+                    // dialable.
+                    if let SwarmEvent::Behaviour(NodeBehaviourEvent::Identify(ev)) = &event {
+                        if let identify::Event::Received { peer_id, info, .. } = &**ev {
+                            if peer_store.replace(*peer_id, info.listen_addrs.iter().cloned()) {
+                                peer_store_dirty = true;
+                                info!(
+                                    "Peer store refreshed for {} from Identify: {}",
+                                    peer_id,
+                                    join_addrs(peer_store.addrs(peer_id).map(Vec::as_slice).unwrap_or_default())
+                                );
+                            }
+                        }
+                    }
+                    // An IP that just failed to connect is not worth keeping:
+                    // on Fargate a peer's old IP never comes back, and as long
+                    // as we hold it every dial to that peer burns the transport
+                    // timeout on it before anything else gets a turn. (Names
+                    // stay — see PeerStore::forget_unreachable.)
+                    if let SwarmEvent::OutgoingConnectionError {
+                        peer_id: Some(peer_id),
+                        error,
+                        ..
+                    } = &event
+                    {
+                        let (forgotten, what) = match error {
+                            // Every address tried was dead.
+                            DialError::Transport(failed) => (
+                                peer_store.forget_unreachable(*peer_id, failed.iter().map(|(a, _)| a.clone())),
+                                format!("unreachable {}", join_addrs(&failed.iter().map(|(a, _)| a.clone()).collect::<Vec<_>>())),
+                            ),
+                            // Someone answered, but not the peer we remembered
+                            // there: the address now belongs to another node.
+                            DialError::WrongPeerId { address, obtained } => (
+                                peer_store.forget_wrong_peer(*peer_id, address.clone()),
+                                format!("{} now answered by {}", address, obtained),
+                            ),
+                            _ => (false, String::new()),
+                        };
+                        if forgotten {
+                            peer_store_dirty = true;
+                            info!("Peer store forgot address(es) of {}: {}", peer_id, what);
+                        }
+                    }
                     Self::handle_swarm_event(&mut swarm, &mut pending, &connected_peers, &event_tx, &crdt_repo, &data_dir, &p256_signing_key, &relay_channels, &content_network_repo, event).await;
                 }
                 // Periodic cleanup of stale pending requests
@@ -750,16 +807,29 @@ impl Libp2pNetwork {
                 }
                 // Periodic reconnection / re-bootstrap
                 _ = peer_maintenance.tick() => {
+                    // This runs on the swarm loop itself, so anything slow here
+                    // stalls every network operation. Time it.
+                    let started = std::time::Instant::now();
                     Self::maintain_connectivity(&mut swarm, &connected_peers, &bootstrap_nodes, &peer_store).await;
+                    let maintain = started.elapsed();
                     // Flush at most once per tick rather than on every new
                     // address, so a busy node does not rewrite the file
                     // constantly.
+                    let save_started = std::time::Instant::now();
                     if peer_store_dirty {
                         if let Err(e) = peer_store.save(&data_dir) {
                             warn!("Failed to persist peer store: {}", e);
                         } else {
                             peer_store_dirty = false;
                         }
+                    }
+                    let save = save_started.elapsed();
+                    // Every 30s at info: this doubles as a swarm-loop heartbeat,
+                    // separate from the runtime-wide one in node.rs.
+                    if maintain + save > Duration::from_millis(500) {
+                        warn!("swarm tick: SLOW maintain_connectivity {:?}, peer_store.save {:?}", maintain, save);
+                    } else {
+                        info!("swarm tick: maintain_connectivity {:?}, peer_store.save {:?}", maintain, save);
                     }
                 }
             }
@@ -793,31 +863,52 @@ impl Libp2pNetwork {
 
         // Configured entry points first, then peers we have met before. The
         // latter is what lets a node recover when every bootstrap is down.
-        let candidates = bootstrap_nodes.iter().map(|(p, a)| (p, a)).chain(
+        // Every address we hold for a peer goes into one dial: a peer that
+        // moved leaves a stale entry behind, and dialling only the first entry
+        // meant trying that dead address on every tick while the fresh one
+        // sat unused.
+        let mut per_peer: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
+        let mut order: Vec<PeerId> = Vec::new();
+        for (peer_id, addr) in bootstrap_nodes.iter().map(|(p, a)| (p, a)).chain(
             peer_store
                 .iter()
                 .flat_map(|(p, addrs)| addrs.iter().map(move |a| (p, a))),
-        );
-
-        let mut dialled: HashSet<PeerId> = HashSet::new();
-        for (peer_id, addr) in candidates {
-            if swarm.local_peer_id() == peer_id
-                || connected.contains(peer_id)
-                || !dialled.insert(*peer_id)
-            {
+        ) {
+            if swarm.local_peer_id() == peer_id || connected.contains(peer_id) {
                 continue;
             }
+            let entry = per_peer.entry(*peer_id).or_insert_with(|| {
+                order.push(*peer_id);
+                Vec::new()
+            });
+            if !entry.contains(addr) {
+                entry.push(addr.clone());
+            }
+        }
+
+        for peer_id in order {
+            let addrs = per_peer.remove(&peer_id).unwrap_or_default();
             // Refresh the address book first: for a DNS address this is what
             // lets a later dial pick up a changed IP.
-            swarm
-                .behaviour_mut()
-                .kademlia
-                .add_address(peer_id, addr.clone());
-            swarm.add_peer_address(*peer_id, addr.clone());
+            for addr in &addrs {
+                swarm
+                    .behaviour_mut()
+                    .kademlia
+                    .add_address(&peer_id, addr.clone());
+                swarm.add_peer_address(peer_id, addr.clone());
+            }
 
-            match swarm.dial(addr.clone()) {
-                Ok(()) => info!("Re-dialling peer {} at {}", peer_id, addr),
-                Err(e) => debug!("Re-dial of {} at {} failed: {:?}", peer_id, addr, e),
+            let opts = libp2p::swarm::dial_opts::DialOpts::peer_id(peer_id)
+                .addresses(addrs.clone())
+                .build();
+            match swarm.dial(opts) {
+                Ok(()) => info!(
+                    "Re-dialling peer {} at {} address(es): {}",
+                    peer_id,
+                    addrs.len(),
+                    join_addrs(&addrs)
+                ),
+                Err(e) => debug!("Re-dial of {} failed: {:?}", peer_id, e),
             }
         }
 
