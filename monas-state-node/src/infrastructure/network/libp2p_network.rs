@@ -750,16 +750,29 @@ impl Libp2pNetwork {
                 }
                 // Periodic reconnection / re-bootstrap
                 _ = peer_maintenance.tick() => {
+                    // This runs on the swarm loop itself, so anything slow here
+                    // stalls every network operation. Time it.
+                    let started = std::time::Instant::now();
                     Self::maintain_connectivity(&mut swarm, &connected_peers, &bootstrap_nodes, &peer_store).await;
+                    let maintain = started.elapsed();
                     // Flush at most once per tick rather than on every new
                     // address, so a busy node does not rewrite the file
                     // constantly.
+                    let save_started = std::time::Instant::now();
                     if peer_store_dirty {
                         if let Err(e) = peer_store.save(&data_dir) {
                             warn!("Failed to persist peer store: {}", e);
                         } else {
                             peer_store_dirty = false;
                         }
+                    }
+                    let save = save_started.elapsed();
+                    // Every 30s at info: this doubles as a swarm-loop heartbeat,
+                    // separate from the runtime-wide one in node.rs.
+                    if maintain + save > Duration::from_millis(500) {
+                        warn!("swarm tick: SLOW maintain_connectivity {:?}, peer_store.save {:?}", maintain, save);
+                    } else {
+                        info!("swarm tick: maintain_connectivity {:?}, peer_store.save {:?}", maintain, save);
                     }
                 }
             }

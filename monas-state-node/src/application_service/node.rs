@@ -339,6 +339,14 @@ impl StateNode {
             self.node_id(),
             self.config.http_addr
         );
+        // How many tasks can actually run in parallel. On a fractional-vCPU
+        // container this is often 1, which turns any blocking computation into
+        // a whole-process stall.
+        tracing::info!(
+            "tokio runtime: {} worker thread(s), available_parallelism={:?}",
+            tokio::runtime::Handle::current().metrics().num_workers(),
+            std::thread::available_parallelism().map(|n| n.get())
+        );
 
         // Spawn relay request handler
         if let Some(mut relay_rx) = self.network.take_relay_receiver().await {
@@ -558,21 +566,21 @@ impl StateNode {
                         break;
                     }
                     _ = interval.tick() => {
-                        tracing::debug!("Running periodic content sync");
+                        tracing::info!("periodic sync: start");
+                        let started = std::time::Instant::now();
                         match sync_service.sync_all_content().await {
                             Ok(results) => {
                                 let total_applied: usize =
                                     results.iter().map(|(_, r)| r.operations_applied).sum();
-                                if total_applied > 0 {
-                                    tracing::info!(
-                                        "Periodic sync completed: {} operations applied across {} contents",
-                                        total_applied,
-                                        results.len()
-                                    );
-                                }
+                                tracing::info!(
+                                    "periodic sync: done in {:?}, {} operations applied across {} contents",
+                                    started.elapsed(),
+                                    total_applied,
+                                    results.len()
+                                );
                             }
                             Err(e) => {
-                                tracing::warn!("Periodic sync failed: {}", e);
+                                tracing::warn!("periodic sync: failed after {:?}: {}", started.elapsed(), e);
                             }
                         }
                     }
@@ -596,18 +604,18 @@ impl StateNode {
                         break;
                     }
                     _ = interval.tick() => {
-                        tracing::debug!("Running periodic redundancy check");
+                        tracing::info!("redundancy check: start");
+                        let started = std::time::Instant::now();
                         match service_for_redundancy.check_all_redundancy().await {
                             Ok(checked) => {
-                                if !checked.is_empty() {
-                                    tracing::info!(
-                                        "Periodic redundancy check completed for {} content networks",
-                                        checked.len()
-                                    );
-                                }
+                                tracing::info!(
+                                    "redundancy check: done in {:?} for {} content networks",
+                                    started.elapsed(),
+                                    checked.len()
+                                );
                             }
                             Err(e) => {
-                                tracing::warn!("Periodic redundancy check failed: {}", e);
+                                tracing::warn!("redundancy check: failed after {:?}: {}", started.elapsed(), e);
                             }
                         }
                     }
@@ -632,12 +640,15 @@ impl StateNode {
                         break;
                     }
                     _ = interval.tick() => {
-                        tracing::debug!("Running outbox retry");
+                        let started = std::time::Instant::now();
                         match reliable_publisher.retry_pending().await {
                             Ok(result) => {
-                                if result.delivered > 0 || result.dropped > 0 {
+                                // Quiet when nothing happened; the heartbeat below
+                                // covers liveness. Anything slow is worth a line.
+                                if result.delivered > 0 || result.dropped > 0 || started.elapsed() > Duration::from_secs(1) {
                                     tracing::info!(
-                                        "Outbox retry: {} delivered, {} failed, {} dropped",
+                                        "outbox retry: done in {:?}, {} delivered, {} failed, {} dropped",
+                                        started.elapsed(),
                                         result.delivered,
                                         result.failed,
                                         result.dropped
@@ -645,9 +656,29 @@ impl StateNode {
                                 }
                             }
                             Err(e) => {
-                                tracing::warn!("Outbox retry failed: {}", e);
+                                tracing::warn!("outbox retry: failed after {:?}: {}", started.elapsed(), e);
                             }
                         }
+                    }
+                }
+            }
+        });
+
+        // Liveness heartbeat. The node has been seen pegging the CPU for minutes
+        // with no log output at all; on a 0.5 vCPU task the runtime likely has
+        // a single worker, so one blocking task starves every other one. If
+        // this line stops while CPU is high, the runtime is starved. If it
+        // keeps going, whatever is stuck is blocked on a lock instead.
+        let token_heartbeat = token.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(10));
+            let mut n: u64 = 0;
+            loop {
+                tokio::select! {
+                    _ = token_heartbeat.cancelled() => break,
+                    _ = interval.tick() => {
+                        n += 1;
+                        tracing::info!("heartbeat #{n}");
                     }
                 }
             }
