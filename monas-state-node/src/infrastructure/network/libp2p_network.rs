@@ -769,33 +769,34 @@ impl Libp2pNetwork {
                             }
                         }
                     }
-                    // An address that just failed to connect is not worth
-                    // keeping: on Fargate a peer's old IP never comes back, and
-                    // as long as we hold it every dial to that peer burns the
-                    // transport timeout on it before anything else gets a turn.
+                    // An IP that just failed to connect is not worth keeping:
+                    // on Fargate a peer's old IP never comes back, and as long
+                    // as we hold it every dial to that peer burns the transport
+                    // timeout on it before anything else gets a turn. (Names
+                    // stay — see PeerStore::forget_unreachable.)
                     if let SwarmEvent::OutgoingConnectionError {
                         peer_id: Some(peer_id),
                         error,
                         ..
                     } = &event
                     {
-                        let failed: Vec<Multiaddr> = match error {
+                        let (forgotten, what) = match error {
                             // Every address tried was dead.
-                            DialError::Transport(failed) => {
-                                failed.iter().map(|(a, _)| a.clone()).collect()
-                            }
+                            DialError::Transport(failed) => (
+                                peer_store.forget_unreachable(*peer_id, failed.iter().map(|(a, _)| a.clone())),
+                                format!("unreachable {}", join_addrs(&failed.iter().map(|(a, _)| a.clone()).collect::<Vec<_>>())),
+                            ),
                             // Someone answered, but not the peer we remembered
-                            // there: the IP has been handed to another task.
-                            DialError::WrongPeerId { address, .. } => vec![address.clone()],
-                            _ => Vec::new(),
+                            // there: the address now belongs to another node.
+                            DialError::WrongPeerId { address, obtained } => (
+                                peer_store.forget_wrong_peer(*peer_id, address.clone()),
+                                format!("{} now answered by {}", address, obtained),
+                            ),
+                            _ => (false, String::new()),
                         };
-                        if peer_store.forget(*peer_id, failed.iter().cloned()) {
+                        if forgotten {
                             peer_store_dirty = true;
-                            info!(
-                                "Peer store forgot unreachable address(es) of {}: {}",
-                                peer_id,
-                                join_addrs(&failed)
-                            );
+                            info!("Peer store forgot address(es) of {}: {}", peer_id, what);
                         }
                     }
                     Self::handle_swarm_event(&mut swarm, &mut pending, &connected_peers, &event_tx, &crdt_repo, &data_dir, &p256_signing_key, &relay_channels, &content_network_repo, event).await;

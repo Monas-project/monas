@@ -193,7 +193,28 @@ impl PeerStore {
     /// dials us or a lookup finds it. The swarm reports failed addresses with
     /// the `/p2p/<peer>` suffix it appended for the dial, which the stored
     /// form does not carry, so that suffix is ignored when matching.
-    pub fn forget(&mut self, peer: PeerId, failed: impl IntoIterator<Item = Multiaddr>) -> bool {
+    ///
+    /// Names are kept. A `/dns4/` address that did not answer is a peer that
+    /// is down *right now*, not an address that has gone stale: the name is
+    /// re-pointed when the peer comes back, and it is the one hint that
+    /// survives a restart, so it must survive the restart window too. Use
+    /// [`forget_wrong_peer`](Self::forget_wrong_peer) when the address
+    /// answered as somebody else — then the name itself is wrong.
+    pub fn forget_unreachable(
+        &mut self,
+        peer: PeerId,
+        failed: impl IntoIterator<Item = Multiaddr>,
+    ) -> bool {
+        self.forget(peer, failed.into_iter().filter(|a| !is_name(a)))
+    }
+
+    /// Drop an address that connected but was answered by a different peer:
+    /// whatever form it has, it now belongs to someone else.
+    pub fn forget_wrong_peer(&mut self, peer: PeerId, addr: Multiaddr) -> bool {
+        self.forget(peer, [addr])
+    }
+
+    fn forget(&mut self, peer: PeerId, failed: impl IntoIterator<Item = Multiaddr>) -> bool {
         let Some(entry) = self.peers.get_mut(&peer) else {
             return false;
         };
@@ -391,10 +412,10 @@ mod tests {
         assert!(store.record(p, addr("/ip4/10.0.1.21/tcp/9001")));
 
         // The swarm reports the address it dialled, `/p2p/<peer>` included.
-        assert!(store.forget(p, [addr(&format!("/ip4/10.0.1.111/tcp/9001/p2p/{p}"))]));
+        assert!(store.forget_unreachable(p, [addr(&format!("/ip4/10.0.1.111/tcp/9001/p2p/{p}"))]));
         assert_eq!(store.addrs(&p).unwrap(), &[addr("/ip4/10.0.1.21/tcp/9001")]);
 
-        assert!(store.forget(p, [addr("/ip4/10.0.1.21/tcp/9001")]));
+        assert!(store.forget_unreachable(p, [addr("/ip4/10.0.1.21/tcp/9001")]));
         assert!(store.addrs(&p).is_none());
         assert!(store.is_empty());
         assert!(
@@ -408,9 +429,57 @@ mod tests {
         let mut store = PeerStore::default();
         let p = peer(1);
         assert!(store.record(p, addr("/ip4/10.0.1.21/tcp/9001")));
-        assert!(!store.forget(p, [addr("/ip4/10.0.9.9/tcp/9001")]));
-        assert!(!store.forget(peer(2), [addr("/ip4/10.0.1.21/tcp/9001")]));
+        assert!(!store.forget_unreachable(p, [addr("/ip4/10.0.9.9/tcp/9001")]));
+        assert!(!store.forget_unreachable(peer(2), [addr("/ip4/10.0.1.21/tcp/9001")]));
         assert_eq!(store.len(), 1);
+    }
+
+    /// Seen during a rollout: while node1 was restarting, its `/dns4/` name
+    /// failed to connect and was dropped along with the dead IP. The name is
+    /// re-pointed the moment node1 is back and is the only hint that survives
+    /// the restart, so an unreachable name must stay.
+    #[test]
+    fn forget_unreachable_keeps_names_and_drops_ips() {
+        let mut store = PeerStore::default();
+        let p = peer(1);
+        assert!(store.replace(
+            p,
+            [
+                addr("/ip4/10.0.0.252/tcp/9001"),
+                addr("/dns4/node1.monas.local/tcp/9001"),
+            ]
+        ));
+        assert!(store.forget_unreachable(
+            p,
+            [
+                addr(&format!("/ip4/10.0.0.252/tcp/9001/p2p/{p}")),
+                addr(&format!("/dns4/node1.monas.local/tcp/9001/p2p/{p}")),
+            ]
+        ));
+        assert_eq!(
+            store.addrs(&p).unwrap(),
+            &[addr("/dns4/node1.monas.local/tcp/9001")]
+        );
+        // Only the name failed: nothing to do, and the file is not rewritten.
+        assert!(!store.forget_unreachable(
+            p,
+            [addr(&format!("/dns4/node1.monas.local/tcp/9001/p2p/{p}"))]
+        ));
+    }
+
+    /// A name that answers as a different peer has been handed to someone
+    /// else (a node whose identity was recreated); then it is wrong for this
+    /// peer and goes.
+    #[test]
+    fn forget_wrong_peer_drops_a_name_too() {
+        let mut store = PeerStore::default();
+        let p = peer(1);
+        assert!(store.replace(p, [addr("/dns4/node1.monas.local/tcp/9001")]));
+        assert!(store.forget_wrong_peer(
+            p,
+            addr(&format!("/dns4/node1.monas.local/tcp/9001/p2p/{p}"))
+        ));
+        assert!(store.is_empty());
     }
 
     #[test]
