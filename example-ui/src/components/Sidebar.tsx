@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import type { Entry, View } from "../types";
-import { Folder, Plus, Upload, FileText, Network, Lock } from "./icons";
+import { Folder, Plus, Upload, FileText, Network, Lock, Inbox } from "./icons";
 
 // A keyboard-accessible, clickable nav row. Reuses the .nav-item styling
 // (which assumes a flex div), so we keep a <div> and add button semantics.
@@ -39,6 +39,7 @@ export function Sidebar({
   onNewFolder,
   onNewFile,
   onUpload,
+  onImportShare,
 }: {
   entries: Entry[];
   view: View;
@@ -47,10 +48,12 @@ export function Sidebar({
   onNewFolder: () => void;
   onNewFile: () => void;
   onUpload: () => void;
+  onImportShare: () => void;
 }) {
   const files = entries.filter((e) => e.kind === "file");
   const synced = files.filter((e) => e.syncedToStateNode).length;
-  const shared = files.filter((e) => e.shares.length > 0).length;
+  // Both directions count as "shared": files I handed out and files handed to me.
+  const shared = files.filter((e) => e.shares.length > 0 || e.receivedShare).length;
 
   return (
     <nav className="sidebar">
@@ -63,6 +66,9 @@ export function Sidebar({
         </button>
         <button className="btn" onClick={onNewFolder}>
           <Folder size={15} /> New folder
+        </button>
+        <button className="btn" onClick={onImportShare} title="Paste a share package someone sent you">
+          <Inbox size={15} /> Import shared
         </button>
       </div>
 

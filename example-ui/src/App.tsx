@@ -9,6 +9,7 @@ import { TextPromptModal, FileEditorModal, ConfirmModal } from "./components/Act
 import { IdentityModal } from "./components/IdentityModal";
 import { SettingsModal } from "./components/SettingsModal";
 import { ShareModal, type ShareInput } from "./components/ShareModal";
+import { ImportShareModal } from "./components/ImportShareModal";
 import { PreviewModal } from "./components/PreviewModal";
 
 import {
@@ -34,7 +35,7 @@ import type { RunView, StepSpec } from "./pipeline/types";
 import * as flows from "./pipeline/flows";
 import * as contentApi from "./api/content";
 import * as shareApi from "./api/share";
-import type { Entry, View } from "./types";
+import type { Entry, Identity, SharePackage, View } from "./types";
 
 type Modal =
   | { type: "none" }
@@ -44,6 +45,7 @@ type Modal =
   | { type: "edit"; entry: Entry; text: string }
   | { type: "delete"; entry: Entry }
   | { type: "share"; entryId: string }
+  | { type: "importShare" }
   | { type: "preview"; entry: Entry; contentB64Url: string }
   | { type: "identity" }
   | { type: "settings" }
@@ -134,7 +136,7 @@ export default function App() {
               ? true
               : view.kind === "synced"
                 ? e.syncedToStateNode
-                : e.shares.length > 0,
+                : e.shares.length > 0 || !!e.receivedShare,
           )
           .sort((a, b) => a.name.localeCompare(b.name));
 
@@ -258,6 +260,14 @@ export default function App() {
       await deleteFolder(entry);
       return;
     }
+    // A received share is the owner's content; "delete" here only forgets it
+    // locally. The gateway keeps the pinned sender key + CEK, which is fine:
+    // re-importing the same package simply works again.
+    if (entry.receivedShare) {
+      removeEntry(entry.id);
+      pushToast(`“${entry.name}” removed from your Drive (the owner's copy is untouched)`, "success");
+      return;
+    }
     const specs = flows.deleteFileFlow({ entry });
     const { ok } = await run("Delete", entry.name, specs);
     if (ok) {
@@ -269,14 +279,85 @@ export default function App() {
   };
 
   const handleOpen = async (entry: Entry) => {
-    const specs = flows.openFileFlow({ entry });
+    let specs: StepSpec[];
+    if (entry.receivedShare) {
+      const recipient = identities.find(
+        (i) => i.publicKeyB64Url === entry.receivedShare!.recipientPublicKeyB64Url,
+      );
+      if (!recipient) {
+        pushToast(
+          `The identity “${entry.receivedShare.recipientLabel}” this share was addressed to is no longer in this browser`,
+          "error",
+        );
+        return;
+      }
+      specs = flows.openReceivedFlow({ entry, recipient });
+    } else {
+      specs = flows.openFileFlow({ entry });
+    }
     const { ok, ctx } = await run("Open", entry.name, specs);
     if (ok && ctx.get) {
-      const g = ctx.get as contentApi.GetContentOutput;
+      const g = ctx.get as { content: string };
       setModal({ type: "preview", entry, contentB64Url: g.content });
     } else {
       pushToast("Could not open file", "error");
     }
+  };
+
+  // Recipient side of a cross-device share: the package came in over chat or
+  // mail, the identity it names is one of ours, and the gateway unwraps it.
+  const handleImportShare = async (pkg: SharePackage, recipient: Identity) => {
+    setBusy(true);
+    const specs = flows.importShareFlow({ pkg, recipient });
+    const { ok, ctx } = await run("Import share", pkg.name, specs);
+    setBusy(false);
+    if (!ok || !ctx.imported) {
+      pushToast(`Could not import “${pkg.name}”`, "error");
+      return;
+    }
+    const res = ctx.imported as shareApi.DecryptSharedContentOutput;
+    // Re-importing (e.g. a re-wrapped envelope after a revoke) replaces the
+    // earlier entry for the same content rather than adding a twin.
+    const existing = allEntries().find(
+      (e) => e.receivedShare && e.localContentId === pkg.content_id,
+    );
+    const receivedShare = {
+      senderPublicKeyB64Url: pkg.sender_public_key,
+      recipientPublicKeyB64Url: recipient.publicKeyB64Url,
+      recipientLabel: recipient.label,
+      recipientKeyId: pkg.recipient_key_id,
+      permissions: pkg.permissions,
+      envelope: pkg.key_envelope,
+      delegatedAccess: pkg.delegated_access,
+      receivedAt: Date.now(),
+    };
+    let entry: Entry;
+    if (existing) {
+      updateEntry(existing.id, { receivedShare, name: pkg.name, sizeBytes: pkg.sizeBytes });
+      entry = { ...existing, receivedShare, name: pkg.name, sizeBytes: pkg.sizeBytes };
+    } else {
+      entry = {
+        id: uuid(),
+        kind: "file",
+        name: pkg.name,
+        parentPath: "/",
+        sizeBytes: pkg.sizeBytes,
+        mimeType: pkg.mimeType || res.metadata?.content_type || mimeFromName(pkg.name),
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        localContentId: pkg.content_id,
+        remoteContentId: pkg.remote_content_id,
+        syncedToStateNode: !!pkg.remote_content_id,
+        versionCount: 1,
+        shares: [],
+        receivedShare,
+      };
+      addEntry(entry);
+    }
+    setView({ kind: "folder" });
+    setPath("/");
+    pushToast(`“${pkg.name}” unwrapped and added to your Drive`, "success");
+    setModal({ type: "preview", entry, contentB64Url: res.content });
   };
 
   const handleShare = async (entry: Entry, input: ShareInput) => {
@@ -309,11 +390,12 @@ export default function App() {
             recipientKeyId: g.recipient_key_id,
             senderPublicKeyB64Url: g.sender_public_key,
             envelope: g.key_envelope,
+            delegatedAccess: g.delegated_access,
             grantedAt: Date.now(),
           },
         ],
       });
-      pushToast(`Shared with ${input.recipientLabel || "recipient"}`, "success");
+      pushToast(`Shared with ${input.recipientLabel || "recipient"} — copy the package to send it`, "success");
     } else {
       pushToast("Share failed", "error");
     }
@@ -467,6 +549,7 @@ export default function App() {
           onNewFile={() => setModal({ type: "newFile" })}
           onNewFolder={() => setModal({ type: "newFolder" })}
           onUpload={() => fileInput.current?.click()}
+          onImportShare={() => setModal({ type: "importShare" })}
         />
         <main className="main">
           <FileBrowser path={path} view={view} entries={current} onNavigate={navigateTo} onAction={onAction} />
@@ -552,6 +635,14 @@ export default function App() {
           busy={busy}
           onShare={handleShare}
           onRevoke={handleRevoke}
+          onClose={() => setModal({ type: "none" })}
+        />
+      )}
+      {modal.type === "importShare" && (
+        <ImportShareModal
+          identities={identities}
+          busy={busy}
+          onImport={handleImportShare}
           onClose={() => setModal({ type: "none" })}
         />
       )}

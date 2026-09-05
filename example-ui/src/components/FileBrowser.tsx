@@ -14,6 +14,7 @@ import {
   Lock,
   Network,
   Cloud,
+  Inbox,
 } from "./icons";
 
 function FileTypeIcon({ entry }: { entry: Entry }) {
@@ -44,6 +45,9 @@ function Row({
   onAction: (a: string, e: Entry) => void;
 }) {
   const isFile = entry.kind === "file";
+  // A file shared to us: we hold an envelope, not the content, so the owner's
+  // actions (edit, share on, delete on the network) are not ours to offer.
+  const received = isFile && !!entry.receivedShare;
   return (
     <div
       className="row"
@@ -58,7 +62,16 @@ function Row({
               <Lock size={11} /> enc
             </span>
           )}
+          {received && (
+            <span
+              className="badge received"
+              title={`Shared with you (${entry.receivedShare!.permissions.join(", ")}) — the owner holds the file`}
+            >
+              <Inbox size={11} /> shared with me
+            </span>
+          )}
           {isFile &&
+            !received &&
             (entry.syncedToStateNode ? (
               <span className="badge synced" title="Synced to a Content Network">
                 <Network size={11} /> synced
@@ -102,7 +115,7 @@ function Row({
                 <Folder size={15} /> Open folder
               </button>
             )}
-            {isFile && (
+            {isFile && !received && (
               <button onClick={() => onAction("update", entry)}>
                 <Pencil size={15} /> Edit contents
               </button>
@@ -112,15 +125,21 @@ function Row({
                 <Pencil size={15} /> Rename
               </button>
             )}
-            {isFile && (
+            {isFile && !received && (
               <button onClick={() => onAction("share", entry)}>
                 <Share size={15} /> Share
               </button>
             )}
             <div className="menu-sep" />
-            <button className="danger" onClick={() => onAction("delete", entry)}>
-              <Trash size={15} /> Delete
-            </button>
+            {received ? (
+              <button className="danger" onClick={() => onAction("delete", entry)}>
+                <Trash size={15} /> Remove from my Drive
+              </button>
+            ) : (
+              <button className="danger" onClick={() => onAction("delete", entry)}>
+                <Trash size={15} /> Delete
+              </button>
+            )}
           </div>
         )}
       </div>

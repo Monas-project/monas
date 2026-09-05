@@ -140,6 +140,18 @@ export const Panel = (p: P) => (
     <path d="M14 4v16" />
   </svg>
 );
+export const Copy = (p: P) => (
+  <svg {...base(p)}>
+    <rect x="9" y="9" width="11" height="11" rx="2" />
+    <path d="M5 15V6a2 2 0 0 1 2-2h9" />
+  </svg>
+);
+export const Inbox = (p: P) => (
+  <svg {...base(p)}>
+    <path d="M4 4h16v16H4z" />
+    <path d="M4 13h5l1.5 2.5h3L15 13h5" />
+  </svg>
+);
 export const Activity = (p: P) => (
   <svg {...base(p)}>
     <path d="M3 12h4l2 6 4-14 2 8h6" />

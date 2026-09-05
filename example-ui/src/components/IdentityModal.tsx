@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Modal } from "./Modal";
-import { Key, Plus, Check, Trash } from "./icons";
+import { Key, Plus, Check, Trash, Copy } from "./icons";
 import { generateKeypair, createSigningAccount } from "../api/account";
 import {
   useIdentities,
@@ -9,6 +9,7 @@ import {
   removeIdentity,
 } from "../store/identity";
 import { pushToast } from "./Toast";
+import { copyText } from "../sharePackage";
 
 export function IdentityModal({ onClose }: { onClose: () => void }) {
   const { identities, activeLabel } = useIdentities();
@@ -50,14 +51,27 @@ export function IdentityModal({ onClose }: { onClose: () => void }) {
     }
   };
 
+  // The public key is what another person needs to share a file with you. It
+  // is shown truncated in the list, so offer the full value on demand: to the
+  // clipboard when the browser allows, otherwise expanded inline to select.
+  const [revealed, setRevealed] = useState<string | null>(null);
+  const copyPublicKey = async (label: string, key: string) => {
+    if (await copyText(key)) {
+      pushToast(`Public key of “${label}” copied`, "success");
+    } else {
+      setRevealed(label);
+      pushToast("Clipboard unavailable — select the key below to copy it", "error");
+    }
+  };
+
   return (
     <Modal title="Identities & keys" icon={<Key />} onClose={onClose} wide>
       <div className="callout">
         Create your <b>account</b> here — the signing account registers a P-256
         key with <b>monas-account</b>, which the SDK uses to sign state-node
-        requests for create / edit / delete. Add extra keypair-only identities to
-        demo sharing (the UI then holds the recipient's private key and proves
-        the HPKE round-trip).
+        requests for create / edit / delete. To receive a file from someone on
+        another device, send them your <b>public key</b> (Copy below); they paste
+        it into their Share dialog and send you back a share package.
       </div>
 
       <div style={{ margin: "16px 0 6px", fontWeight: 650, fontSize: 13 }}>
@@ -88,7 +102,24 @@ export function IdentityModal({ onClose }: { onClose: () => void }) {
             <div className="mono" style={{ fontSize: 10.5 }}>
               {id.keyType} · pub {id.publicKeyB64Url.slice(0, 22)}…
             </div>
+            {revealed === id.label && (
+              <textarea
+                className="input mono public-key"
+                readOnly
+                rows={2}
+                value={id.publicKeyB64Url}
+                onFocus={(e) => e.currentTarget.select()}
+                style={{ fontSize: 10.5, marginTop: 6 }}
+              />
+            )}
           </div>
+          <button
+            className="btn sm"
+            title="Copy this identity's public key (base64url)"
+            onClick={() => copyPublicKey(id.label, id.publicKeyB64Url)}
+          >
+            <Copy size={13} /> Copy public key
+          </button>
           {id.label !== activeLabel && (
             <button className="btn sm" onClick={() => setActive(id.label)}>
               <Check size={13} /> Use

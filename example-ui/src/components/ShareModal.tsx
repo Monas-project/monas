@@ -1,7 +1,9 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Modal } from "./Modal";
-import { Share, Lock } from "./icons";
-import type { Entry, Identity, Permission } from "../types";
+import { Share, Lock, Copy } from "./icons";
+import { pushToast } from "./Toast";
+import { buildSharePackage, copyText, serializeSharePackage } from "../sharePackage";
+import type { Entry, Identity, Permission, ShareGrant } from "../types";
 
 export interface ShareInput {
   recipientPublicKeyB64Url: string;
@@ -43,6 +45,34 @@ export function ShareModal({
   const [verify, setVerify] = useState(false);
 
   const permissions: Permission[] = canWrite ? ["read", "write"] : ["read"];
+
+  // The share package for one recipient, shown as text so it can always be
+  // selected and copied by hand — the clipboard API is not available in every
+  // browser context, and the whole point is to paste this into a chat.
+  // Opens by itself for whichever grant was added or re-wrapped last, since
+  // that is the one the owner now has to deliver.
+  const [packageFor, setPackageFor] = useState<string | null>(null);
+  const newest = entry.shares.reduce<ShareGrant | null>(
+    (best, s) =>
+      !best || (s.reissuedAt ?? s.grantedAt) > (best.reissuedAt ?? best.grantedAt) ? s : best,
+    null,
+  );
+  const newestStamp = newest ? `${newest.recipientKeyId}:${newest.reissuedAt ?? newest.grantedAt}` : null;
+  // Keyed on the stamp, not the grant object: re-open when a grant is added
+  // or reissued, not on every render.
+  useEffect(() => {
+    if (newestStamp) setPackageFor(newestStamp.split(":")[0]);
+  }, [newestStamp]);
+
+  const copyPackage = async (grant: ShareGrant) => {
+    const text = serializeSharePackage(buildSharePackage(entry, grant));
+    if (await copyText(text)) {
+      pushToast(`Share package for ${grant.recipientLabel || "recipient"} copied`, "success");
+    } else {
+      setPackageFor(grant.recipientKeyId);
+      pushToast("Clipboard unavailable — select the package text below to copy it", "error");
+    }
+  };
 
   // Whether submitting can actually do anything. Both branches of submit()
   // bail out early when their input is missing, so without this the button
@@ -119,6 +149,13 @@ export function ShareModal({
                 </div>
               </div>
               <button
+                className="btn sm"
+                title="Copy the share package to send to this recipient"
+                onClick={() => copyPackage(s)}
+              >
+                <Copy size={13} /> Copy package
+              </button>
+              <button
                 className="btn sm danger"
                 disabled={busy}
                 onClick={() => onRevoke(entry, s.recipientPublicKeyB64Url)}
@@ -127,6 +164,33 @@ export function ShareModal({
               </button>
             </div>
           ))}
+          {packageFor &&
+            (() => {
+              const grant = entry.shares.find((s) => s.recipientKeyId === packageFor);
+              if (!grant) return null;
+              return (
+                <div className="field share-package" style={{ marginTop: 10 }}>
+                  <label>
+                    Share package for {grant.recipientLabel || "recipient"} — send this to them
+                    {grant.reissuedAt ? " (re-wrapped: the old one no longer opens)" : ""}
+                  </label>
+                  <textarea
+                    className="input mono"
+                    readOnly
+                    rows={5}
+                    value={serializeSharePackage(buildSharePackage(entry, grant))}
+                    onFocus={(e) => e.currentTarget.select()}
+                    style={{ fontSize: 10.5 }}
+                  />
+                  <div className="hint">
+                    Any channel works (chat, mail). The recipient pastes it into{" "}
+                    <b>Import shared</b> on their own device. It carries the content key
+                    wrapped to their key only, so it is useless to anyone else — but treat
+                    it like a link to the file.
+                  </div>
+                </div>
+              );
+            })()}
           <div style={{ height: 14 }} />
         </>
       )}

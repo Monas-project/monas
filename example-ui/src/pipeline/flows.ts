@@ -10,7 +10,7 @@ import * as contentApi from "../api/content";
 import * as shareApi from "../api/share";
 import * as stateApi from "../api/stateNode";
 import { byteLengthOfBase64Url, short } from "../api/crypto";
-import type { Entry, Identity, Permission } from "../types";
+import type { Entry, Identity, Permission, SharePackage } from "../types";
 import type { StepSpec } from "./types";
 
 function fmtBytes(n: number): string {
@@ -162,6 +162,37 @@ export function openFileFlow(input: { entry: Entry }): StepSpec[] {
   ];
 }
 
+// ------------------------------------------------- open a received share
+// A file shared *to* this device has no entry in the gateway's own content
+// store, so openFileFlow's getContent cannot serve it. Unwrap the envelope we
+// kept at import time instead — the same call as the import, minus the
+// bookkeeping. If the owner has since revoked us (CEK rotated), this is where
+// it shows: the SDK refuses the stale envelope.
+export function openReceivedFlow(input: { entry: Entry; recipient: Identity }): StepSpec[] {
+  const { entry, recipient } = input;
+  const rs = entry.receivedShare!;
+  return [
+    {
+      title: "Unwrap CEK & decrypt · gateway call",
+      hint: "HPKE Auth open · AES-256-GCM",
+      kind: "share",
+      minMs: 180,
+      exec: async (ctx) => {
+        const res = await shareApi.decryptSharedContent({
+          contentId: entry.localContentId!,
+          privateKeyB64Url: recipient.privateKeyB64Url,
+          senderPublicKeyB64Url: rs.senderPublicKeyB64Url,
+          recipientKeyId: rs.recipientKeyId,
+          keyEnvelope: rs.envelope,
+        });
+        ctx.get = res;
+        const n = byteLengthOfBase64Url(res.content);
+        return `Envelope epoch ${rs.envelope.key_epoch} accepted against the pinned sender key · ${fmtBytes(n)} of plaintext`;
+      },
+    },
+  ];
+}
+
 // ------------------------------------------------- verified read (state node)
 // Distinct from openFileFlow: that one reads the gateway's own local store and
 // never touches the network. This pulls the crsl-lib Node from the state node
@@ -289,7 +320,8 @@ export function shareFlow(input: {
       hint: "out-of-band",
       kind: "share",
       minMs: 200,
-      exec: async () => "KeyEnvelope + token handed to the recipient directly",
+      exec: async () =>
+        "Monas does not carry envelopes: copy the share package from the Share dialog and send it over any channel",
     },
   ];
 
@@ -316,6 +348,62 @@ export function shareFlow(input: {
     });
   }
   return steps;
+}
+
+// ------------------------------------------------------ import (recipient)
+// The other side of shareFlow, run on the recipient's device: a pasted share
+// package is unwrapped with the recipient's private key and the ciphertext it
+// carries is decrypted. One real gateway call; the SDK also pins the sender's
+// key and files the CEK under the owner's content id as a side effect.
+export function importShareFlow(input: {
+  pkg: SharePackage;
+  recipient: Identity;
+}): StepSpec[] {
+  const { pkg, recipient } = input;
+  return [
+    {
+      title: "Check the package is addressed to me",
+      hint: "recipient key",
+      kind: "key",
+      minMs: 160,
+      exec: async () => {
+        if (pkg.recipient_public_key !== recipient.publicKeyB64Url) {
+          throw new Error(
+            `this package is for key ${short(pkg.recipient_public_key, 10, 6)}, not for “${recipient.label}”`,
+          );
+        }
+        return `Addressed to “${recipient.label}” · KeyId ${short(pkg.recipient_key_id, 8, 6)} · epoch ${pkg.key_envelope.key_epoch}`;
+      },
+    },
+    {
+      title: "Unwrap CEK & decrypt · gateway call",
+      hint: "HPKE Auth open · AES-256-GCM",
+      kind: "share",
+      minMs: 180,
+      exec: async (ctx) => {
+        const res = await shareApi.decryptSharedContent({
+          contentId: pkg.content_id,
+          privateKeyB64Url: recipient.privateKeyB64Url,
+          senderPublicKeyB64Url: pkg.sender_public_key,
+          recipientKeyId: pkg.recipient_key_id,
+          keyEnvelope: pkg.key_envelope,
+        });
+        ctx.imported = res;
+        const n = byteLengthOfBase64Url(res.content);
+        return `Sender key ${short(pkg.sender_public_key, 10, 6)} pinned (TOFU) · ${fmtBytes(n)} of plaintext recovered`;
+      },
+    },
+    {
+      title: "Add to my Drive",
+      hint: "registry",
+      kind: "storage",
+      minMs: 140,
+      exec: async () =>
+        pkg.remote_content_id
+          ? `Filed as a received share of Content Network ${short(pkg.remote_content_id)}`
+          : "Filed as a received share",
+    },
+  ];
 }
 
 // ---------------------------------------------------------------- revoke

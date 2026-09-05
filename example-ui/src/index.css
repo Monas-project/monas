@@ -456,6 +456,19 @@ a {
   background: #fdf1f1;
   border-color: #f0c4c7;
 }
+/* a file shared TO this device by someone else */
+.badge.received {
+  color: #0f6f8f;
+  background: #eaf6fa;
+  border-color: #bfe0ec;
+}
+.hint.error-text {
+  color: var(--err);
+}
+.share-package textarea,
+textarea.public-key {
+  word-break: break-all;
+}
 
 /* row menu */
 .row-menu-wrap {

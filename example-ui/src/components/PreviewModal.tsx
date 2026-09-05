@@ -52,7 +52,13 @@ export function PreviewModal({
 
   // The state-node calls address the Content Network. For a synced file that's
   // remoteContentId; fall back to the local id like the update/delete flows do.
-  const synced = entry.syncedToStateNode;
+  //
+  // A received share is excluded even though it names a Content Network: the
+  // gateway signs these calls with *this device's* account key, and the state
+  // node only grants reads to the owner or to a delegated token. The SDK does
+  // not yet combine the two, so every panel below would just show 403s.
+  const received = !!entry.receivedShare;
+  const synced = entry.syncedToStateNode && !received;
   const cid = entry.remoteContentId || entry.localContentId;
 
   const [latest, setLatest] = useState<AsyncState<GetLatestVersionOutput>>({ status: "idle" });
@@ -129,10 +135,20 @@ export function PreviewModal({
 
   return (
     <Modal title={entry.name} icon={<Eye />} onClose={onClose} wide>
-      <div className="callout" style={{ marginBottom: 12 }}>
-        Fetched through the gateway and decrypted by the SDK with the CEK. The
-        plaintext below never left the backend unencrypted.
-      </div>
+      {received ? (
+        <div className="callout" style={{ marginBottom: 12 }}>
+          Shared with you by <b className="mono">{short(entry.receivedShare!.senderPublicKeyB64Url, 12, 6)}</b>{" "}
+          ({entry.receivedShare!.permissions.join(", ")}). The SDK unwrapped the
+          content key from their envelope with your identity{" "}
+          <b>{entry.receivedShare!.recipientLabel}</b> and decrypted the ciphertext
+          it carries — this is the version the owner shared.
+        </div>
+      ) : (
+        <div className="callout" style={{ marginBottom: 12 }}>
+          Fetched through the gateway and decrypted by the SDK with the CEK. The
+          plaintext below never left the backend unencrypted.
+        </div>
+      )}
 
       {isImage ? (
         <img
@@ -179,7 +195,16 @@ export function PreviewModal({
         )}
       </div>
 
-      {!synced || !cid ? (
+      {received ? (
+        <div className="callout warn">
+          This file lives in the owner's Content Network
+          {entry.remoteContentId ? <> <b className="mono">{short(entry.remoteContentId)}</b></> : null}.
+          Reading newer versions from the state node as a recipient needs the
+          delegated token in the share package combined with a read signed by
+          your key; the SDK does not do that yet, so this device shows the
+          shared version only. Ask the owner for a fresh package after they edit.
+        </div>
+      ) : !synced || !cid ? (
         <div className="callout warn">
           This file is local-only — it has not been registered on a state-node,
           so there is no Content Network version history or integrity check to
