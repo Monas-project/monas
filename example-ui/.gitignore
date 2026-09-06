@@ -23,3 +23,6 @@ blob-report/
 # Playwright is updated, so they are not committed.
 .claude/
 .mcp.json
+
+# vite dep-optimizer cache (deps_temp_* is left behind by an interrupted `vite`)
+.vite
