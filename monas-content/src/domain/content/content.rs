@@ -150,6 +150,47 @@ impl Content {
         Ok((content, ContentEvent::Updated))
     }
 
+    /// 他所で作られた版をこの系列の新しい版として取り込む。
+    ///
+    /// [`update_content`](Self::update_content) と同じ形の新しい `Content` を
+    /// 作るが、暗号文は再暗号化せず与えられたものをそのまま持つ。State Node に
+    /// 既にある版(write 権限を委譲した受信者が書いた版)を owner が自分の
+    /// レコードへ取り込むための入口で、平文と暗号文の対応は呼び出し側
+    /// (application service)が同じ CEK で復号して確かめている前提。
+    /// 暗号文をそのまま持つのは、ローカルの暗号文と State Node の暗号文の
+    /// 一致(integrity 検証)を保つため。
+    ///
+    /// - name / path / series_id は変更しない
+    /// - `raw_id`(plainCid)は平文から再計算される
+    pub fn adopt_version<G>(
+        &self,
+        raw_content: Vec<u8>,
+        encrypted_content: Vec<u8>,
+        id_generator: &G,
+    ) -> Result<(Self, ContentEvent), ContentError>
+    where
+        G: ContentIdGenerator,
+    {
+        self.ensure_not_deleted()?;
+
+        let new_id = id_generator.generate(&raw_content);
+        let new_enc_id = id_generator.generate_encrypted(&new_id, &encrypted_content);
+        let new_metadata = self.metadata.with_new_id(new_id.clone());
+
+        let content = Self {
+            raw_id: new_id,
+            series_id: self.series_id.clone(),
+            encrypted_id: new_enc_id,
+            metadata: new_metadata,
+            raw_content: Some(raw_content),
+            encrypted_content: Some(encrypted_content),
+            is_deleted: false,
+            content_status: ContentStatus::Active,
+        };
+
+        Ok((content, ContentEvent::Updated))
+    }
+
     /// コンテンツ名のみを変更する。
     ///
     /// - バイナリや暗号化データは変更しない

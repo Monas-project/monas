@@ -9,12 +9,22 @@ use crate::common::{
 };
 use crate::models::state::{
     GetHistoryInput, GetHistoryOutput, GetLatestVersionInput, GetLatestVersionOutput,
-    ReadContentFromStateNodeInput, ReadContentFromStateNodeOutput, VerifyIntegrityInput,
-    VerifyIntegrityOutput,
+    PullContentFromStateNodeInput, PullContentFromStateNodeOutput, ReadContentFromStateNodeInput,
+    ReadContentFromStateNodeOutput, VerifyIntegrityInput, VerifyIntegrityOutput,
 };
 use crate::models::state_node::{StateNodeContentDataResponse, StateNodeContentHistoryResponse};
+use monas_content::application_service::content_service::VerifiedRead;
+use monas_content::domain::content_id::ContentId;
 
 use super::MonasController;
+
+/// `MonasController::adopt_remote_head` の結果。
+pub(super) struct AdoptedHead {
+    pub local_content_id: ContentId,
+    pub version: String,
+    pub adopted: bool,
+    pub plaintext: Vec<u8>,
+}
 
 impl MonasController {
     fn validate_state_content_id<T>(content_id: &str, trace_id: String) -> Option<ApiResponse<T>> {
@@ -75,9 +85,6 @@ impl MonasController {
 
         let trace_id_for_call = trace_id.clone();
         let resp = Self::attach_state_node_auth(self.agent.get(url), auth)
-            .config()
-            .http_status_as_error(false)
-            .build()
             .call()
             .map_err(|e| {
                 ApiResponse::error(
@@ -238,6 +245,116 @@ impl MonasController {
         )
     }
 
+    /// 検証付き read の本体。`read_content_from_state_node` と
+    /// `pull_content_from_state_node` が共有する。読んだ版 CID と検証結果を返す。
+    #[allow(clippy::too_many_arguments)]
+    fn verified_read_from_state_node<T>(
+        &self,
+        content_id: &str,
+        local_content_id: &str,
+        version: Option<&str>,
+        accept_any_version: bool,
+        auth: Option<&StateNodeAuthContext>,
+        trace_id: String,
+    ) -> Result<(String, VerifiedRead), ApiResponse<T>> {
+        let auth = self.resolve_state_read_auth::<T>(auth, content_id, &trace_id)?;
+        let auth = auth.as_ref();
+
+        // 版の決定。明示指定が無ければ履歴の最新を読む。
+        // 履歴は署名も系列検証も無いため「どの版を読むか」の選択にしか使えない。
+        // 選ばれた版の payload は下の CID 検証が守るが、その版が最新である
+        // ことは保証されない(上記「保証範囲」を参照)。
+        let version = match version {
+            Some(v) => v.to_string(),
+            None => self
+                .get_state_node_history::<T>(content_id, auth, trace_id.clone())?
+                .versions
+                .last()
+                .cloned()
+                .unwrap_or_else(|| content_id.to_string()),
+        };
+
+        // Node CBOR の取得 + CID 検証(A)
+        let state_node_data =
+            self.get_state_node_version_data::<T>(content_id, &version, auth, trace_id.clone())?;
+
+        let node_bytes = match BASE64_STANDARD.decode(&state_node_data.data) {
+            Ok(b) => b,
+            Err(e) => {
+                return Err(ApiResponse::error(
+                    ApiError::Internal(format!("invalid base64 data from state node: {e}")),
+                    trace_id,
+                ));
+            }
+        };
+
+        // CID 再計算による改ざん検証 + CEK ロード + AES-GCM 復号 + plain CID 照合
+        //
+        // 検証は `verify_and_decrypt_relay_read` の中で必ず最初に走るので、
+        // ここで先に `verify_and_extract` を呼ぶ必要はない(同じ引数で 2 回
+        // 走らせていた)。検証は content 層の責務として一箇所に置く。
+        //
+        // CEK は「送信者ピンの権威レコード」を優先する。CEK ストアは、その
+        // レコードから導出されるキャッシュに過ぎず、CAS 成功後の書き込み順が
+        // 入れ替わると古い世代へ巻き戻り得る(世代 N の handler が CAS 後に
+        // 停止し、その間に N+1 が権威レコードとキャッシュを進め、その後 N が
+        // 再開してキャッシュだけを N に戻す)。権威レコードから直接引けば、
+        // その巻き戻りは read に影響しない。
+        //
+        // 自分で作成した content には送信者ピンが存在しないので、その場合は
+        // 従来どおりストアを引く。
+        let local_id = ContentId::new(local_content_id.to_string());
+        //
+        // ピンは系列ID(= ここでの `content_id`)でも版ID(`local_content_id`)でも
+        // 保存され得る: share 受信者は `remote_content_id` を渡して系列IDに、
+        // それを渡さない古い呼び出しは版IDに。系列を先に引く。
+        let pinned_cek = {
+            let load = |key: &str| self.sender_pin_store.load(key);
+            let by_series = load(content_id);
+            let pin = match by_series {
+                Ok(Some(p)) => Ok(Some(p)),
+                Ok(None) => load(local_content_id),
+                Err(e) => Err(e),
+            };
+            match pin {
+                Ok(pin) => pin
+                    .and_then(|p| p.cek)
+                    .map(monas_content::domain::content::ContentEncryptionKey),
+                Err(e) => {
+                    return Err(ApiResponse::error(
+                        ApiError::Internal(format!("sender key pin store error: {e}")),
+                        trace_id,
+                    ));
+                }
+            }
+        };
+        // share 受信者は「共有された版の id」の下に CEK を持つが、owner がその後に
+        // 書いた版の平文 CID は知り得ない。`accept_any_version` ではその照合を
+        // 省き、復号した平文が実際に指す id を返す(Node CID と AES-GCM の検証は
+        // そのまま)。
+        let read = if accept_any_version {
+            self.content_service
+                .verify_and_decrypt_relay_read_any_version(
+                    &node_bytes,
+                    &version,
+                    local_id,
+                    pinned_cek,
+                )
+        } else {
+            self.content_service.verify_and_decrypt_relay_read(
+                &node_bytes,
+                &version,
+                local_id,
+                pinned_cek,
+            )
+        };
+        let read = read.map_err(|e| {
+            ApiResponse::error(Self::map_verified_read_error(e, local_content_id), trace_id)
+        })?;
+
+        Ok((version, read))
+    }
+
     /// State Node から content を読み、検証・復号して平文を返す(検証付き read)。
     ///
     /// `docs/design.md` §10「read応答の完全性検証」の実 read 経路。処理フロー:
@@ -274,131 +391,17 @@ impl MonasController {
             );
         }
 
-        let auth = match self.resolve_state_read_auth::<ReadContentFromStateNodeOutput>(
-            auth,
-            &input.content_id,
-            &trace_id,
-        ) {
-            Ok(resolved) => resolved,
-            Err(e) => return e,
-        };
-        let auth = auth.as_ref();
-
-        // 版の決定。明示指定が無ければ履歴の最新を読む。
-        // 履歴は署名も系列検証も無いため「どの版を読むか」の選択にしか使えない。
-        // 選ばれた版の payload は下の CID 検証が守るが、その版が最新である
-        // ことは保証されない(上記「保証範囲」を参照)。
-        let version = match input.version.clone() {
-            Some(v) => v,
-            None => {
-                let history = match self.get_state_node_history::<ReadContentFromStateNodeOutput>(
-                    &input.content_id,
-                    auth,
-                    trace_id.clone(),
-                ) {
-                    Ok(h) => h,
-                    Err(e) => return e,
-                };
-                let latest = history
-                    .versions
-                    .last()
-                    .cloned()
-                    .unwrap_or_else(|| input.content_id.clone());
-                latest
-            }
-        };
-
-        // Node CBOR の取得 + CID 検証(A)
-        let state_node_data = match self
-            .get_state_node_version_data::<ReadContentFromStateNodeOutput>(
+        let (version, read) = match self
+            .verified_read_from_state_node::<ReadContentFromStateNodeOutput>(
                 &input.content_id,
-                &version,
+                &input.local_content_id,
+                input.version.as_deref(),
+                input.accept_any_version,
                 auth,
                 trace_id.clone(),
             ) {
-            Ok(d) => d,
+            Ok(r) => r,
             Err(e) => return e,
-        };
-
-        let node_bytes = match BASE64_STANDARD.decode(&state_node_data.data) {
-            Ok(b) => b,
-            Err(e) => {
-                return ApiResponse::error(
-                    ApiError::Internal(format!("invalid base64 data from state node: {e}")),
-                    trace_id,
-                );
-            }
-        };
-
-        // CID 再計算による改ざん検証 + CEK ロード + AES-GCM 復号 + plain CID 照合
-        //
-        // 検証は `verify_and_decrypt_relay_read` の中で必ず最初に走るので、
-        // ここで先に `verify_and_extract` を呼ぶ必要はない(同じ引数で 2 回
-        // 走らせていた)。検証は content 層の責務として一箇所に置く。
-        //
-        // CEK は「送信者ピンの権威レコード」を優先する。CEK ストアは、その
-        // レコードから導出されるキャッシュに過ぎず、CAS 成功後の書き込み順が
-        // 入れ替わると古い世代へ巻き戻り得る(世代 N の handler が CAS 後に
-        // 停止し、その間に N+1 が権威レコードとキャッシュを進め、その後 N が
-        // 再開してキャッシュだけを N に戻す)。権威レコードから直接引けば、
-        // その巻き戻りは read に影響しない。
-        //
-        // 自分で作成した content には送信者ピンが存在しないので、その場合は
-        // 従来どおりストアを引く。
-        let local_content_id =
-            monas_content::domain::content_id::ContentId::new(input.local_content_id.clone());
-        //
-        // ピンは系列ID(= ここでの `content_id`)でも版ID(`local_content_id`)でも
-        // 保存され得る: share 受信者は `remote_content_id` を渡して系列IDに、
-        // それを渡さない古い呼び出しは版IDに。系列を先に引く。
-        let pinned_cek = {
-            let load = |key: &str| self.sender_pin_store.load(key);
-            let by_series = load(&input.content_id);
-            let pin = match by_series {
-                Ok(Some(p)) => Ok(Some(p)),
-                Ok(None) => load(&input.local_content_id),
-                Err(e) => Err(e),
-            };
-            match pin {
-                Ok(pin) => pin
-                    .and_then(|p| p.cek)
-                    .map(monas_content::domain::content::ContentEncryptionKey),
-                Err(e) => {
-                    return ApiResponse::error(
-                        ApiError::Internal(format!("sender key pin store error: {e}")),
-                        trace_id,
-                    );
-                }
-            }
-        };
-        // share 受信者は「共有された版の id」の下に CEK を持つが、owner がその後に
-        // 書いた版の平文 CID は知り得ない。`accept_any_version` ではその照合を
-        // 省き、復号した平文が実際に指す id を返す(Node CID と AES-GCM の検証は
-        // そのまま)。
-        let read = if input.accept_any_version {
-            self.content_service
-                .verify_and_decrypt_relay_read_any_version(
-                    &node_bytes,
-                    &version,
-                    local_content_id,
-                    pinned_cek,
-                )
-        } else {
-            self.content_service.verify_and_decrypt_relay_read(
-                &node_bytes,
-                &version,
-                local_content_id,
-                pinned_cek,
-            )
-        };
-        let read = match read {
-            Ok(read) => read,
-            Err(e) => {
-                return ApiResponse::error(
-                    Self::map_verified_read_error(e, &input.local_content_id),
-                    trace_id,
-                );
-            }
         };
 
         ApiResponse::success(
@@ -410,6 +413,107 @@ impl MonasController {
             },
             trace_id,
         )
+    }
+
+    /// State Node の head を owner のローカルレコードへ取り込む(pull)。
+    ///
+    /// write 権限を委譲した受信者が書いた版は State Node にだけあり、owner の
+    /// ローカルレコードは古いまま。owner の `update_content` / `revoke_share`
+    /// (再暗号化)はローカル平文から再発行するので、その前にこれを呼ばないと
+    /// 受信者の版を黙って上書きする。`revoke_share` は `remote_content_id` と
+    /// `auth` があれば自分で呼ぶ。
+    ///
+    /// 検証付き read(Node CID 再計算 + 自分の CEK での AES-GCM 復号)を通った
+    /// 版だけを取り込み、暗号文は State Node のものをそのまま保存する
+    /// (`verify_integrity` が一致し続ける)。head がローカル版と同じなら
+    /// `adopted: false` で平文だけ返す。
+    pub fn pull_content_from_state_node(
+        &self,
+        input: PullContentFromStateNodeInput,
+        auth: Option<&StateNodeAuthContext>,
+    ) -> ApiResponse<PullContentFromStateNodeOutput> {
+        let trace_id = generate_trace_id();
+        if let Some(response) = Self::validate_state_content_id(&input.content_id, trace_id.clone())
+        {
+            return response;
+        }
+        if input.local_content_id.is_empty() {
+            return ApiResponse::error(
+                ApiError::Validation("local_content_id must not be empty".into()),
+                trace_id,
+            );
+        }
+        match self.adopt_remote_head::<PullContentFromStateNodeOutput>(
+            &input.content_id,
+            &input.local_content_id,
+            auth,
+            trace_id.clone(),
+        ) {
+            Ok(head) => ApiResponse::success(
+                PullContentFromStateNodeOutput {
+                    content_id: input.content_id,
+                    local_content_id: head.local_content_id.as_str().to_string(),
+                    version: head.version,
+                    adopted: head.adopted,
+                    content: encode_base64url(&head.plaintext),
+                },
+                trace_id,
+            ),
+            Err(response) => response,
+        }
+    }
+
+    /// `pull_content_from_state_node` の本体。`revoke_share` からも呼ぶ。
+    ///
+    /// head の平文 id がローカル版と違えば `ContentService::adopt_version` で
+    /// レコードを head へ進め、共有 ACL も新しい版IDへ引き継ぐ
+    /// (`update_content` と同じ理由: 引き継がないと既存受信者が SDK から消える)。
+    pub(super) fn adopt_remote_head<T>(
+        &self,
+        content_id: &str,
+        local_content_id: &str,
+        auth: Option<&StateNodeAuthContext>,
+        trace_id: String,
+    ) -> Result<AdoptedHead, ApiResponse<T>> {
+        let (version, read) = self.verified_read_from_state_node::<T>(
+            content_id,
+            local_content_id,
+            None,
+            true,
+            auth,
+            trace_id.clone(),
+        )?;
+        if read.plain_content_id.as_str() == local_content_id {
+            return Ok(AdoptedHead {
+                local_content_id: read.plain_content_id,
+                version,
+                adopted: false,
+                plaintext: read.plaintext,
+            });
+        }
+
+        let local = ContentId::new(local_content_id.to_string());
+        let adopted = self
+            .content_service
+            .adopt_version(&local, read.ciphertext)
+            .map_err(|e| {
+                ApiResponse::error(
+                    ApiError::Internal(format!(
+                        "state node head {} could not be adopted into local content {}: {e}",
+                        read.plain_content_id.as_str(),
+                        local_content_id
+                    )),
+                    trace_id.clone(),
+                )
+            })?;
+        self.carry_share_acl(&local, &adopted.content_id);
+
+        Ok(AdoptedHead {
+            local_content_id: adopted.content_id,
+            version,
+            adopted: true,
+            plaintext: read.plaintext,
+        })
     }
 
     /// `verify_and_decrypt_relay_read` のエラーを、呼び出し側が対処を判断できる

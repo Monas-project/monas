@@ -24,12 +24,12 @@ use crate::models::content::{
 use crate::models::keypair::{GenerateKeypairInput, GenerateKeypairOutput};
 use crate::models::share::{
     DecryptSharedContentInput, DecryptSharedContentOutput, RevokeShareInput, RevokeShareOutput,
-    ShareContentInput, ShareContentOutput,
+    ShareContentInput, ShareContentOutput, UpdateSharedContentInput, UpdateSharedContentOutput,
 };
 use crate::models::state::{
     GetHistoryInput, GetHistoryOutput, GetLatestVersionInput, GetLatestVersionOutput,
-    ReadContentFromStateNodeInput, ReadContentFromStateNodeOutput, VerifyIntegrityInput,
-    VerifyIntegrityOutput,
+    PullContentFromStateNodeInput, PullContentFromStateNodeOutput, ReadContentFromStateNodeInput,
+    ReadContentFromStateNodeOutput, VerifyIntegrityInput, VerifyIntegrityOutput,
 };
 
 use super::MonasController;
@@ -129,6 +129,36 @@ impl MonasController {
         input: DecryptSharedContentInput,
     ) -> ApiResponse<DecryptSharedContentOutput> {
         match tokio::task::spawn_blocking(move || self.decrypt_shared_content(input)).await {
+            Ok(resp) => resp,
+            Err(e) => map_join_error(e, fallback_trace_id()),
+        }
+    }
+
+    /// `pull_content_from_state_node` の async 版。
+    pub async fn pull_content_from_state_node_async(
+        self: Arc<Self>,
+        input: PullContentFromStateNodeInput,
+        auth: Option<StateNodeAuthContext>,
+    ) -> ApiResponse<PullContentFromStateNodeOutput> {
+        match tokio::task::spawn_blocking(move || {
+            self.pull_content_from_state_node(input, auth.as_ref())
+        })
+        .await
+        {
+            Ok(resp) => resp,
+            Err(e) => map_join_error(e, fallback_trace_id()),
+        }
+    }
+
+    /// `update_shared_content` の async 版。
+    pub async fn update_shared_content_async(
+        self: Arc<Self>,
+        input: UpdateSharedContentInput,
+        auth: Option<StateNodeAuthContext>,
+    ) -> ApiResponse<UpdateSharedContentOutput> {
+        match tokio::task::spawn_blocking(move || self.update_shared_content(input, auth.as_ref()))
+            .await
+        {
             Ok(resp) => resp,
             Err(e) => map_join_error(e, fallback_trace_id()),
         }

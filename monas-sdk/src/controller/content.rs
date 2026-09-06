@@ -142,7 +142,7 @@ impl MonasController {
         }
     }
 
-    fn try_account_http_error<T>(
+    pub(super) fn try_account_http_error<T>(
         status: u16,
         body: &str,
         trace_id: String,
@@ -229,7 +229,7 @@ impl MonasController {
     /// `operation` / `resource` は State Node 側が
     /// `verify_caller_signature` へ渡す値と一致させること
     /// (create は `("create", "content")`、update は `("update", content_id)`)。
-    fn prepare_state_node_content_auth<T>(
+    pub(super) fn prepare_state_node_content_auth<T>(
         &self,
         auth: Option<&StateNodeAuthContext>,
         operation: &str,
@@ -385,7 +385,7 @@ impl MonasController {
 
     /// base64urlデコードされたコンテンツのバリデーション
     /// エラーがある場合はApiResponse<T>を返し、成功時はVec<u8>を返す
-    fn decode_and_validate_content<T>(
+    pub(super) fn decode_and_validate_content<T>(
         content_base64url: &str,
         trace_id: String,
     ) -> Result<Vec<u8>, ApiResponse<T>> {
@@ -619,17 +619,6 @@ impl MonasController {
         let state_node_request = StateNodeUpdateContentRequest {
             data: encrypted_data_base64,
         };
-        let request_body = match serde_json::to_string(&state_node_request) {
-            Ok(body) => body,
-            Err(e) => {
-                return Some(ApiResponse::error(
-                    ApiError::Internal(format!(
-                        "Failed to serialize State Node update request: {e}"
-                    )),
-                    trace_id,
-                ));
-            }
-        };
         let signed_auth = match self.prepare_state_node_content_auth(
             auth,
             "update",
@@ -640,13 +629,46 @@ impl MonasController {
             Ok(auth) => auth,
             Err(response) => return Some(response),
         };
+        self.send_signed_update_to_state_node(
+            content_id,
+            &state_node_request,
+            signed_auth.as_ref(),
+            trace_id,
+        )
+    }
+
+    /// `PUT /content/:id` を、署名済みの認証コンテキストでそのまま送る。
+    ///
+    /// owner の update は [`send_update_to_state_node`] が account 鍵で署名して
+    /// ここへ来る。share 受信者の update(`update_shared_content`)も同じ
+    /// メッセージに account 鍵で署名するが、Authorization は owner の
+    /// `user:<pubkey>` ではなく委譲 Token の `Bearer` のままにするので、
+    /// 署名の付け方を呼び出し側に委ねている。
+    pub(super) fn send_signed_update_to_state_node<T>(
+        &self,
+        content_id: &str,
+        state_node_request: &StateNodeUpdateContentRequest,
+        signed_auth: Option<&StateNodeAuthContext>,
+        trace_id: String,
+    ) -> Option<ApiResponse<T>> {
+        let request_body = match serde_json::to_string(state_node_request) {
+            Ok(body) => body,
+            Err(e) => {
+                return Some(ApiResponse::error(
+                    ApiError::Internal(format!(
+                        "Failed to serialize State Node update request: {e}"
+                    )),
+                    trace_id,
+                ));
+            }
+        };
 
         let state_node_url = format!("{}/content/{}", self.state_node_url, content_id);
         let req = Self::attach_state_node_auth(
             self.agent
                 .put(&state_node_url)
                 .header("Content-Type", "application/json"),
-            signed_auth.as_ref(),
+            signed_auth,
         );
 
         let resp = match req.send(request_body) {
@@ -1111,12 +1133,7 @@ impl MonasController {
         // 失敗しても更新自体は成立している(ローカル・State Node とも新しい版)
         // ので巻き戻さない。次の share / revoke で「受信者がいない」として現れる。
         if result.content_id.as_str() != base_version_id {
-            let share_repository = &self.share_service.share_repository;
-            if let Ok(Some(share)) = share_repository.load(&ContentId::new(base_version_id.clone()))
-            {
-                let _ =
-                    share_repository.save(&share.with_new_content_id(result.content_id.clone()));
-            }
+            self.carry_share_acl(&ContentId::new(base_version_id.clone()), &result.content_id);
         }
 
         let output = UpdateContentOutput {
@@ -1127,6 +1144,23 @@ impl MonasController {
         };
 
         ApiResponse::success(output, trace_id)
+    }
+
+    /// 版IDに紐づく共有 ACL を新しい版IDへ引き継ぐ(best effort)。
+    /// `update_content` と `adopt_remote_head` で版IDが変わるときに呼ぶ。
+    ///
+    /// `to` に既に ACL があれば触らない: その ACL は `from` のものを引き継いだ
+    /// 後に変更された(受信者の追加・取り消し)より新しい状態であり、古い方で
+    /// 上書きすると後から加えた受信者が消える(head を取り込んだ後に古い版IDで
+    /// もう一度取り込む、といった再入で起きる)。
+    pub(super) fn carry_share_acl(&self, from: &ContentId, to: &ContentId) {
+        let share_repository = &self.share_service.share_repository;
+        if let Ok(Some(_)) = share_repository.load(to) {
+            return;
+        }
+        if let Ok(Some(share)) = share_repository.load(from) {
+            let _ = share_repository.save(&share.with_new_content_id(to.clone()));
+        }
     }
 
     /// コンテンツを削除する。

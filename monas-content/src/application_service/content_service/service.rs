@@ -289,6 +289,111 @@ where
         Ok(plaintext)
     }
 
+    /// Adopt a version that already exists on the state node as the newest
+    /// local version of `content_id`.
+    ///
+    /// The owner's counterpart of a write share: a recipient with write
+    /// access wrote `encrypted_content` under the owner's CEK, and the owner's
+    /// local record is now behind the network head. Every owner-side
+    /// operation that re-publishes from the local record — `update`,
+    /// `reencrypt` on revoke — would otherwise silently overwrite that
+    /// version with the stale local plaintext. Calling this first moves the
+    /// local record to the head.
+    ///
+    /// The ciphertext is decrypted with the record's own CEK to obtain the
+    /// plaintext (so a ciphertext this device cannot open is refused, and the
+    /// caller's claim about the plaintext is never trusted) and stored
+    /// as-is, so the local ciphertext keeps matching the state node's for
+    /// integrity checks. Idempotent: adopting the version the record is
+    /// already at just returns it.
+    pub fn adopt_version(
+        &self,
+        content_id: &ContentId,
+        encrypted_content: Vec<u8>,
+    ) -> Result<UpdateContentResult, UpdateError> {
+        let content = self
+            .content_repository
+            .find_by_id(content_id)
+            .map_err(UpdateError::Repository)?
+            .ok_or(UpdateError::NotFound)?;
+        let key = self
+            .cek_store
+            .load(content.raw_id())
+            .map_err(UpdateError::KeyStore)?
+            .ok_or_else(|| {
+                UpdateError::KeyStore(ContentEncryptionKeyStoreError::Storage(
+                    "missing content encryption key for content".to_string(),
+                ))
+            })?;
+        let raw_content = self
+            .encryptor
+            .decrypt(&key, &encrypted_content)
+            .map_err(UpdateError::Domain)?;
+
+        let (adopted, _event) = content
+            .adopt_version(raw_content, encrypted_content, &self.content_id_generator)
+            .map_err(UpdateError::Domain)?;
+
+        if adopted.raw_id() != content.raw_id() {
+            self.cek_store
+                .save(adopted.raw_id(), &key)
+                .map_err(UpdateError::KeyStore)?;
+            match adopted.metadata().provider() {
+                Some(provider) => {
+                    self.content_repository
+                        .save_to(provider.as_str(), adopted.raw_id(), &adopted)
+                }
+                None => self.content_repository.save(adopted.raw_id(), &adopted),
+            }
+            .map_err(UpdateError::Repository)?;
+        }
+
+        let encrypted_content = adopted
+            .encrypted_content()
+            .ok_or(UpdateError::MissingEncryptedContent)?
+            .clone();
+        Ok(UpdateContentResult {
+            content_id: adopted.raw_id().clone(),
+            series_id: adopted.series_id().clone(),
+            metadata: adopted.metadata().clone(),
+            encrypted_content,
+        })
+    }
+
+    /// Encrypt a new plaintext under a caller-supplied CEK, without a local
+    /// content record.
+    ///
+    /// The inverse of [`decrypt_with_cek`](Self::decrypt_with_cek), for a
+    /// share recipient who writes a new version of the owner's content: the
+    /// recipient holds the CEK (from the owner's envelope) but no `Content`
+    /// aggregate, so [`update`](Self::update) cannot be used. The ciphertext
+    /// is what the state node stores as the version payload; the returned
+    /// plain id is the version's `local_content_id`, derived exactly as
+    /// [`Content::update_content`](crate::domain::content::Content::update_content)
+    /// derives it for the owner, so both sides address the version the same way.
+    ///
+    /// The CEK is also cached under that id so this device can later run a
+    /// verified read of the version it wrote. A cache failure is not an error:
+    /// the caller's authoritative CEK record still holds the key.
+    pub fn encrypt_with_cek(
+        &self,
+        key: &ContentEncryptionKey,
+        plaintext: &[u8],
+    ) -> Result<EncryptedWithCek, ContentError> {
+        if key.0.is_empty() {
+            return Err(ContentError::EncryptionError(
+                "Missing content encryption key".to_string(),
+            ));
+        }
+        let ciphertext = self.encryptor.encrypt(key, plaintext)?;
+        let plain_content_id = self.content_id_generator.generate(plaintext);
+        let _ = self.cek_store.save(&plain_content_id, key);
+        Ok(EncryptedWithCek {
+            ciphertext,
+            plain_content_id,
+        })
+    }
+
     /// Verify and decrypt a relay-read response fetched from a state node.
     ///
     /// The state node returns the whole crsl-lib `Node` (CBOR). This:
@@ -401,6 +506,7 @@ where
             plaintext,
             parents: verified.parents,
             plain_content_id,
+            ciphertext: verified.ciphertext,
         })
     }
 
@@ -748,12 +854,23 @@ pub enum DecryptWithCekError {
     Domain(ContentError),
 }
 
+/// Result of [`ContentService::encrypt_with_cek`]: the version payload for the
+/// state node and the plain id the plaintext addresses to.
+#[derive(Debug)]
+pub struct EncryptedWithCek {
+    pub ciphertext: Vec<u8>,
+    pub plain_content_id: ContentId,
+}
+
 /// Result of a verified relay read: the plaintext plus the verified node's
 /// parent version CIDs (used by the caller for the monotonicity check).
 #[derive(Debug)]
 pub struct VerifiedRead {
     pub plaintext: Vec<u8>,
     pub parents: Vec<String>,
+    /// The version payload exactly as the state node holds it, for a caller
+    /// that adopts the version locally ([`ContentService::adopt_version`]).
+    pub ciphertext: Vec<u8>,
     /// The content id the decrypted plaintext addresses to. Equal to the
     /// expected id when one was given; for a reader that could not know it
     /// (a share recipient reading a version newer than the one shared) it

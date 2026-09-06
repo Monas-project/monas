@@ -130,6 +130,13 @@ pub struct RevokeShareOutput {
     /// 決める。残存受信者には、この時刻より後に発行した Token を配り直す必要がある。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_invalidated_at: Option<u64>,
+    /// revoke は再暗号化の前に State Node の head をローカルへ取り込む
+    /// (write を委譲した受信者の版を巻き戻さないため)。その取り込みに失敗
+    /// したときの理由。revoke 自体はローカルの版で続行している — 取り消しは
+    /// 書き手に妨げられてはならない — ので、呼び出し側はこれを見て
+    /// 「head が失われたかもしれない」と扱うこと。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_pull_error: Option<String>,
 }
 
 /// revoke 後に残存受信者向けへ再発行された KeyEnvelope。
@@ -182,6 +189,32 @@ pub struct DecryptSharedContentOutput {
     pub version: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<ContentMetadata>,
+}
+
+/// 共有を受けた側がコンテンツを更新するリクエスト。
+///
+/// 受信者はローカルに content レコードを持たない(持つのは envelope から
+/// 取り出した CEK と送信者ピンだけ)。新しい平文をその CEK で暗号化し、
+/// owner の Content Network(`remote_content_id`)へ write 委譲 Token 付きで
+/// PUT する。State Node は Token の `aud` 鍵(この端末の account 鍵)で
+/// 署名を検証し、Token の capability で書き込みを許可する。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateSharedContentInput {
+    /// State Node の系列ID(owner の share package の `remote_content_id`)。
+    pub remote_content_id: String,
+    /// 新しい平文(base64url)。
+    pub content: String,
+}
+
+/// 共有を受けた側の更新レスポンス
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateSharedContentOutput {
+    pub remote_content_id: String,
+    /// 新しい平文の content id(plain CID)。owner 側の版IDと同じ規則で
+    /// 導出されるので、以後この版を読むときの `local_content_id` になる。
+    pub version_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
 }
 
 #[cfg(test)]
@@ -272,9 +305,11 @@ mod tests {
             revoked_at: Some("2025-12-05T12:34:56Z".into()),
             reissued_envelopes: vec![],
             token_invalidated_at: None,
+            head_pull_error: None,
         };
         let json = serde_json::to_string(&output).unwrap();
         assert!(json.contains("\"revoked\":true"));
+        assert!(!json.contains("head_pull_error"));
         // 空の envelope リストは serialize されない(後方互換)
         assert!(!json.contains("reissued_envelopes"));
         // state node 連携なしなら失効時刻も出さない
@@ -290,6 +325,7 @@ mod tests {
             revoked_at: None,
             reissued_envelopes: vec![],
             token_invalidated_at: Some(1_700_000_000),
+            head_pull_error: None,
         };
         let json = serde_json::to_string(&output).unwrap();
         assert!(json.contains("\"token_invalidated_at\":1700000000"));
@@ -314,6 +350,7 @@ mod tests {
                 delegated_access: None,
             }],
             token_invalidated_at: None,
+            head_pull_error: None,
         };
         let json = serde_json::to_string(&output).unwrap();
         assert!(json.contains("\"reissued_envelopes\""));

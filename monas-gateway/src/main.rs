@@ -1,16 +1,19 @@
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
-    routing::{get, post},
+    routing::{get, post, put},
     Json, Router,
 };
 use monas_sdk::models::content::{
     CreateContentInput, DeleteContentInput, GetContentInput, UpdateContentInput,
 };
 use monas_sdk::models::keypair::GenerateKeypairInput;
-use monas_sdk::models::share::{DecryptSharedContentInput, RevokeShareInput, ShareContentInput};
+use monas_sdk::models::share::{
+    DecryptSharedContentInput, RevokeShareInput, ShareContentInput, UpdateSharedContentInput,
+};
 use monas_sdk::models::state::{
-    GetHistoryInput, GetLatestVersionInput, ReadContentFromStateNodeInput, VerifyIntegrityInput,
+    GetHistoryInput, GetLatestVersionInput, PullContentFromStateNodeInput,
+    ReadContentFromStateNodeInput, VerifyIntegrityInput,
 };
 use monas_sdk::{
     generate_trace_id, ApiError, ApiResponse, MonasConfig, MonasController, StateNodeAuthContext,
@@ -56,10 +59,12 @@ async fn main() {
         .route("/share", post(share_content))
         .route("/share/revoke", post(revoke_share))
         .route("/share/decrypt", post(decrypt_shared_content))
+        .route("/share/content/{id}", put(update_shared_content))
         // state
         .route("/state/latest-version", post(get_latest_version))
         .route("/state/history", post(get_history))
         .route("/state/read", post(read_content_from_state_node))
+        .route("/state/pull", post(pull_content_from_state_node))
         .route("/state/verify-integrity", post(verify_integrity))
         .with_state(app_state);
 
@@ -214,6 +219,37 @@ async fn decrypt_shared_content(
     )
 }
 
+/// 共有を受けた側の書き込み。`Authorization: Bearer <委譲 Token>` が必須で、
+/// gateway は自分の account 鍵で署名して State Node に転送する。
+async fn update_shared_content(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<UpdateSharedContentBody>,
+) -> (
+    StatusCode,
+    Json<ApiResponse<monas_sdk::models::share::UpdateSharedContentOutput>>,
+) {
+    let auth = match build_state_node_auth_context(&headers) {
+        Ok(auth) => auth,
+        Err(error) => return auth_error_json(error),
+    };
+    let input = UpdateSharedContentInput {
+        remote_content_id: id,
+        content: body.content,
+    };
+    api_json(
+        Arc::clone(&state.controller)
+            .update_shared_content_async(input, Some(auth))
+            .await,
+    )
+}
+
+#[derive(serde::Deserialize)]
+struct UpdateSharedContentBody {
+    content: String,
+}
+
 async fn get_latest_version(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -267,6 +303,25 @@ async fn read_content_from_state_node(
     api_json(
         Arc::clone(&state.controller)
             .read_content_from_state_node_async(input, Some(auth))
+            .await,
+    )
+}
+
+async fn pull_content_from_state_node(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<PullContentFromStateNodeInput>,
+) -> (
+    StatusCode,
+    Json<ApiResponse<monas_sdk::models::state::PullContentFromStateNodeOutput>>,
+) {
+    let auth = match build_state_node_auth_context(&headers) {
+        Ok(auth) => auth,
+        Err(error) => return auth_error_json(error),
+    };
+    api_json(
+        Arc::clone(&state.controller)
+            .pull_content_from_state_node_async(input, Some(auth))
             .await,
     )
 }

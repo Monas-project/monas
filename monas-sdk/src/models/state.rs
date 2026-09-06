@@ -97,6 +97,37 @@ pub struct ReadContentFromStateNodeOutput {
 }
 
 // ============================================
+// pull_content_from_state_node
+
+/// State Node の最新版を owner のローカルレコードへ取り込む。
+///
+/// write 権限を委譲した受信者が新しい版を書くと、owner のローカルレコードは
+/// ネットワークの head より古くなる。その状態で owner が更新や revoke
+/// (再暗号化)をすると、古いローカル平文で受信者の版を黙って上書きする。
+/// これはその前に呼ぶ「pull」で、検証付き read(Node CID 再計算 + 自分の CEK
+/// での AES-GCM 復号)を通った版だけを取り込む。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PullContentFromStateNodeInput {
+    /// State Node の系列ID。
+    pub content_id: String,
+    /// 現在のローカル版ID(CEK とローカルレコードの選択に使う)。
+    pub local_content_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PullContentFromStateNodeOutput {
+    pub content_id: String,
+    /// 取り込み後のローカル版ID。head が既にローカル版なら入力と同じ。
+    pub local_content_id: String,
+    /// 読んだ版 CID(検証済み)。
+    pub version: String,
+    /// ローカルレコードが動いたか(head がローカル版と違ったか)。
+    pub adopted: bool,
+    /// head の平文(base64url)。
+    pub content: String,
+}
+
+// ============================================
 // verify_integrity
 // ============================================
 

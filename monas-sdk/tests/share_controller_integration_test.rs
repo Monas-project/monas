@@ -695,6 +695,17 @@ async fn revoke_share_invalidates_previously_issued_tokens() {
         "revoke_share should succeed: {:?}",
         revoke_response.error
     );
+    // No history/version mock here: the pre-rotation head pull cannot run,
+    // and the revoke must still go through (a writer must never be able to
+    // block revocation) while saying so.
+    assert!(
+        revoke_response
+            .data
+            .as_ref()
+            .and_then(|d| d.head_pull_error.as_deref())
+            .is_some(),
+        "the failed head pull must be reported"
+    );
 
     invalidate_mock.assert();
     update_mock.assert();
