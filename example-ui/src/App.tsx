@@ -35,6 +35,7 @@ import type { RunView, StepSpec } from "./pipeline/types";
 import * as flows from "./pipeline/flows";
 import * as contentApi from "./api/content";
 import * as shareApi from "./api/share";
+import * as stateApi from "./api/stateNode";
 import type { Entry, Identity, SharePackage, View } from "./types";
 
 type Modal =
@@ -220,15 +221,75 @@ export default function App() {
   const handleEditOpen = async (entry: Entry) => {
     setModal({ type: "loadingEdit" });
     try {
-      const res = await contentApi.getContent(entry.localContentId!);
-      setModal({ type: "edit", entry, text: base64UrlToUtf8(res.content) });
+      let text: string;
+      if (entry.receivedShare) {
+        // A received share is edited from the owner's *newest* version, not
+        // from the one the envelope carried: the gateway has no local copy of
+        // it anyway, and the state node is where the recipient's write lands.
+        text = (
+          await stateApi.readFromStateNode({
+            contentId: entry.remoteContentId!,
+            localContentId: entry.localContentId!,
+            acceptAnyVersion: true,
+            auth: { delegatedToken: entry.receivedShare.delegatedAccess!.delegated_token },
+          })
+        ).content;
+      } else if (entry.syncedToStateNode && entry.remoteContentId) {
+        // The owner's local copy may be behind the Content Network: a
+        // recipient with write access can have edited since. Pull the head
+        // into the local record first, so the edit starts from — and the
+        // update is applied over — their version instead of silently
+        // overwriting it.
+        const pulled = await stateApi.pullFromStateNode({
+          contentId: entry.remoteContentId,
+          localContentId: entry.localContentId!,
+        });
+        if (pulled.adopted) {
+          updateEntry(entry.id, {
+            localContentId: pulled.local_content_id,
+            versionCount: entry.versionCount + 1,
+          });
+          entry = { ...entry, localContentId: pulled.local_content_id };
+          pushToast("Pulled a newer version written by a recipient into your copy", "info");
+        }
+        text = pulled.content;
+      } else {
+        text = (await contentApi.getContent(entry.localContentId!)).content;
+      }
+      setModal({ type: "edit", entry, text: base64UrlToUtf8(text) });
     } catch (e) {
       pushToast(`Could not load contents: ${(e as Error).message}`, "error");
       setModal({ type: "edit", entry, text: "" });
     }
   };
 
+  // Recipient side of a write share: the new plaintext goes straight to the
+  // owner's Content Network under the delegated token. The name field of the
+  // editor is local here — a recipient cannot rename the owner's file.
+  const handleReceivedEditSave = async (entry: Entry, v: { name: string; text: string }) => {
+    setModal({ type: "none" });
+    const sizeBytes = new Blob([v.text]).size;
+    const specs = flows.updateReceivedFlow({
+      entry,
+      contentBase64Url: utf8ToBase64Url(v.text),
+      sizeBytes,
+    });
+    const { ok, ctx } = await run("Update (as recipient)", entry.name, specs);
+    if (ok && ctx.update) {
+      const upd = ctx.update as shareApi.UpdateSharedContentOutput;
+      updateEntry(entry.id, {
+        sizeBytes,
+        versionCount: entry.versionCount + 1,
+        receivedShare: { ...entry.receivedShare!, writtenVersionId: upd.version_id },
+      });
+      pushToast(`“${entry.name}” updated on the owner's Content Network`, "success");
+    } else {
+      pushToast("Update failed", "error");
+    }
+  };
+
   const handleEditSave = async (entry: Entry, v: { name: string; text: string }) => {
+    if (entry.receivedShare) return handleReceivedEditSave(entry, v);
     setModal({ type: "none" });
     const sizeBytes = new Blob([v.text]).size;
     const renamed = v.name && v.name !== entry.name ? v.name : undefined;
@@ -445,7 +506,21 @@ export default function App() {
               }
             : s;
         });
-      updateEntry(entry.id, { shares });
+      // The SDK pulls the Content Network head before rotating, so if a
+      // write-share recipient had edited since our last save, the local
+      // record — and its id — moved to their version.
+      const moved = r && r.content_id !== entry.localContentId;
+      updateEntry(entry.id, {
+        shares,
+        ...(moved ? { localContentId: r.content_id, versionCount: entry.versionCount + 1 } : {}),
+      });
+
+      if (r?.head_pull_error) {
+        pushToast(
+          `Revoked from the local copy: the Content Network head could not be pulled first (${r.head_pull_error}). A recipient's newer version may have been overwritten.`,
+          "error",
+        );
+      }
 
       const stale = shares.filter((s) => !reissued.has(s.recipientKeyId)).length;
       const cutoff = r?.token_invalidated_at

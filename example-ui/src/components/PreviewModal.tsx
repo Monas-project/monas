@@ -128,16 +128,18 @@ export function PreviewModal({
   // version would always fail the comparison it is meant to prove. Offering
   // that choice made the control look broken rather than honest.
   //
-  // A recipient cannot know the plain id of versions the owner wrote after
-  // sharing, so for received files the read only uses the local id to pick
-  // the CEK and reports the id the plaintext actually addresses to.
+  // Neither side can assume the newest version is its own: the owner may
+  // have edited since sharing, and a write-share recipient may have written
+  // since. So the read only uses the local id to pick the CEK, and reports
+  // the id the plaintext actually addresses to; the rows below say whose
+  // version that is.
   const runRead = () => {
     if (!cid || !entry.localContentId) return;
     setRead({ status: "loading" });
     readFromStateNode({
       contentId: cid,
       localContentId: entry.localContentId,
-      acceptAnyVersion: received,
+      acceptAnyVersion: true,
       auth,
     })
       .then((d) => setRead({ status: "ok", data: d }))
@@ -153,6 +155,13 @@ export function PreviewModal({
           content key from their envelope with your identity{" "}
           <b>{entry.receivedShare!.recipientLabel}</b> and decrypted the ciphertext
           it carries — this is the version the owner shared.
+          {entry.receivedShare!.writtenVersionId && (
+            <>
+              {" "}
+              You have since written a newer version with the delegated token;
+              “Read from state-node” below shows the current one.
+            </>
+          )}
         </div>
       ) : (
         <div className="callout" style={{ marginBottom: 12 }}>
@@ -334,8 +343,10 @@ export function PreviewModal({
               The preview above came from the gateway's own store. This reads the
               newest version back from the state node — relayed to a member node
               if the one we contacted isn't one — and only shows plaintext after
-              the Node CID is recomputed, the CEK decrypts it (AES-GCM), and the
-              plaintext re-addresses to the local id. A relay cannot forge this.
+              the Node CID is recomputed and the CEK decrypts it (AES-GCM). The
+              plaintext is then re-addressed, and if the id differs from the
+              local copy the rows below say who wrote it. A relay cannot forge
+              this.
             </div>
             <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
               <button className="btn sm" disabled={read.status === "loading"} onClick={runRead}>
@@ -355,15 +366,35 @@ export function PreviewModal({
                   <span>version read</span>
                   <b className="mono">{short(read.data.version)}</b>
                 </div>
-                {received && read.data.local_content_id !== entry.localContentId && (
-                  <div className="kv">
-                    <span>newer than shared</span>
-                    <b className="mono">
-                      plaintext now addresses {short(read.data.local_content_id)} — the owner has
-                      edited since sharing
-                    </b>
-                  </div>
-                )}
+                {read.data.local_content_id !== entry.localContentId &&
+                  (received ? (
+                    read.data.local_content_id === entry.receivedShare?.writtenVersionId ? (
+                      <div className="kv">
+                        <span>your edit</span>
+                        <b className="mono">
+                          plaintext addresses {short(read.data.local_content_id)} — the version
+                          this device wrote with the delegated token
+                        </b>
+                      </div>
+                    ) : (
+                      <div className="kv">
+                        <span>newer than shared</span>
+                        <b className="mono">
+                          plaintext now addresses {short(read.data.local_content_id)} — the owner
+                          has edited since sharing
+                        </b>
+                      </div>
+                    )
+                  ) : (
+                    <div className="kv">
+                      <span>newer than your copy</span>
+                      <b className="mono">
+                        plaintext now addresses {short(read.data.local_content_id)} — a recipient
+                        with write access has edited since your last save. “Edit contents” pulls
+                        it into your copy first.
+                      </b>
+                    </div>
+                  ))}
                 <div className="preview-box" style={{ marginTop: 8 }}>
                   {(() => {
                     if ((entry.mimeType || "").startsWith("image/"))

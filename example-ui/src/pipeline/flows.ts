@@ -133,6 +133,46 @@ export function updateFileFlow(input: {
   ];
 }
 
+// ------------------------------------------------ update a received share
+// The recipient's counterpart of updateFileFlow. This device has no content
+// record to re-encrypt from — only the CEK the SDK pinned at import — so the
+// gateway encrypts the new plaintext under that CEK and PUTs it to the
+// owner's Content Network, presenting the delegated token. The owner's next
+// verified read sees this version.
+export function updateReceivedFlow(input: {
+  entry: Entry;
+  contentBase64Url: string;
+  sizeBytes: number;
+}): StepSpec[] {
+  const { entry } = input;
+  const token = entry.receivedShare!.delegatedAccess!;
+  return [
+    {
+      title: "Encrypt under the shared CEK · gateway call",
+      hint: "monas-sdk · AES-256-GCM",
+      kind: "crypto",
+      minMs: 160,
+      exec: async (ctx) => {
+        const resp = await shareApi.updateSharedContent({
+          remoteContentId: entry.remoteContentId!,
+          contentBase64Url: input.contentBase64Url,
+          delegatedToken: token.delegated_token,
+        });
+        ctx.update = resp;
+        return `New ciphertext (${fmtBytes(input.sizeBytes)}) under the CEK from the owner's envelope · version ${short(resp.version_id)}`;
+      },
+    },
+    {
+      title: "Write to the owner's Content Network",
+      hint: "delegated token · signed",
+      kind: "state",
+      minMs: 220,
+      exec: async () =>
+        `PUT ${short(entry.remoteContentId!)} accepted: token ${short(token.jti, 6, 4)} grants write, request signed with this device's account key (the token's audience)`,
+    },
+  ];
+}
+
 // ---------------------------------------------------------------- open / preview
 export function openFileFlow(input: { entry: Entry }): StepSpec[] {
   const { entry } = input;

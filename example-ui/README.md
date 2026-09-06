@@ -88,9 +88,12 @@ contexts, each bound to its **own gateway + monas-account pair**, exchange only
 what people would paste into a chat — a public key one way, a share package
 the other. The recipient unwraps it, reads the shared version back from *his*
 state node with the delegated token, is refused after the owner revokes a
-third party, reads again with the reissued token, is refused the stale
-package, and reads the owner's post-share edit. Point the second pair at a
-**different node** so the reads prove replication too:
+third party, reads again with the reissued token, reads the owner's post-share
+edit, **writes his own version** with the token (which the owner reads from
+*her* node and pulls into her copy), is refused the stale package, and — once
+the owner revokes him — has his write refused while her copy keeps his last
+authorised version. Point the second pair at a **different node** so the
+reads prove replication too:
 
 ```bash
 MONAS_STATE_NODE_URL=https://node2.monas-demo.net ./scripts/second-device.sh   # :3001 / :4003
@@ -226,7 +229,8 @@ copy-paste:
    Drive**. The gateway unwraps the content key with your identity (HPKE Auth,
    so it also proves the package came from that sender and pins their key)
    and decrypts. The file appears with a *shared with me* badge; **Open**
-   unwraps it again from the kept envelope.
+   unwraps it again from the kept envelope; with a write share, **Edit
+   contents** writes back to the owner's Content Network (below).
 
 The package is one JSON document (`kind: "monas-share"`, `v: 1`): the file's
 name/type/size, the owner's content id and Content Network id, both public
@@ -253,10 +257,26 @@ the SDK keeps the sender pin (sender key, key epoch, CEK) under the Content
 Network id, so the check holds across the owner's edits even though those
 change the content id the package names.
 
-What it does **not** do: write as a recipient. A read+write share is
-accepted, but the recipient's gateway has no local record of the file to
-update, and the non-owner write path on the state node is untested. That is
-the next piece of SDK work.
+**Writing as a recipient.** With a read+write share the row menu of a received
+file offers **Edit contents**. The editor loads the owner's newest version
+from the state node (not the one the envelope carried), and *Re-encrypt &
+save* goes to `PUT /api/share/content/:networkId` with the delegated token:
+the gateway encrypts under the CEK it pinned at import — it has no content
+record of its own — signs with your account key and PUTs to the owner's
+Content Network. The state node grants the write on the token's `write`
+capability and refuses it after a revoke. In the preview, *Read from
+state-node* then reports the version as *your edit*.
+
+The owner sees it the other way round: their local copy is now behind the
+head, so their verified read flags it as *newer than your copy*. **Edit
+contents** on the owner's side first **pulls** the head into the local
+record (`POST /api/state/pull`: a verified read whose ciphertext is adopted as
+the newest local version, keeping integrity checks true), so the edit starts
+from the recipient's version rather than overwriting it. A revoke pulls the
+same way inside the SDK before rotating the key — otherwise re-encrypting the
+stale local plaintext would silently roll the file back. If that pull fails
+the revoke still goes through (a writer must not be able to block
+revocation) and the UI says so.
 
 ## What's real vs. illustrative
 

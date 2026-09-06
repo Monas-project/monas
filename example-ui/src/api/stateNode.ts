@@ -97,6 +97,33 @@ export function readFromStateNode(input: {
   });
 }
 
+export interface PullFromStateNodeOutput {
+  content_id: string;
+  /** The local id after the pull — the head's plain id if it was adopted. */
+  local_content_id: string;
+  version: string;
+  /** True when the head was someone else's version and the local record
+   *  moved to it. */
+  adopted: boolean;
+  content: string; // head plaintext, base64url
+}
+
+/**
+ * Owner-side pull: adopt the Content Network's newest version into the
+ * gateway's local record. Needed once a recipient with write access has
+ * edited — the local copy is then behind the head, and any owner-side
+ * re-publish (an edit, a revoke's re-encryption) would overwrite the
+ * recipient's version with stale plaintext. The SDK's revoke pulls by
+ * itself; the editor calls this before opening.
+ */
+export function pullFromStateNode(input: { contentId: string; localContentId: string }) {
+  return gateway<PullFromStateNodeOutput>("/state/pull", {
+    method: "POST",
+    timestamp: true,
+    body: { content_id: input.contentId, local_content_id: input.localContentId },
+  });
+}
+
 export interface VerifyIntegrityOutput {
   valid: boolean;
   computed_hash: string;

@@ -90,6 +90,11 @@ export interface ReceivedShare {
   envelope: KeyEnvelopeData;
   delegatedAccess?: DelegatedAccessToken;
   receivedAt: number;
+  /** Plain content id of the newest version *this device* wrote to the
+   *  owner's Content Network (write shares only). The entry's localContentId
+   *  stays the id the envelope decrypts to, so this is how the preview tells
+   *  "your edit" apart from "the owner edited since sharing". */
+  writtenVersionId?: string;
 }
 
 // One row in the Drive. Folders are purely logical (path prefixes); only files
@@ -111,9 +116,10 @@ export interface Entry {
   syncedToStateNode: boolean;
   versionCount: number;
   shares: ShareGrant[];
-  /** Present when this file was shared *to* this device by someone else. Such
-   *  an entry is read-only here: opening it unwraps the envelope again, and
-   *  deleting it only removes it from this Drive. */
+  /** Present when this file was shared *to* this device by someone else.
+   *  Opening it unwraps the envelope again; deleting it only removes it from
+   *  this Drive; editing it (write shares) writes straight to the owner's
+   *  Content Network with the delegated token. */
   receivedShare?: ReceivedShare;
 }
 

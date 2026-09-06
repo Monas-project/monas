@@ -79,7 +79,7 @@ async function newDevice(browser: Browser): Promise<{ context: BrowserContext; p
 
 const readClipboard = (page: Page) => page.evaluate(() => navigator.clipboard.readText());
 
-test("J-4: a file shared from one device opens on another via a pasted share package", async ({
+test("J-4: a file shared from one device opens, reads and is edited on another via a pasted share package", async ({
   browser,
 }) => {
   const name = `j4-${nonce}.txt`;
@@ -121,12 +121,13 @@ test("J-4: a file shared from one device opens on another via a pasted share pac
   });
 
   let sharePackage = "";
-  await test.step("Alice shares to Bob's pasted key and copies the share package", async () => {
+  await test.step("Alice shares (read + write) to Bob's pasted key and copies the share package", async () => {
     await rowAction(alice.page, name, "Share");
     const modal = alice.page.locator(".modal");
     await modal.locator(".seg button", { hasText: "Paste public key" }).click();
     await pubKeyBox(modal).fill(bobPublicKey);
     await modal.locator(".field", { hasText: "Label (optional)" }).locator("input.input").fill("bob");
+    await modal.locator(".field", { hasText: "Permission" }).locator(".seg button", { hasText: "read + write" }).click();
     await modal.getByRole("button", { name: "Wrap CEK & share" }).click();
     await expectToast(alice.page, "Shared with bob");
 
@@ -139,6 +140,7 @@ test("J-4: a file shared from one device opens on another via a pasted share pac
     expect(parsed.name).toBe(name);
     expect(parsed.recipient_public_key).toBe(bobPublicKey);
     expect(parsed.remote_content_id).toBeTruthy();
+    expect(parsed.permissions).toEqual(["read", "write"]);
     expect(parsed.key_envelope.ciphertext).toBeTruthy();
     // …and "Copy package" puts exactly that text on the clipboard.
     await modal
@@ -176,12 +178,13 @@ test("J-4: a file shared from one device opens on another via a pasted share pac
 
     const r = row(bob.page, name);
     await expect(r.locator(".badge.received")).toBeVisible();
-    // Bob holds an envelope, not the file: no Edit, no Share, no network delete.
+    // Bob holds an envelope plus a write token, not the file: he can edit
+    // (straight to Alice's Content Network) but not re-share or delete it.
     await r.locator(".row-menu-wrap .icon-btn").click();
     const menu = bob.page.locator(".menu");
     await expect(menu.locator("button", { hasText: "Open / preview" })).toBeVisible();
+    await expect(menu.locator("button", { hasText: "Edit contents" })).toBeVisible();
     await expect(menu.locator("button", { hasText: "Remove from my Drive" })).toBeVisible();
-    await expect(menu.locator("button", { hasText: "Edit contents" })).toHaveCount(0);
     await expect(menu.locator("button", { hasText: "Share" })).toHaveCount(0);
     await bob.page.keyboard.press("Escape");
   });
@@ -303,6 +306,56 @@ test("J-4: a file shared from one device opens on another via a pasted share pac
     await closeModal(bob.page);
   });
 
+  const secret3 = `journey-4 bob's draft ${nonce}`;
+  await test.step("Bob edits with the delegated token; Alice's verified read sees his version", async () => {
+    // The editor loads the owner's newest version, not the one the envelope
+    // carried.
+    await rowAction(bob.page, name, "Edit contents");
+    const editor = bob.page.locator(".modal");
+    await expect(editor.locator("textarea.input")).toHaveValue(secret2, { timeout: 120_000 });
+    await editor.locator("textarea.input").fill(secret3);
+    await bob.page.getByRole("button", { name: "Re-encrypt & save" }).click();
+    await expectToast(bob.page, `“${name}” updated on the owner's Content Network`);
+    await expect(bob.page.locator(".run").first()).toContainText("grants write");
+
+    // Bob's own state node now serves the version he wrote…
+    await rowAction(bob.page, name, "Open / preview");
+    const preview = bob.page.locator(".modal");
+    await expect(preview).toContainText("You have since written a newer version");
+    await preview.getByRole("button", { name: "Read from state-node" }).click();
+    await expect(preview.locator(".badge.synced", { hasText: "verified" })).toBeVisible({
+      timeout: 120_000,
+    });
+    await expect(preview.locator(".preview-box").nth(1)).toHaveText(secret3);
+    await expect(preview.locator(".kv", { hasText: "your edit" })).toBeVisible();
+    await closeModal(bob.page);
+
+    // …and so does Alice's, flagged against her local copy, which still holds
+    // her own last save.
+    await rowAction(alice.page, name, "Open / preview");
+    const aliceView = alice.page.locator(".modal");
+    await expect(aliceView.locator(".preview-box").first()).toHaveText(secret2);
+    await aliceView.getByRole("button", { name: "Read from state-node" }).click();
+    await expect(aliceView.locator(".badge.synced", { hasText: "verified" })).toBeVisible({
+      timeout: 120_000,
+    });
+    await expect(aliceView.locator(".preview-box").nth(1)).toHaveText(secret3);
+    await expect(aliceView.locator(".kv", { hasText: "newer than your copy" })).toBeVisible();
+    await closeModal(alice.page);
+
+    // Opening the editor pulls Bob's version into her local record first, so
+    // her next save (or a revoke's re-encryption) builds on it, not over it.
+    await rowAction(alice.page, name, "Edit contents");
+    await expectToast(alice.page, /Pulled a newer version/);
+    await expect(alice.page.locator(".modal textarea.input")).toHaveValue(secret3, {
+      timeout: 120_000,
+    });
+    await closeModal(alice.page);
+    await rowAction(alice.page, name, "Open / preview");
+    await expect(alice.page.locator(".modal .preview-box").first()).toHaveText(secret3);
+    await closeModal(alice.page);
+  });
+
   // The epoch record lives in the SDK's sender pin, keyed by the Content
   // Network — not by the owner's content id, which the edit above has just
   // changed. A pre-rotation package naming the OLD id must still be refused.
@@ -317,6 +370,34 @@ test("J-4: a file shared from one device opens on another via a pasted share pac
       timeout: 30_000,
     });
     await closeModal(bob.page);
+  });
+
+  await test.step("Alice revokes Bob; his write is refused and Alice's copy is unchanged", async () => {
+    await rowAction(alice.page, name, "Share");
+    const modal = alice.page.locator(".modal");
+    await modal.locator(".recipient-row", { hasText: "bob" }).getByRole("button", { name: "Revoke" }).click();
+    await expectToast(alice.page, "Access revoked & content re-encrypted");
+    await closeModal(alice.page);
+
+    // The voided token cannot even load the current version for editing; the
+    // editor opens empty and the save is refused by the state node.
+    await rowAction(bob.page, name, "Edit contents");
+    await expectToast(bob.page, /Could not load contents/);
+    const editor = bob.page.locator(".modal");
+    await editor.locator("textarea.input").fill("this must not land");
+    await bob.page.getByRole("button", { name: "Re-encrypt & save" }).click();
+    await expectToast(bob.page, "Update failed");
+    await expect(bob.page.locator(".run").first()).toContainText(/HTTP 40[13]/);
+
+    // Alice's node still serves Bob's earlier (authorised) version.
+    await rowAction(alice.page, name, "Open / preview");
+    const view = alice.page.locator(".modal");
+    await view.getByRole("button", { name: "Read from state-node" }).click();
+    await expect(view.locator(".badge.synced", { hasText: "verified" })).toBeVisible({
+      timeout: 120_000,
+    });
+    await expect(view.locator(".preview-box").nth(1)).toHaveText(secret3);
+    await closeModal(alice.page);
   });
 
   await test.step("cleanup: Alice deletes the file, Bob removes his copy", async () => {

@@ -48,6 +48,12 @@ function Row({
   // A file shared to us: we hold an envelope, not the content, so the owner's
   // actions (edit, share on, delete on the network) are not ours to offer.
   const received = isFile && !!entry.receivedShare;
+  // A write share can be edited from here: the new version goes to the
+  // owner's Content Network with the delegated token, so both are needed.
+  const canWrite =
+    received &&
+    entry.receivedShare!.permissions.includes("write") &&
+    !!entry.receivedShare!.delegatedAccess;
   return (
     <div
       className="row"
@@ -115,7 +121,7 @@ function Row({
                 <Folder size={15} /> Open folder
               </button>
             )}
-            {isFile && !received && (
+            {isFile && (!received || canWrite) && (
               <button onClick={() => onAction("update", entry)}>
                 <Pencil size={15} /> Edit contents
               </button>

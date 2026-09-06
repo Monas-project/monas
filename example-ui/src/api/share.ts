@@ -77,6 +77,12 @@ export interface RevokeShareOutput {
    *  token issued at or before this is void — including ones held by the
    *  recipients that were *not* revoked. */
   token_invalidated_at?: number;
+  /** The revoke pulls the Content Network head into the local record before
+   *  re-encrypting (so a write-share recipient's version is rotated, not
+   *  overwritten). If that pull failed, the revoke still went through on the
+   *  local copy — revocation must not be blockable by a writer — and this
+   *  says why, so the caller knows the head may have been lost. */
+  head_pull_error?: string;
 }
 
 export function revokeShare(input: {
@@ -101,6 +107,41 @@ export function revokeShare(input: {
       recipient_public_key: input.recipientPublicKeyB64Url,
     },
   });
+}
+
+export interface UpdateSharedContentOutput {
+  remote_content_id: string;
+  /** Plain content id of the version this device wrote — the id the
+   *  plaintext addresses to, derived the same way the owner derives theirs. */
+  version_id: string;
+  updated_at?: string;
+}
+
+/**
+ * Write a new version of someone else's file, as a share recipient.
+ *
+ * This device has no content record for the file — only the CEK the SDK
+ * pinned when the share package was imported — so the gateway encrypts the
+ * new plaintext with that CEK and PUTs it to the owner's Content Network
+ * with the delegated token from the package. The state node accepts it only
+ * if the token carries `write` and has not been voided by a revoke; the
+ * gateway signs the request with this device's account key (the token's
+ * audience) like every other write.
+ */
+export function updateSharedContent(input: {
+  remoteContentId: string;
+  contentBase64Url: string;
+  delegatedToken: string;
+}) {
+  return gateway<UpdateSharedContentOutput>(
+    `/share/content/${encodeURIComponent(input.remoteContentId)}`,
+    {
+      method: "PUT",
+      timestamp: true,
+      headers: { Authorization: `Bearer ${input.delegatedToken}` },
+      body: { content: input.contentBase64Url },
+    },
+  );
 }
 
 export interface DecryptSharedContentOutput {
