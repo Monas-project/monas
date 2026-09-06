@@ -53,12 +53,16 @@ export function PreviewModal({
   // The state-node calls address the Content Network. For a synced file that's
   // remoteContentId; fall back to the local id like the update/delete flows do.
   //
-  // A received share is excluded even though it names a Content Network: the
-  // gateway signs these calls with *this device's* account key, and the state
-  // node only grants reads to the owner or to a delegated token. The SDK does
-  // not yet combine the two, so every panel below would just show 403s.
+  // A received share reads with the delegated token from its package: the
+  // gateway still signs with this device's account key (the token's audience)
+  // and presents the token, and the state node grants the recipient what the
+  // owner delegated. The token lives an hour and is voided by any revoke on
+  // the file, after which the owner has to send a fresh package.
   const received = !!entry.receivedShare;
-  const synced = entry.syncedToStateNode && !received;
+  const token = entry.receivedShare?.delegatedAccess;
+  const tokenExpired = !!token && token.expires_at * 1000 < Date.now();
+  const auth = token ? { delegatedToken: token.delegated_token } : undefined;
+  const synced = entry.syncedToStateNode && (!received || !!token);
   const cid = entry.remoteContentId || entry.localContentId;
 
   const [latest, setLatest] = useState<AsyncState<GetLatestVersionOutput>>({ status: "idle" });
@@ -75,26 +79,27 @@ export function PreviewModal({
     setHistory({ status: "loading" });
     setVerify({ status: "idle" });
     setRead({ status: "idle" });
-    getLatestVersion(cid)
+    getLatestVersion(cid, auth)
       .then((d) => !cancelled && setLatest({ status: "ok", data: d }))
       .catch((e) => !cancelled && setLatest({ status: "error", message: errMsg(e) }));
-    getHistory(cid)
+    getHistory(cid, 100, auth)
       .then((d) => !cancelled && setHistory({ status: "ok", data: d }))
       .catch((e) => !cancelled && setHistory({ status: "error", message: errMsg(e) }));
     return () => {
       cancelled = true;
     };
     // re-run if we navigate to a different content (e.g. after an edit reopens)
-  }, [cid, synced]);
+    // or the received share was re-imported with a fresh token
+  }, [cid, synced, token?.delegated_token]);
 
   const reload = () => {
     if (!synced || !cid) return;
     setLatest({ status: "loading" });
     setHistory({ status: "loading" });
-    getLatestVersion(cid)
+    getLatestVersion(cid, auth)
       .then((d) => setLatest({ status: "ok", data: d }))
       .catch((e) => setLatest({ status: "error", message: errMsg(e) }));
-    getHistory(cid)
+    getHistory(cid, 100, auth)
       .then((d) => setHistory({ status: "ok", data: d }))
       .catch((e) => setHistory({ status: "error", message: errMsg(e) }));
   };
@@ -122,12 +127,18 @@ export function PreviewModal({
   // its own — the registry keeps just the current one, so asking for an older
   // version would always fail the comparison it is meant to prove. Offering
   // that choice made the control look broken rather than honest.
+  //
+  // A recipient cannot know the plain id of versions the owner wrote after
+  // sharing, so for received files the read only uses the local id to pick
+  // the CEK and reports the id the plaintext actually addresses to.
   const runRead = () => {
     if (!cid || !entry.localContentId) return;
     setRead({ status: "loading" });
     readFromStateNode({
       contentId: cid,
       localContentId: entry.localContentId,
+      acceptAnyVersion: received,
+      auth,
     })
       .then((d) => setRead({ status: "ok", data: d }))
       .catch((e) => setRead({ status: "error", message: errMsg(e) }));
@@ -195,14 +206,26 @@ export function PreviewModal({
         )}
       </div>
 
-      {received ? (
+      {received && token && !tokenExpired && (
+        <div className="muted" style={{ fontSize: 11.5, marginBottom: 8 }}>
+          Reading as a recipient with the delegated token from the share package
+          (jti {short(token.jti, 6, 4)}, valid until{" "}
+          {new Date(token.expires_at * 1000).toLocaleTimeString()}). The gateway
+          signs the request with your account key — the token's audience — and
+          the state node checks both.
+        </div>
+      )}
+      {received && !token ? (
         <div className="callout warn">
-          This file lives in the owner's Content Network
-          {entry.remoteContentId ? <> <b className="mono">{short(entry.remoteContentId)}</b></> : null}.
-          Reading newer versions from the state node as a recipient needs the
-          delegated token in the share package combined with a read signed by
-          your key; the SDK does not do that yet, so this device shows the
-          shared version only. Ask the owner for a fresh package after they edit.
+          The share package carried no delegated token, so this device cannot
+          read the owner's Content Network. Ask the owner to share again.
+        </div>
+      ) : received && tokenExpired ? (
+        <div className="callout warn">
+          The delegated token in the share package expired at{" "}
+          {new Date(token!.expires_at * 1000).toLocaleString()}. Ask the owner for
+          a fresh package to read from the state node again; the version they
+          shared still opens from the envelope.
         </div>
       ) : !synced || !cid ? (
         <div className="callout warn">
@@ -257,6 +280,9 @@ export function PreviewModal({
             ) : null}
           </div>
 
+          {/* Integrity compares the gateway's own ciphertext with the state
+              node's; a recipient's gateway holds no ciphertext for this file. */}
+          {!received && (
           <div className="field" style={{ marginTop: 10 }}>
             <label>integrity</label>
             <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
@@ -299,6 +325,7 @@ export function PreviewModal({
               </div>
             )}
           </div>
+          )}
 
           {/* ---- verified read straight off the state node ---- */}
           <div className="field" style={{ marginTop: 10 }}>
@@ -328,6 +355,15 @@ export function PreviewModal({
                   <span>version read</span>
                   <b className="mono">{short(read.data.version)}</b>
                 </div>
+                {received && read.data.local_content_id !== entry.localContentId && (
+                  <div className="kv">
+                    <span>newer than shared</span>
+                    <b className="mono">
+                      plaintext now addresses {short(read.data.local_content_id)} — the owner has
+                      edited since sharing
+                    </b>
+                  </div>
+                )}
                 <div className="preview-box" style={{ marginTop: 8 }}>
                   {(() => {
                     if ((entry.mimeType || "").startsWith("image/"))

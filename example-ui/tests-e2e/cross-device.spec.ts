@@ -17,8 +17,14 @@ import {
  * receives. Nothing crosses between them except what a person would paste into
  * a chat: Bob's public key one way, Alice's share package the other.
  *
+ * The two gateways should point at *different* state nodes (node1 / node2) so
+ * that Bob's reads prove replication as well as delegation: Bob reads the
+ * version Alice shared, then the version she wrote afterwards, from his own
+ * node with the delegated token in the package. A revoke voids that token;
+ * the re-wrapped package carries a fresh one.
+ *
  * Requirements: the usual stack (vite :5174, gateway :3000, account :4002)
- * plus `MONAS_STATE_NODE_URL=… ./scripts/second-device.sh`.
+ * plus `MONAS_STATE_NODE_URL=https://node2.… ./scripts/second-device.sh`.
  */
 
 const BASE = process.env.E2E_URL || "http://localhost:5174";
@@ -188,6 +194,29 @@ test("J-4: a file shared from one device opens on another via a pasted share pac
     await closeModal(bob.page);
   });
 
+  /** Open Bob's copy and read it back from HIS state node with the delegated
+   *  token; returns the plaintext the verified read produced. */
+  async function bobReadsFromStateNode(): Promise<string> {
+    await rowAction(bob.page, name, "Open / preview");
+    const modal = bob.page.locator(".modal");
+    await expect(modal).toContainText("Reading as a recipient with the delegated token");
+    // latest + history load with the token too
+    await expect(modal.locator(".kv", { hasText: "latest version" }).locator("b.mono")).toBeVisible({
+      timeout: 60_000,
+    });
+    await modal.getByRole("button", { name: "Read from state-node" }).click();
+    await expect(modal.locator(".badge.synced", { hasText: "verified" })).toBeVisible({
+      timeout: 120_000,
+    });
+    const text = await modal.locator(".preview-box").nth(1).innerText();
+    await closeModal(bob.page);
+    return text;
+  }
+
+  await test.step("Bob reads the shared version back from his own state node", async () => {
+    expect(await bobReadsFromStateNode()).toBe(secret);
+  });
+
   let rewrapped = "";
   await test.step("Alice revokes a third party; Bob's envelope is re-wrapped and re-sent", async () => {
     // A throwaway P-256 key stands in for a third recipient.
@@ -221,20 +250,39 @@ test("J-4: a file shared from one device opens on another via a pasted share pac
     const before = JSON.parse(sharePackage);
     const after = JSON.parse(rewrapped);
     expect(after.key_envelope.key_epoch).toBeGreaterThan(before.key_envelope.key_epoch);
+    // The revoke voided every earlier token, Bob's included; the re-wrapped
+    // package must carry a fresh one, issued after the invalidation boundary.
+    expect(after.delegated_access.jti).not.toBe(before.delegated_access.jti);
+    expect(after.delegated_access.issued_at).toBeGreaterThan(before.delegated_access.issued_at);
     await closeModal(alice.page);
   });
 
-  await test.step("Bob imports the re-wrapped package: same entry, still readable", async () => {
+  await test.step("with the old token Bob's state-node read is refused", async () => {
+    await rowAction(bob.page, name, "Open / preview");
+    const modal = bob.page.locator(".modal");
+    await modal.getByRole("button", { name: "Read from state-node" }).click();
+    await expect(modal.locator(".inline-err").first()).toBeVisible({ timeout: 120_000 });
+    await expect(modal.locator(".badge.synced", { hasText: "verified" })).toHaveCount(0);
+    await closeModal(bob.page);
+  });
+
+  await test.step("Bob imports the re-wrapped package: same entry, readable again from the state node", async () => {
     await bob.page.getByRole("button", { name: "Import shared" }).click();
     const modal = bob.page.locator(".modal");
     await modal.locator("textarea.input").fill(rewrapped);
     await modal.getByRole("button", { name: "Unwrap & add to my Drive" }).click();
     await expectToast(bob.page, `“${name}” unwrapped and added to your Drive`);
+    // The re-wrapped envelope carries the re-encrypted current version.
     await expect(bob.page.locator(".modal .preview-box").first()).toHaveText(secret);
     await closeModal(bob.page);
     await expect(bob.page.locator(".row", { hasText: name })).toHaveCount(1);
+    // …and the fresh token reads from the state node again.
+    expect(await bobReadsFromStateNode()).toBe(secret);
   });
 
+  // The epoch check lives in the SDK's sender pin, which is keyed by the
+  // owner's content id — so this only catches a stale package for the *same*
+  // version id, which is why this step runs before Alice edits.
   await test.step("the pre-rotation package is refused as stale", async () => {
     await bob.page.getByRole("button", { name: "Import shared" }).click();
     const modal = bob.page.locator(".modal");
@@ -245,6 +293,29 @@ test("J-4: a file shared from one device opens on another via a pasted share pac
     await expect(bob.page.locator(".run").first()).toContainText(/stale key envelope|key_epoch/i, {
       timeout: 30_000,
     });
+    await closeModal(bob.page);
+  });
+
+  const secret2 = `journey-4 second draft ${nonce}`;
+  await test.step("Alice edits; Bob reads the newer version with the same token and CEK", async () => {
+    await rowAction(alice.page, name, "Edit contents");
+    const editor = alice.page.locator(".modal");
+    await expect(editor.locator("textarea.input")).toHaveValue(secret, { timeout: 60_000 });
+    await editor.locator("textarea.input").fill(secret2);
+    await alice.page.getByRole("button", { name: "Re-encrypt & save" }).click();
+    await expectToast(alice.page, `“${name}” updated`);
+
+    // Bob's envelope still opens the version he was given…
+    await rowAction(bob.page, name, "Open / preview");
+    const preview = bob.page.locator(".modal");
+    await expect(preview.locator(".preview-box").first()).toHaveText(secret);
+    // …and the state node hands him the new one, flagged as newer than shared.
+    await preview.getByRole("button", { name: "Read from state-node" }).click();
+    await expect(preview.locator(".badge.synced", { hasText: "verified" })).toBeVisible({
+      timeout: 120_000,
+    });
+    await expect(preview.locator(".preview-box").nth(1)).toHaveText(secret2);
+    await expect(preview.locator(".kv", { hasText: "newer than shared" })).toBeVisible();
     await closeModal(bob.page);
   });
 

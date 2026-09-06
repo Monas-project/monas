@@ -292,6 +292,7 @@ export function shareFlow(input: {
       exec: async (ctx) => {
         const grant = await shareApi.shareContent({
           contentId: entry.localContentId!,
+          remoteContentId: entry.remoteContentId,
           senderPublicKeyB64Url: identity.publicKeyB64Url,
           senderPrivateKeyB64Url: identity.privateKeyB64Url,
           recipientPublicKeyB64Url: input.recipientPublicKeyB64Url,

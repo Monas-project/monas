@@ -316,10 +316,17 @@ export default function App() {
       return;
     }
     const res = ctx.imported as shareApi.DecryptSharedContentOutput;
-    // Re-importing (e.g. a re-wrapped envelope after a revoke) replaces the
-    // earlier entry for the same content rather than adding a twin.
+    // Re-importing (a re-wrapped envelope after a revoke, or a fresh package
+    // after the owner edited) replaces the earlier entry for the same content
+    // rather than adding a twin. The owner's content id changes with every
+    // edit, so match on the Content Network (series) when the package names
+    // one, and fall back to the content id for local-only content.
     const existing = allEntries().find(
-      (e) => e.receivedShare && e.localContentId === pkg.content_id,
+      (e) =>
+        e.receivedShare &&
+        (pkg.remote_content_id
+          ? e.remoteContentId === pkg.remote_content_id
+          : e.localContentId === pkg.content_id),
     );
     const receivedShare = {
       senderPublicKeyB64Url: pkg.sender_public_key,
@@ -333,8 +340,17 @@ export default function App() {
     };
     let entry: Entry;
     if (existing) {
-      updateEntry(existing.id, { receivedShare, name: pkg.name, sizeBytes: pkg.sizeBytes });
-      entry = { ...existing, receivedShare, name: pkg.name, sizeBytes: pkg.sizeBytes };
+      // The SDK filed the CEK under the package's content id (the owner's
+      // current version), so that is the id later reads must select by.
+      const patch = {
+        receivedShare,
+        name: pkg.name,
+        sizeBytes: pkg.sizeBytes,
+        localContentId: pkg.content_id,
+        versionCount: existing.versionCount + (existing.localContentId !== pkg.content_id ? 1 : 0),
+      };
+      updateEntry(existing.id, patch);
+      entry = { ...existing, ...patch };
     } else {
       entry = {
         id: uuid(),
@@ -413,14 +429,21 @@ export default function App() {
       // reissued under the new key_epoch. Keeping the old envelope would leave
       // them unable to decrypt, and re-presenting it is rejected as a
       // rollback replay — so swap in the reissued one, keyed by recipientKeyId.
-      const reissued = new Map(
-        (r?.reissued_envelopes ?? []).map((e) => [e.recipient_key_id, e.key_envelope]),
-      );
+      const reissued = new Map((r?.reissued_envelopes ?? []).map((e) => [e.recipient_key_id, e]));
       const shares = entry.shares
         .filter((s) => s.recipientPublicKeyB64Url !== recipientPublicKeyB64Url)
         .map((s) => {
           const fresh = reissued.get(s.recipientKeyId);
-          return fresh ? { ...s, envelope: fresh, reissuedAt: Date.now() } : s;
+          // The survivor's token was voided along with the revoked one's, so
+          // the fresh package must carry the reissued token, not the old one.
+          return fresh
+            ? {
+                ...s,
+                envelope: fresh.key_envelope,
+                delegatedAccess: fresh.delegated_access ?? undefined,
+                reissuedAt: Date.now(),
+              }
+            : s;
         });
       updateEntry(entry.id, { shares });
 

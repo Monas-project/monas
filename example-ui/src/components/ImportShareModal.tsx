@@ -116,11 +116,22 @@ export function ImportShareModal({
             </div>
           </div>
           {recipient ? (
-            <div className="hint">
-              Addressed to your identity <b>{recipient.label}</b>. Unwrapping pins the
-              sender's key for this file (trust on first use); a later package from a
-              different sender for the same file will be refused.
-            </div>
+            <>
+              <div className="hint">
+                Addressed to your identity <b>{recipient.label}</b>. Unwrapping pins the
+                sender's key for this file (trust on first use); a later package from a
+                different sender for the same file will be refused.
+              </div>
+              {!recipient.isSigningAccount && (
+                <div className="hint">
+                  <b>{recipient.label}</b> is not this device's signing account, so the
+                  envelope will open but the state node cannot be read as this identity
+                  (it verifies the delegated token against the key that signs requests).
+                  To follow the owner's edits, ask them to share to your signing account's
+                  public key instead.
+                </div>
+              )}
+            </>
           ) : (
             <div className="hint error-text">
               None of your identities holds the key this package is for. Send the

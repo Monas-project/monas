@@ -33,6 +33,10 @@ export interface ShareContentOutput {
 
 export function shareContent(input: {
   contentId: string; // local content id
+  /** State-node series id. The delegated token is issued for this — the
+   *  state node matches capabilities by series id, so a token for the
+   *  local id would never authorise the recipient. */
+  remoteContentId?: string;
   senderPublicKeyB64Url: string;
   /** Required: HPKE Auth-mode wrap mixes the sender's private key in. The SDK
    *  does not persist it. */
@@ -44,6 +48,7 @@ export function shareContent(input: {
     method: "POST",
     body: {
       content_id: input.contentId,
+      remote_content_id: input.remoteContentId,
       sender_public_key: input.senderPublicKeyB64Url,
       sender_private_key: input.senderPrivateKeyB64Url,
       recipient_public_key: input.recipientPublicKeyB64Url,
@@ -57,6 +62,9 @@ export function shareContent(input: {
 export interface ReissuedKeyEnvelope {
   recipient_key_id: string;
   key_envelope: KeyEnvelope;
+  /** A fresh token: the revoke voided every token issued before it,
+   *  the survivors' included. Absent only if issuance failed. */
+  delegated_access?: DelegatedAccessToken;
 }
 
 export interface RevokeShareOutput {

@@ -86,12 +86,14 @@ cascade delete.
 `tests-e2e/cross-device.spec.ts` (J-4) is the two-device share: two browser
 contexts, each bound to its **own gateway + monas-account pair**, exchange only
 what people would paste into a chat — a public key one way, a share package
-the other — and the recipient reads the plaintext, re-imports a re-wrapped
-package after a revoke, and is refused the stale one. It needs the second pair
-running:
+the other. The recipient unwraps it, reads the shared version back from *his*
+state node with the delegated token, is refused after the owner revokes a
+third party, reads again with the reissued token, is refused the stale
+package, and reads the owner's post-share edit. Point the second pair at a
+**different node** so the reads prove replication too:
 
 ```bash
-MONAS_STATE_NODE_URL=https://node1.monas-demo.net ./scripts/second-device.sh   # :3001 / :4003
+MONAS_STATE_NODE_URL=https://node2.monas-demo.net ./scripts/second-device.sh   # :3001 / :4003
 ```
 
 vite proxies `/api2` and `/account-api2` to it (`VITE_GATEWAY2_TARGET` /
@@ -232,14 +234,29 @@ keys, the recipient KeyId, permissions, the `KeyEnvelope` and the delegated
 token. It is not secret — the key inside is wrapped to the recipient only —
 but it is a capability, so treat it like a link to the file.
 
-What it does **not** do yet: read newer versions from the state node. The
-envelope carries the ciphertext of the version that was shared, so after the
-owner edits, the recipient needs a fresh package. Reading as a recipient
-directly from the state node needs the delegated token combined with a request
-signed by the recipient's key; the SDK issues the token for the owner-side
-content id and does not yet sign delegated reads, so that is SDK work, not
-UI work. After a revoke of *another* recipient the owner's dialog shows the
-re-wrapped package; the pre-rotation one is refused as stale on import.
+**Reading from the state node as a recipient.** The package also carries a
+delegated token (JWT, one hour, issued for the Content Network id). In the
+preview of a received file the state-node panel — latest version, history,
+**Read from state-node** — works with that token: the gateway signs the
+request with your account key (the token's audience) and presents the token,
+and the state node checks both. So the identity you receive with must be your
+signing account. The verified read uses the shared version's id only to pick
+the CEK and reports the id the plaintext actually addresses to, so it follows
+the owner's edits: after they edit, *Read from state-node* shows the new
+version and flags it as newer than shared.
+
+A revoke of *any* recipient voids every token issued before it, yours
+included; the owner's dialog then shows a re-wrapped package with a fresh
+token — import it and reads work again (the old envelope still opens the
+version it carried). A pre-rotation package for the same version id is
+refused as stale on import. That check is keyed by the owner's content id,
+which changes with every edit, so a stale package for an *older* version id
+is not caught by it — only its token is dead.
+
+What it does **not** do: write as a recipient. A read+write share is
+accepted, but the recipient's gateway has no local record of the file to
+update, and the non-owner write path on the state node is untested. That is
+the next piece of SDK work.
 
 ## What's real vs. illustrative
 
