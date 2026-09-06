@@ -412,6 +412,7 @@ async fn revoke_share_rolls_back_local_state_when_state_node_sync_fails() {
 
     let get_shared_response = controller.decrypt_shared_content(DecryptSharedContentInput {
         content_id: created.content_id.clone(),
+        remote_content_id: None,
         private_key: recipient.private_key.clone(),
         sender_public_key: shared.sender_public_key.clone(),
         recipient_key_id: shared.recipient_key_id.clone(),
@@ -828,6 +829,7 @@ async fn revoke_share_fails_when_token_invalidation_fails() {
     // ローカル状態は一切触っていないので、元の共有はそのまま復号できる。
     let get_shared = controller.decrypt_shared_content(DecryptSharedContentInput {
         content_id: created.content_id.clone(),
+        remote_content_id: None,
         private_key: recipient.private_key.clone(),
         sender_public_key: shared.sender_public_key.clone(),
         recipient_key_id: shared.recipient_key_id.clone(),

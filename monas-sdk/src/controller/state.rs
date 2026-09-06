@@ -347,15 +347,28 @@ impl MonasController {
         // 従来どおりストアを引く。
         let local_content_id =
             monas_content::domain::content_id::ContentId::new(input.local_content_id.clone());
-        let pinned_cek = match self.sender_pin_store.load(&input.local_content_id) {
-            Ok(pin) => pin
-                .and_then(|p| p.cek)
-                .map(monas_content::domain::content::ContentEncryptionKey),
-            Err(e) => {
-                return ApiResponse::error(
-                    ApiError::Internal(format!("sender key pin store error: {e}")),
-                    trace_id,
-                );
+        //
+        // ピンは系列ID(= ここでの `content_id`)でも版ID(`local_content_id`)でも
+        // 保存され得る: share 受信者は `remote_content_id` を渡して系列IDに、
+        // それを渡さない古い呼び出しは版IDに。系列を先に引く。
+        let pinned_cek = {
+            let load = |key: &str| self.sender_pin_store.load(key);
+            let by_series = load(&input.content_id);
+            let pin = match by_series {
+                Ok(Some(p)) => Ok(Some(p)),
+                Ok(None) => load(&input.local_content_id),
+                Err(e) => Err(e),
+            };
+            match pin {
+                Ok(pin) => pin
+                    .and_then(|p| p.cek)
+                    .map(monas_content::domain::content::ContentEncryptionKey),
+                Err(e) => {
+                    return ApiResponse::error(
+                        ApiError::Internal(format!("sender key pin store error: {e}")),
+                        trace_id,
+                    );
+                }
             }
         };
         // share 受信者は「共有された版の id」の下に CEK を持つが、owner がその後に

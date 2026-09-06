@@ -180,6 +180,7 @@ export function openReceivedFlow(input: { entry: Entry; recipient: Identity }): 
       exec: async (ctx) => {
         const res = await shareApi.decryptSharedContent({
           contentId: entry.localContentId!,
+          remoteContentId: entry.remoteContentId,
           privateKeyB64Url: recipient.privateKeyB64Url,
           senderPublicKeyB64Url: rs.senderPublicKeyB64Url,
           recipientKeyId: rs.recipientKeyId,
@@ -384,6 +385,7 @@ export function importShareFlow(input: {
       exec: async (ctx) => {
         const res = await shareApi.decryptSharedContent({
           contentId: pkg.content_id,
+          remoteContentId: pkg.remote_content_id,
           privateKeyB64Url: recipient.privateKeyB64Url,
           senderPublicKeyB64Url: pkg.sender_public_key,
           recipientKeyId: pkg.recipient_key_id,

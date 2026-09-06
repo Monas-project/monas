@@ -238,6 +238,7 @@ async fn share_recipient_reads_content_after_processing_envelope() {
     // KeyEnvelope を処理すると CEK が受信者ローカルに永続化される
     let decrypt_response = recipient_controller.decrypt_shared_content(DecryptSharedContentInput {
         content_id: created.local_content_id.clone(),
+        remote_content_id: None,
         private_key: created.recipient_private_key.clone(),
         sender_public_key: created.shared.sender_public_key.clone(),
         recipient_key_id: created.shared.recipient_key_id.clone(),
@@ -359,6 +360,7 @@ async fn cek_rotation_after_revoke_updates_recipient_and_read() {
     let recipient_controller = MonasController::with_urls(server.url(), server.url());
     let decrypt_v1 = recipient_controller.decrypt_shared_content(DecryptSharedContentInput {
         content_id: created.content_id.clone(),
+        remote_content_id: None,
         private_key: surviving_recipient.private_key.clone(),
         sender_public_key: shared_surviving.sender_public_key.clone(),
         recipient_key_id: shared_surviving.recipient_key_id.clone(),
@@ -445,6 +447,7 @@ async fn cek_rotation_after_revoke_updates_recipient_and_read() {
     // 再発行 envelope を処理 → 保存 CEK がローテーション後のものへ更新される
     let decrypt_v2 = recipient_controller.decrypt_shared_content(DecryptSharedContentInput {
         content_id: created.content_id.clone(),
+        remote_content_id: None,
         private_key: surviving_recipient.private_key.clone(),
         sender_public_key: shared_surviving.sender_public_key.clone(),
         recipient_key_id: reissued.recipient_key_id.clone(),
@@ -472,6 +475,7 @@ async fn cek_rotation_after_revoke_updates_recipient_and_read() {
     );
     let replay = recipient_controller.decrypt_shared_content(DecryptSharedContentInput {
         content_id: created.content_id.clone(),
+        remote_content_id: None,
         private_key: surviving_recipient.private_key.clone(),
         sender_public_key: shared_surviving.sender_public_key.clone(),
         recipient_key_id: shared_surviving.recipient_key_id.clone(),
@@ -501,6 +505,7 @@ async fn cek_rotation_after_revoke_updates_recipient_and_read() {
     let reprocess_same_epoch =
         recipient_controller.decrypt_shared_content(DecryptSharedContentInput {
             content_id: created.content_id.clone(),
+            remote_content_id: None,
             private_key: surviving_recipient.private_key.clone(),
             sender_public_key: shared_surviving.sender_public_key.clone(),
             recipient_key_id: reissued.recipient_key_id.clone(),
@@ -582,6 +587,7 @@ async fn envelope_sender_auth_rejects_wrong_sender_key() {
     let decrypt_with_sender = |sender_public_key: String| {
         recipient_controller.decrypt_shared_content(DecryptSharedContentInput {
             content_id: created.local_content_id.clone(),
+            remote_content_id: None,
             private_key: created.recipient_private_key.clone(),
             sender_public_key,
             recipient_key_id: created.shared.recipient_key_id.clone(),
@@ -634,6 +640,7 @@ async fn share_recipient_reads_a_version_written_after_the_share() {
     let recipient_controller = MonasController::with_urls(server.url(), server.url());
     let decrypt_response = recipient_controller.decrypt_shared_content(DecryptSharedContentInput {
         content_id: created.local_content_id.clone(),
+        remote_content_id: None,
         private_key: created.recipient_private_key.clone(),
         sender_public_key: created.shared.sender_public_key.clone(),
         recipient_key_id: created.shared.recipient_key_id.clone(),
@@ -885,4 +892,151 @@ async fn delegated_read_keeps_the_bearer_token_and_signs_with_the_account_key() 
     assert_eq!(response.data.unwrap().latest_version, "v1");
     sign_mock.assert();
     history_mock.assert();
+}
+
+/// 送信者ピン(鍵世代の記録)は系列IDに属する。版IDでピンすると、owner が
+/// 編集して版IDが変わった後に revoke で世代が進んでも、編集前の版IDで作られた
+/// 古い envelope は「その版IDには記録が無い」として受理され、rotation の
+/// replay 防止が編集1回で素通りになる。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pre_rotation_envelope_for_an_older_version_id_is_still_refused() {
+    let _guard = acquire_test_lock();
+    let mut server = Server::new_async().await;
+    let creator = MonasController::with_urls(server.url(), server.url());
+
+    let _create_mock = server
+        .mock("POST", "/content")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(format!(r#"{{"content_id":"{REMOTE_ID}"}}"#))
+        .create_async()
+        .await;
+    let _delegate_mock = server
+        .mock("POST", "/issuer/delegate")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"delegated_token":"dummy.jwt.token","issued_at":1700000000,"expires_at":1700003600,"jti":"jti-1"}"#,
+        )
+        .expect_at_least(1)
+        .create_async()
+        .await;
+    let _update_mock = server
+        .mock("PUT", format!("/content/{REMOTE_ID}").as_str())
+        .with_status(200)
+        .expect_at_least(1)
+        .create_async()
+        .await;
+
+    let keypair = || {
+        creator
+            .generate_keypair(GenerateKeypairInput {
+                key_type: KeyType::Secp256r1,
+            })
+            .data
+            .expect("keypair")
+    };
+    let sender = keypair();
+    let bob = keypair();
+    let carol = keypair();
+
+    let created = creator
+        .create_content(
+            CreateContentInput {
+                content: URL_SAFE_NO_PAD.encode(b"pin v1"),
+                metadata: Some(ContentMetadata {
+                    name: Some("pin.txt".to_string()),
+                    content_type: Some("text/plain".to_string()),
+                    created_at: None,
+                    updated_at: None,
+                }),
+            },
+            None,
+        )
+        .data
+        .expect("create");
+
+    let share = |content_id: &str,
+                 recipient: &monas_sdk::models::keypair::GenerateKeypairOutput| {
+        creator
+            .share_content(ShareContentInput {
+                content_id: content_id.to_string(),
+                remote_content_id: Some(REMOTE_ID.into()),
+                sender_public_key: sender.public_key.clone(),
+                sender_private_key: sender.private_key.clone(),
+                recipient_public_key: recipient.public_key.clone(),
+                permissions: vec![Permission::Read],
+            })
+            .data
+            .expect("share")
+    };
+    let bob_v1 = share(&created.content_id, &bob);
+
+    // Bob (another device) processes the epoch-0 envelope for version 1.
+    let bob_device = MonasController::with_urls(server.url(), server.url());
+    let decrypt = |content_id: &str, envelope: &monas_sdk::models::share::KeyEnvelope| {
+        bob_device.decrypt_shared_content(DecryptSharedContentInput {
+            content_id: content_id.to_string(),
+            remote_content_id: Some(REMOTE_ID.into()),
+            private_key: bob.private_key.clone(),
+            sender_public_key: bob_v1.sender_public_key.clone(),
+            recipient_key_id: bob_v1.recipient_key_id.clone(),
+            key_envelope: envelope.clone(),
+            version: None,
+        })
+    };
+    let first = decrypt(&created.content_id, &bob_v1.key_envelope);
+    assert!(first.success, "{:?}", first.error);
+
+    // The owner edits (new version id), shares to carol, revokes carol:
+    // the CEK rotates and Bob gets an epoch-1 envelope for version 2.
+    let updated = creator
+        .update_content(
+            monas_sdk::models::content::UpdateContentInput {
+                local_content_id: created.content_id.clone(),
+                remote_content_id: REMOTE_ID.into(),
+                content: URL_SAFE_NO_PAD.encode(b"pin v2 after edit"),
+                metadata: None,
+            },
+            None,
+        )
+        .data
+        .expect("update");
+    assert_ne!(updated.version_id, created.content_id);
+    share(&updated.version_id, &carol);
+    let revoked = creator
+        .revoke_share(
+            monas_sdk::models::share::RevokeShareInput {
+                content_id: updated.version_id.clone(),
+                remote_content_id: Some(REMOTE_ID.into()),
+                sender_public_key: sender.public_key.clone(),
+                sender_private_key: sender.private_key.clone(),
+                recipient_public_key: carol.public_key.clone(),
+            },
+            None,
+        )
+        .data
+        .expect("revoke");
+    let bob_v2 = revoked
+        .reissued_envelopes
+        .iter()
+        .find(|e| e.recipient_key_id == bob_v1.recipient_key_id)
+        .expect("bob is re-wrapped");
+    assert!(bob_v2.key_envelope.key_epoch > bob_v1.key_envelope.key_epoch);
+    let second = decrypt(&updated.version_id, &bob_v2.key_envelope);
+    assert!(second.success, "{:?}", second.error);
+
+    // Replaying the pre-rotation envelope — which names the OLD version id —
+    // must be refused: the series has moved on to epoch 1.
+    let replay = decrypt(&created.content_id, &bob_v1.key_envelope);
+    assert!(
+        !replay.success,
+        "a pre-rotation envelope must not be accepted"
+    );
+    match replay.error {
+        Some(ApiError::Conflict(msg)) => assert!(msg.contains("stale key envelope"), "{msg}"),
+        other => panic!("expected Conflict(stale), got {other:?}"),
+    }
+
+    cleanup_content_artifacts();
 }

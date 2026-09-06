@@ -155,6 +155,13 @@ pub struct ReissuedKeyEnvelope {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DecryptSharedContentInput {
     pub content_id: String,
+    /// State Node の系列ID。送信者ピン(TOFU の送信者鍵・鍵世代・CEK)は
+    /// これをキーに保存する。`content_id` は owner 側の版IDで編集のたびに
+    /// 変わるので、版IDでピンすると「編集前の古い envelope」が新しい世代の
+    /// 記録と別の場所に落ちて replay 検出をすり抜ける。未指定なら
+    /// `content_id`(State Node 未登録のローカル専用コンテンツ向け)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_content_id: Option<String>,
     pub private_key: String,
     /// 送信者の公開鍵（base64url）。HPKE Auth モードの unwrap に用いる。
     /// この content で初めての envelope 処理なら TOFU でピン留めされ、
@@ -317,6 +324,7 @@ mod tests {
     fn test_decrypt_shared_content_input() {
         let input = DecryptSharedContentInput {
             content_id: "test_id".into(),
+            remote_content_id: None,
             private_key: "test_key".into(),
             sender_public_key: "sender_public_key".into(),
             recipient_key_id: "recipient_key_id".into(),

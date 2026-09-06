@@ -280,22 +280,6 @@ test("J-4: a file shared from one device opens on another via a pasted share pac
     expect(await bobReadsFromStateNode()).toBe(secret);
   });
 
-  // The epoch check lives in the SDK's sender pin, which is keyed by the
-  // owner's content id — so this only catches a stale package for the *same*
-  // version id, which is why this step runs before Alice edits.
-  await test.step("the pre-rotation package is refused as stale", async () => {
-    await bob.page.getByRole("button", { name: "Import shared" }).click();
-    const modal = bob.page.locator(".modal");
-    await modal.locator("textarea.input").fill(sharePackage);
-    await modal.getByRole("button", { name: "Unwrap & add to my Drive" }).click();
-    await expectToast(bob.page, `Could not import “${name}”`);
-    // The pipeline names the reason: an older key_epoch than the one pinned.
-    await expect(bob.page.locator(".run").first()).toContainText(/stale key envelope|key_epoch/i, {
-      timeout: 30_000,
-    });
-    await closeModal(bob.page);
-  });
-
   const secret2 = `journey-4 second draft ${nonce}`;
   await test.step("Alice edits; Bob reads the newer version with the same token and CEK", async () => {
     await rowAction(alice.page, name, "Edit contents");
@@ -316,6 +300,22 @@ test("J-4: a file shared from one device opens on another via a pasted share pac
     });
     await expect(preview.locator(".preview-box").nth(1)).toHaveText(secret2);
     await expect(preview.locator(".kv", { hasText: "newer than shared" })).toBeVisible();
+    await closeModal(bob.page);
+  });
+
+  // The epoch record lives in the SDK's sender pin, keyed by the Content
+  // Network — not by the owner's content id, which the edit above has just
+  // changed. A pre-rotation package naming the OLD id must still be refused.
+  await test.step("the pre-rotation package is refused as stale, even after the edit", async () => {
+    await bob.page.getByRole("button", { name: "Import shared" }).click();
+    const modal = bob.page.locator(".modal");
+    await modal.locator("textarea.input").fill(sharePackage);
+    await modal.getByRole("button", { name: "Unwrap & add to my Drive" }).click();
+    await expectToast(bob.page, `Could not import “${name}”`);
+    // The pipeline names the reason: an older key_epoch than the one pinned.
+    await expect(bob.page.locator(".run").first()).toContainText(/stale key envelope|key_epoch/i, {
+      timeout: 30_000,
+    });
     await closeModal(bob.page);
   });
 

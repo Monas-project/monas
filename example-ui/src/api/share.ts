@@ -112,6 +112,10 @@ export interface DecryptSharedContentOutput {
 
 export function decryptSharedContent(input: {
   contentId: string;
+  /** Series id: the sender pin (TOFU key + key_epoch + CEK) is kept under
+   *  it, so a stale envelope is caught even after the owner's edits have
+   *  changed the content id. */
+  remoteContentId?: string;
   privateKeyB64Url: string;
   /** Sender public key for the HPKE Auth unwrap. On the first envelope for
    *  this content the SDK pins it (TOFU); later envelopes must match. */
@@ -124,6 +128,7 @@ export function decryptSharedContent(input: {
     method: "POST",
     body: {
       content_id: input.contentId,
+      remote_content_id: input.remoteContentId,
       private_key: input.privateKeyB64Url,
       sender_public_key: input.senderPublicKeyB64Url,
       recipient_key_id: input.recipientKeyId,

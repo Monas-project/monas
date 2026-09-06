@@ -806,7 +806,13 @@ impl MonasController {
         //    作った」ことだけで、「owner が作った」ことではないため、平文を知る
         //    第三者が正規 envelope より先にピンを取れる。初回鍵を owner identity
         //    へ束縛する修正は trust anchor の課題として別 issue で追跡する。
-        let pinned = match self.sender_pin_store.load(content_id.as_str()) {
+        // ピンのキーは系列ID。版IDは編集で変わるが、送信者と鍵世代は系列に
+        // 属する(`DecryptSharedContentInput::remote_content_id` を参照)。
+        let pin_key = input
+            .remote_content_id
+            .clone()
+            .unwrap_or_else(|| input.content_id.clone());
+        let pinned = match self.sender_pin_store.load(&pin_key) {
             Ok(p) => p,
             Err(e) => {
                 return ApiResponse::error(
@@ -961,23 +967,23 @@ impl MonasController {
         let should_refresh_cek_cache = if already_current {
             true
         } else {
-            let advanced = match self.sender_pin_store.compare_and_save(
-                content_id.as_str(),
-                pinned.as_ref(),
-                &new_pin,
-            ) {
-                Ok(advanced) => advanced,
-                Err(e) => {
-                    return ApiResponse::error(
-                        ApiError::Internal(format!(
+            let advanced =
+                match self
+                    .sender_pin_store
+                    .compare_and_save(&pin_key, pinned.as_ref(), &new_pin)
+                {
+                    Ok(advanced) => advanced,
+                    Err(e) => {
+                        return ApiResponse::error(
+                            ApiError::Internal(format!(
                             "decrypted the shared content but failed to persist the sender key pin \
                              for {}: {e}. Re-process the KeyEnvelope.",
                             content_id.as_str()
                         )),
-                        trace_id,
-                    );
-                }
-            };
+                            trace_id,
+                        );
+                    }
+                };
             // CAS に負けた場合は、勝った側がより新しい(または同じ)世代を
             // 書いているので、こちらの CEK でキャッシュを上書きしてはいけない。
             advanced

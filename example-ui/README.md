@@ -248,10 +248,10 @@ version and flags it as newer than shared.
 A revoke of *any* recipient voids every token issued before it, yours
 included; the owner's dialog then shows a re-wrapped package with a fresh
 token — import it and reads work again (the old envelope still opens the
-version it carried). A pre-rotation package for the same version id is
-refused as stale on import. That check is keyed by the owner's content id,
-which changes with every edit, so a stale package for an *older* version id
-is not caught by it — only its token is dead.
+version it carried). A pre-rotation package is refused as stale on import:
+the SDK keeps the sender pin (sender key, key epoch, CEK) under the Content
+Network id, so the check holds across the owner's edits even though those
+change the content id the package names.
 
 What it does **not** do: write as a recipient. A read+write share is
 accepted, but the recipient's gateway has no local record of the file to
