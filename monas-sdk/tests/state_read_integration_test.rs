@@ -673,9 +673,17 @@ async fn share_recipient_reads_a_version_written_after_the_share() {
         )
         .create_async()
         .await;
-    // 共有し直すのは暗号文を取り出すためだけなので、送信者鍵は何でもよい
-    // (受信者側でこの envelope を処理はしない)。
+    // 共有し直すのは暗号文を取り出すためだけなので、送信者鍵も宛先も何でも
+    // よい(この envelope を処理する受信者はいない)。ACL は編集後の版へ引き
+    // 継がれているので、元の受信者への再 share は「共有済み」で拒否される —
+    // 別の宛先を使う。
     let sender = creator
+        .generate_keypair(GenerateKeypairInput {
+            key_type: KeyType::Secp256r1,
+        })
+        .data
+        .unwrap();
+    let other = creator
         .generate_keypair(GenerateKeypairInput {
             key_type: KeyType::Secp256r1,
         })
@@ -687,7 +695,7 @@ async fn share_recipient_reads_a_version_written_after_the_share() {
             remote_content_id: Some(REMOTE_ID.into()),
             sender_public_key: sender.public_key.clone(),
             sender_private_key: sender.private_key.clone(),
-            recipient_public_key: created.shared.recipient_public_key.clone(),
+            recipient_public_key: other.public_key.clone(),
             permissions: vec![Permission::Read],
         })
         .data

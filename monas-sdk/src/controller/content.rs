@@ -1101,6 +1101,24 @@ impl MonasController {
             return response;
         }
 
+        // 共有 ACL は版IDに紐づいて保存されている。新しい版へ引き継がないと、
+        // 編集した瞬間に既存の受信者が(SDK から見て)いなくなる: その後の share
+        // で作られる Share は新しい受信者だけを含み、誰かを revoke すると
+        // CEK はローテーションされるのに既存受信者には envelope も Token も
+        // 再発行されず、静かに締め出される。CEK 自体は content 層が新しい版へ
+        // コピーしているので、ACL も同じ扱いにする。
+        //
+        // 失敗しても更新自体は成立している(ローカル・State Node とも新しい版)
+        // ので巻き戻さない。次の share / revoke で「受信者がいない」として現れる。
+        if result.content_id.as_str() != base_version_id {
+            let share_repository = &self.share_service.share_repository;
+            if let Ok(Some(share)) = share_repository.load(&ContentId::new(base_version_id.clone()))
+            {
+                let _ =
+                    share_repository.save(&share.with_new_content_id(result.content_id.clone()));
+            }
+        }
+
         let output = UpdateContentOutput {
             series_id: result.series_id.as_str().to_string(),
             previous_version_id: base_version_id,

@@ -1147,3 +1147,150 @@ async fn revoke_reissues_a_valid_token_for_each_surviving_recipient() {
 
     cleanup_content_artifacts();
 }
+
+/// 共有 ACL は版IDに紐づく。編集で版IDが変わっても引き継がれなければ、編集後に
+/// 別の受信者を revoke したとき、編集前からの受信者は CEK ローテーションから
+/// 締め出される(envelope も Token も再発行されない)。
+#[tokio::test(flavor = "multi_thread")]
+async fn share_acl_survives_an_edit_so_a_later_revoke_reissues_to_earlier_recipients() {
+    let _guard = acquire_test_lock();
+    let mut state_node = Server::new_async().await;
+    let mut account = Server::new_async().await;
+
+    let create_mock = state_node
+        .mock("POST", "/content")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"content_id":"acl-remote"}"#)
+        .create_async()
+        .await;
+    let delegate = account
+        .mock("POST", "/issuer/delegate")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"delegated_token":"t.jwt","issued_at":1700000600,"expires_at":1700004200,"jti":"jti-acl"}"#,
+        )
+        .expect_at_least(2)
+        .create_async()
+        .await;
+    let _update_mock = state_node
+        .mock("PUT", "/content/acl-remote")
+        .with_status(200)
+        .expect_at_least(1)
+        .create_async()
+        .await;
+    let _invalidate_mock = state_node
+        .mock("POST", "/content/acl-remote/access/invalidate")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"content_id":"acl-remote","new_min_valid_issued_at":1700000500}"#)
+        .create_async()
+        .await;
+    let _sign_mock = account
+        .mock("POST", "/accounts/sign")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"signature_base64":"c2lnbmVk","public_key_base64":"BAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMw==","algorithm":"P256"}"#,
+        )
+        .create_async()
+        .await;
+
+    let controller = controller_with_wide_skew(state_node.url(), account.url());
+    let auth = auth_context("Bearer owner");
+    let keypair = || {
+        controller
+            .generate_keypair(GenerateKeypairInput {
+                key_type: KeyType::Secp256r1,
+            })
+            .data
+            .expect("keypair")
+    };
+    let sender = keypair();
+    let bob = keypair();
+    let carol = keypair();
+
+    let created = controller
+        .create_content(
+            CreateContentInput {
+                content: URL_SAFE_NO_PAD.encode(b"acl v1"),
+                metadata: Some(ContentMetadata {
+                    name: Some("acl.txt".to_string()),
+                    content_type: Some("text/plain".to_string()),
+                    created_at: None,
+                    updated_at: None,
+                }),
+            },
+            None,
+        )
+        .data
+        .expect("create");
+    create_mock.assert();
+
+    let share = |content_id: &str,
+                 recipient: &monas_sdk::models::keypair::GenerateKeypairOutput| {
+        controller.share_content(ShareContentInput {
+            content_id: content_id.to_string(),
+            remote_content_id: Some("acl-remote".to_string()),
+            sender_public_key: sender.public_key.clone(),
+            sender_private_key: sender.private_key.clone(),
+            recipient_public_key: recipient.public_key.clone(),
+            permissions: vec![Permission::Read],
+        })
+    };
+    assert!(share(&created.content_id, &bob).success);
+
+    // The owner edits: a new version id.
+    let updated = controller
+        .update_content(
+            monas_sdk::models::content::UpdateContentInput {
+                local_content_id: created.content_id.clone(),
+                remote_content_id: "acl-remote".to_string(),
+                content: URL_SAFE_NO_PAD.encode(b"acl v2 after edit"),
+                metadata: None,
+            },
+            Some(&auth),
+        )
+        .data
+        .expect("update");
+    assert_ne!(updated.version_id, created.content_id);
+
+    // Share the new version to carol, then revoke her.
+    assert!(share(&updated.version_id, &carol).success);
+    let revoke = controller
+        .revoke_share(
+            RevokeShareInput {
+                content_id: updated.version_id.clone(),
+                remote_content_id: Some("acl-remote".to_string()),
+                sender_public_key: sender.public_key.clone(),
+                sender_private_key: sender.private_key.clone(),
+                recipient_public_key: carol.public_key.clone(),
+            },
+            Some(&auth),
+        )
+        .data
+        .expect("revoke");
+    delegate.assert();
+
+    // Bob, shared before the edit, is still a recipient and gets re-wrapped.
+    let bob_key_id = {
+        use sha2::{Digest, Sha256};
+        let pk = URL_SAFE_NO_PAD.decode(&bob.public_key).unwrap();
+        URL_SAFE_NO_PAD.encode(&Sha256::digest(&pk)[..16])
+    };
+    assert!(
+        revoke
+            .reissued_envelopes
+            .iter()
+            .any(|e| e.recipient_key_id == bob_key_id),
+        "bob must be re-wrapped after the edit; got {:?}",
+        revoke
+            .reissued_envelopes
+            .iter()
+            .map(|e| &e.recipient_key_id)
+            .collect::<Vec<_>>()
+    );
+
+    cleanup_content_artifacts();
+}
