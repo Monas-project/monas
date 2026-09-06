@@ -38,6 +38,13 @@ pub struct KeyEnvelope {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShareContentInput {
     pub content_id: String,
+    /// State Node へ登録済みの系列ID(`UpdateContentInput` / `RevokeShareInput` と
+    /// 同じ区別)。委譲 Token の resource はこれで発行される: State Node は
+    /// `monas://content/<系列ID>` で capability を照合するので、ローカル版ID
+    /// で発行した Token は受信者の read/write に使えない。未指定なら
+    /// `content_id`(State Node 未登録のローカル専用コンテンツ向け)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_content_id: Option<String>,
     /// 送信者の公開鍵（base64url） - sender_key_idを計算するために使用
     pub sender_public_key: String,
     /// 送信者の秘密鍵（base64url）。KeyEnvelope の HPKE Auth モード wrap
@@ -131,6 +138,13 @@ pub struct ReissuedKeyEnvelope {
     /// 再発行先の受信者 key id(base64url)
     pub recipient_key_id: String,
     pub key_envelope: KeyEnvelope,
+    /// 再発行した委譲 Token。revoke は State Node の `min_valid_issued_at` を
+    /// 進めるので、残存受信者が持っていた Token も一緒に失効している。
+    /// 新しい envelope と一緒に届けなければ、その受信者は復号はできても
+    /// State Node からは読めない。発行に失敗した場合は `None`(envelope の
+    /// 再発行自体は成立している)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegated_access: Option<DelegatedAccessToken>,
 }
 
 // ============================================
@@ -289,6 +303,8 @@ mod tests {
                     ciphertext: "cipher".into(),
                     key_epoch: 1,
                 },
+
+                delegated_access: None,
             }],
             token_invalidated_at: None,
         };

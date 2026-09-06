@@ -72,12 +72,23 @@ pub struct ReadContentFromStateNodeInput {
     pub local_content_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// 平文 CID の `local_content_id` との一致検証を省く。
+    ///
+    /// share の受信者は CEK を「共有された版の content_id」の下に持つが、
+    /// owner がその後に書いた版の平文 CID は知り得ない。`true` なら
+    /// `local_content_id` は CEK の選択にだけ使い、復号した平文が実際に
+    /// 指す id を `ReadContentFromStateNodeOutput::local_content_id` で返す。
+    /// Node CID の再計算と AES-GCM の認証はそのまま効く。
+    #[serde(default)]
+    pub accept_any_version: bool,
 }
 
 /// State Node からの検証付き read レスポンス。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadContentFromStateNodeOutput {
     pub content_id: String,
+    /// 復号した平文が指す content_id。`accept_any_version` でなければ入力の
+    /// `local_content_id` と同じ。
     pub local_content_id: String,
     /// 実際に読まれた版 CID（CID 再計算で検証済み）
     pub version: String,

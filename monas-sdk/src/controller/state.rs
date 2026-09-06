@@ -29,9 +29,15 @@ impl MonasController {
 
     /// State Node の読み取り API 用の認証コンテキストを解決する。
     ///
-    /// 呼び出し元が Authorization を明示していればそのまま透過する。
-    /// 無ければ書き込み系（create/update/delete）と同じく monas-account で
-    /// `read:<content_id>:<timestamp>` に署名し、`user:<hex(pubkey)>` トークンを組み立てる。
+    /// 呼び出し元が Authorization と署名の両方を明示していればそのまま透過する。
+    /// 署名が無ければ書き込み系（create/update/delete）と同じく monas-account で
+    /// `read:<content_id>:<timestamp>` に署名する。そのとき Authorization は:
+    /// - 無ければ `user:<hex(pubkey)>`(owner としての読み取り)
+    /// - `Bearer <委譲 Token>` があればそれを残す(share 受信者としての読み取り)。
+    ///   State Node は Token の `aud` 鍵で署名を検証するので、受信者は Token の
+    ///   宛先鍵 = この gateway の account 鍵で署名しなければならない。Token を
+    ///   渡すだけで署名しないと "Request signature is required" で拒否される。
+    ///
     /// State Node 側は読み取り時にこの署名メッセージを検証する
     /// （`verify_read_access` → `verify_caller_signature("read", content_id, ..)`）。
     /// 署名を content_id にバインドすることで、relay 先ノード等に渡った署名を
@@ -43,8 +49,15 @@ impl MonasController {
         trace_id: &str,
     ) -> Result<Option<StateNodeAuthContext>, ApiResponse<T>> {
         match auth {
-            Some(ctx) if ctx.authorization.is_none() => {
-                self.prepare_state_node_metadata_auth(auth, "read", content_id, trace_id)
+            Some(ctx) if ctx.request_signature.is_none() => {
+                let signed =
+                    self.prepare_state_node_metadata_auth(auth, "read", content_id, trace_id)?;
+                Ok(signed.map(|mut s| {
+                    if ctx.authorization.is_some() {
+                        s.authorization = ctx.authorization.clone();
+                    }
+                    s
+                }))
             }
             _ => Ok(auth.cloned()),
         }
@@ -345,13 +358,28 @@ impl MonasController {
                 );
             }
         };
-        let plaintext = match self.content_service.verify_and_decrypt_relay_read(
-            &node_bytes,
-            &version,
-            local_content_id,
-            pinned_cek,
-        ) {
-            Ok(read) => read.plaintext,
+        // share 受信者は「共有された版の id」の下に CEK を持つが、owner がその後に
+        // 書いた版の平文 CID は知り得ない。`accept_any_version` ではその照合を
+        // 省き、復号した平文が実際に指す id を返す(Node CID と AES-GCM の検証は
+        // そのまま)。
+        let read = if input.accept_any_version {
+            self.content_service
+                .verify_and_decrypt_relay_read_any_version(
+                    &node_bytes,
+                    &version,
+                    local_content_id,
+                    pinned_cek,
+                )
+        } else {
+            self.content_service.verify_and_decrypt_relay_read(
+                &node_bytes,
+                &version,
+                local_content_id,
+                pinned_cek,
+            )
+        };
+        let read = match read {
+            Ok(read) => read,
             Err(e) => {
                 return ApiResponse::error(
                     Self::map_verified_read_error(e, &input.local_content_id),
@@ -363,9 +391,9 @@ impl MonasController {
         ApiResponse::success(
             ReadContentFromStateNodeOutput {
                 content_id: input.content_id,
-                local_content_id: input.local_content_id,
+                local_content_id: read.plain_content_id.as_str().to_string(),
                 version,
-                content: encode_base64url(&plaintext),
+                content: encode_base64url(&read.plaintext),
             },
             trace_id,
         )

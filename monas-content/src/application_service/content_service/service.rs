@@ -324,6 +324,48 @@ where
         local_content_id: ContentId,
         cek: Option<ContentEncryptionKey>,
     ) -> Result<VerifiedRead, VerifiedReadError> {
+        self.verify_and_decrypt_relay_read_inner(
+            node_bytes,
+            expected_version_cid,
+            &local_content_id,
+            Some(&local_content_id),
+            cek,
+        )
+    }
+
+    /// [`verify_and_decrypt_relay_read`](Self::verify_and_decrypt_relay_read)
+    /// for a reader who cannot know the plain content id of the version in
+    /// advance: a share recipient reading a version the owner wrote *after*
+    /// sharing. The CEK is still selected by `key_content_id` (the id the
+    /// share was received under), the Node CID is still recomputed, and
+    /// AES-GCM still authenticates the ciphertext under that key — what is
+    /// skipped is only the comparison of the re-derived plain id against an
+    /// expectation the caller does not have. The id it does derive is
+    /// returned in `plain_content_id`.
+    pub fn verify_and_decrypt_relay_read_any_version(
+        &self,
+        node_bytes: &[u8],
+        expected_version_cid: &str,
+        key_content_id: ContentId,
+        cek: Option<ContentEncryptionKey>,
+    ) -> Result<VerifiedRead, VerifiedReadError> {
+        self.verify_and_decrypt_relay_read_inner(
+            node_bytes,
+            expected_version_cid,
+            &key_content_id,
+            None,
+            cek,
+        )
+    }
+
+    fn verify_and_decrypt_relay_read_inner(
+        &self,
+        node_bytes: &[u8],
+        expected_version_cid: &str,
+        key_content_id: &ContentId,
+        expected_plain_id: Option<&ContentId>,
+        cek: Option<ContentEncryptionKey>,
+    ) -> Result<VerifiedRead, VerifiedReadError> {
         let verified = crate::infrastructure::node_verification::verify_and_extract(
             node_bytes,
             expected_version_cid,
@@ -334,18 +376,31 @@ where
             Some(key) => key,
             None => self
                 .cek_store
-                .load(&local_content_id)
+                .load(key_content_id)
                 .map_err(VerifiedReadError::KeyStore)?
                 .ok_or(VerifiedReadError::MissingKey)?,
         };
 
         let plaintext = self
-            .decrypt_with_cek(local_content_id, key, verified.ciphertext)
-            .map_err(VerifiedReadError::Decrypt)?;
+            .encryptor
+            .decrypt(&key, &verified.ciphertext)
+            .map_err(|e| VerifiedReadError::Decrypt(DecryptWithCekError::Domain(e)))?;
+        let plain_content_id = self.content_id_generator.generate(&plaintext);
+        if let Some(expected) = expected_plain_id {
+            if &plain_content_id != expected {
+                return Err(VerifiedReadError::Decrypt(
+                    DecryptWithCekError::ContentIdMismatch {
+                        expected: expected.as_str().to_string(),
+                        actual: plain_content_id.as_str().to_string(),
+                    },
+                ));
+            }
+        }
 
         Ok(VerifiedRead {
             plaintext,
             parents: verified.parents,
+            plain_content_id,
         })
     }
 
@@ -699,6 +754,11 @@ pub enum DecryptWithCekError {
 pub struct VerifiedRead {
     pub plaintext: Vec<u8>,
     pub parents: Vec<String>,
+    /// The content id the decrypted plaintext addresses to. Equal to the
+    /// expected id when one was given; for a reader that could not know it
+    /// (a share recipient reading a version newer than the one shared) it
+    /// is the only place the id comes from.
+    pub plain_content_id: ContentId,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1685,6 +1745,57 @@ mod tests {
             fallback.is_err() || fallback.unwrap().plaintext != plaintext,
             "the stale cache must not yield the correct plaintext"
         );
+    }
+
+    /// A share recipient reads a version the owner wrote after sharing: the
+    /// CEK is filed under the id the share came in as, but the plaintext of
+    /// the newer version addresses to a different id. The strict read must
+    /// refuse (it cannot tell this from tampering); the any-version read must
+    /// decrypt and report the id it derived.
+    #[test]
+    fn any_version_relay_read_decrypts_a_newer_version_and_reports_its_plain_id() {
+        let (repo, _storage) = TestContentRepository::new(false);
+        let (key_store, _key_storage) = TestKeyStore::new(false, false);
+        let service = build_service(repo, TestKeyGenerator, TestEncryptor, key_store);
+
+        let key = ContentEncryptionKey(vec![7]);
+        let shared_plain = b"version one".to_vec();
+        let shared_id = service.content_id_generator.generate(&shared_plain);
+        service
+            .cek_store
+            .save(&shared_id, &key)
+            .expect("save cek under the shared id");
+
+        // The test id generator derives the id from the length, so make the
+        // newer version a different length.
+        let newer_plain = b"version two, longer".to_vec();
+        let newer_id = service.content_id_generator.generate(&newer_plain);
+        assert_ne!(shared_id, newer_id);
+        let ciphertext = service
+            .encryptor
+            .encrypt(&key, &newer_plain)
+            .expect("encrypt");
+        let node_bytes = make_test_node_bytes(&ciphertext);
+        let version =
+            crate::infrastructure::node_verification::recompute_node_cid(&node_bytes).unwrap();
+
+        let strict =
+            service.verify_and_decrypt_relay_read(&node_bytes, &version, shared_id.clone(), None);
+        assert!(
+            matches!(
+                strict,
+                Err(VerifiedReadError::Decrypt(
+                    DecryptWithCekError::ContentIdMismatch { .. }
+                ))
+            ),
+            "the strict read must not accept a plaintext that addresses elsewhere"
+        );
+
+        let read = service
+            .verify_and_decrypt_relay_read_any_version(&node_bytes, &version, shared_id, None)
+            .expect("the any-version read decrypts under the shared CEK");
+        assert_eq!(read.plaintext, newer_plain);
+        assert_eq!(read.plain_content_id, newer_id);
     }
 
     #[test]

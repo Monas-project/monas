@@ -83,6 +83,7 @@ async fn share_content_succeeds_after_content_creation() {
 
     let share_response = controller.share_content(ShareContentInput {
         content_id: created.content_id.clone(),
+        remote_content_id: None,
         sender_public_key: sender.public_key.clone(),
         sender_private_key: sender.private_key.clone(),
         recipient_public_key: recipient.public_key.clone(),
@@ -193,6 +194,7 @@ async fn revoke_share_updates_state_node_version() {
 
     let share_response = controller.share_content(ShareContentInput {
         content_id: created.content_id.clone(),
+        remote_content_id: None,
         sender_public_key: sender.public_key.clone(),
         sender_private_key: sender.private_key.clone(),
         recipient_public_key: recipient.public_key.clone(),
@@ -285,6 +287,7 @@ async fn revoke_share_syncs_state_node_by_remote_content_id() {
 
     let share_response = controller.share_content(ShareContentInput {
         content_id: created.content_id.clone(),
+        remote_content_id: None,
         sender_public_key: sender.public_key.clone(),
         sender_private_key: sender.private_key.clone(),
         recipient_public_key: recipient.public_key.clone(),
@@ -381,6 +384,7 @@ async fn revoke_share_rolls_back_local_state_when_state_node_sync_fails() {
 
     let share_response = controller.share_content(ShareContentInput {
         content_id: created.content_id.clone(),
+        remote_content_id: None,
         sender_public_key: sender.public_key.clone(),
         sender_private_key: sender.private_key.clone(),
         recipient_public_key: recipient.public_key.clone(),
@@ -519,6 +523,7 @@ async fn revoke_share_rollback_fires_on_inner_share_service_error() {
     let _ = controller
         .share_content(ShareContentInput {
             content_id: created.content_id.clone(),
+            remote_content_id: None,
             sender_public_key: sender.public_key.clone(),
             sender_private_key: sender.private_key.clone(),
             recipient_public_key: recipient.public_key.clone(),
@@ -663,6 +668,7 @@ async fn revoke_share_invalidates_previously_issued_tokens() {
         controller
             .share_content(ShareContentInput {
                 content_id: created.content_id.clone(),
+                remote_content_id: None,
                 sender_public_key: sender.public_key.clone(),
                 sender_private_key: sender.private_key.clone(),
                 recipient_public_key: recipient.public_key.clone(),
@@ -791,6 +797,7 @@ async fn revoke_share_fails_when_token_invalidation_fails() {
     let shared = controller
         .share_content(ShareContentInput {
             content_id: created.content_id.clone(),
+            remote_content_id: None,
             sender_public_key: sender.public_key.clone(),
             sender_private_key: sender.private_key.clone(),
             recipient_public_key: recipient.public_key.clone(),
@@ -913,6 +920,7 @@ async fn concurrent_revokes_do_not_lose_either_removal() {
             controller
                 .share_content(ShareContentInput {
                     content_id: created.content_id.clone(),
+                    remote_content_id: None,
                     sender_public_key: sender.public_key.clone(),
                     sender_private_key: sender.private_key.clone(),
                     recipient_public_key: recipient.public_key.clone(),
@@ -963,6 +971,7 @@ async fn concurrent_revokes_do_not_lose_either_removal() {
     for (label, recipient) in [("a", &recipient_a), ("b", &recipient_b)] {
         let shared_again = controller.share_content(ShareContentInput {
             content_id: created.content_id.clone(),
+            remote_content_id: None,
             sender_public_key: sender.public_key.clone(),
             sender_private_key: sender.private_key.clone(),
             recipient_public_key: recipient.public_key.clone(),
@@ -974,6 +983,167 @@ async fn concurrent_revokes_do_not_lose_either_removal() {
             shared_again.error
         );
     }
+
+    cleanup_content_artifacts();
+}
+
+/// revoke は残存受信者の Token も失効させる(`min_valid_issued_at` が進む)ので、
+/// 再発行 envelope には境界より後の iat を持つ Token を同梱する。issuer が
+/// 境界と同じ秒で発行してきたら次の秒まで待って発行し直す — 同じ秒の Token
+/// は State Node の `iat > min_valid_issued_at` で生まれた瞬間から無効なので。
+#[tokio::test(flavor = "multi_thread")]
+async fn revoke_reissues_a_valid_token_for_each_surviving_recipient() {
+    let _guard = acquire_test_lock();
+    let mut state_node = Server::new_async().await;
+    let mut account = Server::new_async().await;
+
+    let create_mock = state_node
+        .mock("POST", "/content")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"content_id":"reissue-remote"}"#)
+        .create_async()
+        .await;
+    // The two initial shares get ordinary tokens.
+    let initial_delegate = account
+        .mock("POST", "/issuer/delegate")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"delegated_token":"initial.jwt","issued_at":1700000000,"expires_at":1700003600,"jti":"jti-initial"}"#,
+        )
+        .expect(2)
+        .create_async()
+        .await;
+    let invalidate_mock = state_node
+        .mock("POST", "/content/reissue-remote/access/invalidate")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"content_id":"reissue-remote","new_min_valid_issued_at":1700000500}"#)
+        .expect(1)
+        .create_async()
+        .await;
+    let update_mock = state_node
+        .mock("PUT", "/content/reissue-remote")
+        .with_status(200)
+        .expect(1)
+        .create_async()
+        .await;
+    let sign_mock = account
+        .mock("POST", "/accounts/sign")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"signature_base64":"c2lnbmVk","public_key_base64":"BAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMw==","algorithm":"P256"}"#,
+        )
+        .expect_at_least(1)
+        .create_async()
+        .await;
+
+    let controller = controller_with_wide_skew(state_node.url(), account.url());
+    let auth = auth_context("Bearer owner");
+    let keypair = || {
+        controller
+            .generate_keypair(GenerateKeypairInput {
+                key_type: KeyType::Secp256r1,
+            })
+            .data
+            .expect("keypair")
+    };
+    let sender = keypair();
+    let survivor = keypair();
+    let revoked = keypair();
+
+    let created = controller
+        .create_content(
+            CreateContentInput {
+                content: URL_SAFE_NO_PAD.encode(b"reissue-target"),
+                metadata: Some(ContentMetadata {
+                    name: Some("reissue.txt".to_string()),
+                    content_type: Some("text/plain".to_string()),
+                    created_at: None,
+                    updated_at: None,
+                }),
+            },
+            None,
+        )
+        .data
+        .expect("create should return data");
+    create_mock.assert();
+
+    for (recipient, permissions) in [
+        (&survivor, vec![Permission::Write]),
+        (&revoked, vec![Permission::Read]),
+    ] {
+        let shared = controller.share_content(ShareContentInput {
+            content_id: created.content_id.clone(),
+            remote_content_id: Some("reissue-remote".to_string()),
+            sender_public_key: sender.public_key.clone(),
+            sender_private_key: sender.private_key.clone(),
+            recipient_public_key: recipient.public_key.clone(),
+            permissions,
+        });
+        assert!(shared.success, "{:?}", shared.error);
+    }
+    initial_delegate.assert();
+
+    // The reissue: the issuer first answers with iat == boundary (unusable),
+    // then with iat > boundary. The SDK must keep the second one.
+    let on_boundary = account
+        .mock("POST", "/issuer/delegate")
+        .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+            "content_id": "reissue-remote",
+            "capabilities": ["write"],
+        })))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"delegated_token":"boundary.jwt","issued_at":1700000500,"expires_at":1700004100,"jti":"jti-boundary"}"#,
+        )
+        .expect(1)
+        .create_async()
+        .await;
+    let past_boundary = account
+        .mock("POST", "/issuer/delegate")
+        .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+            "content_id": "reissue-remote",
+            "capabilities": ["write"],
+        })))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"delegated_token":"fresh.jwt","issued_at":1700000501,"expires_at":1700004101,"jti":"jti-fresh"}"#,
+        )
+        .expect(1)
+        .create_async()
+        .await;
+
+    let revoke_response = controller.revoke_share(
+        RevokeShareInput {
+            content_id: created.content_id,
+            remote_content_id: Some("reissue-remote".to_string()),
+            sender_public_key: sender.public_key.clone(),
+            sender_private_key: sender.private_key.clone(),
+            recipient_public_key: revoked.public_key,
+        },
+        Some(&auth),
+    );
+    assert!(revoke_response.success, "{:?}", revoke_response.error);
+    invalidate_mock.assert();
+    update_mock.assert();
+    sign_mock.assert();
+    on_boundary.assert();
+    past_boundary.assert();
+
+    let output = revoke_response.data.expect("revoke should return data");
+    assert_eq!(output.token_invalidated_at, Some(1_700_000_500));
+    assert_eq!(output.reissued_envelopes.len(), 1, "one survivor");
+    let token = output.reissued_envelopes[0]
+        .delegated_access
+        .as_ref()
+        .expect("the survivor gets a fresh token with the re-wrapped envelope");
+    assert_eq!(token.delegated_token, "fresh.jwt");
+    assert!(token.issued_at > 1_700_000_500);
 
     cleanup_content_artifacts();
 }

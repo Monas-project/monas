@@ -127,6 +127,7 @@ async fn create_and_share(
 
     let share_response = controller.share_content(ShareContentInput {
         content_id: created.content_id.clone(),
+        remote_content_id: None,
         sender_public_key: sender.public_key.clone(),
         sender_private_key: sender.private_key.clone(),
         recipient_public_key: recipient.public_key.clone(),
@@ -172,6 +173,7 @@ async fn creator_reads_own_content_from_state_node() {
             content_id: REMOTE_ID.into(),
             local_content_id: created.local_content_id.clone(),
             version: None,
+            accept_any_version: false,
         },
         None,
     );
@@ -221,6 +223,7 @@ async fn share_recipient_reads_content_after_processing_envelope() {
             content_id: REMOTE_ID.into(),
             local_content_id: created.local_content_id.clone(),
             version: None,
+            accept_any_version: false,
         },
         None,
     );
@@ -253,6 +256,7 @@ async fn share_recipient_reads_content_after_processing_envelope() {
             content_id: REMOTE_ID.into(),
             local_content_id: created.local_content_id.clone(),
             version: None,
+            accept_any_version: false,
         },
         None,
     );
@@ -338,6 +342,7 @@ async fn cek_rotation_after_revoke_updates_recipient_and_read() {
     let share_to = |recipient_pub: &str| {
         creator.share_content(ShareContentInput {
             content_id: created.content_id.clone(),
+            remote_content_id: None,
             sender_public_key: sender.public_key.clone(),
             sender_private_key: sender.private_key.clone(),
             recipient_public_key: recipient_pub.to_string(),
@@ -418,6 +423,7 @@ async fn cek_rotation_after_revoke_updates_recipient_and_read() {
                 content_id: REMOTE_ID.into(),
                 local_content_id: created.content_id.clone(),
                 version: None,
+                accept_any_version: false,
             },
             None,
         )
@@ -538,6 +544,7 @@ async fn read_rejects_tampered_node() {
             content_id: REMOTE_ID.into(),
             local_content_id: created.local_content_id.clone(),
             version: None,
+            accept_any_version: false,
         },
         None,
     );
@@ -608,4 +615,266 @@ async fn envelope_sender_auth_rejects_wrong_sender_key() {
     }
 
     cleanup_content_artifacts();
+}
+
+/// 別デバイスの受信者が、共有後に owner が書いた版を読む。
+///
+/// 受信者の CEK は「共有された版の id」の下にある。owner が更新した版の平文
+/// CID はそれと異なるので、厳密 read は ContentIdMismatch で拒否する(改ざんと
+/// 区別できない)。`accept_any_version` なら復号し、平文が指す id を返す。
+#[tokio::test(flavor = "multi_thread")]
+async fn share_recipient_reads_a_version_written_after_the_share() {
+    let _guard = acquire_test_lock();
+    let mut server = Server::new_async().await;
+    let creator = MonasController::with_urls(server.url(), server.url());
+
+    let created = create_and_share(&mut server, &creator, b"first version").await;
+
+    // 受信者は別インスタンス。envelope を処理して CEK を得る。
+    let recipient_controller = MonasController::with_urls(server.url(), server.url());
+    let decrypt_response = recipient_controller.decrypt_shared_content(DecryptSharedContentInput {
+        content_id: created.local_content_id.clone(),
+        private_key: created.recipient_private_key.clone(),
+        sender_public_key: created.shared.sender_public_key.clone(),
+        recipient_key_id: created.shared.recipient_key_id.clone(),
+        key_envelope: created.shared.key_envelope.clone(),
+        version: None,
+    });
+    assert!(decrypt_response.success, "{:?}", decrypt_response.error);
+
+    // owner が新しい版を書く(同じ CEK で再暗号化される)。新しい暗号文は、
+    // もう一度 share したときの envelope から取り出す。
+    let update_mock = server
+        .mock("PUT", format!("/content/{REMOTE_ID}").as_str())
+        .with_status(200)
+        .create_async()
+        .await;
+    let updated = creator
+        .update_content(
+            monas_sdk::models::content::UpdateContentInput {
+                local_content_id: created.local_content_id.clone(),
+                remote_content_id: REMOTE_ID.into(),
+                content: URL_SAFE_NO_PAD.encode(b"second version, written after sharing"),
+                metadata: None,
+            },
+            None,
+        )
+        .data
+        .expect("update should succeed");
+    update_mock.assert();
+    assert_ne!(updated.version_id, created.local_content_id);
+
+    let delegate_mock = server
+        .mock("POST", "/issuer/delegate")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"delegated_token":"dummy.jwt.token","issued_at":1700000001,"expires_at":1700003601,"jti":"jti-2"}"#,
+        )
+        .create_async()
+        .await;
+    // 共有し直すのは暗号文を取り出すためだけなので、送信者鍵は何でもよい
+    // (受信者側でこの envelope を処理はしない)。
+    let sender = creator
+        .generate_keypair(GenerateKeypairInput {
+            key_type: KeyType::Secp256r1,
+        })
+        .data
+        .unwrap();
+    let reshared = creator
+        .share_content(ShareContentInput {
+            content_id: updated.version_id.clone(),
+            remote_content_id: Some(REMOTE_ID.into()),
+            sender_public_key: sender.public_key.clone(),
+            sender_private_key: sender.private_key.clone(),
+            recipient_public_key: created.shared.recipient_public_key.clone(),
+            permissions: vec![Permission::Read],
+        })
+        .data
+        .expect("re-share should succeed");
+    let new_ciphertext = URL_SAFE_NO_PAD
+        .decode(&reshared.key_envelope.ciphertext)
+        .unwrap();
+    delegate_mock.assert();
+
+    let v2_bytes = make_node_bytes(&new_ciphertext, vec![], None);
+    let v2_cid = recompute_node_cid(&v2_bytes).unwrap();
+    let _history = mock_history(&mut server, &[&v2_cid])
+        .await
+        .expect_at_least(1);
+    let _data = mock_version_data(&mut server, &v2_cid, &v2_bytes)
+        .await
+        .expect_at_least(1);
+
+    // 厳密 read: 共有された版の id を期待して読むと不一致で拒否される
+    let strict = recipient_controller.read_content_from_state_node(
+        ReadContentFromStateNodeInput {
+            content_id: REMOTE_ID.into(),
+            local_content_id: created.local_content_id.clone(),
+            version: None,
+            accept_any_version: false,
+        },
+        None,
+    );
+    assert!(
+        !strict.success,
+        "a strict read must not accept a newer version"
+    );
+    assert!(
+        matches!(strict.error, Some(ApiError::Conflict(_))),
+        "expected Conflict, got {:?}",
+        strict.error
+    );
+
+    // any-version read: 同じ CEK で復号でき、平文が指す id = owner 側の新しい版 id
+    let lenient = recipient_controller.read_content_from_state_node(
+        ReadContentFromStateNodeInput {
+            content_id: REMOTE_ID.into(),
+            local_content_id: created.local_content_id.clone(),
+            version: None,
+            accept_any_version: true,
+        },
+        None,
+    );
+    assert!(lenient.success, "{:?}", lenient.error);
+    let out = lenient.data.unwrap();
+    assert_eq!(
+        URL_SAFE_NO_PAD.decode(out.content).unwrap(),
+        b"second version, written after sharing"
+    );
+    assert_eq!(out.version, v2_cid);
+    assert_eq!(
+        out.local_content_id, updated.version_id,
+        "the derived plain id is the owner's new version id"
+    );
+
+    cleanup_content_artifacts();
+}
+
+/// 委譲 Token は State Node が知っている系列IDで発行される。ローカル版IDで
+/// 発行した Token は `monas://content/<系列ID>` の照合で必ず落ちる。
+#[tokio::test(flavor = "multi_thread")]
+async fn delegated_token_is_issued_for_the_remote_content_id() {
+    let _guard = acquire_test_lock();
+    let mut server = Server::new_async().await;
+    let controller = MonasController::with_urls(server.url(), server.url());
+
+    let create_mock = server
+        .mock("POST", "/content")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(format!(r#"{{"content_id":"{REMOTE_ID}"}}"#))
+        .create_async()
+        .await;
+    let create_response = controller.create_content(
+        CreateContentInput {
+            content: URL_SAFE_NO_PAD.encode(b"token resource"),
+            metadata: Some(ContentMetadata {
+                name: Some("token.txt".to_string()),
+                content_type: Some("text/plain".to_string()),
+                created_at: None,
+                updated_at: None,
+            }),
+        },
+        None,
+    );
+    let created = create_response
+        .data
+        .unwrap_or_else(|| panic!("create: {:?}", create_response.error));
+    create_mock.assert();
+    assert_ne!(created.content_id, REMOTE_ID);
+
+    // The issuer must be asked for the *remote* id, never the local one.
+    let delegate_mock = server
+        .mock("POST", "/issuer/delegate")
+        .match_body(mockito::Matcher::PartialJson(
+            serde_json::json!({ "content_id": REMOTE_ID }),
+        ))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"delegated_token":"dummy.jwt.token","issued_at":1700000000,"expires_at":1700003600,"jti":"jti-r"}"#,
+        )
+        .create_async()
+        .await;
+
+    let sender = controller
+        .generate_keypair(GenerateKeypairInput {
+            key_type: KeyType::Secp256r1,
+        })
+        .data
+        .unwrap();
+    let recipient = controller
+        .generate_keypair(GenerateKeypairInput {
+            key_type: KeyType::Secp256r1,
+        })
+        .data
+        .unwrap();
+    let shared = controller.share_content(ShareContentInput {
+        content_id: created.content_id.clone(),
+        remote_content_id: Some(REMOTE_ID.into()),
+        sender_public_key: sender.public_key,
+        sender_private_key: sender.private_key,
+        recipient_public_key: recipient.public_key,
+        permissions: vec![Permission::Read],
+    });
+    assert!(shared.success, "{:?}", shared.error);
+    delegate_mock.assert();
+
+    cleanup_content_artifacts();
+}
+
+/// share 受信者としての read: 呼び出し側が委譲 Token を `Authorization: Bearer`
+/// で渡し署名は渡さない場合、SDK は account 鍵で `read:<id>:<ts>` に署名しつつ
+/// Token をそのまま残す。State Node は Token の `aud` 鍵で署名を検証する
+/// ので、`user:` トークンに差し替えては通らない。
+#[tokio::test(flavor = "multi_thread")]
+async fn delegated_read_keeps_the_bearer_token_and_signs_with_the_account_key() {
+    let _guard = acquire_test_lock();
+    let mut server = Server::new_async().await;
+    let controller = MonasController::with_urls(server.url(), server.url());
+
+    let sign_mock = server
+        .mock("POST", "/accounts/sign")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"signature_base64":"c2lnbmVk","public_key_base64":"AQID","algorithm":"P256"}"#,
+        )
+        .expect(1)
+        .create_async()
+        .await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let history_mock = server
+        .mock("GET", format!("/content/{REMOTE_ID}/history").as_str())
+        .match_header("authorization", "Bearer delegated.jwt.token")
+        .match_header("x-request-signature", "c2lnbmVk")
+        .match_header("x-request-timestamp", now.to_string().as_str())
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(format!(
+            r#"{{"content_id":"{REMOTE_ID}","versions":["v1"]}}"#
+        ))
+        .expect(1)
+        .create_async()
+        .await;
+
+    let auth = monas_sdk::StateNodeAuthContext {
+        authorization: Some("Bearer delegated.jwt.token".to_string()),
+        request_signature: None,
+        request_timestamp: Some(now),
+    };
+    let response = controller.get_latest_version(
+        monas_sdk::models::state::GetLatestVersionInput {
+            content_id: REMOTE_ID.into(),
+        },
+        Some(&auth),
+    );
+    assert!(response.success, "{:?}", response.error);
+    assert_eq!(response.data.unwrap().latest_version, "v1");
+    sign_mock.assert();
+    history_mock.assert();
 }

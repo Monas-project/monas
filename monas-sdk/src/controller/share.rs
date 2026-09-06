@@ -132,6 +132,18 @@ impl MonasController {
         Ok(DomainPermission::Read)
     }
 
+    /// ACL に記録された権限(ドメイン型)から、Token に載せる権限を選ぶ。
+    /// Write があれば Write、それ以外は Read。Owner は委譲しない。
+    fn resolve_domain_permission(perms: &[DomainPermission]) -> Option<DomainPermission> {
+        if perms.iter().any(|p| matches!(p, DomainPermission::Write)) {
+            Some(DomainPermission::Write)
+        } else if perms.iter().any(|p| matches!(p, DomainPermission::Read)) {
+            Some(DomainPermission::Read)
+        } else {
+            None
+        }
+    }
+
     fn to_key_envelope(domain_envelope: &DomainKeyEnvelope) -> KeyEnvelope {
         let recipient = domain_envelope.recipient();
         KeyEnvelope {
@@ -153,37 +165,66 @@ impl MonasController {
         }
     }
 
+    /// 委譲 Token を発行する。
+    ///
+    /// `min_issued_after` は State Node の `min_valid_issued_at`(revoke が進めた
+    /// 失効境界)。State Node は `iat > min_valid_issued_at` の Token だけを
+    /// 受け付けるので、失効と同じ秒に発行された Token は生まれた瞬間から無効
+    /// になる。境界と同じ秒か、時計のずれで手前に出てしまった場合は、次の秒
+    /// まで待って発行し直す(上限あり)。
     fn issue_delegated_token(
         &self,
         content_id: &str,
         recipient_public_key_bytes: &[u8],
         permission: DomainPermission,
+        min_issued_after: Option<u64>,
     ) -> Result<DelegatedAccessToken, ApiError> {
+        const MAX_WAIT_SECS: u64 = 5;
         let issuer_url = format!("{}/issuer/delegate", self.account_url);
-        let req = IssueDelegatedTokenRequest {
-            recipient_public_key_base64: BASE64_STANDARD.encode(recipient_public_key_bytes),
-            content_id: content_id.to_string(),
-            capabilities: Self::permission_to_capabilities(permission)?,
-            ttl_secs: DEFAULT_DELEGATION_TTL_SECS,
-        };
+        let capabilities = Self::permission_to_capabilities(permission)?;
 
-        let mut response = self
-            .agent
-            .post(&issuer_url)
-            .send_json(req)
-            .map_err(|e| ApiError::from_ureq_error("Failed to call issuer API", e))?;
+        let mut waited = 0;
+        loop {
+            let req = IssueDelegatedTokenRequest {
+                recipient_public_key_base64: BASE64_STANDARD.encode(recipient_public_key_bytes),
+                content_id: content_id.to_string(),
+                capabilities: capabilities.clone(),
+                ttl_secs: DEFAULT_DELEGATION_TTL_SECS,
+            };
 
-        let body: IssueDelegatedTokenResponse = response
-            .body_mut()
-            .read_json()
-            .map_err(|e| ApiError::Internal(format!("Invalid issuer API response: {e}")))?;
+            let mut response = self
+                .agent
+                .post(&issuer_url)
+                .send_json(req)
+                .map_err(|e| ApiError::from_ureq_error("Failed to call issuer API", e))?;
 
-        Ok(DelegatedAccessToken {
-            delegated_token: body.delegated_token,
-            issued_at: body.issued_at,
-            expires_at: body.expires_at,
-            jti: body.jti,
-        })
+            let body: IssueDelegatedTokenResponse = response
+                .body_mut()
+                .read_json()
+                .map_err(|e| ApiError::Internal(format!("Invalid issuer API response: {e}")))?;
+
+            let token = DelegatedAccessToken {
+                delegated_token: body.delegated_token,
+                issued_at: body.issued_at,
+                expires_at: body.expires_at,
+                jti: body.jti,
+            };
+            match min_issued_after {
+                Some(boundary) if token.issued_at <= boundary => {
+                    let short_by = boundary - token.issued_at + 1;
+                    if waited + short_by > MAX_WAIT_SECS {
+                        return Err(ApiError::Internal(format!(
+                            "delegated token would be issued at {} but the state node only accepts \
+                             tokens issued after {}: clocks differ by more than {}s",
+                            token.issued_at, boundary, MAX_WAIT_SECS
+                        )));
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(short_by));
+                    waited += short_by;
+                }
+                _ => return Ok(token),
+            }
+        }
     }
 
     /// ShareApplicationErrorをApiErrorにマッピング
@@ -362,10 +403,18 @@ impl MonasController {
             }
         };
 
+        // Token の resource は State Node が知っている系列ID。ローカル版IDで
+        // 発行すると受信者の read/write が capability 不一致で拒否される。
+        let token_content_id = input
+            .remote_content_id
+            .as_deref()
+            .unwrap_or(&input.content_id)
+            .to_string();
         let delegated_access = match self.issue_delegated_token(
-            &input.content_id,
+            &token_content_id,
             &recipient_public_key_bytes,
             permission,
+            None,
         ) {
             Ok(token) => token,
             Err(e) => {
@@ -629,12 +678,49 @@ impl MonasController {
         // 残存受信者向けの再発行 envelope(新 CEK・新 ciphertext)を出力に載せる。
         // owner はこれを各受信者へ配布し、受信者が decrypt_shared_content で処理すると
         // ローカル保存済み CEK がローテーション後のものへ更新される。
+        //
+        // 3.5 で State Node の失効境界を進めているので、残存受信者が持っていた
+        // Token も失効している。envelope だけ届けても復号はできるが State Node
+        // からは読めないので、境界より後の iat で Token も発行し直して同梱する。
+        // 発行に失敗しても revoke 自体は完了しているので巻き戻さず、その受信者
+        // の `delegated_access` を `None` にして返す。
+        let survivors_permissions = self
+            .share_service
+            .share_repository
+            .load(&result.content_id)
+            .ok()
+            .flatten();
         let reissued_envelopes = result
             .envelopes
             .iter()
-            .map(|env| ReissuedKeyEnvelope {
-                recipient_key_id: encode_base64url(env.recipient().key_id().as_bytes()),
-                key_envelope: Self::to_key_envelope(env),
+            .map(|env| {
+                let key_id = env.recipient().key_id();
+                let delegated_access = survivors_permissions
+                    .as_ref()
+                    .and_then(|share| share.permissions_of(key_id))
+                    .and_then(Self::resolve_domain_permission)
+                    .and_then(|permission| {
+                        self.share_service
+                            .public_key_directory
+                            .find_public_key(key_id)
+                            .ok()
+                            .flatten()
+                            .map(|pk| (pk, permission))
+                    })
+                    .and_then(|(pk, permission)| {
+                        self.issue_delegated_token(
+                            &state_node_content_id,
+                            &pk,
+                            permission,
+                            token_invalidated_at,
+                        )
+                        .ok()
+                    });
+                ReissuedKeyEnvelope {
+                    recipient_key_id: encode_base64url(key_id.as_bytes()),
+                    key_envelope: Self::to_key_envelope(env),
+                    delegated_access,
+                }
             })
             .collect();
 
