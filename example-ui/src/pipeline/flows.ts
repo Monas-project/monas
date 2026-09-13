@@ -321,7 +321,6 @@ export function shareFlow(input: {
   recipientPublicKeyB64Url: string;
   recipientLabel?: string;
   permissions: Permission[];
-  recipientPrivateKeyB64Url?: string; // when present, run an unwrap+decrypt proof
 }): StepSpec[] {
   const { entry, identity } = input;
   const steps: StepSpec[] = [
@@ -367,28 +366,6 @@ export function shareFlow(input: {
     },
   ];
 
-  if (input.recipientPrivateKeyB64Url) {
-    steps.push({
-      title: "Recipient unwraps & decrypts · gateway call",
-      hint: "HPKE Auth open · AES-256-GCM",
-      kind: "verify",
-      minMs: 180,
-      exec: async (ctx) => {
-        const g = ctx.share as shareApi.ShareContentOutput;
-        const res = await shareApi.decryptSharedContent({
-          contentId: entry.localContentId!,
-          privateKeyB64Url: input.recipientPrivateKeyB64Url!,
-          // Auth-mode unwrap is bound to the sender's key, TOFU-pinned on the
-          // recipient's first envelope for this content.
-          senderPublicKeyB64Url: g.sender_public_key,
-          recipientKeyId: g.recipient_key_id,
-          keyEnvelope: g.key_envelope,
-        });
-        const n = byteLengthOfBase64Url(res.content);
-        return `Round-trip OK · ${fmtBytes(n)} of plaintext recovered as the recipient (sender key pinned)`;
-      },
-    });
-  }
   return steps;
 }
 

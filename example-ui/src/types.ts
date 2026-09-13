@@ -99,6 +99,15 @@ export interface ReceivedShare {
 
 // One row in the Drive. Folders are purely logical (path prefixes); only files
 // carry Monas content/crypto state.
+export interface NetworkHead {
+  /** Node CID of the head version as the state node reports it. Unknown right
+   *  after this device wrote the head itself (the write returns plain ids). */
+  version?: string;
+  /** Plain content id the head's plaintext addresses to (verified read). */
+  localId: string;
+  checkedAt: number;
+}
+
 export interface Entry {
   id: string; // local UI id (uuid)
   kind: EntryKind;
@@ -115,6 +124,14 @@ export interface Entry {
   seriesId?: string; // logical series across versions
   syncedToStateNode: boolean;
   versionCount: number;
+  /** What the Content Network's head looked like when this device last
+   *  checked (a verified read). `localId` is the plain content id the head's
+   *  plaintext addresses to — comparing it with what this device holds is how
+   *  "up to date" is told from "newer on network". */
+  networkHead?: NetworkHead;
+  /** Set when the last check failed (unreachable node, voided token, …);
+   *  `networkHead` is then whatever the previous successful check saw. */
+  networkCheckError?: string;
   shares: ShareGrant[];
   /** Present when this file was shared *to* this device by someone else.
    *  Opening it unwraps the envelope again; deleting it only removes it from

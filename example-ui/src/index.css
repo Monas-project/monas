@@ -456,6 +456,18 @@ a {
   background: #fdf1f1;
   border-color: #f0c4c7;
 }
+/* Sync status against the Content Network head: amber = the network has a
+   version this copy has not adopted. Distinct from `local` (never synced). */
+.badge.behind {
+  color: #9a5b00;
+  background: #fff3df;
+  border-color: #f3d6a4;
+}
+.spinner.xs {
+  width: 9px;
+  height: 9px;
+  border-width: 1.5px;
+}
 /* a file shared TO this device by someone else */
 .badge.received {
   color: #0f6f8f;

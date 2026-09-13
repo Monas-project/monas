@@ -124,7 +124,6 @@ test("J-4: a file shared from one device opens, reads and is edited on another v
   await test.step("Alice shares (read + write) to Bob's pasted key and copies the share package", async () => {
     await rowAction(alice.page, name, "Share");
     const modal = alice.page.locator(".modal");
-    await modal.locator(".seg button", { hasText: "Paste public key" }).click();
     await pubKeyBox(modal).fill(bobPublicKey);
     await modal.locator(".field", { hasText: "Label (optional)" }).locator("input.input").fill("bob");
     await modal.locator(".field", { hasText: "Permission" }).locator(".seg button", { hasText: "read + write" }).click();
@@ -235,7 +234,6 @@ test("J-4: a file shared from one device opens, reads and is edited on another v
     });
     await rowAction(alice.page, name, "Share");
     const modal = alice.page.locator(".modal");
-    await modal.locator(".seg button", { hasText: "Paste public key" }).click();
     await pubKeyBox(modal).fill(carolKey);
     await modal.locator(".field", { hasText: "Label (optional)" }).locator("input.input").fill("carol");
     await modal.getByRole("button", { name: "Wrap CEK & share" }).click();
@@ -341,7 +339,11 @@ test("J-4: a file shared from one device opens, reads and is edited on another v
     });
     await expect(aliceView.locator(".preview-box").nth(1)).toHaveText(secret3);
     await expect(aliceView.locator(".kv", { hasText: "newer than your copy" })).toBeVisible();
+    // The verified read recorded the head on the entry, so the status line in
+    // the preview and the row's sync badge now both say she is behind.
+    await expect(aliceView.locator(".sync-status[data-sync=behind]")).toBeVisible();
     await closeModal(alice.page);
+    await expect(row(alice.page, name).locator(".badge.sync[data-sync=behind]")).toBeVisible();
 
     // Opening the editor pulls Bob's version into her local record first, so
     // her next save (or a revoke's re-encryption) builds on it, not over it.
@@ -351,6 +353,8 @@ test("J-4: a file shared from one device opens, reads and is edited on another v
       timeout: 120_000,
     });
     await closeModal(alice.page);
+    // …and the pull made her copy the head again.
+    await expect(row(alice.page, name).locator(".badge.sync[data-sync=current]")).toBeVisible();
     await rowAction(alice.page, name, "Open / preview");
     await expect(alice.page.locator(".modal .preview-box").first()).toHaveText(secret3);
     await closeModal(alice.page);
