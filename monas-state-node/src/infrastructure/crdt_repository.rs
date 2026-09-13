@@ -4,6 +4,7 @@
 //! using crsl-lib for CRDT-based content versioning.
 
 use crate::domain::access_policy::AccessPolicy;
+use crate::infrastructure::merge_policy::MonasMergePolicy;
 use crate::port::content_repository::{
     CommitResult, ContentRepository, PreparedCreate, SerializedOperation,
 };
@@ -65,11 +66,29 @@ impl CrslCrdtRepository {
 
         let state = CrdtState::new(op_storage);
         let dag = DagGraph::new(node_storage);
-        let repo = Repo::new(state, dag);
+        // Field-wise convergence: body is LWW, the access policy's cutoff is
+        // a max. crsl-lib's default LWW over the whole payload lets a
+        // concurrent write erase a revoke (see merge_policy.rs).
+        let repo = Repo::new(state, dag).with_merge_policy(Box::new(MonasMergePolicy));
 
         Ok(Self {
             repo: Mutex::new(repo),
         })
+    }
+
+    /// The head of a content, after converging any concurrent heads.
+    ///
+    /// Every read of "the current version" goes through here. `Repo::latest`
+    /// alone picks one concurrent head by timestamp; with a field-wise merge
+    /// policy that is the wrong answer whenever the branches differ in
+    /// different fields — a revoke on one, a write on the other — because
+    /// the reader sees only one branch's fields. Merging first makes reads
+    /// see what the policy decides, and makes a write that copies the head's
+    /// policy (or a revoke that copies the head's body) start from the
+    /// converged value instead of racing it.
+    fn converged_head(repo: &mut ContentRepo, genesis: &Cid) -> Result<Option<Cid>> {
+        repo.merge_heads(genesis)
+            .map_err(|e| anyhow::anyhow!("Failed to merge concurrent heads: {}", e))
     }
 
     /// Check if the repository is healthy (can list contents).
@@ -187,8 +206,8 @@ impl ContentRepository for CrslCrdtRepository {
         let policy = if access_policy.is_some() {
             access_policy
         } else {
-            let repo = self.repo.lock();
-            repo.latest(&genesis).and_then(|latest_cid| {
+            let mut repo = self.repo.lock();
+            Self::converged_head(&mut repo, &genesis)?.and_then(|latest_cid| {
                 repo.dag
                     .get_node(&latest_cid)
                     .ok()
@@ -221,10 +240,10 @@ impl ContentRepository for CrslCrdtRepository {
     async fn get_latest(&self, genesis_cid: &str) -> Result<Option<Vec<u8>>> {
         let genesis = Self::parse_cid(genesis_cid)?;
 
-        let repo = self.repo.lock();
+        let mut repo = self.repo.lock();
 
         // Get the latest version CID
-        match repo.latest(&genesis) {
+        match Self::converged_head(&mut repo, &genesis)? {
             Some(latest_cid) => {
                 // Get the node to retrieve payload (data part only)
                 match repo.dag.get_node(&latest_cid) {
@@ -243,10 +262,10 @@ impl ContentRepository for CrslCrdtRepository {
     ) -> Result<Option<(Vec<u8>, String)>> {
         let genesis = Self::parse_cid(genesis_cid)?;
 
-        let repo = self.repo.lock();
+        let mut repo = self.repo.lock();
 
         // Get the latest version CID
-        match repo.latest(&genesis) {
+        match Self::converged_head(&mut repo, &genesis)? {
             Some(latest_cid) => {
                 // Get the node to retrieve payload (data part only)
                 match repo.dag.get_node(&latest_cid) {
@@ -288,9 +307,9 @@ impl ContentRepository for CrslCrdtRepository {
     ) -> Result<Option<(Vec<u8>, String)>> {
         let genesis = Self::parse_cid(genesis_cid)?;
 
-        let repo = self.repo.lock();
+        let mut repo = self.repo.lock();
 
-        match repo.latest(&genesis) {
+        match Self::converged_head(&mut repo, &genesis)? {
             Some(latest_cid) => match repo.dag.get_node(&latest_cid) {
                 Ok(Some(node)) => {
                     let bytes = node
@@ -337,9 +356,9 @@ impl ContentRepository for CrslCrdtRepository {
     async fn get_access_policy(&self, genesis_cid: &str) -> Result<Option<AccessPolicy>> {
         let genesis = Self::parse_cid(genesis_cid)?;
 
-        let repo = self.repo.lock();
+        let mut repo = self.repo.lock();
 
-        match repo.latest(&genesis) {
+        match Self::converged_head(&mut repo, &genesis)? {
             Some(latest_cid) => match repo.dag.get_node(&latest_cid) {
                 Ok(Some(node)) => Ok(node.payload().access_policy.clone()),
                 Ok(None) => Ok(None),
@@ -359,8 +378,8 @@ impl ContentRepository for CrslCrdtRepository {
 
         // Get current data from latest version
         let current_data = {
-            let repo = self.repo.lock();
-            repo.latest(&genesis)
+            let mut repo = self.repo.lock();
+            Self::converged_head(&mut repo, &genesis)?
                 .and_then(|latest_cid| {
                     repo.dag
                         .get_node(&latest_cid)
@@ -1320,5 +1339,119 @@ mod tests {
             .unwrap();
         assert!(!operations.is_empty());
         assert_eq!(operations[0].genesis_cid, result.genesis_cid);
+    }
+
+    // ---- concurrent revoke × write across two replicas -------------------
+
+    use crate::domain::identity::Identity;
+    use crate::domain::value_objects::ContentId;
+
+    fn owner_policy(genesis: &str) -> AccessPolicy {
+        AccessPolicy::new(
+            ContentId::new(genesis.to_string()).unwrap(),
+            Identity::user("alice".to_string()).unwrap(),
+        )
+    }
+
+    /// Two replicas holding the same content: `a` revokes, `b` (which has
+    /// not seen the revoke) accepts a write. Then they sync both ways.
+    ///
+    /// Returns the replicas after convergence.
+    async fn revoke_on_a_write_on_b(
+        write_first: bool,
+    ) -> (
+        CrslCrdtRepository,
+        CrslCrdtRepository,
+        String,
+        tempfile::TempDir,
+        tempfile::TempDir,
+    ) {
+        let tmp_a = tempdir().unwrap();
+        let tmp_b = tempdir().unwrap();
+        let a = CrslCrdtRepository::open(tmp_a.path().join("crdt")).unwrap();
+        let b = CrslCrdtRepository::open(tmp_b.path().join("crdt")).unwrap();
+
+        // Shared base: created on a, replicated to b. The policy is set on
+        // the first update so both replicas hold it under the genesis.
+        let created = a.create_content(b"AB", "alice", None).await.unwrap();
+        let genesis = created.genesis_cid.clone();
+        a.update_access_policy(&genesis, owner_policy(&genesis), "alice")
+            .await
+            .unwrap();
+        let base_ops = a.get_operations(&genesis, None).await.unwrap();
+        b.apply_operations(&base_ops).await.unwrap();
+        assert_eq!(b.get_latest(&genesis).await.unwrap().unwrap(), b"AB");
+
+        // Concurrent: a revokes (policy-only), b takes a write. Order of the
+        // two only decides which node carries the newer timestamp.
+        async fn revoke(a: &CrslCrdtRepository, genesis: &str) {
+            let mut p = a.get_access_policy(genesis).await.unwrap().unwrap();
+            p.invalidate_tokens();
+            a.update_access_policy(genesis, p, "alice").await.unwrap();
+        }
+        async fn write(b: &CrslCrdtRepository, genesis: &str) {
+            b.update_content(genesis, b"ABC", "bob", None)
+                .await
+                .unwrap();
+        }
+        // `invalidate_tokens` stamps whole seconds; sleep past one so the
+        // two nodes are distinguishable by timestamp.
+        if write_first {
+            write(&b, &genesis).await;
+            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+            revoke(&a, &genesis).await;
+        } else {
+            revoke(&a, &genesis).await;
+            tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+            write(&b, &genesis).await;
+        }
+
+        // Sync both ways. Applying the other side's ops creates concurrent
+        // heads on each replica; the head reads below converge them.
+        let ops_a = a.get_operations(&genesis, None).await.unwrap();
+        let ops_b = b.get_operations(&genesis, None).await.unwrap();
+        b.apply_operations(&ops_a).await.unwrap();
+        a.apply_operations(&ops_b).await.unwrap();
+        // No commit needed to converge: every head read merges first.
+        (a, b, genesis, tmp_a, tmp_b)
+    }
+
+    /// Write after revoke (the observed production case): the write wins the
+    /// body, but the revoke must not be erased by it.
+    #[tokio::test]
+    async fn concurrent_write_after_revoke_keeps_cutoff_on_both_replicas() {
+        let (a, b, genesis, _ta, _tb) = revoke_on_a_write_on_b(false).await;
+        for (name, r) in [("a", &a), ("b", &b)] {
+            let policy = r.get_access_policy(&genesis).await.unwrap().unwrap();
+            assert!(
+                policy.min_valid_issued_at() > 0,
+                "replica {name}: the revoke was erased by the concurrent write"
+            );
+            assert_eq!(r.get_latest(&genesis).await.unwrap().unwrap(), b"ABC");
+        }
+        // Each replica mints its own merge node (its own timestamp), so the
+        // head CIDs differ until the next sync merges the two merge nodes —
+        // which, being equal in every field, converge on the same payload.
+        // That was already true of the lazy merge; the guarantee here is
+        // the payload, not the CID.
+    }
+
+    /// Revoke after write: the revoke is newer but did not write, so the
+    /// write it never conflicted with must survive.
+    #[tokio::test]
+    async fn concurrent_revoke_after_write_keeps_write_on_both_replicas() {
+        let (a, b, genesis, _ta, _tb) = revoke_on_a_write_on_b(true).await;
+        for (name, r) in [("a", &a), ("b", &b)] {
+            let policy = r.get_access_policy(&genesis).await.unwrap().unwrap();
+            assert!(
+                policy.min_valid_issued_at() > 0,
+                "replica {name}: cutoff lost"
+            );
+            assert_eq!(
+                r.get_latest(&genesis).await.unwrap().unwrap(),
+                b"ABC",
+                "replica {name}: a policy-only revoke overwrote a concurrent write"
+            );
+        }
     }
 }

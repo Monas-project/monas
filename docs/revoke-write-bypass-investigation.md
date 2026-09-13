@@ -102,6 +102,17 @@ Phase A〜C（write共有での編集、AlreadyShared確認、revoke→再share�
 
 **C を採用**(PR #47 内で完結させるため)。B は別 issue として起票する。
 
+### 追記: マージ規則の欠陥(C の後に判明)
+
+C の実装後、A/B/C のどれとも別に、**CRDT のマージ規則そのものが revoke を消す**ことが分かった。access_policy は版ノードの payload に本体と同居しており、crsl-lib の Merge は payload を timestamp で丸ごと選ぶ(純 LWW)。よって revoke と並行する write が timestamp で勝つと、Merge ノードの policy は write 側の古い `min_valid_issued_at` になり、失効境界が巻き戻る — 「窓の中で1回書ける」ではなく「窓の中で1回書ければ以後も書ける」だった。逆(revoke が timestamp で勝つ)では、本体を変えていない revoke ノードが並行する正当な write を消す。
+
+これは A/B の代替ではなく前提で、分断や sync 遅延など「並行 head が生じる状況」すべてで起きる。修正は「policy を別 DAG に出す」のではなく、同じ payload のままフィールド別に畳む(本体は本体を変えた head の中で LWW、`min_valid_issued_at` は max)。crsl-lib に利用側からマージポリシーを注入する口(`Repo::with_merge_policy`)と、head を読む前に並行 head を畳む口(`Repo::merge_heads`)を足し、state-node で `MonasMergePolicy` を注入する。詳細は design.md §11。
+
+- crsl-lib: PR (feat/injectable-merge-policy)
+- monas: PR (feat/policy-aware-merge → feat/example-ui-monas-drive)
+
+残るのは「窓の中の write が1回本体として残る」だけで、それは B で閉じる。
+
 ### C で入れたもの
 
 - `monas-state-node` `invalidate_tokens_inner`: 各メンバーへの `push_operations` を1回リトライし、届いた/届かなかったメンバーを `InvalidateTokensOutcome { new_min_valid_issued_at, notified_members, unreached_members, relayed }` で返す。挙動(revoke は待たない・失敗しない)は変えない。relay 経路では伝播情報は「不明」(`relayed: true`)。

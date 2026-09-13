@@ -260,6 +260,8 @@ flowchart TD
 
 失効を先に行うのは、逆順だと「再暗号化してから失効するまでの窓」で取り消し済みの相手が書き込めてしまうためである。先に失効させておけば、後段が失敗してローカル状態を巻き戻しても、余分な失効が残るだけで害はない。
 
+ただし失効はstate-nodeの**1メンバーにcommitされた時点で成功**であり、他メンバーへの伝播はベストエフォートのpush + 定期syncである。各メンバーの認可は自分の持つpolicyに対するローカル判断なので、境界がまだ届いていないメンバーは旧Tokenのwriteをその間受理する。取り消しはこれを待たない（書き手が取り消しを妨げられてはならない）。代わりにstate-nodeは届いた/届かなかったメンバーを返し（`InvalidateTokensOutcome`）、SDKは`RevokeShareOutput::token_invalidation_reach`として呼び出し側に見せる。そうして受理されたwriteが失効を巻き戻さないことは、CRDTのフィールド別マージ（§11）が保証する。
+
 `min_valid_issued_at`は時刻ベースの一括失効なので、**残存する受信者のTokenも巻き添えで失効する**（判定は排他なので、取り消しと同じ秒に発行されたTokenも失効する）。呼び出し側は取り消し後に、残存受信者へ新しいKeyEnvelopeと新しいTokenの両方を配り直す必要がある。SDKは`RevokeShareOutput`で再発行KeyEnvelope（`reissued_envelopes`）と失効時刻（`token_invalidated_at`）の両方を返す。
 
 取り消しはACL・CEK・ローカルciphertext・state node状態にまたがるload-modify-saveであり、そのどれにもversion CASが無い。したがって**同じcontentへの取り消しはcontent単位で直列化する**。並行させると、双方が同じShareを読んで後勝ちでsaveし片方の受信者削除が消える（lost update）、異なるCEKが同じ`key_epoch`として配られる、といった分岐が起こる。SDKのコントローラはgatewayから共有され複数リクエストから同時に呼ばれるため、これは理論上の話ではない。現状の直列化はプロセス内に閉じており、複数gatewayプロセスからの並行取り消しには対応しない — そこまで守るにはShare・CEK・ciphertextを1つのtransactional CASにまとめるか、state node側にCASを置く必要がある。
@@ -456,10 +458,22 @@ crsl-libはMonasのために設計されたCIDネイティブなDAG CRDTライ�
 他のノードへ同期
     │
     ▼
-コンフリクト時はLWW（Last-Write-Wins）でマージ
+コンフリクト時はフィールド別にマージ（下記）
 ```
 
-コンテンツ本体の意味的なマージは現時点で未実装であり、研究課題として位置づけられている。
+並行して進んだ版（複数のhead）は、次のcommitか、headを読む操作の直前に1つのMergeノードへ畳まれる。畳み方はcrsl-libが利用側から受け取るマージポリシーで決まり（`Repo::with_merge_policy`）、state-nodeは版のpayloadを**フィールドごとに別の規則**で畳む：
+
+| フィールド | 規則 | 理由 |
+|---|---|---|
+| コンテンツ本体（ciphertext） | LWW — ただし**親から本体を変えたheadの中で**timestamp最大 | 最後の書き込みが正。policyだけを進めたhead（revoke等）は本体を親からコピーしているだけで「書いて」いないので、並行する本物の書き込みに勝ってはならない |
+| `access_policy.min_valid_issued_at` | 全headの**max** | 失効境界は単調にしか進まない。timestampで選ぶと、境界を知らないノードが受理した並行writeが境界を巻き戻す |
+| `access_policy.owner` / `content_id` | 不変（genesisで確定） | — |
+
+payload全体をtimestampで丸ごと選ぶ（純粋なLWW）と、revokeと並行するwriteの一方が必ず消える — writeがtimestampで勝てばrevokeが消え、revokeが勝てば正当なwriteが消える。どちらも「競合していないフィールドの変更が、競合したフィールドの勝敗に巻き込まれる」のが原因で、フィールド別に畳めば両方残る。マージポリシーはプロセスに焼かれておりデータとともには流れないため、**同じContent Networkの全メンバーが同じ規則を持つ**必要がある。
+
+このマージが決めるのは「Mergeノードに何を入れるか」であり、「そのheadを受理してよかったか」ではない。失効境界を知らないメンバーが旧Tokenで受理したwriteは、最新のwriteであれば本体として残る（境界は残るので以後は書けない）。それを弾くにはwriteが自分のTokenを持ち歩き、マージ時に畳んだ境界に対して検証する必要がある — ワイヤ形式の変更を伴うため別issueで追跡する。
+
+コンテンツ本体の意味的なマージ（同じフィールド内での両立）は現時点で未実装であり、研究課題として位置づけられている。
 
 ### 将来のCRDT拡張
 
