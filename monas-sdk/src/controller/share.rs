@@ -611,18 +611,19 @@ impl MonasController {
             .as_deref()
             .unwrap_or(&input.content_id)
             .to_string();
-        let token_invalidated_at = if auth.is_some() {
+        let (token_invalidated_at, token_invalidation_reach) = if auth.is_some() {
             match self.send_invalidate_to_state_node::<RevokeShareOutput>(
                 &state_node_content_id,
                 auth,
                 trace_id.clone(),
             ) {
-                Ok(v) => v,
+                Ok(Some((at, reach))) => (Some(at), reach),
+                Ok(None) => (None, None),
                 // ここはまだローカル状態を一切変更していないので巻き戻し不要。
                 Err(response) => return response,
             }
         } else {
-            None
+            (None, None)
         };
 
         // 4. まず CEK をローテーションして再暗号化する。
@@ -774,6 +775,7 @@ impl MonasController {
             reissued_envelopes,
             token_invalidated_at,
             head_pull_error,
+            token_invalidation_reach,
         };
 
         ApiResponse::success(output, trace_id)

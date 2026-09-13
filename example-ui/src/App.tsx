@@ -574,6 +574,22 @@ export default function App() {
         // that is a real problem for the demo, so don't report it as success.
         stale > 0 ? "error" : "success",
       );
+      // The cutoff is enforced per member, on each member's own copy of the
+      // policy; a member it did not reach still accepts writes under the
+      // voided tokens until its next sync. Say so — "revoked" alone would
+      // overstate what just happened.
+      const reach = r?.token_invalidation_reach;
+      if (reach?.relayed) {
+        pushToast(
+          "The revoke was relayed to a member node; which members enforce the cutoff yet is not known from here. Writes under the old token may land on members that have not synced.",
+          "error",
+        );
+      } else if (reach && reach.unreached_members.length > 0) {
+        pushToast(
+          `Cutoff did not reach ${reach.unreached_members.length} member node(s). Until they sync (~30 s), a write under the revoked token can still land there.`,
+          "error",
+        );
+      }
       if (stale > 0) {
         pushToast(
           `${stale} other recipient(s) got no reissued envelope and can no longer decrypt`,

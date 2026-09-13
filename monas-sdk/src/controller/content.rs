@@ -10,6 +10,7 @@ use crate::models::content::{
     CreateContentInput, CreateContentOutput, DeleteContentInput, DeleteContentOutput,
     GetContentInput, GetContentOutput, UpdateContentInput, UpdateContentOutput,
 };
+use crate::models::share::{TokenInvalidationReach, UnreachedMember};
 use crate::models::state_node::{
     StateNodeCreateContentRequest, StateNodeCreateContentResponse, StateNodeDeleteContentResponse,
     StateNodeErrorResponse, StateNodeInvalidateTokensResponse, StateNodeUpdateContentRequest,
@@ -735,7 +736,7 @@ impl MonasController {
         content_id: &str,
         auth: Option<&StateNodeAuthContext>,
         trace_id: String,
-    ) -> Result<Option<u64>, ApiResponse<T>> {
+    ) -> Result<Option<(u64, Option<TokenInvalidationReach>)>, ApiResponse<T>> {
         let state_node_url = format!(
             "{}/content/{}/access/invalidate",
             self.state_node_url, content_id
@@ -781,8 +782,26 @@ impl MonasController {
             return Ok(None);
         }
 
-        match serde_json::from_str::<StateNodeInvalidateTokensResponse>(&body) {
-            Ok(parsed) => Ok(Some(parsed.new_min_valid_issued_at)),
+        match StateNodeInvalidateTokensResponse::from_json(&body) {
+            // A state node from before the propagation report: nothing is
+            // known about who has the cutoff. `None` reach, not an empty
+            // (= "everyone reached") one.
+            Ok(parsed) if !parsed.reports_reach => Ok(Some((parsed.new_min_valid_issued_at, None))),
+            Ok(parsed) => Ok(Some((
+                parsed.new_min_valid_issued_at,
+                Some(TokenInvalidationReach {
+                    notified_members: parsed.notified_members,
+                    unreached_members: parsed
+                        .unreached_members
+                        .into_iter()
+                        .map(|m| UnreachedMember {
+                            node_id: m.node_id,
+                            error: m.error,
+                        })
+                        .collect(),
+                    relayed: parsed.relayed,
+                }),
+            ))),
             Err(e) => Err(ApiResponse::error(
                 ApiError::Internal(format!(
                     "Invalid State Node token invalidation response JSON: {e}"

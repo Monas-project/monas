@@ -137,6 +137,33 @@ pub struct RevokeShareOutput {
     /// 「head が失われたかもしれない」と扱うこと。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head_pull_error: Option<String>,
+    /// 失効境界(`token_invalidated_at`)がどこまで届いたか。
+    ///
+    /// State Node の認可はメンバーごとのローカル判断なので、境界を受け取って
+    /// いないメンバーは次回 sync まで**失効済み Token の書き込みを受理する**。
+    /// revoke 自体はそれを待たない(書き手に取り消しを妨げさせない)ため、
+    /// 呼び出し側は「全員に届いた」と「N 台にまだ届いていない」を
+    /// ここで区別する。state node 連携なしの場合は `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_invalidation_reach: Option<TokenInvalidationReach>,
+}
+
+/// revoke の失効境界がメンバーへどこまで伝わったか。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TokenInvalidationReach {
+    /// 境界を受け取り、以後それで認可するメンバー。
+    pub notified_members: Vec<String>,
+    /// 届かなかったメンバーと最後のエラー。空 = 既知の全メンバーに届いた
+    /// (`relayed` でない限り)。
+    pub unreached_members: Vec<UnreachedMember>,
+    /// State Node が commit せず relay した。上の2つは不明。
+    pub relayed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UnreachedMember {
+    pub node_id: String,
+    pub error: String,
 }
 
 /// revoke 後に残存受信者向けへ再発行された KeyEnvelope。
@@ -306,6 +333,7 @@ mod tests {
             reissued_envelopes: vec![],
             token_invalidated_at: None,
             head_pull_error: None,
+            token_invalidation_reach: None,
         };
         let json = serde_json::to_string(&output).unwrap();
         assert!(json.contains("\"revoked\":true"));
@@ -326,6 +354,7 @@ mod tests {
             reissued_envelopes: vec![],
             token_invalidated_at: Some(1_700_000_000),
             head_pull_error: None,
+            token_invalidation_reach: None,
         };
         let json = serde_json::to_string(&output).unwrap();
         assert!(json.contains("\"token_invalidated_at\":1700000000"));
@@ -351,6 +380,7 @@ mod tests {
             }],
             token_invalidated_at: None,
             head_pull_error: None,
+            token_invalidation_reach: None,
         };
         let json = serde_json::to_string(&output).unwrap();
         assert!(json.contains("\"reissued_envelopes\""));

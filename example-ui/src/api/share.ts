@@ -83,6 +83,23 @@ export interface RevokeShareOutput {
    *  local copy — revocation must not be blockable by a writer — and this
    *  says why, so the caller knows the head may have been lost. */
   head_pull_error?: string;
+  /** How far the token cutoff got. A state-node member authorizes against
+   *  its own copy of the policy, so a member the cutoff has not reached
+   *  keeps accepting writes under the voided tokens until its next sync.
+   *  The revoke does not wait for that (a writer must not be able to block
+   *  it); this is how the UI tells "revoked everywhere" from "revoked, N
+   *  members still to hear". Absent when no state node was involved. */
+  token_invalidation_reach?: TokenInvalidationReach;
+}
+
+export interface TokenInvalidationReach {
+  /** Members that took the new cutoff during the call. */
+  notified_members: string[];
+  /** Members the push did not reach, with the last error. Empty = every
+   *  known member has it (unless `relayed`). */
+  unreached_members: { node_id: string; error: string }[];
+  /** The contacted node relayed the request; the two lists are unknown. */
+  relayed: boolean;
 }
 
 export function revokeShare(input: {
