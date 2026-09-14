@@ -88,6 +88,10 @@ features = [
     "macros",
     "cbor",
     "quic",
+    # NAT traversal: reachability probing, circuit relay v2, and hole punching.
+    "autonat",
+    "relay",
+    "dcutr",
 ]
 
 # WebRTC transport (alpha - for future browser-to-server communication)

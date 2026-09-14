@@ -10,6 +10,9 @@ BOOTSTRAP_ADDR="${BOOTSTRAP_ADDR:-}"
 BOOTSTRAP_DNS="${BOOTSTRAP_DNS:-}"
 BOOTSTRAP_PEER_ID="${BOOTSTRAP_PEER_ID:-}"
 DISABLE_MDNS="${DISABLE_MDNS:-}"
+DISABLE_NAT_TRAVERSAL="${DISABLE_NAT_TRAVERSAL:-}"
+RELAY_SERVICE="${RELAY_SERVICE:-}"
+EXTERNAL_ADDR="${EXTERNAL_ADDR:-}"
 
 ARGS=(
     --data-dir "$DATA_DIR"
@@ -25,6 +28,27 @@ ARGS=(
 case "$DISABLE_MDNS" in
     1|true|TRUE|yes|YES) ARGS+=(--disable-mdns) ;;
 esac
+
+# Externally reachable addresses to advertise (comma-separated multiaddrs).
+if [ -n "$EXTERNAL_ADDR" ]; then
+    IFS=',' read -ra EXT_ADDRS <<< "$EXTERNAL_ADDR"
+    for a in "${EXT_ADDRS[@]}"; do
+        a="$(echo "$a" | tr -d '[:space:]')"
+        [ -n "$a" ] && ARGS+=(--external-address "$a")
+    done
+fi
+
+# NAT traversal is on by default; this is the switch that turns it off
+# without a code change.
+if [ -n "$DISABLE_NAT_TRAVERSAL" ]; then
+    ARGS+=(--disable-nat-traversal)
+fi
+
+# Acting as a relay for other peers is opt-in: it carries traffic for nodes
+# we know nothing about. Requires EXTERNAL_ADDR.
+if [ -n "$RELAY_SERVICE" ]; then
+    ARGS+=(--relay-service)
+fi
 
 # Bootstrap addresses.
 #

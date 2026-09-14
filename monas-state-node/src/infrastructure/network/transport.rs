@@ -19,6 +19,28 @@ use libp2p::{
 /// - QUIC: Modern, efficient transport with built-in encryption
 /// - WebRTC: Required for browser communication (future)
 pub fn build_transport(keypair: &Keypair) -> anyhow::Result<Boxed<(PeerId, StreamMuxerBox)>> {
+    build_transport_inner(keypair, None)
+}
+
+/// Build the transport with circuit-relay dialling folded in.
+///
+/// The relay client is a *transport*, not just a behaviour: dialling
+/// `/…/p2p-circuit/p2p/<peer>` has to be handled at the transport layer, and
+/// the transport half can only be obtained together with the behaviour half
+/// from `relay::client::new`. So a node that wants to reach peers through a
+/// relay must build its transport with this function and register the matching
+/// behaviour — the two halves are useless apart.
+pub fn build_transport_with_relay(
+    keypair: &Keypair,
+    relay_transport: libp2p::relay::client::Transport,
+) -> anyhow::Result<Boxed<(PeerId, StreamMuxerBox)>> {
+    build_transport_inner(keypair, Some(relay_transport))
+}
+
+fn build_transport_inner(
+    keypair: &Keypair,
+    relay_transport: Option<libp2p::relay::client::Transport>,
+) -> anyhow::Result<Boxed<(PeerId, StreamMuxerBox)>> {
     use rand::rngs::OsRng;
 
     // TCP transport with DNS resolution
@@ -58,8 +80,31 @@ pub fn build_transport(keypair: &Keypair) -> anyhow::Result<Boxed<(PeerId, Strea
             futures::future::Either::Right((peer_id, muxer)) => {
                 (peer_id, StreamMuxerBox::new(muxer))
             }
-        })
-        .boxed();
+        });
+
+    // Relay connections still need to be authenticated and multiplexed: the
+    // circuit only carries bytes, and the relay itself must not be able to
+    // read or tamper with what flows through it. Noise runs end-to-end between
+    // the two clients, so a relay sees ciphertext only.
+    let transport = match relay_transport {
+        Some(relay) => {
+            let relay_upgraded = relay
+                .upgrade(upgrade::Version::V1)
+                .authenticate(noise::Config::new(keypair)?)
+                .multiplex(yamux::Config::default())
+                .timeout(std::time::Duration::from_secs(20));
+            transport
+                .or_transport(relay_upgraded)
+                .map(|either, _| match either {
+                    futures::future::Either::Left((peer_id, muxer)) => (peer_id, muxer),
+                    futures::future::Either::Right((peer_id, muxer)) => {
+                        (peer_id, StreamMuxerBox::new(muxer))
+                    }
+                })
+                .boxed()
+        }
+        None => transport.boxed(),
+    };
 
     Ok(transport)
 }
