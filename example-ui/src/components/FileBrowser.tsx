@@ -16,6 +16,30 @@ import {
   Cloud,
   Inbox,
 } from "./icons";
+import { syncStatusOf, describeSync } from "../store/sync";
+
+// Where this copy stands against the Content Network head. One badge, four
+// states, so a glance at the list says whether "Open" would show the newest
+// version or whether someone (the owner, or a writer we shared with) has
+// moved the file on since. The check itself runs on open and on a timer in
+// App; this only renders what the entry records.
+export function SyncBadge({ entry }: { entry: Entry }) {
+  const s = syncStatusOf(entry);
+  const d = describeSync(s);
+  const cls =
+    s.kind === "current"
+      ? "synced"
+      : s.kind === "behind"
+        ? "behind"
+        : s.kind === "unreachable"
+          ? "invalid"
+          : "";
+  return (
+    <span className={`badge sync ${cls}`} data-sync={s.kind} title={d.title}>
+      {s.kind === "checking" ? <span className="spinner xs" /> : <Network size={11} />} {d.label}
+    </span>
+  );
+}
 
 function FileTypeIcon({ entry }: { entry: Entry }) {
   if (entry.kind === "folder")
@@ -78,15 +102,12 @@ function Row({
           )}
           {isFile &&
             !received &&
-            (entry.syncedToStateNode ? (
-              <span className="badge synced" title="Synced to a Content Network">
-                <Network size={11} /> synced
-              </span>
-            ) : (
+            !entry.syncedToStateNode && (
               <span className="badge local" title="Stored & encrypted, not on the state-node">
                 <Cloud size={11} /> local
               </span>
-            ))}
+            )}
+          {isFile && entry.syncedToStateNode && <SyncBadge entry={entry} />}
           {isFile && entry.shares.length > 0 && (
             <span className="badge shared">
               <Share size={11} /> {entry.shares.length}

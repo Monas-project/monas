@@ -173,25 +173,39 @@ test("J-1: a fresh user can create, read, verify, edit and delete content on the
 });
 
 // ---------------------------------------------------------------------------
-// Journey 2 — sharing lifecycle: share to a local identity (with the HPKE
-// round-trip proof), share to a pasted external key, revoke one recipient and
-// confirm the survivor's envelope is reissued under the new epoch.
+// Journey 2 — sharing lifecycle: share to two pasted external keys, revoke
+// one recipient and confirm the survivor's envelope is reissued under the new
+// epoch. (A device has exactly one account, so every share is to a pasted key
+// — the recipient's private half never exists here, and the HPKE round trip
+// is proven on their device in J-4.)
 // ---------------------------------------------------------------------------
+
+/** A P-256 public key obtained the way an external user would hand one over:
+ *  minted by the gateway, only the PUBLIC half is pasted into the form. */
+async function externalPublicKey(page: Page): Promise<string> {
+  return page.evaluate(async () => {
+    const res = await fetch("/api/keypair", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ key_type: "secp256r1" }),
+    });
+    if (!res.ok) throw new Error(`keypair failed: ${res.status}`);
+    // The gateway wraps every reply in the SDK envelope
+    // ({ success, data, trace_id }); the key lives under `data`.
+    const body = (await res.json()) as { data?: { public_key?: string } };
+    const key = body.data?.public_key;
+    if (!key) throw new Error(`keypair reply had no public_key: ${JSON.stringify(body)}`);
+    return key;
+  });
+}
+
 test("J-2: sharing, external-key sharing, and revoke with envelope reissue", async ({
   page,
 }) => {
   const name = `j2-${nonce}.txt`;
 
-  await test.step("create signing account and a recipient identity", async () => {
+  await test.step("create the signing account", async () => {
     await createSigningAccount(page, "j2-main");
-    await page.locator(".account-chip").click();
-    await page.getByPlaceholder("e.g. me, alice, bob").fill("bob");
-    await page.locator('input[type="checkbox"]').first().uncheck();
-    await page.locator(".btn.primary", { hasText: "Create identity" }).click();
-    await expect(page.locator(".modal")).toContainText("bob");
-    // The signing account must stay active — creating bob must not switch.
-    await page.keyboard.press("Escape");
-    await expect(page.locator(".overlay")).toHaveCount(0);
     await expect(page.locator(".account-chip")).toContainText("j2-main");
   });
 
@@ -199,16 +213,12 @@ test("J-2: sharing, external-key sharing, and revoke with envelope reissue", asy
     await createTextFile(page, name, `journey-2 secret ${nonce}`);
   });
 
-  await test.step("share with bob, proving the HPKE round trip as the recipient", async () => {
+  await test.step("share with bob (pasted key)", async () => {
+    const pubKey = await externalPublicKey(page);
     await rowAction(page, name, "Share");
     const modal = page.locator(".modal");
-    await modal.locator("select.select").selectOption({ label: "bob · secp256r1" });
-    // "Prove access" is off by default, and this journey leaves it off: it
-    // decrypts as the recipient, which replaces the stored CEK for this content
-    // with the recipient's copy. The revoke later in this journey rotates the
-    // CEK, and the owner would then be holding a stale one. The HPKE round trip
-    // itself is covered by the pasted-key step below.
-    await expect(modal.locator('input[type="checkbox"]')).not.toBeChecked();
+    await modal.locator(".field", { hasText: "Recipient public key" }).locator("textarea").fill(pubKey);
+    await modal.locator(".field", { hasText: "Label (optional)" }).locator("input.input").fill("bob");
     await modal.getByRole("button", { name: "Wrap CEK & share" }).click();
     await expectToast(page, "Shared with bob");
     await expectLastRunComplete(page);
@@ -219,26 +229,9 @@ test("J-2: sharing, external-key sharing, and revoke with envelope reissue", asy
     await expect(row(page, name).locator(".badge.shared")).toContainText("1");
   });
 
-  await test.step("share to a pasted public key (external recipient)", async () => {
-    // A P-256 keypair obtained the way an external user would hand one over —
-    // minted by the gateway, only its PUBLIC half is pasted into the form.
-    const pubKey = await page.evaluate(async () => {
-      const res = await fetch("/api/keypair", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ key_type: "secp256r1" }),
-      });
-      if (!res.ok) throw new Error(`keypair failed: ${res.status}`);
-      // The gateway wraps every reply in the SDK envelope
-      // ({ success, data, trace_id }); the key lives under `data`.
-      const body = (await res.json()) as { data?: { public_key?: string } };
-      const key = body.data?.public_key;
-      if (!key) throw new Error(`keypair reply had no public_key: ${JSON.stringify(body)}`);
-      return key;
-    });
-
+  await test.step("share to a second pasted public key (carol)", async () => {
+    const pubKey = await externalPublicKey(page);
     const modal = page.locator(".modal");
-    await modal.locator(".seg button", { hasText: "Paste public key" }).click();
     // Not `textarea.input`: with bob's grant in place the dialog also shows
     // his share package in a textarea.
     await modal.locator(".field", { hasText: "Recipient public key" }).locator("textarea").fill(pubKey);

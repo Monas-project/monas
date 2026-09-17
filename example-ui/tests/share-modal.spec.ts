@@ -40,10 +40,8 @@ test("G-34: 'Wrap CEK & share' is disabled until a recipient is supplied", async
 
   const modal = page.locator(".modal.wide");
 
-  // Only the signing account exists, so there is no *other* identity to pick:
-  // "Pick identity (none)" is disabled and the modal opens in key mode.
-  await modal.getByRole("button", { name: /^Paste public key/ }).click();
-
+  // Sharing is always to a pasted key: a device has one account, so there is
+  // no local identity to pick.
   const textarea = modal.getByPlaceholder(
     "P-256 public key, base64url (from the gateway /keypair)",
   );
@@ -55,18 +53,17 @@ test("G-34: 'Wrap CEK & share' is disabled until a recipient is supplied", async
     - heading /Share/ [level=2]
     - button:
       - img
-    - text: Add recipient
-    - button /Pick identity/ [disabled]
-    - button "Paste public key"
-    - text: Recipient public key (base64url)
-    - textbox
+    - text: Add recipient Ask them for the public key of their account (identity chip → Copy public key on their device) and paste it here. Recipient public key (base64url)
+    - textbox "P-256 public key, base64url (from the gateway /keypair)"
     - text: Paste a recipient public key to enable sharing. Label (optional)
     - textbox
     - text: Permission
     - button "read"
     - button "read + write"
     - button "Close"
-    - button "Wrap CEK & share" [disabled]
+    - button "Wrap CEK & share" [disabled]:
+      - img
+      - text: Wrap CEK & share
   `);
 
   const shareBtn = modal.getByRole("button", { name: "Wrap CEK & share" });

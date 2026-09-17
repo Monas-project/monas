@@ -249,6 +249,30 @@ impl IntoResponse for StateNodeError {
 pub struct InvalidateTokensResponse {
     pub content_id: String,
     pub new_min_valid_issued_at: u64,
+    /// Members that acknowledged the new cutoff during this call. They refuse
+    /// tokens issued at or before `new_min_valid_issued_at` from now on.
+    ///
+    /// The three propagation fields are always serialized, even when empty:
+    /// a client must be able to tell "this node reports propagation and
+    /// reached everyone" from "this node predates the report" (where the
+    /// fields are simply absent).
+    pub notified_members: Vec<String>,
+    /// Members the cutoff could not be pushed to. Each still authorizes
+    /// against its previous policy — and so will accept a write under a
+    /// token this call voided — until its next sync. Empty when every known
+    /// member was reached, or when the request was relayed (the relay
+    /// protocol does not carry propagation facts; see `relayed`).
+    pub unreached_members: Vec<UnreachedMember>,
+    /// True when this node did not commit the cutoff itself but relayed the
+    /// request to a member. `notified_members`/`unreached_members` are then
+    /// unknown, not empty.
+    pub relayed: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UnreachedMember {
+    pub node_id: String,
+    pub error: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -919,9 +943,16 @@ async fn invalidate_tokens_handler(
         .invalidate_tokens(&content_id, &token, request_signature.as_deref(), timestamp)
         .await
     {
-        Ok(new_min_valid_issued_at) => Json(InvalidateTokensResponse {
+        Ok(outcome) => Json(InvalidateTokensResponse {
             content_id,
-            new_min_valid_issued_at,
+            new_min_valid_issued_at: outcome.new_min_valid_issued_at,
+            notified_members: outcome.notified_members,
+            unreached_members: outcome
+                .unreached_members
+                .into_iter()
+                .map(|(node_id, error)| UnreachedMember { node_id, error })
+                .collect(),
+            relayed: outcome.relayed,
         })
         .into_response(),
         Err(e) => e.into_response(),

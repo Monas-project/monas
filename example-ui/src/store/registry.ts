@@ -37,6 +37,13 @@ export function updateEntry(id: string, patch: Partial<Entry>) {
   );
 }
 
+// Bookkeeping that is not a modification of the file (sync-status checks):
+// records the patch without touching `updatedAt`, so the Modified column
+// keeps meaning "when the content last changed".
+export function noteEntry(id: string, patch: Partial<Entry>) {
+  store.set((prev) => prev.map((e) => (e.id === id ? { ...e, ...patch } : e)));
+}
+
 export function removeEntry(id: string) {
   store.set((prev) => prev.filter((e) => e.id !== id));
 }

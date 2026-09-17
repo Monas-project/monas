@@ -872,7 +872,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -1039,7 +1039,7 @@ checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 [[package]]
 name = "crsl-lib"
 version = "0.1.0"
-source = "git+https://github.com/Monas-project/crsl-lib?rev=e13b86ce6d6a9c27ebd01a9b4fe82d6bc18f8a01#e13b86ce6d6a9c27ebd01a9b4fe82d6bc18f8a01"
+source = "git+https://github.com/Monas-project/crsl-lib?rev=0fbabbf#0fbabbf0c054444dc284f7b0f90fc8ae56a52798"
 dependencies = [
  "bincode 2.0.1",
  "cid",

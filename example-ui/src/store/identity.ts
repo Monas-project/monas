@@ -24,9 +24,18 @@ export function getIdentities(): Identity[] {
   return store.get().identities;
 }
 
+// "You" is this device's signing account: monas-account holds exactly one key,
+// and it is the key the SDK signs state-node requests with and the audience of
+// every delegated token issued to this device. Anything else in the list is a
+// legacy keypair-only identity that cannot act on the network.
 export function getActive(): Identity | null {
   const s = store.get();
-  return s.identities.find((i) => i.label === s.activeLabel) || s.identities[0] || null;
+  return (
+    s.identities.find((i) => i.isSigningAccount) ||
+    s.identities.find((i) => i.label === s.activeLabel) ||
+    s.identities[0] ||
+    null
+  );
 }
 
 export function addIdentity(identity: Identity, makeActive = false) {

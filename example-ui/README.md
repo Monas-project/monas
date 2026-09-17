@@ -151,13 +151,13 @@ so the suite cannot go non-deterministic on a model update.
 
 | Action            | Gateway call                          | SDK model                         |
 | ----------------- | ------------------------------------- | --------------------------------- |
-| Create identity   | `POST /keypair`                       | `GenerateKeypair{Input,Output}`   |
+| Create account    | `POST /account-api/accounts`          | (monas-account)                   |
 | New file / Upload  | `POST /content`                       | `CreateContent{Input,Output}`     |
 | Open / preview    | `GET /content/{id}`                   | `GetContent{Input,Output}`        |
 | Edit contents     | `PUT /content/{id}`                   | `UpdateContent{Input,Output}`     |
 | Delete            | `DELETE /content/{id}`                | `DeleteContent{Input,Output}`     |
 | Share             | `POST /share`                         | `ShareContent{Input,Output}`      |
-| Prove access      | `POST /share/decrypt`                 | `DecryptSharedContent{Input,Out}` |
+| Import shared     | `POST /share/decrypt`                 | `DecryptSharedContent{Input,Out}` |
 | Revoke            | `POST /share/revoke`                  | `RevokeShare{Input,Output}`       |
 | Verified read     | `POST /state/read`                    | `ReadContentFromStateNode{In,Out}`|
 | (history/version) | `POST /state/history`, `/state/...`   | `state` models                    |
@@ -197,22 +197,46 @@ Notes on the contract:
 
 ## Accounts & the signing key
 
-Create your account from the UI: open the identity chip (top-right) → **Create
-account**. With *Register as signing account* checked, the UI sends
-`POST /accounts` to **monas-account** (via the `/account-api` proxy), which
-registers a **P-256** key. The SDK uses that key to sign state-node requests for
-**create / edit / delete**.
+A device has **one account**. Open the identity chip (top-right) → **Create
+account**: the UI sends `POST /accounts` to **monas-account** (via the
+`/account-api` proxy), which generates and keeps a **P-256** key. The SDK signs
+every state-node request with that key (create / edit / delete, and a
+recipient's reads and writes under a delegated token), and it is the key
+other people share *to* — a delegated token's audience is the recipient's
+signing key, so a share addressed to any other key could open its envelope but
+never read or write the state node.
 
-This is needed because the gateway's `/keypair` is stateless — it returns a
-fresh keypair (handy for share recipients) but does **not** register a signing
-key. So:
+monas-account holds exactly one key, which is why the dialog does not offer a
+second account or a keypair-only identity: creating another would overwrite
+the key monas-account signs with and silently orphan the first. To start over,
+remove the account and create a new one (content created under the old key can
+then no longer be updated or deleted from this device).
 
-- **Create account** (signing) → `POST /account-api/accounts` → monas-account.
-- **Add identity** (keypair-only, e.g. a share recipient) → `POST /api/keypair`
-  → gateway.
+## Is my copy the newest? (sync status)
 
-Sharing (`/share`, `/share/decrypt`, `/share/revoke`) only uses the keypairs the
-UI holds, so a recipient identity doesn't need to be a signing account.
+Every synced row carries a sync badge, and the preview repeats it as a one-line
+status:
+
+| Badge                | Meaning                                                                 |
+| -------------------- | ----------------------------------------------------------------------- |
+| `up to date`         | the Content Network head is the version this device holds               |
+| `newer on network`   | someone else wrote after this device's last save/import                 |
+| `synced`             | on a Content Network, head not compared yet                             |
+| `can't reach network`| the last check failed (node down, token voided, …); hover for the error |
+
+The comparison is a **verified read** of the head (`POST /state/read` with
+`accept_any_version`): the plaintext is re-derived and re-addressed, and the
+resulting plain id is compared with the one this device holds — the owner's
+local version, or for a recipient the version it last wrote (else the one the
+envelope carried). It runs when a file is opened, on *Check now* / *Read from
+state-node*, and in a background sweep every 30 s. When behind, the owner's
+*Pull & edit* adopts the head into the local copy first (`POST /state/pull`);
+a write-share recipient's *Edit contents* already starts from the head.
+
+*Verify integrity* is related but narrower: it byte-compares the ciphertext
+this gateway stored with the head's. "Not the head" there is the same
+*newer on network* condition, not a corruption; the reason string from the SDK
+is shown under the badge.
 
 ## Sharing with someone on another device
 

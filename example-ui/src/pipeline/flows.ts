@@ -321,7 +321,6 @@ export function shareFlow(input: {
   recipientPublicKeyB64Url: string;
   recipientLabel?: string;
   permissions: Permission[];
-  recipientPrivateKeyB64Url?: string; // when present, run an unwrap+decrypt proof
 }): StepSpec[] {
   const { entry, identity } = input;
   const steps: StepSpec[] = [
@@ -367,28 +366,6 @@ export function shareFlow(input: {
     },
   ];
 
-  if (input.recipientPrivateKeyB64Url) {
-    steps.push({
-      title: "Recipient unwraps & decrypts · gateway call",
-      hint: "HPKE Auth open · AES-256-GCM",
-      kind: "verify",
-      minMs: 180,
-      exec: async (ctx) => {
-        const g = ctx.share as shareApi.ShareContentOutput;
-        const res = await shareApi.decryptSharedContent({
-          contentId: entry.localContentId!,
-          privateKeyB64Url: input.recipientPrivateKeyB64Url!,
-          // Auth-mode unwrap is bound to the sender's key, TOFU-pinned on the
-          // recipient's first envelope for this content.
-          senderPublicKeyB64Url: g.sender_public_key,
-          recipientKeyId: g.recipient_key_id,
-          keyEnvelope: g.key_envelope,
-        });
-        const n = byteLengthOfBase64Url(res.content);
-        return `Round-trip OK · ${fmtBytes(n)} of plaintext recovered as the recipient (sender key pinned)`;
-      },
-    });
-  }
   return steps;
 }
 
@@ -467,7 +444,7 @@ export function revokeFlow(input: {
       kind: "state",
       minMs: 200,
       exec: async () =>
-        "Token cutoff advanced on the state-node first — before rotation, so the revoked recipient cannot write in between",
+        "Token cutoff advanced on the state-node first, before the key rotation. How far it reaches is reported below.",
     },
     {
       title: "Revoke & re-encrypt under new CEK · gateway call",
@@ -488,6 +465,48 @@ export function revokeFlow(input: {
           ? ` · token cutoff ${r.token_invalidated_at}`
           : "";
         return `Access revoked=${r.revoked} · ${reissued} surviving recipient(s) re-wrapped${cutoff}`;
+      },
+    },
+    {
+      // The honest part. Each state-node member authorizes a write against
+      // its own copy of the access policy, and the cutoff is pushed to them
+      // best-effort — the revoke does not wait for a member that is down or
+      // slow (a writer must never be able to block a revocation). So a member
+      // the cutoff did not reach still accepts writes under the voided
+      // tokens until its next periodic sync. Say exactly which case this is
+      // instead of claiming "cannot write" for the cluster as a whole.
+      title: "Cutoff propagation",
+      hint: "members · best-effort push",
+      kind: "state",
+      minMs: 200,
+      // The revoke itself succeeded; this step going red must not fail the
+      // run or skip the envelope reissue that follows.
+      optional: true,
+      exec: async (ctx) => {
+        const r = ctx.revoke as shareApi.RevokeShareOutput;
+        const reach = r.token_invalidation_reach;
+        if (!reach) return "No state node involved — nothing to propagate";
+        if (reach.relayed) {
+          return (
+            "The node we contacted relayed the revoke to a member; which members " +
+            "have the cutoff is not known from here. Until their next sync, members " +
+            "without it may still accept writes under the old tokens."
+          );
+        }
+        const n = reach.notified_members.length;
+        if (reach.unreached_members.length === 0) {
+          return n === 0
+            ? "The committing node knows no other members for this Content Network — nothing to push"
+            : `All ${n} other member(s) acknowledged the cutoff — the revoked recipient cannot write anywhere in this Content Network`;
+        }
+        const who = reach.unreached_members
+          .map((m) => `${short(m.node_id, 8, 4)} (${m.error})`)
+          .join(", ");
+        throw new Error(
+          `${reach.unreached_members.length} member(s) did not get the cutoff: ${who}. ` +
+            `Until they sync (~30 s), a write under the revoked token can still land there. ` +
+            `${n} member(s) acknowledged.`,
+        );
       },
     },
     {

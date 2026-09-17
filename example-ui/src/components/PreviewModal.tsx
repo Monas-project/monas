@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Modal } from "./Modal";
-import { Eye, Network, Refresh, Check, X } from "./icons";
+import { Eye, Network, Refresh, Check, X, Pencil } from "./icons";
 import type { Entry } from "../types";
 import { base64UrlToUtf8, base64UrlToStandard, short } from "../api/crypto";
 import { ApiError } from "../api/http";
@@ -14,6 +14,7 @@ import {
   type ReadFromStateNodeOutput,
   type VerifyIntegrityOutput,
 } from "../api/stateNode";
+import { syncStatusOf, describeSync, heldVersionId } from "../store/sync";
 
 // One async slice (latest / history / verify). Mirrors the small idle→loading→
 // ok|error state machine the rest of the app uses, kept local to this modal.
@@ -31,13 +32,30 @@ function errMsg(e: unknown): string {
     : (e as Error).message;
 }
 
+// The SDK's verify-integrity reasons this UI knows how to explain. Matching on
+// the message is brittle but the response has no code field; the strings are
+// in monas-sdk/src/controller/state.rs.
+function classifyVerify(v: VerifyIntegrityOutput): "valid" | "behind" | "no-local" | "mismatch" {
+  if (v.valid) return "valid";
+  if (v.reason?.includes("differs from local ciphertext")) return "behind";
+  if (v.reason?.includes("failed to load local ciphertext")) return "no-local";
+  return "mismatch";
+}
+
 export function PreviewModal({
   entry,
   contentB64Url,
+  onCheckHead,
+  onEdit,
   onClose,
 }: {
   entry: Entry;
   contentB64Url: string;
+  /** Verified read of the head that also records it on the entry — the
+   *  list's sync badge and the status line here read from that record. */
+  onCheckHead: (entry: Entry) => Promise<ReadFromStateNodeOutput | null>;
+  /** "Edit contents"; for the owner this pulls the head first. */
+  onEdit: (entry: Entry) => void;
   onClose: () => void;
 }) {
   const isImage = (entry.mimeType || "").startsWith("image/");
@@ -64,6 +82,7 @@ export function PreviewModal({
   const auth = token ? { delegatedToken: token.delegated_token } : undefined;
   const synced = entry.syncedToStateNode && (!received || !!token);
   const cid = entry.remoteContentId || entry.localContentId;
+  const canWrite = !received || !!entry.receivedShare?.permissions.includes("write");
 
   const [latest, setLatest] = useState<AsyncState<GetLatestVersionOutput>>({ status: "idle" });
   const [history, setHistory] = useState<AsyncState<GetHistoryOutput>>({ status: "idle" });
@@ -122,29 +141,36 @@ export function PreviewModal({
   // store), this pulls the version off the state node — relayed to a member if
   // the contacted node isn't one — and only yields plaintext once the CID has
   // been recomputed and the AES-GCM decryption re-addresses to the local id.
-  // Only the newest version can be verified here. The check re-derives the
-  // plaintext and compares it against `local_content_id`, and each version has
-  // its own — the registry keeps just the current one, so asking for an older
-  // version would always fail the comparison it is meant to prove. Offering
-  // that choice made the control look broken rather than honest.
   //
   // Neither side can assume the newest version is its own: the owner may
   // have edited since sharing, and a write-share recipient may have written
   // since. So the read only uses the local id to pick the CEK, and reports
   // the id the plaintext actually addresses to; the rows below say whose
-  // version that is.
+  // version that is. For a synced file it goes through the entry-recording
+  // check, so the sync badge in the list and the status line here agree with
+  // what was just read.
   const runRead = () => {
     if (!cid || !entry.localContentId) return;
     setRead({ status: "loading" });
-    readFromStateNode({
-      contentId: cid,
-      localContentId: entry.localContentId,
-      acceptAnyVersion: true,
-      auth,
-    })
-      .then((d) => setRead({ status: "ok", data: d }))
-      .catch((e) => setRead({ status: "error", message: errMsg(e) }));
+    const p = synced
+      ? onCheckHead(entry).then((d) => {
+          if (!d) throw new Error(entry.networkCheckError || "could not read the Content Network head");
+          return d;
+        })
+      : readFromStateNode({ contentId: cid, localContentId: entry.localContentId, acceptAnyVersion: true, auth });
+    p.then((d) => setRead({ status: "ok", data: d })).catch((e) =>
+      setRead({ status: "error", message: errMsg(e) }),
+    );
   };
+
+  // The one-line answer to "am I looking at the newest version?". Derived
+  // from what the entry recorded at the last head check (open, sweep, or the
+  // verified read below), so it stays right even while this dialog is idle.
+  const sync = syncStatusOf(entry);
+  const syncText = describeSync(sync);
+  const held = heldVersionId(entry);
+  const syncBadgeClass =
+    sync.kind === "current" ? "synced" : sync.kind === "behind" ? "behind" : sync.kind === "unreachable" ? "invalid" : "";
 
   return (
     <Modal title={entry.name} icon={<Eye />} onClose={onClose} wide>
@@ -178,6 +204,55 @@ export function PreviewModal({
         />
       ) : (
         <div className="preview-box">{text || "(empty)"}</div>
+      )}
+
+      {/* ---- is this the newest version? ---- */}
+      {synced && cid && (
+        <div
+          className={`callout sync-status ${sync.kind === "behind" ? "warn" : ""}`}
+          data-sync={sync.kind}
+          style={{ marginTop: 12, display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}
+        >
+          <span className={`badge sync ${syncBadgeClass}`}>
+            {sync.kind === "checking" ? <span className="spinner xs" /> : <Network size={11} />} {syncText.label}
+          </span>
+          <span style={{ flex: 1, minWidth: 200 }}>
+            {sync.kind === "current" && (
+              <>
+                The text above <b>is</b> the newest version on the Content Network (checked{" "}
+                {new Date(sync.head.checkedAt).toLocaleTimeString()}).
+              </>
+            )}
+            {sync.kind === "behind" && (
+              <>
+                The Content Network has a <b>newer version</b> than the text above
+                {received
+                  ? " — the owner has edited since sharing"
+                  : " — a recipient with write access has edited since your last save"}
+                . <i>Read from state-node</i> shows it
+                {canWrite ? (received ? "; Edit contents starts from it." : "; Pull & edit adopts it into your copy.") : "."}
+              </>
+            )}
+            {sync.kind === "unchecked" && <>Not compared with the Content Network yet.</>}
+            {sync.kind === "checking" && <>Reading the Content Network head…</>}
+            {sync.kind === "unreachable" && (
+              <>
+                Could not read the Content Network head: <span className="mono">{sync.error}</span>
+                {sync.head ? ` (last seen ${new Date(sync.head.checkedAt).toLocaleTimeString()})` : ""}.
+              </>
+            )}
+          </span>
+          {sync.kind !== "checking" && (
+            <button className="btn ghost sm" onClick={runRead} title="Verified read of the head">
+              <Refresh size={13} /> Check now
+            </button>
+          )}
+          {sync.kind === "behind" && canWrite && (
+            <button className="btn sm" onClick={() => onEdit(entry)}>
+              <Pencil size={13} /> {received ? "Edit contents" : "Pull & edit"}
+            </button>
+          )}
+        </div>
       )}
 
       <div style={{ marginTop: 14 }}>
@@ -294,6 +369,12 @@ export function PreviewModal({
           {!received && (
           <div className="field" style={{ marginTop: 10 }}>
             <label>integrity</label>
+            <div className="muted" style={{ fontSize: 11.5, marginBottom: 8 }}>
+              Byte-compares the ciphertext this device stored with the newest version
+              the state node holds. Equal means your copy is the head; different
+              usually means someone else wrote a newer version, not that anything
+              was tampered with.
+            </div>
             <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
               <button
                 className="btn sm"
@@ -304,29 +385,66 @@ export function PreviewModal({
                 Verify integrity
               </button>
               {verify.status === "ok" &&
-                (verify.data.valid ? (
-                  <span className="badge synced">
-                    <Check size={11} /> valid
-                  </span>
-                ) : (
-                  <span className="badge invalid">
-                    <X size={11} /> invalid
-                  </span>
-                ))}
+                (() => {
+                  switch (classifyVerify(verify.data)) {
+                    case "valid":
+                      return (
+                        <span className="badge synced">
+                          <Check size={11} /> valid — your copy is the head
+                        </span>
+                      );
+                    case "behind":
+                      return (
+                        <span className="badge behind">
+                          <Network size={11} /> not the head — newer version on the network
+                        </span>
+                      );
+                    case "no-local":
+                      return (
+                        <span className="badge invalid">
+                          <X size={11} /> no local ciphertext
+                        </span>
+                      );
+                    default:
+                      return (
+                        <span className="badge invalid">
+                          <X size={11} /> invalid — does not match
+                        </span>
+                      );
+                  }
+                })()}
             </div>
-            {verify.status === "ok" && (
-              <>
-                <div className="kv" style={{ marginTop: 8 }}>
-                  <span>computed_hash</span>
-                  <b className="mono">{short(verify.data.computed_hash)}</b>
-                </div>
-                {verify.data.reason && (
-                  <div className="kv">
-                    <span>reason</span>
-                    <b>{verify.data.reason}</b>
-                  </div>
+            {verify.status === "ok" && !verify.data.valid && (
+              <div
+                className={`callout ${classifyVerify(verify.data) === "behind" ? "warn" : ""}`}
+                style={{ marginTop: 8 }}
+              >
+                {classifyVerify(verify.data) === "behind" ? (
+                  <>
+                    Not a corruption: the state node's newest version is not the one this
+                    device holds — a recipient with write access wrote after your last save.
+                    <i> Read from state-node</i> shows it; <i>Pull &amp; edit</i> adopts it into
+                    your copy.
+                  </>
+                ) : classifyVerify(verify.data) === "no-local" ? (
+                  <>
+                    This device's gateway no longer holds ciphertext for this file (its store
+                    was reset or points elsewhere), so there is nothing to compare the network
+                    against. The row in the list is stale — delete it and start over.
+                  </>
+                ) : (
+                  <>The state node's copy does not match what this device holds.</>
                 )}
-              </>
+                <div className="mono" style={{ fontSize: 10.5, marginTop: 6, opacity: 0.8 }}>
+                  {verify.data.reason}
+                </div>
+              </div>
+            )}
+            {verify.status === "ok" && (
+              <div className="kv" style={{ marginTop: 8 }}>
+                <span>computed_hash</span>
+                <b className="mono">{short(verify.data.computed_hash)}</b>
+              </div>
             )}
             {verify.status === "error" && (
               <div className="inline-err" style={{ marginTop: 6 }}>
@@ -366,35 +484,42 @@ export function PreviewModal({
                   <span>version read</span>
                   <b className="mono">{short(read.data.version)}</b>
                 </div>
-                {read.data.local_content_id !== entry.localContentId &&
-                  (received ? (
-                    read.data.local_content_id === entry.receivedShare?.writtenVersionId ? (
-                      <div className="kv">
-                        <span>your edit</span>
-                        <b className="mono">
-                          plaintext addresses {short(read.data.local_content_id)} — the version
-                          this device wrote with the delegated token
-                        </b>
-                      </div>
-                    ) : (
-                      <div className="kv">
-                        <span>newer than shared</span>
-                        <b className="mono">
-                          plaintext now addresses {short(read.data.local_content_id)} — the owner
-                          has edited since sharing
-                        </b>
-                      </div>
-                    )
-                  ) : (
+                {read.data.local_content_id === held ? (
+                  received && entry.receivedShare?.writtenVersionId === held ? (
                     <div className="kv">
-                      <span>newer than your copy</span>
+                      <span>your edit</span>
                       <b className="mono">
-                        plaintext now addresses {short(read.data.local_content_id)} — a recipient
-                        with write access has edited since your last save. “Edit contents” pulls
-                        it into your copy first.
+                        plaintext addresses {short(read.data.local_content_id)} — the version
+                        this device wrote with the delegated token
                       </b>
                     </div>
-                  ))}
+                  ) : (
+                    <div className="kv">
+                      <span>up to date</span>
+                      <b className="mono">
+                        plaintext addresses {short(read.data.local_content_id)} — the same
+                        version this device holds
+                      </b>
+                    </div>
+                  )
+                ) : received ? (
+                  <div className="kv">
+                    <span>newer than shared</span>
+                    <b className="mono">
+                      plaintext now addresses {short(read.data.local_content_id)} — the owner
+                      has edited since sharing
+                    </b>
+                  </div>
+                ) : (
+                  <div className="kv">
+                    <span>newer than your copy</span>
+                    <b className="mono">
+                      plaintext now addresses {short(read.data.local_content_id)} — a recipient
+                      with write access has edited since your last save. “Edit contents” pulls
+                      it into your copy first.
+                    </b>
+                  </div>
+                )}
                 <div className="preview-box" style={{ marginTop: 8 }}>
                   {(() => {
                     if ((entry.mimeType || "").startsWith("image/"))

@@ -23,6 +23,7 @@ import {
   folderPath,
 } from "./store/registry";
 import { useIdentities, getActive } from "./store/identity";
+import { checkNetworkHead, checkAllNetworkHeads } from "./store/sync";
 import { probeGateway } from "./api/http";
 import {
   uuid,
@@ -73,7 +74,7 @@ function mimeFromName(name: string): string {
 
 export default function App() {
   const entries = useEntries();
-  const { identities, activeLabel } = useIdentities();
+  const { identities } = useIdentities();
   const active = getActive();
 
   const [path, setPath] = useState("/");
@@ -95,6 +96,27 @@ export default function App() {
     const t = setInterval(poll, 6000);
     return () => clearInterval(t);
   }, [poll]);
+
+  // Sync-status sweep: a verified read of every synced file's head, shortly
+  // after load and then every 30 s while the gateway is up. Sequential and
+  // slow on purpose — the state node rate-limits — but it is what lets the
+  // list say "newer on network" without anyone pressing a button. The first
+  // run is deferred a few seconds so it never races the initial render (and
+  // the tests' localStorage seeding, which reloads right after writing).
+  useEffect(() => {
+    if (!gatewayUp) return;
+    let stopped = false;
+    const sweep = async () => {
+      if (!stopped) await checkAllNetworkHeads();
+    };
+    const first = setTimeout(sweep, 5_000);
+    const t = setInterval(sweep, 30_000);
+    return () => {
+      stopped = true;
+      clearTimeout(first);
+      clearInterval(t);
+    };
+  }, [gatewayUp]);
 
   // ---- pipeline plumbing ----------------------------------------------
   const upsertRun = useCallback((run: RunView) => {
@@ -143,6 +165,14 @@ export default function App() {
 
   const liveEntry = (id: string) => allEntries().find((e) => e.id === id);
 
+  // Right after this device wrote a version, it *is* the head — record that
+  // so the row reads "up to date" without a round trip. The Node CID is not
+  // known here (writes return plain ids); the next check fills it in.
+  const ownHead = (localId: string) => ({
+    networkHead: { localId, checkedAt: Date.now() },
+    networkCheckError: undefined,
+  });
+
   // ---- actions --------------------------------------------------------
   const createFromBytes = async (
     name: string,
@@ -168,6 +198,7 @@ export default function App() {
         syncedToStateNode: !!created.remote_content_id,
         versionCount: 1,
         shares: [],
+        ...(created.remote_content_id ? ownHead(created.content_id) : {}),
       });
       // Drop back to folder browsing so the new file is visible at `path`
       // (it wouldn't match an active filter view yet).
@@ -248,9 +279,12 @@ export default function App() {
           updateEntry(entry.id, {
             localContentId: pulled.local_content_id,
             versionCount: entry.versionCount + 1,
+            ...ownHead(pulled.local_content_id),
           });
           entry = { ...entry, localContentId: pulled.local_content_id };
           pushToast("Pulled a newer version written by a recipient into your copy", "info");
+        } else {
+          updateEntry(entry.id, ownHead(pulled.local_content_id));
         }
         text = pulled.content;
       } else {
@@ -281,6 +315,7 @@ export default function App() {
         sizeBytes,
         versionCount: entry.versionCount + 1,
         receivedShare: { ...entry.receivedShare!, writtenVersionId: upd.version_id },
+        ...ownHead(upd.version_id),
       });
       pushToast(`“${entry.name}” updated on the owner's Content Network`, "success");
     } else {
@@ -308,6 +343,7 @@ export default function App() {
         sizeBytes,
         versionCount: entry.versionCount + 1,
         ...(renamed ? { name: renamed } : {}),
+        ...(entry.syncedToStateNode ? ownHead(upd.version_id) : {}),
       });
       pushToast(`“${renamed || entry.name}” updated`, "success");
     } else {
@@ -360,6 +396,7 @@ export default function App() {
     if (ok && ctx.get) {
       const g = ctx.get as { content: string };
       setModal({ type: "preview", entry, contentB64Url: g.content });
+      void checkNetworkHead(entry);
     } else {
       pushToast("Could not open file", "error");
     }
@@ -435,6 +472,9 @@ export default function App() {
     setPath("/");
     pushToast(`“${pkg.name}” unwrapped and added to your Drive`, "success");
     setModal({ type: "preview", entry, contentB64Url: res.content });
+    // The envelope carries the version the owner shared; whether that is
+    // still the head only the network knows.
+    void checkNetworkHead(entry);
   };
 
   const handleShare = async (entry: Entry, input: ShareInput) => {
@@ -450,7 +490,6 @@ export default function App() {
       recipientPublicKeyB64Url: input.recipientPublicKeyB64Url,
       recipientLabel: input.recipientLabel,
       permissions: input.permissions,
-      recipientPrivateKeyB64Url: input.recipientPrivateKeyB64Url,
     });
     const { ok, ctx } = await run("Share", entry.name, specs);
     if (ok && ctx.share) {
@@ -513,6 +552,9 @@ export default function App() {
       updateEntry(entry.id, {
         shares,
         ...(moved ? { localContentId: r.content_id, versionCount: entry.versionCount + 1 } : {}),
+        // The SDK just re-encrypted under the new CEK and wrote that as the
+        // head, so whatever id the local record now has is the network head.
+        ...(r && entry.syncedToStateNode ? ownHead(r.content_id) : {}),
       });
 
       if (r?.head_pull_error) {
@@ -532,6 +574,22 @@ export default function App() {
         // that is a real problem for the demo, so don't report it as success.
         stale > 0 ? "error" : "success",
       );
+      // The cutoff is enforced per member, on each member's own copy of the
+      // policy; a member it did not reach still accepts writes under the
+      // voided tokens until its next sync. Say so — "revoked" alone would
+      // overstate what just happened.
+      const reach = r?.token_invalidation_reach;
+      if (reach?.relayed) {
+        pushToast(
+          "The revoke was relayed to a member node; which members enforce the cutoff yet is not known from here. Writes under the old token may land on members that have not synced.",
+          "error",
+        );
+      } else if (reach && reach.unreached_members.length > 0) {
+        pushToast(
+          `Cutoff did not reach ${reach.unreached_members.length} member node(s). Until they sync (~30 s), a write under the revoked token can still land there.`,
+          "error",
+        );
+      }
       if (stale > 0) {
         pushToast(
           `${stale} other recipient(s) got no reissued envelope and can no longer decrypt`,
@@ -730,8 +788,6 @@ export default function App() {
       {modal.type === "share" && shareEntry && (
         <ShareModal
           entry={shareEntry}
-          identities={identities}
-          activeLabel={activeLabel}
           busy={busy}
           onShare={handleShare}
           onRevoke={handleRevoke}
@@ -748,8 +804,10 @@ export default function App() {
       )}
       {modal.type === "preview" && (
         <PreviewModal
-          entry={modal.entry}
+          entry={liveEntry(modal.entry.id) ?? modal.entry}
           contentB64Url={modal.contentB64Url}
+          onCheckHead={checkNetworkHead}
+          onEdit={(e) => handleEditOpen(e)}
           onClose={() => setModal({ type: "none" })}
         />
       )}

@@ -3,46 +3,34 @@ import { Modal } from "./Modal";
 import { Share, Lock, Copy } from "./icons";
 import { pushToast } from "./Toast";
 import { buildSharePackage, copyText, serializeSharePackage } from "../sharePackage";
-import type { Entry, Identity, Permission, ShareGrant } from "../types";
+import type { Entry, Permission, ShareGrant } from "../types";
 
 export interface ShareInput {
   recipientPublicKeyB64Url: string;
   recipientLabel?: string;
   permissions: Permission[];
-  recipientPrivateKeyB64Url?: string;
 }
 
+// Sharing is always to a pasted public key. A device has exactly one account
+// (see IdentityModal), so there is no second local identity to pick, and the
+// recipient's private key is never on this device — the HPKE round trip is
+// proven on *their* device when they import the package.
 export function ShareModal({
   entry,
-  identities,
-  activeLabel,
   busy,
   onShare,
   onRevoke,
   onClose,
 }: {
   entry: Entry;
-  identities: Identity[];
-  activeLabel: string | null;
   busy: boolean;
   onShare: (entry: Entry, input: ShareInput) => void;
   onRevoke: (entry: Entry, recipientPublicKeyB64Url: string) => void;
   onClose: () => void;
 }) {
-  const others = identities.filter((i) => i.label !== activeLabel);
-  const [mode, setMode] = useState<"identity" | "key">(
-    others.length > 0 ? "identity" : "key",
-  );
-  const [pickLabel, setPickLabel] = useState(others[0]?.label || "");
   const [pubKey, setPubKey] = useState("");
   const [label, setLabel] = useState("");
   const [canWrite, setCanWrite] = useState(false);
-  // Off by default: proving access decrypts as the recipient, and the SDK
-  // stores the CEK it recovers under this content id — the same slot the owner
-  // reads from. After a revoke rotates the CEK, the owner is then left holding
-  // the recipient's stale copy and can no longer read their own file. Useful to
-  // demonstrate the HPKE round trip, but it is not free.
-  const [verify, setVerify] = useState(false);
 
   const permissions: Permission[] = canWrite ? ["read", "write"] : ["read"];
 
@@ -74,32 +62,17 @@ export function ShareModal({
     }
   };
 
-  // Whether submitting can actually do anything. Both branches of submit()
-  // bail out early when their input is missing, so without this the button
-  // stayed enabled and clicking it was a silent no-op.
-  const recipientReady =
-    mode === "identity"
-      ? others.some((i) => i.label === pickLabel)
-      : pubKey.trim().length > 0;
+  // Whether submitting can actually do anything; without this the button
+  // stayed enabled and clicking it with an empty key was a silent no-op.
+  const recipientReady = pubKey.trim().length > 0;
 
   const submit = () => {
-    if (mode === "identity") {
-      const who = others.find((i) => i.label === pickLabel);
-      if (!who) return;
-      onShare(entry, {
-        recipientPublicKeyB64Url: who.publicKeyB64Url,
-        recipientLabel: who.label,
-        permissions,
-        recipientPrivateKeyB64Url: verify ? who.privateKeyB64Url : undefined,
-      });
-    } else {
-      if (!pubKey.trim()) return;
-      onShare(entry, {
-        recipientPublicKeyB64Url: pubKey.trim(),
-        recipientLabel: label.trim() || undefined,
-        permissions,
-      });
-    }
+    if (!pubKey.trim()) return;
+    onShare(entry, {
+      recipientPublicKeyB64Url: pubKey.trim(),
+      recipientLabel: label.trim() || undefined,
+      permissions,
+    });
   };
 
   return (
@@ -116,7 +89,7 @@ export function ShareModal({
           <button
             className="btn primary"
             disabled={busy || !recipientReady}
-            title={recipientReady ? undefined : "Choose a recipient identity or paste a public key"}
+            title={recipientReady ? undefined : "Paste the recipient's public key"}
             onClick={submit}
           >
             {busy ? <span className="spinner" /> : <Lock size={14} />} Wrap CEK & share
@@ -198,77 +171,29 @@ export function ShareModal({
       <div style={{ fontWeight: 650, fontSize: 13, marginBottom: 8 }}>
         Add recipient
       </div>
-
-      <div className="seg" style={{ marginBottom: 14 }}>
-        <button
-          className={mode === "identity" ? "on" : ""}
-          onClick={() => setMode("identity")}
-          disabled={others.length === 0}
-        >
-          Pick identity {others.length === 0 ? "(none)" : ""}
-        </button>
-        <button className={mode === "key" ? "on" : ""} onClick={() => setMode("key")}>
-          Paste public key
-        </button>
+      <div className="hint" style={{ marginBottom: 10 }}>
+        Ask them for the public key of their account (identity chip → <b>Copy public
+        key</b> on their device) and paste it here.
       </div>
 
-      {mode === "identity" ? (
-        <div className="field">
-          <label>Recipient identity</label>
-          <select
-            className="select"
-            value={pickLabel}
-            onChange={(e) => setPickLabel(e.target.value)}
-          >
-            {others.map((i) => (
-              <option key={i.label} value={i.label}>
-                {i.label} · {i.keyType}
-              </option>
-            ))}
-          </select>
-          <label
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: 8,
-              marginTop: 10,
-              fontWeight: 500,
-              textTransform: "none",
-              color: "var(--text)",
-            }}
-          >
-            <input type="checkbox" checked={verify} onChange={(e) => setVerify(e.target.checked)} />
-            Prove access: unwrap CEK & decrypt as the recipient
-          </label>
+      <div className="field">
+        <label>Recipient public key (base64url)</label>
+        <textarea
+          className="input"
+          value={pubKey}
+          onChange={(e) => setPubKey(e.target.value)}
+          placeholder="P-256 public key, base64url (from the gateway /keypair)"
+        />
+        {!pubKey.trim() && (
           <div className="hint">
-            Decrypts as the recipient to show the HPKE round trip really works.
-            It also replaces the locally stored CEK for this content with the
-            recipient's copy, so a later revoke — which rotates the CEK — leaves
-            you unable to read your own file until you share it again.
+            Paste a recipient public key to enable sharing.
           </div>
-        </div>
-      ) : (
-        <>
-          <div className="field">
-            <label>Recipient public key (base64url)</label>
-            <textarea
-              className="input"
-              value={pubKey}
-              onChange={(e) => setPubKey(e.target.value)}
-              placeholder="P-256 public key, base64url (from the gateway /keypair)"
-            />
-            {!pubKey.trim() && (
-              <div className="hint">
-                Paste a recipient public key to enable sharing.
-              </div>
-            )}
-          </div>
-          <div className="field">
-            <label>Label (optional)</label>
-            <input className="input" value={label} onChange={(e) => setLabel(e.target.value)} />
-          </div>
-        </>
-      )}
+        )}
+      </div>
+      <div className="field">
+        <label>Label (optional)</label>
+        <input className="input" value={label} onChange={(e) => setLabel(e.target.value)} />
+      </div>
 
       <div className="field">
         <label>Permission</label>
