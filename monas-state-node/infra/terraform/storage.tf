@@ -8,7 +8,8 @@ resource "aws_efs_access_point" "node" {
   }
 
   root_directory {
-    path = "/${var.node_name}-v3"
+    # v4 starts fresh for the required body_updated_at payload field.
+    path = "/${var.node_name}-v4"
 
     creation_info {
       owner_uid   = 1000
