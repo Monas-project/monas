@@ -135,6 +135,100 @@ impl PeerStore {
         true
     }
 
+    /// Replace everything we know about a peer with the addresses it just
+    /// announced. Returns true if this changed anything.
+    ///
+    /// `record` only learns the address *we* dialled, so a peer that connected
+    /// to us — which is how every member reaches the bootstrap node, and how
+    /// any node reaches a peer that has just moved — never updated its entry.
+    /// After an ECS restart gives a peer a new IP, the store kept the old one
+    /// and `maintain_connectivity` re-dialled it forever. Identify carries the
+    /// peer's own listen addresses, which is the freshest information there
+    /// is; it wins over anything remembered.
+    pub fn replace(&mut self, peer: PeerId, addrs: impl IntoIterator<Item = Multiaddr>) -> bool {
+        let mut fresh: Vec<Multiaddr> = Vec::new();
+        for a in addrs {
+            if is_shareable(&a) && !fresh.contains(&a) {
+                fresh.push(a);
+            }
+        }
+        // A peer that announces nothing usable tells us nothing; keep what we had.
+        if fresh.is_empty() {
+            return false;
+        }
+        // Names first: a `/dns4/` address survives the peer moving, an IP does
+        // not, so when the cap bites it is the IPs that go. Identify hands the
+        // addresses over in hash order, so sort the rest too — otherwise the
+        // same announcement looks different every time and rewrites the file.
+        fresh.sort_by_cached_key(|a| (!is_name(a), a.to_string()));
+        fresh.truncate(MAX_ADDRS_PER_PEER);
+
+        if self.peers.get(&peer) == Some(&fresh) {
+            return false;
+        }
+        if !self.peers.contains_key(&peer) {
+            self.order.push(peer);
+        }
+        self.peers.insert(peer, fresh);
+        if self.order.len() > MAX_PEERS {
+            let oldest = self.order.remove(0);
+            self.peers.remove(&oldest);
+        }
+        true
+    }
+
+    /// Drop addresses that just failed to dial. Returns true if this changed
+    /// anything.
+    ///
+    /// The store is a cache of hints, and a hint that demonstrably does not
+    /// work is worse than none: as long as a dead address stays, every dial to
+    /// that peer spends the full transport timeout on it, and on a Fargate
+    /// deployment a peer's old IP is dead for good. Two peers that both moved
+    /// while apart each held only the other's old IP, so neither ever
+    /// connected, Identify never fired, and `replace` never got the chance to
+    /// fix it. Forgetting the dead address lets the next dial fall through to
+    /// whatever Kademlia has learned from a third party instead.
+    ///
+    /// A peer left with no addresses is removed; it comes back the moment it
+    /// dials us or a lookup finds it. The swarm reports failed addresses with
+    /// the `/p2p/<peer>` suffix it appended for the dial, which the stored
+    /// form does not carry, so that suffix is ignored when matching.
+    ///
+    /// Names are kept. A `/dns4/` address that did not answer is a peer that
+    /// is down *right now*, not an address that has gone stale: the name is
+    /// re-pointed when the peer comes back, and it is the one hint that
+    /// survives a restart, so it must survive the restart window too. Use
+    /// [`forget_wrong_peer`](Self::forget_wrong_peer) when the address
+    /// answered as somebody else — then the name itself is wrong.
+    pub fn forget_unreachable(
+        &mut self,
+        peer: PeerId,
+        failed: impl IntoIterator<Item = Multiaddr>,
+    ) -> bool {
+        self.forget(peer, failed.into_iter().filter(|a| !is_name(a)))
+    }
+
+    /// Drop an address that connected but was answered by a different peer:
+    /// whatever form it has, it now belongs to someone else.
+    pub fn forget_wrong_peer(&mut self, peer: PeerId, addr: Multiaddr) -> bool {
+        self.forget(peer, [addr])
+    }
+
+    fn forget(&mut self, peer: PeerId, failed: impl IntoIterator<Item = Multiaddr>) -> bool {
+        let Some(entry) = self.peers.get_mut(&peer) else {
+            return false;
+        };
+        let failed: Vec<Multiaddr> = failed.into_iter().map(strip_p2p).collect();
+        let before = entry.len();
+        entry.retain(|a| !failed.contains(a));
+        let changed = entry.len() != before;
+        if entry.is_empty() {
+            self.peers.remove(&peer);
+            self.order.retain(|p| p != &peer);
+        }
+        changed
+    }
+
     pub fn addrs(&self, peer: &PeerId) -> Option<&Vec<Multiaddr>> {
         self.peers.get(peer)
     }
@@ -159,6 +253,27 @@ impl PeerStore {
 /// (`/p2p-circuit`) addresses — a circuit is only valid while that particular
 /// relay connection lives, so persisting one just means re-dialling a dead
 /// path every maintenance tick.
+/// Whether the address names the host rather than numbering it.
+fn is_name(addr: &Multiaddr) -> bool {
+    use libp2p::multiaddr::Protocol;
+    addr.iter().any(|p| {
+        matches!(
+            p,
+            Protocol::Dns(_) | Protocol::Dns4(_) | Protocol::Dns6(_) | Protocol::Dnsaddr(_)
+        )
+    })
+}
+
+/// The address without a trailing `/p2p/<peer>`; that is how the swarm
+/// reports the addresses of a failed dial.
+fn strip_p2p(mut addr: Multiaddr) -> Multiaddr {
+    use libp2p::multiaddr::Protocol;
+    if matches!(addr.iter().last(), Some(Protocol::P2p(_))) {
+        addr.pop();
+    }
+    addr
+}
+
 fn is_shareable(addr: &Multiaddr) -> bool {
     use libp2p::multiaddr::Protocol;
     !addr.iter().any(|p| match p {
@@ -186,6 +301,185 @@ mod tests {
 
     fn addr(s: &str) -> Multiaddr {
         Multiaddr::from_str(s).unwrap()
+    }
+
+    /// The production failure: a peer restarts on a new IP, connects to us,
+    /// and Identify announces the new address. The stale one must be gone —
+    /// with it still first in the list, every maintenance tick re-dialled a
+    /// dead address.
+    #[test]
+    fn identify_replaces_a_stale_address_with_the_announced_one() {
+        let mut store = PeerStore::default();
+        let p = peer(1);
+        assert!(store.record(p, addr("/ip4/10.0.1.196/tcp/9001")));
+
+        // Identify announces the peer's own listen addresses: the new private
+        // IP plus the loopback and link-local ones every node also binds.
+        assert!(store.replace(
+            p,
+            [
+                addr("/ip4/127.0.0.1/tcp/9001"),
+                addr("/ip4/169.254.172.2/tcp/9001"),
+                addr("/ip4/10.0.1.111/tcp/9001"),
+            ]
+        ));
+        assert_eq!(
+            store.addrs(&p).unwrap(),
+            &[addr("/ip4/10.0.1.111/tcp/9001")]
+        );
+    }
+
+    #[test]
+    fn replace_with_the_same_addresses_is_a_no_op() {
+        let mut store = PeerStore::default();
+        let p = peer(1);
+        assert!(store.replace(p, [addr("/ip4/10.0.1.111/tcp/9001")]));
+        assert!(!store.replace(p, [addr("/ip4/10.0.1.111/tcp/9001")]));
+        assert_eq!(store.len(), 1);
+    }
+
+    /// A peer that announces only loopback or link-local addresses has told
+    /// us nothing we can use from a fresh process; what we had stays.
+    #[test]
+    fn replace_with_nothing_shareable_keeps_the_old_entry() {
+        let mut store = PeerStore::default();
+        let p = peer(1);
+        assert!(store.record(p, addr("/ip4/10.0.1.196/tcp/9001")));
+        assert!(!store.replace(
+            p,
+            [
+                addr("/ip4/127.0.0.1/tcp/9001"),
+                addr("/ip4/169.254.1.1/tcp/9001")
+            ]
+        ));
+        assert_eq!(
+            store.addrs(&p).unwrap(),
+            &[addr("/ip4/10.0.1.196/tcp/9001")]
+        );
+    }
+
+    #[test]
+    fn replace_caps_addresses_per_peer() {
+        let mut store = PeerStore::default();
+        let p = peer(1);
+        let many: Vec<Multiaddr> = (0..10)
+            .map(|i| addr(&format!("/ip4/10.0.2.{i}/tcp/9001")))
+            .collect();
+        assert!(store.replace(p, many));
+        assert_eq!(store.addrs(&p).unwrap().len(), MAX_ADDRS_PER_PEER);
+    }
+
+    /// A node that announces its DNS name alongside its IPs: the name is the
+    /// one hint that stays valid after the node moves, so it must be kept
+    /// ahead of the IPs and survive the cap.
+    #[test]
+    fn replace_keeps_the_dns_name_first_and_past_the_cap() {
+        let mut store = PeerStore::default();
+        let p = peer(1);
+        let mut announced: Vec<Multiaddr> = (0..MAX_ADDRS_PER_PEER + 2)
+            .map(|i| addr(&format!("/ip4/10.0.2.{i}/tcp/9001")))
+            .collect();
+        announced.push(addr("/dns4/node3.monas.local/tcp/9001"));
+        assert!(store.replace(p, announced));
+
+        let kept = store.addrs(&p).unwrap();
+        assert_eq!(kept.len(), MAX_ADDRS_PER_PEER);
+        assert_eq!(kept[0], addr("/dns4/node3.monas.local/tcp/9001"));
+    }
+
+    /// Identify hands addresses over in hash order. The same announcement in
+    /// a different order must not count as a change, or the file is rewritten
+    /// on every Identify round.
+    #[test]
+    fn replace_ignores_announcement_order() {
+        let mut store = PeerStore::default();
+        let p = peer(1);
+        let a = addr("/ip4/10.0.2.1/tcp/9001");
+        let b = addr("/dns4/node3.monas.local/tcp/9001");
+        assert!(store.replace(p, [a.clone(), b.clone()]));
+        assert!(!store.replace(p, [b, a]));
+    }
+
+    /// The other half of the production failure: two peers that both moved
+    /// while apart each hold only the other's dead IP. Forgetting an address
+    /// the moment it fails to dial is what lets the next dial use whatever a
+    /// third party has told Kademlia instead of timing out on the dead one.
+    #[test]
+    fn forget_drops_the_failed_address_and_the_peer_once_empty() {
+        let mut store = PeerStore::default();
+        let p = peer(1);
+        assert!(store.record(p, addr("/ip4/10.0.1.111/tcp/9001")));
+        assert!(store.record(p, addr("/ip4/10.0.1.21/tcp/9001")));
+
+        // The swarm reports the address it dialled, `/p2p/<peer>` included.
+        assert!(store.forget_unreachable(p, [addr(&format!("/ip4/10.0.1.111/tcp/9001/p2p/{p}"))]));
+        assert_eq!(store.addrs(&p).unwrap(), &[addr("/ip4/10.0.1.21/tcp/9001")]);
+
+        assert!(store.forget_unreachable(p, [addr("/ip4/10.0.1.21/tcp/9001")]));
+        assert!(store.addrs(&p).is_none());
+        assert!(store.is_empty());
+        assert!(
+            store.order.is_empty(),
+            "eviction order must not keep a ghost"
+        );
+    }
+
+    #[test]
+    fn forget_of_an_unknown_address_or_peer_is_a_no_op() {
+        let mut store = PeerStore::default();
+        let p = peer(1);
+        assert!(store.record(p, addr("/ip4/10.0.1.21/tcp/9001")));
+        assert!(!store.forget_unreachable(p, [addr("/ip4/10.0.9.9/tcp/9001")]));
+        assert!(!store.forget_unreachable(peer(2), [addr("/ip4/10.0.1.21/tcp/9001")]));
+        assert_eq!(store.len(), 1);
+    }
+
+    /// Seen during a rollout: while node1 was restarting, its `/dns4/` name
+    /// failed to connect and was dropped along with the dead IP. The name is
+    /// re-pointed the moment node1 is back and is the only hint that survives
+    /// the restart, so an unreachable name must stay.
+    #[test]
+    fn forget_unreachable_keeps_names_and_drops_ips() {
+        let mut store = PeerStore::default();
+        let p = peer(1);
+        assert!(store.replace(
+            p,
+            [
+                addr("/ip4/10.0.0.252/tcp/9001"),
+                addr("/dns4/node1.monas.local/tcp/9001"),
+            ]
+        ));
+        assert!(store.forget_unreachable(
+            p,
+            [
+                addr(&format!("/ip4/10.0.0.252/tcp/9001/p2p/{p}")),
+                addr(&format!("/dns4/node1.monas.local/tcp/9001/p2p/{p}")),
+            ]
+        ));
+        assert_eq!(
+            store.addrs(&p).unwrap(),
+            &[addr("/dns4/node1.monas.local/tcp/9001")]
+        );
+        // Only the name failed: nothing to do, and the file is not rewritten.
+        assert!(!store.forget_unreachable(
+            p,
+            [addr(&format!("/dns4/node1.monas.local/tcp/9001/p2p/{p}"))]
+        ));
+    }
+
+    /// A name that answers as a different peer has been handed to someone
+    /// else (a node whose identity was recreated); then it is wrong for this
+    /// peer and goes.
+    #[test]
+    fn forget_wrong_peer_drops_a_name_too() {
+        let mut store = PeerStore::default();
+        let p = peer(1);
+        assert!(store.replace(p, [addr("/dns4/node1.monas.local/tcp/9001")]));
+        assert!(store.forget_wrong_peer(
+            p,
+            addr(&format!("/dns4/node1.monas.local/tcp/9001/p2p/{p}"))
+        ));
+        assert!(store.is_empty());
     }
 
     #[test]

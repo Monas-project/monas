@@ -101,6 +101,19 @@ impl AccessPolicy {
         self.min_valid_issued_at == 0 || issued_at > self.min_valid_issued_at
     }
 
+    /// Raise the cutoff to `cutoff` if it is higher than the current one.
+    ///
+    /// The cutoff only moves forward: this is what makes it safe to take the
+    /// max across concurrent versions when they merge. A lower value is
+    /// ignored rather than an error, because the caller (the merge) does not
+    /// know which of its inputs is "current" — there is no such thing.
+    pub fn raise_min_valid_issued_at(&mut self, cutoff: u64) {
+        if cutoff > self.min_valid_issued_at {
+            self.min_valid_issued_at = cutoff;
+            self.updated_at = self.updated_at.max(cutoff);
+        }
+    }
+
     /// Invalidate every token issued at or before the current time.
     /// Sets min_valid_issued_at to the current timestamp and returns the new value.
     pub fn invalidate_tokens(&mut self) -> u64 {

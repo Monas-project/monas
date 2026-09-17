@@ -48,7 +48,7 @@ monas-account = { path = "../monas-account" }
 base64-url = "2.0"
 
 # crsl-lib for CRDT-based content versioning
-crsl-lib = { git = "https://github.com/Monas-project/crsl-lib", rev = "e13b86ce6d6a9c27ebd01a9b4fe82d6bc18f8a01" }
+crsl-lib = { git = "https://github.com/Monas-project/crsl-lib", rev = "0fbabbf" }
 
 # sled for persistence
 sled = "0.34"
@@ -97,6 +97,7 @@ features = ["tokio"]
 
 [dev-dependencies]
 tempfile = "3.8"
+tower = { version = "0.5", features = ["util"] }
 
 # ============================================================
 # WASM Support (Future)

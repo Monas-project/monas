@@ -95,7 +95,8 @@ pub fn verify_and_extract(
 }
 
 /// Pull `data: Vec<u8>` out of the decoded payload value. The payload is
-/// `ContentPayload { data, access_policy }`, CBOR-encoded as a map.
+/// `ContentPayload { data, body_updated_at, access_policy }`, CBOR-encoded as
+/// a map. Additional payload fields remain covered by the raw-byte CID check.
 fn extract_payload_data(payload: &serde_cbor::Value) -> Result<Vec<u8>, NodeVerificationError> {
     use serde_cbor::Value;
     match payload {
@@ -175,6 +176,37 @@ mod tests {
         let verified = verify_and_extract(&bytes, &cid).expect("should verify");
         assert_eq!(verified.ciphertext, b"ciphertext-bytes");
         assert!(verified.parents.is_empty());
+    }
+
+    #[test]
+    fn body_write_order_is_verified_without_affecting_ciphertext_extraction() {
+        use crsl_lib::convergence::metadata::ContentMetadata;
+        use crsl_lib::dasl::node::Node;
+        #[derive(Clone, serde::Serialize, serde::Deserialize)]
+        struct Payload {
+            data: Vec<u8>,
+            body_updated_at: u64,
+            access_policy: Option<()>,
+        }
+        let mut node = Node::new_genesis(
+            Payload {
+                data: b"ciphertext".to_vec(),
+                body_updated_at: 10,
+                access_policy: None,
+            },
+            20,
+            ContentMetadata::default(),
+        );
+        let version = node.content_id().unwrap().to_string();
+        let verified = verify_and_extract(&node.to_bytes().unwrap(), &version).unwrap();
+        assert_eq!(verified.ciphertext, b"ciphertext");
+        // Same ciphertext, but changing its ordering metadata must invalidate
+        // the version CID too. The new field is not outside the trust check.
+        node.payload.body_updated_at = 11;
+        assert!(matches!(
+            verify_and_extract(&node.to_bytes().unwrap(), &version),
+            Err(NodeVerificationError::CidMismatch { .. })
+        ));
     }
 
     #[test]

@@ -1,0 +1,364 @@
+# Monas Drive — example UI
+
+A minimal, Google-Drive-like web UI for the Monas protocol, built on the
+**monas-sdk** via the **monas-gateway** HTTP API. It lets you **create, open,
+edit, share, revoke and delete** files and folders, and surfaces the
+encryption + state-node work behind every action in a live **Protocol activity**
+panel (CEK → AES-256-GCM → SHA-256 CID → storage → state-node → HPKE).
+
+The UI talks to a **single backend — the gateway** — which embeds the SDK and
+orchestrates everything server-side:
+
+```
+┌──────────────┐    /api/*  (Vite proxy)   ┌───────────────┐  embeds monas-sdk
+│   this UI    │ ────────────────────────▶ │ monas-gateway │ ─┬─▶ encrypt + store (monas-content)
+│ (React+Vite) │      single endpoint      │     :3000     │  ├─▶ state-node  (:8080)
+└──────────────┘                           └───────────────┘  └─▶ sign        (monas-account :4002)
+```
+
+## Run
+
+```bash
+cd example-ui
+npm install
+npm run dev          # http://localhost:5173
+```
+
+You also need the gateway (and the services it calls) running, e.g. via your
+local Docker. The gateway defaults to `:3000` and reads:
+
+```
+MONAS_API_PORT=3000
+MONAS_STATE_NODE_URL=http://127.0.0.1:8080
+MONAS_ACCOUNT_URL=http://127.0.0.1:4002
+MONAS_PERSISTENCE_DIR=...   # recommended; otherwise CEK/shares are in-memory
+```
+
+### Endpoint & CORS
+
+The browser calls same-origin `/api/*`, and the **Vite dev server proxies it**
+to the gateway — so you never hit CORS locally. The target is configurable in
+`.env` (copy `.env.example`):
+
+```
+VITE_GATEWAY_TARGET=http://127.0.0.1:3000
+```
+
+You can also repoint the gateway at runtime from the **Settings** dialog (gear
+icon) — there are presets for *local (proxied)* and a *public API*. ⚠️ Pointing
+at a cross-origin URL directly (not through the proxy) requires that server to
+send permissive CORS headers.
+
+## Tests
+
+### Isolated UI regressions (no backend required)
+
+```bash
+npm ci --ignore-scripts
+npx playwright install chromium  # once, if not already installed
+npm run test:regression
+npm run build
+```
+
+This suite starts its own Vite on `127.0.0.1:5198` (fails if occupied). It runs
+actual App/store/flow/API-adapter paths with HTTP fixtures, intercepts all
+backend requests, rejects unknown endpoints and blocks external origins. No
+hosted nodes or account keys are needed or modified. Results/traces go to
+`/tmp/monas-ui-regression-results`. It covers recipient import → edit → reopen,
+owner preview/head checks, revocation reach reporting, and legacy identities.
+These are UI regressions, not cryptographic or distributed-protocol tests.
+
+Legacy identity migration keeps the **last-created signing account**, matching
+`POST /accounts` replacing monas-account's single key. Earlier signing entries
+remain available as envelope-decryption keypairs; removing the current account
+does not promote them. `activeLabel` from old UI switching cannot change the
+backend's key. The account API has no read-current-key endpoint, so a reset or
+externally replaced backend key still requires explicit user recovery.
+
+### Real-stack suites
+
+```bash
+npm test                 # UI suite (tests/) — ~22s
+npm run test:ui          # same, in the Playwright UI runner
+npm run test:e2e         # real-stack journeys (tests-e2e/) — minutes
+```
+
+Both need a running stack. `npm test` only needs vite + gateway + account;
+`test:e2e` additionally exercises the state-node round trip, so the gateway's
+`MONAS_STATE_NODE_URL` must point at a node that is up — a local cluster
+(`monas-state-node/scripts/start-local-nodes.sh`) or a hosted node.
+
+Two suites, deliberately split by what they cost and what they prove:
+
+| | `tests/` (`npm test`) | `tests-e2e/` (`npm run test:e2e`) |
+| --- | --- | --- |
+| Proves | the **UI** behaves — every control does what it claims | a fresh user can run every journey against **real nodes** |
+| Content mutations | none (seeds `localStorage` directly) | many — create/edit/share/revoke/delete on the network |
+| Runtime | ~22s | minutes |
+
+`tests/` avoids content mutations on purpose: a create is a real crypto +
+state-node round trip, so a suite that made one per scenario would take minutes
+and mostly re-test the protocol that the journeys already cover. Where a
+scenario needs a file to exist, it writes a registry entry into `localStorage`
+and reloads.
+
+`tests-e2e/full-stack.spec.ts` holds three independent journeys: the content
+lifecycle (create → preview → verify integrity → verified read → edit →
+old-version read → reload → delete), the sharing lifecycle (share to a local
+identity with the HPKE round-trip proof, share to a pasted external key,
+revoke with envelope reissue), and folders + binary upload + filter views +
+cascade delete.
+
+`tests-e2e/cross-device.spec.ts` (J-4) is the two-device share: two browser
+contexts, each bound to its **own gateway + monas-account pair**, exchange only
+what people would paste into a chat — a public key one way, a share package
+the other. The recipient unwraps it, reads the shared version back from *his*
+state node with the delegated token, is refused after the owner revokes a
+third party, reads again with the reissued token, reads the owner's post-share
+edit, **writes his own version** with the token (which the owner reads from
+*her* node and pulls into her copy), is refused the stale package, and — once
+the owner revokes him — has his write refused while her copy keeps his last
+authorised version. Point the second pair at a **different node** so the
+reads prove replication too:
+
+```bash
+MONAS_STATE_NODE_URL=https://node2.monas-demo.net ./scripts/second-device.sh   # :3001 / :4003
+```
+
+vite proxies `/api2` and `/account-api2` to it (`VITE_GATEWAY2_TARGET` /
+`VITE_ACCOUNT2_TARGET` to override).
+
+Modal structure is asserted with **ARIA snapshots** (`toMatchAriaSnapshot`)
+rather than CSS selectors, so the whole control set of a dialog is checked in
+one assertion and the tests survive styling changes.
+
+### Bugs this suite found (and now guards)
+
+Writing the suite surfaced two defects, both since fixed. The tests are the
+regression guards — reverting either fix makes them fail, which was verified
+rather than assumed:
+
+- **G-34** — with *Paste public key* selected and the field empty, *Wrap CEK &
+  share* stayed enabled and did nothing: both branches of `submit()` return
+  early on missing input, with no toast and no validation. The button is now
+  gated on a `recipientReady` check and the empty field explains why.
+- **S-07** — *Test connection* called `saveEndpoints(cfg)` before probing,
+  because the probe could only read the endpoint back out of storage. Testing
+  an endpoint therefore committed it, and *Reset to proxy* only resets
+  component state, so a cancelled edit could not be undone from the dialog.
+  `probeGateway(base?)` now takes the candidate URL, so probing has no side
+  effect.
+
+The plan the suite was generated from lives in `specs/ui-coverage.md`
+(49 scenarios); the tests here cover the P0 subset that needs no fixtures.
+
+### Extending the suite
+
+The plan and the tests were produced with [Playwright
+Agents](https://playwright.dev/docs/test-agents) — a *planner* explores the
+running app and writes the plan, a *generator* turns plan entries into specs
+while verifying selectors against the live UI, and a *healer* repairs tests
+whose locators have drifted. The agent definitions are gitignored (they are
+per-developer and must be regenerated when Playwright is updated):
+
+```bash
+npx playwright init-agents --loop=claude   # or codex | vscode | opencode
+```
+
+`tests/seed.spec.ts` is the bootstrap the planner starts from: it clears
+`localStorage` and creates the signing account, without which content
+operations are refused and most of the UI is unreachable.
+
+Note that the agents are used at **authoring** time only. What runs in CI is
+ordinary, deterministic Playwright code — no model is in the execution loop,
+so the suite cannot go non-deterministic on a model update.
+
+## Gateway / SDK endpoints used
+
+| Action            | Gateway call                          | SDK model                         |
+| ----------------- | ------------------------------------- | --------------------------------- |
+| Create account    | `POST /account-api/accounts`          | (monas-account)                   |
+| New file / Upload  | `POST /content`                       | `CreateContent{Input,Output}`     |
+| Open / preview    | `GET /content/{id}`                   | `GetContent{Input,Output}`        |
+| Edit contents     | `PUT /content/{id}`                   | `UpdateContent{Input,Output}`     |
+| Delete            | `DELETE /content/{id}`                | `DeleteContent{Input,Output}`     |
+| Share             | `POST /share`                         | `ShareContent{Input,Output}`      |
+| Import shared     | `POST /share/decrypt`                 | `DecryptSharedContent{Input,Out}` |
+| Revoke            | `POST /share/revoke`                  | `RevokeShare{Input,Output}`       |
+| Verified read     | `POST /state/read`                    | `ReadContentFromStateNode{In,Out}`|
+| (history/version) | `POST /state/history`, `/state/...`   | `state` models                    |
+
+Notes on the contract:
+
+- All content/keys are exchanged as **base64url (no padding)** — matching the
+  SDK models.
+- Responses are wrapped in the SDK `ApiResponse<T>` envelope
+  (`{ success, data, error: { type, message }, trace_id }`); the client unwraps
+  `data` or throws the typed error.
+- `POST /content`, `PUT/DELETE /content/{id}`, `POST /share/revoke` and the
+  `/state/*` calls require an **`X-Request-Timestamp`** header (the gateway
+  returns 401 without it). The UI sends the current Unix time; the SDK then
+  signs the state-node request via the account service.
+- **Two read paths, and they prove different things.** `GET /content/{id}`
+  reads the gateway's own local store — convenient, but it never touches the
+  network, so it proves nothing about what the state node holds.
+  `POST /state/read` fetches the version from the state node (relayed to a
+  member when the contacted node isn't one) and verifies it: the Node CID is
+  recomputed, the CEK decrypts it (AES-256-GCM) and the plaintext is
+  re-addressed to the local id. The preview modal exposes both.
+  What the verified read does *not* prove is that the version is the newest or
+  that a legitimate writer produced it — version metadata has no trust anchor
+  yet (issue #59).
+- **Sharing is HPKE Auth mode.** `/share` and `/share/revoke` take the sender's
+  *private* key (the SDK never stores it) because the wrap mixes it in;
+  `/share/decrypt` correspondingly takes the sender's **public key**, not a
+  self-asserted `sender_key_id`. The recipient TOFU-pins that key on the first
+  envelope for a content and rejects any later envelope that doesn't match.
+- **`key_epoch` must be carried through untouched.** Every revoke rotates the
+  CEK and bumps the epoch, and recipients reject envelopes older than the epoch
+  they've recorded (rollback replay defence). A revoke therefore also returns
+  `reissued_envelopes` for the *surviving* recipients — the UI swaps those into
+  its registry, because a recipient left holding the pre-rotation envelope can
+  no longer decrypt.
+
+## Accounts & the signing key
+
+A device has **one account**. Open the identity chip (top-right) → **Create
+account**: the UI sends `POST /accounts` to **monas-account** (via the
+`/account-api` proxy), which generates and keeps a **P-256** key. The SDK signs
+every state-node request with that key (create / edit / delete, and a
+recipient's reads and writes under a delegated token), and it is the key
+other people share *to* — a delegated token's audience is the recipient's
+signing key, so a share addressed to any other key could open its envelope but
+never read or write the state node.
+
+monas-account holds exactly one key, which is why the dialog does not offer a
+second account or a keypair-only identity: creating another would overwrite
+the key monas-account signs with and silently orphan the first. To start over,
+remove the account and create a new one (content created under the old key can
+then no longer be updated or deleted from this device).
+
+## Is my copy the newest? (sync status)
+
+Every synced row carries a sync badge, and the preview repeats it as a one-line
+status:
+
+| Badge                | Meaning                                                                 |
+| -------------------- | ----------------------------------------------------------------------- |
+| `up to date`         | the Content Network head is the version this device holds               |
+| `newer on network`   | someone else wrote after this device's last save/import                 |
+| `synced`             | on a Content Network, head not compared yet                             |
+| `can't reach network`| the last check failed (node down, token voided, …); hover for the error |
+
+The comparison is a **verified read** of the head (`POST /state/read` with
+`accept_any_version`): the plaintext is re-derived and re-addressed, and the
+resulting plain id is compared with the one this device holds — the owner's
+local version, or for a recipient the version it last wrote (else the one the
+envelope carried). It runs when a file is opened, on *Check now* / *Read from
+state-node*, and in a background sweep every 30 s. When behind, the owner's
+*Pull & edit* adopts the head into the local copy first (`POST /state/pull`);
+a write-share recipient's *Edit contents* already starts from the head.
+
+*Verify integrity* is related but narrower: it byte-compares the ciphertext
+this gateway stored with the head's. "Not the head" there is the same
+*newer on network* condition, not a corruption; the reason string from the SDK
+is shown under the badge.
+
+## Sharing with someone on another device
+
+Monas does not carry key envelopes between people — that is deliberately left
+to whatever channel the two of you already have. The UI makes both ends a
+copy-paste:
+
+1. **Recipient**: identity chip → **Copy public key** on the identity you want
+   to receive with, and send it to the owner.
+2. **Owner**: row menu → **Share** → *Paste public key* → **Wrap CEK & share**.
+   The dialog shows the **share package** for that recipient (also **Copy
+   package** on the row). Send it over chat, mail, anything.
+3. **Recipient**: sidebar **Import shared** → paste → **Unwrap & add to my
+   Drive**. The gateway unwraps the content key with your identity (HPKE Auth,
+   so it also proves the package came from that sender and pins their key)
+   and decrypts. The file appears with a *shared with me* badge; **Open**
+   unwraps it again from the kept envelope; with a write share, **Edit
+   contents** writes back to the owner's Content Network (below).
+
+The package is one JSON document (`kind: "monas-share"`, `v: 1`): the file's
+name/type/size, the owner's content id and Content Network id, both public
+keys, the recipient KeyId, permissions, the `KeyEnvelope` and the delegated
+token. It is not secret — the key inside is wrapped to the recipient only —
+but it is a capability, so treat it like a link to the file.
+
+**Reading from the state node as a recipient.** The package also carries a
+delegated token (JWT, one hour, issued for the Content Network id). In the
+preview of a received file the state-node panel — latest version, history,
+**Read from state-node** — works with that token: the gateway signs the
+request with your account key (the token's audience) and presents the token,
+and the state node checks both. So the identity you receive with must be your
+signing account. The verified read uses the shared version's id only to pick
+the CEK and reports the id the plaintext actually addresses to, so it follows
+the owner's edits: after they edit, *Read from state-node* shows the new
+version and flags it as newer than shared.
+
+A revoke of *any* recipient voids every token issued before it, yours
+included; the owner's dialog then shows a re-wrapped package with a fresh
+token — import it and reads work again (the old envelope still opens the
+version it carried). A pre-rotation package is refused as stale on import:
+the SDK keeps the sender pin (sender key, key epoch, CEK) under the Content
+Network id, so the check holds across the owner's edits even though those
+change the content id the package names.
+
+**Writing as a recipient.** With a read+write share the row menu of a received
+file offers **Edit contents**. The editor loads the owner's newest version
+from the state node (not the one the envelope carried), and *Re-encrypt &
+save* goes to `PUT /api/share/content/:networkId` with the delegated token:
+the gateway encrypts under the CEK it pinned at import — it has no content
+record of its own — signs with your account key and PUTs to the owner's
+Content Network. The state node grants the write on the token's `write`
+capability and refuses it after a revoke. In the preview, *Read from
+state-node* then reports the version as *your edit*.
+
+The owner sees it the other way round: their local copy is now behind the
+head, so their verified read flags it as *newer than your copy*. **Edit
+contents** on the owner's side first **pulls** the head into the local
+record (`POST /api/state/pull`: a verified read whose ciphertext is adopted as
+the newest local version, keeping integrity checks true), so the edit starts
+from the recipient's version rather than overwriting it. A revoke pulls the
+same way inside the SDK before rotating the key — otherwise re-encrypting the
+stale local plaintext would silently roll the file back. If that pull fails
+the revoke still goes through (a writer must not be able to block
+revocation) and the UI says so.
+
+## What's real vs. illustrative
+
+A single gateway call does the whole orchestration server-side, so the Protocol
+activity panel pairs **one real call** per action with **illustrative phases**
+that narrate the protocol and read ids out of the response:
+
+- **Real:** the labelled "· gateway call" step in each run (and the share
+  unwrap+decrypt proof). Errors are shown verbatim with their SDK type.
+- **Illustrative:** CEK generation, CID addressing, member selection, token
+  issuance, etc. — these happen *inside* the SDK call; the panel narrates them
+  with a short minimum duration for readability.
+
+## Notes
+
+- **Folders are logical** (path prefixes). The gateway has no folder/listing
+  concept, so the UI keeps its own file registry in `localStorage`
+  (`monas.registry.v3`). Identities and the endpoint live there too. Clearing
+  site data resets the demo.
+- **Rename** of a file is local-only here (the SDK applies a new name on the
+  next content edit); folder rename re-paths its descendants locally.
+- Private keys for demo identities are stored in `localStorage` so the HPKE
+  round-trip proof can run — fine for a local demo, not for production.
+
+## Project layout
+
+```
+src/
+  api/          gateway client (account=keypair, content, share, stateNode=state) + base64url helpers
+  pipeline/     per-action flow definitions + sequential runner → drives the activity panel
+  store/        localStorage-backed registry + identities (React via useSyncExternalStore)
+  components/   TopBar, Sidebar, FileBrowser, PipelinePanel, modals, icons, toasts
+  config.ts     single gateway endpoint (proxy default + presets)
+  App.tsx       wiring: actions → pipeline → registry updates
+```

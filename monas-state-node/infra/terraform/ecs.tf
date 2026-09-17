@@ -24,6 +24,9 @@ resource "aws_ecs_task_definition" "node" {
         { name = "BOOTSTRAP_ADDR", value = var.bootstrap_addr },
         { name = "BOOTSTRAP_DNS", value = var.bootstrap_dns },
         { name = "BOOTSTRAP_PEER_ID", value = var.bootstrap_peer_id },
+        # Announce the Cloud Map name rather than the task IP: the IP changes
+        # on every restart and peers that remembered it would keep dialling it.
+        { name = "EXTERNAL_ADDRESS", value = "/dns4/${var.node_name}.${var.service_discovery_namespace_name}/tcp/${var.p2p_port}" },
         { name = "HTTP_LISTEN", value = "0.0.0.0:${var.http_port}" },
         { name = "P2P_PORT", value = tostring(var.p2p_port) },
         { name = "DATA_DIR", value = "/data" },

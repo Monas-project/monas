@@ -10,8 +10,9 @@ use crate::common::{
 use crate::models::share::{
     DecryptSharedContentInput, DecryptSharedContentOutput, DelegatedAccessToken, KeyEnvelope,
     Permission, ReissuedKeyEnvelope, RevokeShareInput, RevokeShareOutput, ShareContentInput,
-    ShareContentOutput,
+    ShareContentOutput, UpdateSharedContentInput, UpdateSharedContentOutput,
 };
+use crate::models::state_node::StateNodeUpdateContentRequest;
 
 use monas_content::application_service::content_service::{
     ContentEncryptionKeyStore, ContentRepository, DecryptWithCekError, ReencryptContentCommand,
@@ -132,6 +133,18 @@ impl MonasController {
         Ok(DomainPermission::Read)
     }
 
+    /// ACL に記録された権限(ドメイン型)から、Token に載せる権限を選ぶ。
+    /// Write があれば Write、それ以外は Read。Owner は委譲しない。
+    fn resolve_domain_permission(perms: &[DomainPermission]) -> Option<DomainPermission> {
+        if perms.iter().any(|p| matches!(p, DomainPermission::Write)) {
+            Some(DomainPermission::Write)
+        } else if perms.iter().any(|p| matches!(p, DomainPermission::Read)) {
+            Some(DomainPermission::Read)
+        } else {
+            None
+        }
+    }
+
     fn to_key_envelope(domain_envelope: &DomainKeyEnvelope) -> KeyEnvelope {
         let recipient = domain_envelope.recipient();
         KeyEnvelope {
@@ -153,37 +166,74 @@ impl MonasController {
         }
     }
 
+    /// 委譲 Token を発行する。
+    ///
+    /// `min_issued_after` は State Node の `min_valid_issued_at`(revoke が進めた
+    /// 失効境界)。State Node は `iat > min_valid_issued_at` の Token だけを
+    /// 受け付けるので、失効と同じ秒に発行された Token は生まれた瞬間から無効
+    /// になる。境界と同じ秒か、時計のずれで手前に出てしまった場合は、次の秒
+    /// まで待って発行し直す(上限あり)。
     fn issue_delegated_token(
         &self,
         content_id: &str,
         recipient_public_key_bytes: &[u8],
         permission: DomainPermission,
+        min_issued_after: Option<u64>,
     ) -> Result<DelegatedAccessToken, ApiError> {
+        const MAX_WAIT_SECS: u64 = 5;
         let issuer_url = format!("{}/issuer/delegate", self.account_url);
-        let req = IssueDelegatedTokenRequest {
-            recipient_public_key_base64: BASE64_STANDARD.encode(recipient_public_key_bytes),
-            content_id: content_id.to_string(),
-            capabilities: Self::permission_to_capabilities(permission)?,
-            ttl_secs: DEFAULT_DELEGATION_TTL_SECS,
-        };
+        let capabilities = Self::permission_to_capabilities(permission)?;
 
-        let mut response = self
-            .agent
-            .post(&issuer_url)
-            .send_json(req)
-            .map_err(|e| ApiError::from_ureq_error("Failed to call issuer API", e))?;
+        let mut waited = 0;
+        loop {
+            let req = IssueDelegatedTokenRequest {
+                recipient_public_key_base64: BASE64_STANDARD.encode(recipient_public_key_bytes),
+                content_id: content_id.to_string(),
+                capabilities: capabilities.clone(),
+                ttl_secs: DEFAULT_DELEGATION_TTL_SECS,
+            };
 
-        let body: IssueDelegatedTokenResponse = response
-            .body_mut()
-            .read_json()
-            .map_err(|e| ApiError::Internal(format!("Invalid issuer API response: {e}")))?;
+            let response = self
+                .agent
+                .post(&issuer_url)
+                .send_json(req)
+                .map_err(|e| ApiError::from_ureq_error("Failed to call issuer API", e))?;
+            let status = response.status().as_u16();
+            let body = response
+                .into_body()
+                .read_to_string()
+                .map_err(|e| ApiError::Internal(format!("Failed to read issuer response: {e}")))?;
+            if let Some(response) = Self::try_account_http_error::<()>(status, &body, String::new())
+            {
+                return Err(response.error.unwrap_or_else(|| {
+                    ApiError::Internal(format!("Issuer API returned HTTP {status}"))
+                }));
+            }
+            let body: IssueDelegatedTokenResponse = serde_json::from_str(&body)
+                .map_err(|e| ApiError::Internal(format!("Invalid issuer API response: {e}")))?;
 
-        Ok(DelegatedAccessToken {
-            delegated_token: body.delegated_token,
-            issued_at: body.issued_at,
-            expires_at: body.expires_at,
-            jti: body.jti,
-        })
+            let token = DelegatedAccessToken {
+                delegated_token: body.delegated_token,
+                issued_at: body.issued_at,
+                expires_at: body.expires_at,
+                jti: body.jti,
+            };
+            match min_issued_after {
+                Some(boundary) if token.issued_at <= boundary => {
+                    let short_by = boundary - token.issued_at + 1;
+                    if waited + short_by > MAX_WAIT_SECS {
+                        return Err(ApiError::Internal(format!(
+                            "delegated token would be issued at {} but the state node only accepts \
+                             tokens issued after {}: clocks differ by more than {}s",
+                            token.issued_at, boundary, MAX_WAIT_SECS
+                        )));
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(short_by));
+                    waited += short_by;
+                }
+                _ => return Ok(token),
+            }
+        }
     }
 
     /// ShareApplicationErrorをApiErrorにマッピング
@@ -362,10 +412,18 @@ impl MonasController {
             }
         };
 
+        // Token の resource は State Node が知っている系列ID。ローカル版IDで
+        // 発行すると受信者の read/write が capability 不一致で拒否される。
+        let token_content_id = input
+            .remote_content_id
+            .as_deref()
+            .unwrap_or(&input.content_id)
+            .to_string();
         let delegated_access = match self.issue_delegated_token(
-            &input.content_id,
+            &token_content_id,
             &recipient_public_key_bytes,
             permission,
+            None,
         ) {
             Ok(token) => token,
             Err(e) => {
@@ -453,8 +511,41 @@ impl MonasController {
             }
         }
 
-        // 2. ContentIdに変換
-        let content_id = ContentId::new(input.content_id.clone());
+        // 2. State Node の head を取り込んでから始める。write を委譲した受信者が
+        //    書いた版はローカルに無く、後段の reencrypt はローカル平文から
+        //    再発行するので、これを省くと revoke がその受信者の版を黙って
+        //    巻き戻す(取り消す相手の版であっても、他の残存受信者や owner
+        //    自身が見ていた最新状態を失う)。State Node 連携なしなら不要。
+        //
+        //    取り込みで版IDが変われば、以後はその版IDに対して revoke する
+        //    (ACL は取り込み時に引き継がれている)。
+        //
+        //    取り込みに失敗しても revoke は止めない: head が壊れている・自分の
+        //    CEK で開けない(正規でない書き手が何か置いた)場合こそ取り消して
+        //    ローテーションしたいのであり、書き手が取り消しを妨げられては
+        //    ならない。代わりに `head_pull_error` で報告する。
+        let mut head_pull_error = None;
+        let local_content_id = match (input.remote_content_id.as_deref(), auth) {
+            (Some(remote), Some(_)) => match self.adopt_remote_head::<RevokeShareOutput>(
+                remote,
+                &input.content_id,
+                auth,
+                trace_id.clone(),
+            ) {
+                Ok(head) => head.local_content_id.as_str().to_string(),
+                Err(response) => {
+                    head_pull_error = Some(
+                        response
+                            .error
+                            .map(|e| e.to_string())
+                            .unwrap_or_else(|| "unknown error".to_string()),
+                    );
+                    input.content_id.clone()
+                }
+            },
+            _ => input.content_id.clone(),
+        };
+        let content_id = ContentId::new(local_content_id.clone());
 
         // この content への revoke を直列化する。revoke は ACL・CEK・ローカル
         // ciphertext・state node 状態にまたがる load-modify-save で、どこにも
@@ -520,18 +611,19 @@ impl MonasController {
             .as_deref()
             .unwrap_or(&input.content_id)
             .to_string();
-        let token_invalidated_at = if auth.is_some() {
+        let (token_invalidated_at, token_invalidation_reach) = if auth.is_some() {
             match self.send_invalidate_to_state_node::<RevokeShareOutput>(
                 &state_node_content_id,
                 auth,
                 trace_id.clone(),
             ) {
-                Ok(v) => v,
+                Ok(Some((at, reach))) => (Some(at), reach),
+                Ok(None) => (None, None),
                 // ここはまだローカル状態を一切変更していないので巻き戻し不要。
                 Err(response) => return response,
             }
         } else {
-            None
+            (None, None)
         };
 
         // 4. まず CEK をローテーションして再暗号化する。
@@ -540,7 +632,7 @@ impl MonasController {
         //    配ってしまい、ローテーションの意味がなくなる
         //    (service 側 step 2 の「再暗号化後はここが新しい CEK になっている想定」に一致させる)。
         let reencryption = match self.content_service.reencrypt(ReencryptContentCommand {
-            content_id: ContentId::new(input.content_id.clone()),
+            content_id: content_id.clone(),
         }) {
             Ok(result) => result,
             Err(e) => {
@@ -629,12 +721,49 @@ impl MonasController {
         // 残存受信者向けの再発行 envelope(新 CEK・新 ciphertext)を出力に載せる。
         // owner はこれを各受信者へ配布し、受信者が decrypt_shared_content で処理すると
         // ローカル保存済み CEK がローテーション後のものへ更新される。
+        //
+        // 3.5 で State Node の失効境界を進めているので、残存受信者が持っていた
+        // Token も失効している。envelope だけ届けても復号はできるが State Node
+        // からは読めないので、境界より後の iat で Token も発行し直して同梱する。
+        // 発行に失敗しても revoke 自体は完了しているので巻き戻さず、その受信者
+        // の `delegated_access` を `None` にして返す。
+        let survivors_permissions = self
+            .share_service
+            .share_repository
+            .load(&result.content_id)
+            .ok()
+            .flatten();
         let reissued_envelopes = result
             .envelopes
             .iter()
-            .map(|env| ReissuedKeyEnvelope {
-                recipient_key_id: encode_base64url(env.recipient().key_id().as_bytes()),
-                key_envelope: Self::to_key_envelope(env),
+            .map(|env| {
+                let key_id = env.recipient().key_id();
+                let delegated_access = survivors_permissions
+                    .as_ref()
+                    .and_then(|share| share.permissions_of(key_id))
+                    .and_then(Self::resolve_domain_permission)
+                    .and_then(|permission| {
+                        self.share_service
+                            .public_key_directory
+                            .find_public_key(key_id)
+                            .ok()
+                            .flatten()
+                            .map(|pk| (pk, permission))
+                    })
+                    .and_then(|(pk, permission)| {
+                        self.issue_delegated_token(
+                            &state_node_content_id,
+                            &pk,
+                            permission,
+                            token_invalidated_at,
+                        )
+                        .ok()
+                    });
+                ReissuedKeyEnvelope {
+                    recipient_key_id: encode_base64url(key_id.as_bytes()),
+                    key_envelope: Self::to_key_envelope(env),
+                    delegated_access,
+                }
             })
             .collect();
 
@@ -645,6 +774,8 @@ impl MonasController {
             revoked_at: Some(Utc::now().to_rfc3339()),
             reissued_envelopes,
             token_invalidated_at,
+            head_pull_error,
+            token_invalidation_reach,
         };
 
         ApiResponse::success(output, trace_id)
@@ -720,7 +851,13 @@ impl MonasController {
         //    作った」ことだけで、「owner が作った」ことではないため、平文を知る
         //    第三者が正規 envelope より先にピンを取れる。初回鍵を owner identity
         //    へ束縛する修正は trust anchor の課題として別 issue で追跡する。
-        let pinned = match self.sender_pin_store.load(content_id.as_str()) {
+        // ピンのキーは系列ID。版IDは編集で変わるが、送信者と鍵世代は系列に
+        // 属する(`DecryptSharedContentInput::remote_content_id` を参照)。
+        let pin_key = input
+            .remote_content_id
+            .clone()
+            .unwrap_or_else(|| input.content_id.clone());
+        let pinned = match self.sender_pin_store.load(&pin_key) {
             Ok(p) => p,
             Err(e) => {
                 return ApiResponse::error(
@@ -875,23 +1012,23 @@ impl MonasController {
         let should_refresh_cek_cache = if already_current {
             true
         } else {
-            let advanced = match self.sender_pin_store.compare_and_save(
-                content_id.as_str(),
-                pinned.as_ref(),
-                &new_pin,
-            ) {
-                Ok(advanced) => advanced,
-                Err(e) => {
-                    return ApiResponse::error(
-                        ApiError::Internal(format!(
+            let advanced =
+                match self
+                    .sender_pin_store
+                    .compare_and_save(&pin_key, pinned.as_ref(), &new_pin)
+                {
+                    Ok(advanced) => advanced,
+                    Err(e) => {
+                        return ApiResponse::error(
+                            ApiError::Internal(format!(
                             "decrypted the shared content but failed to persist the sender key pin \
                              for {}: {e}. Re-process the KeyEnvelope.",
                             content_id.as_str()
                         )),
-                        trace_id,
-                    );
-                }
-            };
+                            trace_id,
+                        );
+                    }
+                };
             // CAS に負けた場合は、勝った側がより新しい(または同じ)世代を
             // 書いているので、こちらの CEK でキャッシュを上書きしてはいけない。
             advanced
@@ -926,5 +1063,143 @@ impl MonasController {
         };
 
         ApiResponse::success(output, trace_id)
+    }
+
+    /// 共有を受けた側として、owner の Content Network に新しい版を書く。
+    ///
+    /// 受信者の端末には content レコードが無い。あるのは
+    /// [`decrypt_shared_content`](Self::decrypt_shared_content) が送信者ピンの
+    /// 権威レコードへ保存した CEK だけなので、通常の `update_content`(ローカル
+    /// レコードを要求する)ではなく、その CEK で平文を暗号化して State Node へ
+    /// 直接 PUT する。
+    ///
+    /// 認証は `auth` の `Authorization: Bearer <委譲 Token>` が必須。State Node は
+    /// 非 owner の write を Token の capability(`content/write`)で許可し、
+    /// リクエスト署名を Token の `aud` 鍵で検証するので、署名はこの gateway の
+    /// account 鍵で行い(owner の update と同じメッセージ形式)、Authorization
+    /// だけ Token のまま送る。Token が無い・read しか許されていない・revoke で
+    /// 失効している場合は State Node が 401/403 で拒否し、そのまま返す。
+    ///
+    /// 新しい版の `local_content_id`(平文 CID)は owner と同じ規則で導出して
+    /// 返す。owner 側はこの版を読むとき、自分のローカル版IDとは一致しないので
+    /// `accept_any_version` で読む必要がある。
+    pub fn update_shared_content(
+        &self,
+        input: UpdateSharedContentInput,
+        auth: Option<&StateNodeAuthContext>,
+    ) -> ApiResponse<UpdateSharedContentOutput> {
+        let trace_id = generate_trace_id();
+
+        if let Err(e) = Self::validate_non_empty("remote_content_id", &input.remote_content_id) {
+            return ApiResponse::error(e, trace_id);
+        }
+        let plaintext = match Self::decode_and_validate_content(&input.content, trace_id.clone()) {
+            Ok(bytes) => bytes,
+            Err(response) => return response,
+        };
+
+        // 委譲 Token が無ければ State Node に届く前に落とす。owner の update は
+        // `update_content` を使うので、ここに `user:` で来るのは呼び出し側の誤り。
+        let bearer = auth
+            .and_then(|ctx| ctx.authorization.as_deref())
+            .filter(|value| value.len() > 7 && value[..7].eq_ignore_ascii_case("bearer "));
+        let Some(bearer) = bearer else {
+            return ApiResponse::error(
+                ApiError::Unauthorized(
+                    "update_shared_content requires the delegated token from the share package \
+                     as `Authorization: Bearer <token>`"
+                        .into(),
+                ),
+                trace_id,
+            );
+        };
+        let bearer = bearer.to_string();
+
+        // CEK は送信者ピンの権威レコードから取る(系列IDでキー)。CEK ストアは
+        // そのキャッシュに過ぎず、この端末はこの系列の版IDを一般には知らない。
+        let cek = match self.sender_pin_store.load(&input.remote_content_id) {
+            Ok(Some(pin)) => match pin.cek {
+                Some(bytes) => ContentEncryptionKey(bytes),
+                None => {
+                    return ApiResponse::error(
+                        ApiError::NotFound(format!(
+                            "no content encryption key is recorded for {}: re-process the \
+                             owner's KeyEnvelope (decrypt_shared_content) on this device first",
+                            input.remote_content_id
+                        )),
+                        trace_id,
+                    );
+                }
+            },
+            Ok(None) => {
+                return ApiResponse::error(
+                    ApiError::NotFound(format!(
+                        "content {} has not been shared to this device: import the owner's \
+                         share package (decrypt_shared_content) before writing to it",
+                        input.remote_content_id
+                    )),
+                    trace_id,
+                );
+            }
+            Err(e) => {
+                return ApiResponse::error(
+                    ApiError::Internal(format!("sender key pin store error: {e}")),
+                    trace_id,
+                );
+            }
+        };
+
+        let encrypted = match self.content_service.encrypt_with_cek(&cek, &plaintext) {
+            Ok(encrypted) => encrypted,
+            Err(e) => {
+                return ApiResponse::error(
+                    ApiError::Internal(format!("failed to encrypt the new version: {e:?}")),
+                    trace_id,
+                );
+            }
+        };
+
+        // owner の update と同じ `update:<content_id>:<ts>:<body digest>` に account
+        // 鍵で署名し、Authorization だけ委譲 Token に差し替える。
+        let signed_auth = match self.prepare_state_node_content_auth(
+            auth,
+            "update",
+            &input.remote_content_id,
+            &encrypted.ciphertext,
+            &trace_id,
+        ) {
+            Ok(Some(mut signed)) => {
+                signed.authorization = Some(bearer);
+                signed
+            }
+            Ok(None) => {
+                return ApiResponse::error(
+                    ApiError::Unauthorized("State Node authentication context is required".into()),
+                    trace_id,
+                );
+            }
+            Err(response) => return response,
+        };
+
+        let request = StateNodeUpdateContentRequest {
+            data: BASE64_STANDARD.encode(&encrypted.ciphertext),
+        };
+        if let Some(response) = self.send_signed_update_to_state_node(
+            &input.remote_content_id,
+            &request,
+            Some(&signed_auth),
+            trace_id.clone(),
+        ) {
+            return response;
+        }
+
+        ApiResponse::success(
+            UpdateSharedContentOutput {
+                remote_content_id: input.remote_content_id,
+                version_id: encrypted.plain_content_id.as_str().to_string(),
+                updated_at: Some(Utc::now().to_rfc3339()),
+            },
+            trace_id,
+        )
     }
 }

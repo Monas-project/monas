@@ -299,9 +299,16 @@ impl MonasController {
     }
 
     /// 設定から ureq::Agent を構築するヘルパーメソッド
+    ///
+    /// 非 2xx をエラーにしない: 各呼び出し側が status とレスポンス body から
+    /// `ApiError`(401/403/404/409 …)へ写す(`try_state_node_http_error` /
+    /// `try_account_http_error`)。ureq 既定のままだと 4xx が `send()` の Err に
+    /// なり、body ごと捨てて `Internal`(500)に潰れる — State Node の
+    /// 「Token 失効で 403」が gateway から 500 に見えていた。
     fn build_agent(config: &MonasConfig) -> ureq::Agent {
         let ureq_config = ureq::Agent::config_builder()
             .timeout_global(Some(config.request_timeout))
+            .http_status_as_error(false)
             .build();
         ureq::Agent::new_with_config(ureq_config)
     }

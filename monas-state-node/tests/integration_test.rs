@@ -656,6 +656,7 @@ async fn test_access_control_update_and_verify() {
 /// のか区別できなくなるため。
 #[tokio::test]
 async fn test_signed_mutation_cannot_be_replayed_after_a_newer_one() {
+    let request_timestamp = test_timestamp();
     let (service, _crdt_repo, _temp_dir) = create_test_service_with_ac().await;
 
     service.init_access_control("content-1").await.unwrap();
@@ -681,7 +682,7 @@ async fn test_signed_mutation_cannot_be_replayed_after_a_newer_one() {
             &update_a,
             Some(&test_token()),
             Some(&sig_a),
-            test_timestamp(),
+            request_timestamp,
         )
         .await
         .expect("first update should apply");
@@ -690,7 +691,7 @@ async fn test_signed_mutation_cannot_be_replayed_after_a_newer_one() {
             &update_b,
             Some(&test_token()),
             Some(&sig_b),
-            test_timestamp(),
+            request_timestamp,
         )
         .await
         .expect("second update should apply");
@@ -707,12 +708,14 @@ async fn test_signed_mutation_cannot_be_replayed_after_a_newer_one() {
     // 攻撃者が捕まえておいた B の署名を再送する。
     // (A の再送はドメイン側の単調性チェックが別途弾くので、消費記録が
     //  効いていることを見るにはこちらを使う)
+    // Cross a whole-second boundary: replay must preserve the original timestamp.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
     let replay = service
         .update_access_control(
             &update_b,
             Some(&test_token()),
             Some(&sig_b),
-            test_timestamp(),
+            request_timestamp,
         )
         .await;
     assert!(replay.is_err(), "replaying a consumed signature must fail");
@@ -743,6 +746,7 @@ async fn test_signed_mutation_cannot_be_replayed_after_a_newer_one() {
 /// 状態巻き戻しが成立する。ID は署名対象メッセージから導くのでこれは効かない。
 #[tokio::test]
 async fn test_signed_mutation_replay_survives_signature_malleability() {
+    let request_timestamp = test_timestamp();
     use p256::ecdsa::Signature;
 
     let (service, _crdt_repo, _temp_dir) = create_test_service_with_ac().await;
@@ -773,18 +777,20 @@ async fn test_signed_mutation_replay_survives_signature_malleability() {
             &update,
             Some(&test_token()),
             Some(&canonical),
-            test_timestamp(),
+            request_timestamp,
         )
         .await
         .expect("first presentation should apply");
 
     // 同じリクエストを、別バイト列の署名で再送する
+    // Cross a whole-second boundary: replay must preserve the original timestamp.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
     let replay = service
         .update_access_control(
             &update,
             Some(&test_token()),
             Some(&malleated),
-            test_timestamp(),
+            request_timestamp,
         )
         .await;
     assert!(
@@ -798,6 +804,7 @@ async fn test_signed_mutation_replay_survives_signature_malleability() {
 /// 通してしまうと正規リクエスト後に発行された Token まで巻き添えで失効する。
 #[tokio::test]
 async fn test_signed_mutation_is_single_use() {
+    let request_timestamp = test_timestamp();
     let (service, _crdt_repo, _temp_dir) = create_test_service_with_ac().await;
 
     service.init_access_control("content-1").await.unwrap();
@@ -812,17 +819,19 @@ async fn test_signed_mutation_is_single_use() {
             &update,
             Some(&test_token()),
             Some(&request_signature),
-            test_timestamp(),
+            request_timestamp,
         )
         .await
         .expect("first presentation should apply");
 
+    // Cross a whole-second boundary: replay must preserve the original timestamp.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
     let replay = service
         .update_access_control(
             &update,
             Some(&test_token()),
             Some(&request_signature),
-            test_timestamp(),
+            request_timestamp,
         )
         .await;
     assert!(replay.is_err(), "the same signature must not apply twice");
