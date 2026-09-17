@@ -31,7 +31,7 @@ export function heldVersionId(entry: Entry): string | undefined {
 
 const checking = new Set<string>();
 
-export function syncStatusOf(entry: Entry): SyncStatus {
+export function syncStatusOf(entry: Entry, comparedVersionId = heldVersionId(entry)): SyncStatus {
   if (entry.kind !== "file" || !entry.syncedToStateNode || !entry.remoteContentId) {
     return { kind: "local" };
   }
@@ -40,7 +40,7 @@ export function syncStatusOf(entry: Entry): SyncStatus {
     return { kind: "unreachable", error: entry.networkCheckError, head: entry.networkHead };
   }
   if (!entry.networkHead) return { kind: "unchecked" };
-  return entry.networkHead.localId === heldVersionId(entry)
+  return entry.networkHead.localId === comparedVersionId
     ? { kind: "current", head: entry.networkHead }
     : { kind: "behind", head: entry.networkHead };
 }

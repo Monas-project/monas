@@ -16,6 +16,7 @@ use crsl_lib::convergence::metadata::ContentMetadata;
 use crsl_lib::crdt::crdt_state::CrdtState;
 use crsl_lib::crdt::operation::{Operation, OperationType};
 use crsl_lib::crdt::storage::LeveldbStorage;
+use crsl_lib::crdt::timestamp::next_monotonic_timestamp;
 use crsl_lib::graph::dag::DagGraph;
 use crsl_lib::graph::storage::{LeveldbNodeStorage, NodeStorage};
 use crsl_lib::repo::Repo;
@@ -30,6 +31,11 @@ use std::path::Path;
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ContentPayload {
     pub data: Vec<u8>,
+    /// Ordering of the last explicit body write, not of the containing node.
+    /// Policy-only updates and merges MUST copy this together with `data`.
+    /// Required on the wire: silently defaulting old data would invent a write
+    /// order. Deploy this format to all members together with fresh stores.
+    pub body_updated_at: u64,
     pub access_policy: Option<AccessPolicy>,
 }
 
@@ -171,6 +177,7 @@ impl ContentRepository for CrslCrdtRepository {
         let placeholder = Self::generate_placeholder_cid(data);
         let payload = ContentPayload {
             data: data.to_vec(),
+            body_updated_at: next_monotonic_timestamp(),
             access_policy,
         };
 
@@ -202,33 +209,36 @@ impl ContentRepository for CrslCrdtRepository {
     ) -> Result<CommitResult> {
         let genesis = Self::parse_cid(genesis_cid)?;
 
-        // If no access_policy provided, preserve the existing one from the latest version
-        let policy = if access_policy.is_some() {
-            access_policy
-        } else {
-            let mut repo = self.repo.lock();
-            Self::converged_head(&mut repo, &genesis)?.and_then(|latest_cid| {
-                repo.dag
-                    .get_node(&latest_cid)
-                    .ok()
-                    .flatten()
-                    .and_then(|node| node.payload().access_policy.clone())
-            })
-        };
-
+        // Read/derive/commit under one lock: a policy arriving between the
+        // read and commit must not be overwritten by the policy we copied.
+        let mut repo = self.repo.lock();
+        let head = Self::converged_head(&mut repo, &genesis)?
+            .ok_or_else(|| anyhow::anyhow!("Content not found: {genesis}"))?;
+        let current = repo
+            .dag
+            .get_node(&head)?
+            .ok_or_else(|| anyhow::anyhow!("Head node not found: {head}"))?;
+        let current = current.payload();
+        let mut policy = access_policy.or_else(|| current.access_policy.clone());
+        if let (Some(policy), Some(previous)) = (&mut policy, &current.access_policy) {
+            policy.raise_min_valid_issued_at(previous.min_valid_issued_at());
+        }
+        // Advance past an observed write even if this replica's wall clock
+        // lags. Equal timestamps on independent replicas are broken by bytes
+        // in MonasMergePolicy, never by storage/arrival order.
+        let after_current = current
+            .body_updated_at
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("Body write timestamp exhausted"))?;
         let payload = ContentPayload {
             data: data.to_vec(),
+            body_updated_at: next_monotonic_timestamp().max(after_current),
             access_policy: policy,
         };
-
-        // Create update operation - parents will be auto-filled by crsl-lib
         let op = Operation::new(genesis, OperationType::Update(payload), author.to_string());
-
-        let version_cid = {
-            let mut repo = self.repo.lock();
-            repo.commit_operation(op)
-                .map_err(|e| anyhow::anyhow!("Failed to commit update operation: {}", e))?
-        };
+        let version_cid = repo
+            .commit_operation(op)
+            .map_err(|e| anyhow::anyhow!("Failed to commit update operation: {}", e))?;
 
         Ok(CommitResult {
             genesis_cid: genesis_cid.to_string(),
@@ -376,32 +386,24 @@ impl ContentRepository for CrslCrdtRepository {
     ) -> Result<CommitResult> {
         let genesis = Self::parse_cid(genesis_cid)?;
 
-        // Get current data from latest version
-        let current_data = {
-            let mut repo = self.repo.lock();
-            Self::converged_head(&mut repo, &genesis)?
-                .and_then(|latest_cid| {
-                    repo.dag
-                        .get_node(&latest_cid)
-                        .ok()
-                        .flatten()
-                        .map(|node| node.payload().data.clone())
-                })
-                .unwrap_or_default()
-        };
-
-        let payload = ContentPayload {
-            data: current_data,
-            access_policy: Some(policy),
-        };
-
+        let mut repo = self.repo.lock();
+        let head = Self::converged_head(&mut repo, &genesis)?
+            .ok_or_else(|| anyhow::anyhow!("Content not found: {genesis}"))?;
+        let current = repo
+            .dag
+            .get_node(&head)?
+            .ok_or_else(|| anyhow::anyhow!("Head node not found: {head}"))?;
+        let mut payload = current.payload().clone();
+        let mut policy = policy;
+        if let Some(previous) = &payload.access_policy {
+            policy.raise_min_valid_issued_at(previous.min_valid_issued_at());
+        }
+        // Only the policy changed. Keep both the body and its original order.
+        payload.access_policy = Some(policy);
         let op = Operation::new(genesis, OperationType::Update(payload), author.to_string());
-
-        let version_cid = {
-            let mut repo = self.repo.lock();
-            repo.commit_operation(op)
-                .map_err(|e| anyhow::anyhow!("Failed to commit access policy update: {}", e))?
-        };
+        let version_cid = repo
+            .commit_operation(op)
+            .map_err(|e| anyhow::anyhow!("Failed to commit access policy update: {}", e))?;
 
         Ok(CommitResult {
             genesis_cid: genesis_cid.to_string(),
@@ -435,110 +437,176 @@ impl ContentRepository for CrslCrdtRepository {
             .get_operations_with_index(&genesis)
             .map_err(|e| anyhow::anyhow!("Failed to get operations: {}", e))?;
 
-        // The linear history is ordered genesis → head, and `indexed_ops` is
-        // ordered by timestamp, so position N in one is position N in the
-        // other. Every lookup below uses that correspondence rather than
-        // comparing timestamps: two versions written inside the same second
-        // are indistinguishable by timestamp, and guessing between them
-        // silently dropped or re-sent versions.
-        let history = repo
-            .linear_history(&genesis)
-            .map_err(|e| anyhow::anyhow!("Failed to get history: {}", e))?;
+        use crsl_lib::dasl::node::Node;
+        use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-        // Filter by since_version if provided: return only what came after it.
-        let since_index = if let Some(since) = since_version {
-            let since_cid = Self::parse_cid(since)?;
-
-            // 1-based, matching `indexed_ops`. An unknown version yields None,
-            // which sends the full history — the safe direction, since the
-            // receiver can discard what it already has but cannot invent what
-            // it never received.
-            history
-                .iter()
-                .position(|cid| *cid == since_cid)
-                .map(|pos| pos + 1)
-        } else {
-            None
-        };
-
-        // Pair each operation with the DAG node it produced.
-        //
-        // The receiver recomputes a node's CID from `node_timestamp`, so an
-        // operation carrying the wrong one is re-derived as a different node —
-        // or, when two operations carry the same one, collapses onto a single
-        // CID and the newer version is lost.
-        //
-        // `linear_history` is ordered genesis → head and `indexed_ops` is
-        // ordered by timestamp, so the two line up position by position. That
-        // is the only reliable correspondence: matching by timestamp proximity
-        // returned the first node within ±1s, which is the genesis for every
-        // operation written in the same second.
-        // A node we cannot read must not be skipped: dropping one shifts every
-        // pair after it by one, which is worse than the tail simply running
-        // short.
-        let node_timestamps = history
-            .iter()
-            .map(|cid| {
-                repo.dag
-                    .get_node(cid)
-                    .ok()
-                    .flatten()
-                    .map(|node| node.timestamp())
-                    .ok_or_else(|| {
-                        anyhow::anyhow!("Missing DAG node {cid} in the history of {genesis_cid}")
-                    })
-            })
-            .collect::<Result<Vec<u64>>>()?;
-
-        // The pairing below is positional, and that only holds while the
-        // history is a line: `get_operations_with_index` returns every
-        // operation for this genesis, while `linear_history` picks a single
-        // child at each branch. Once the DAG forks, the lists differ and an
-        // index no longer identifies the node an operation produced.
-        //
-        // Refuse rather than guess. Handing an operation a timestamp from an
-        // unrelated node is what corrupted replicas in the first place, and a
-        // failed sync round is retried; a silently mis-stamped one is not.
-        if node_timestamps.len() != indexed_ops.len() {
-            return Err(anyhow::anyhow!(
-                "Cannot pair operations with their DAG nodes for {genesis_cid}: \
-                 {} operations over a {}-node linear history. The history is not \
-                 linear, so no positional pairing is trustworthy.",
-                indexed_ops.len(),
-                node_timestamps.len()
-            ));
+        let node_cids = repo
+            .dag
+            .get_nodes_by_genesis(&genesis)
+            .map_err(|e| anyhow::anyhow!("Failed to get DAG nodes: {}", e))?;
+        let mut nodes = HashMap::new();
+        for cid in node_cids {
+            let node = repo
+                .dag
+                .get_node(&cid)?
+                .ok_or_else(|| anyhow::anyhow!("Missing DAG node {cid}"))?;
+            nodes.insert(cid, node);
         }
 
-        let mut operations = Vec::new();
-        for (idx, op) in indexed_ops {
-            // `idx` is 1-based over the full operation list, which is exactly
-            // the position of this operation's node in the linear history.
-            // Guarded above: the two lists are the same length, so every
-            // 1-based operation index addresses its own node.
-            let node_timestamp = node_timestamps[idx - 1];
+        // Local operations (including auto-merges) do not store their node
+        // timestamp. Match the complete node structure with only that field
+        // removed; operation timestamps and linear-history positions are NOT
+        // node identities. Imported operations already carry an exact stamp.
+        let mut by_structure: HashMap<Cid, Vec<Cid>> = HashMap::new();
+        for (cid, node) in &nodes {
+            let mut unstamped = node.clone();
+            unstamped.timestamp = 0;
+            by_structure
+                .entry(unstamped.content_id()?)
+                .or_default()
+                .push(*cid);
+        }
 
-            // Skip operations at or before the since_version index. This runs
-            // after the lookup above so that skipping never shifts the
-            // remaining operations onto the wrong nodes.
-            if let Some(since_idx) = since_index {
-                if idx <= since_idx {
-                    continue;
+        let mut templates = Vec::new();
+        for (_, op) in indexed_ops {
+            let node = match &op.kind {
+                OperationType::Create(payload) => {
+                    Node::new_genesis(payload.clone(), 0, ContentMetadata::default())
+                }
+                OperationType::Update(payload) | OperationType::Merge(payload) => {
+                    let parent = op
+                        .parents
+                        .first()
+                        .and_then(|cid| nodes.get(cid))
+                        .ok_or_else(|| anyhow::anyhow!("Missing parent for operation {}", op.id))?;
+                    Node::new_child(
+                        payload.clone(),
+                        op.parents.clone(),
+                        genesis,
+                        0,
+                        parent.metadata().clone(),
+                    )
+                }
+                // Delete has no payload and the public content API does not
+                // produce it. Do not guess its historical payload.
+                OperationType::Delete => {
+                    anyhow::bail!("Cannot pair delete operation {} with its DAG node", op.id)
+                }
+            };
+            templates.push((op, node));
+        }
+
+        // Reserve exact imported matches first. Two replicas can independently
+        // merge identical parents/payloads at different times. Once exchanged,
+        // the imported stamp disambiguates the remaining local merge node.
+        let mut claimed = HashSet::new();
+        let mut paired = Vec::new();
+        let mut local = Vec::new();
+        for (op, mut node) in templates {
+            if let Some(timestamp) = op.node_timestamp {
+                node.timestamp = timestamp;
+                let cid = node.content_id()?;
+                anyhow::ensure!(
+                    nodes.get(&cid) == Some(&node),
+                    "Missing DAG node for operation {}",
+                    op.id
+                );
+                claimed.insert(cid);
+                paired.push((cid, op));
+            } else {
+                local.push((op, node));
+            }
+        }
+        for (op, node) in local {
+            let candidates: Vec<_> = by_structure
+                .get(&node.content_id()?)
+                .into_iter()
+                .flatten()
+                .filter(|cid| !claimed.contains(*cid))
+                .copied()
+                .collect();
+            anyhow::ensure!(
+                candidates.len() == 1,
+                "Cannot uniquely pair operation {} with its DAG node: {} candidates",
+                op.id,
+                candidates.len()
+            );
+            let cid = candidates[0];
+            claimed.insert(cid);
+            paired.push((cid, op));
+        }
+
+        // A receiver holding one branch tip knows its ancestors, not sibling
+        // branches. Unknown versions safely request the complete DAG.
+        let mut known = HashSet::new();
+        if let Some(since) = since_version {
+            let since = Self::parse_cid(since)?;
+            if nodes.contains_key(&since) {
+                let mut pending = vec![since];
+                while let Some(cid) = pending.pop() {
+                    if known.insert(cid) {
+                        let node = nodes
+                            .get(&cid)
+                            .ok_or_else(|| anyhow::anyhow!("Missing ancestor DAG node {cid}"))?;
+                        pending.extend(node.parents().iter().copied());
+                    }
                 }
             }
-
-            // Serialize the operation using serde_json for network transfer
-            let serialized = serde_json::to_vec(&op)
-                .map_err(|e| anyhow::anyhow!("Failed to serialize operation: {}", e))?;
-
-            operations.push(SerializedOperation {
-                data: serialized,
-                genesis_cid: genesis_cid.to_string(),
-                author: op.author.clone(),
-                timestamp: op.timestamp,
-                node_timestamp,
-            });
         }
 
+        // Emit parents before children even when operation clocks disagree.
+        // BTreeMap makes the choice between ready siblings deterministic.
+        let mut pending: BTreeMap<Cid, Vec<Operation<Cid, ContentPayload>>> = BTreeMap::new();
+        for (cid, op) in paired {
+            if !known.contains(&cid) {
+                pending.entry(cid).or_default().push(op);
+            }
+        }
+        let mut children: HashMap<Cid, Vec<Cid>> = HashMap::new();
+        let mut remaining_parents = HashMap::new();
+        let mut ready_nodes = BTreeSet::new();
+        for cid in pending.keys() {
+            let mut count = 0;
+            for parent in nodes[cid].parents() {
+                if !known.contains(parent) {
+                    anyhow::ensure!(
+                        pending.contains_key(parent),
+                        "Missing parent operation for DAG node {parent}"
+                    );
+                    children.entry(*parent).or_default().push(*cid);
+                    count += 1;
+                }
+            }
+            remaining_parents.insert(*cid, count);
+            if count == 0 {
+                ready_nodes.insert(*cid);
+            }
+        }
+        let mut operations = Vec::new();
+        while let Some(ready) = ready_nodes.pop_first() {
+            for op in pending.remove(&ready).expect("ready node is pending") {
+                operations.push(SerializedOperation {
+                    data: serde_json::to_vec(&op).context("Failed to serialize operation")?,
+                    genesis_cid: genesis_cid.to_string(),
+                    author: op.author.clone(),
+                    timestamp: op.timestamp,
+                    node_timestamp: nodes[&ready].timestamp(),
+                });
+            }
+            if let Some(children) = children.get(&ready) {
+                for child in children {
+                    let remaining = remaining_parents.get_mut(child).expect("child is pending");
+                    *remaining -= 1;
+                    if *remaining == 0 {
+                        ready_nodes.insert(*child);
+                    }
+                }
+            }
+        }
+        anyhow::ensure!(
+            pending.is_empty(),
+            "Cannot export cyclic DAG for {genesis_cid}"
+        );
         Ok(operations)
     }
 
@@ -651,8 +719,10 @@ impl ContentRepository for CrslCrdtRepository {
         // 1. Build the Create operation and compute genesis CID via pure math
         //    (Node serialization + SHA-256). No storage is touched.
         let placeholder = Self::generate_placeholder_cid(data);
+        let body_updated_at = next_monotonic_timestamp();
         let create_payload = ContentPayload {
             data: data.to_vec(),
+            body_updated_at,
             access_policy: None,
         };
         let create_op = Operation::new(
@@ -694,6 +764,7 @@ impl ContentRepository for CrslCrdtRepository {
             let policy = AccessPolicy::new(content_id_vo, identity);
             let update_payload = ContentPayload {
                 data: data.to_vec(),
+                body_updated_at,
                 access_policy: Some(policy),
             };
             let update_op = Operation::new(
@@ -990,22 +1061,10 @@ mod tests {
         );
     }
 
-    /// The position pairing only holds while the history is linear.
-    ///
-    /// `get_operations_with_index` returns every operation for the genesis;
-    /// `linear_history` walks one path and picks a single child at each
-    /// branch. The moment the DAG forks the two lists differ in length and
-    /// order, and pairing by index hands an operation a timestamp belonging
-    /// to some unrelated node — the same "wrong stamp, wrong CID" failure
-    /// this module was changed to fix, arriving through another door.
-    ///
-    /// A node lookup that fails mid-history is worse still: `filter_map`
-    /// drops it, so every pair after that point shifts by one.
-    ///
-    /// We cannot honestly stamp operations we cannot place, so refuse rather
-    /// than guess.
+    /// Export all branches using their actual DAG identities, never the
+    /// positions in the single path returned by linear_history.
     #[tokio::test]
-    async fn refuses_to_stamp_operations_it_cannot_place() {
+    async fn forked_operations_replay_with_their_actual_node_cids() {
         let (creator, _tmp, genesis_cid) = creator_with_three_versions().await;
 
         // Sanity: the linear case still works.
@@ -1063,23 +1122,32 @@ mod tests {
             )
         };
 
-        if ops_len == history_len {
-            // Auto-merge collapsed the fork back into a line; the invariant
-            // still holds and there is nothing to refuse.
-            return;
+        assert!(ops_len > history_len, "fixture must contain a real fork");
+        let operations = creator.get_operations(&genesis_cid, None).await.unwrap();
+        assert_eq!(operations.len(), ops_len);
+        let replica_tmp = tempdir().unwrap();
+        let replica = CrslCrdtRepository::open(replica_tmp.path()).unwrap();
+        assert_eq!(
+            replica.apply_operations(&operations).await.unwrap(),
+            ops_len
+        );
+        let expected_nodes = {
+            let repo = creator.repo.lock();
+            repo.dag.get_nodes_by_genesis(&genesis).unwrap()
+        };
+        for cid in expected_nodes {
+            assert_eq!(
+                replica
+                    .get_version_node_bytes(&genesis_cid, &cid.to_string())
+                    .await
+                    .unwrap(),
+                creator
+                    .get_version_node_bytes(&genesis_cid, &cid.to_string())
+                    .await
+                    .unwrap(),
+                "every branch node must retain its original CID"
+            );
         }
-
-        // The lists disagree, so no index pairing is trustworthy. Stamping
-        // anyway is what corrupts replicas, so the call must fail loudly.
-        let err = creator.get_operations(&genesis_cid, None).await.expect_err(
-            "with {ops_len} operations over a {history_len}-node history, \
-                 pairing by index is a guess and must be refused",
-        );
-        let msg = err.to_string();
-        assert!(
-            msg.contains("history") || msg.contains("operations"),
-            "the error should say the pairing broke, got: {msg}"
-        );
     }
 
     /// A replica that committed a WRONG node CID under the old pairing must

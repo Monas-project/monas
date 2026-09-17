@@ -18,6 +18,23 @@ const store = createStore<IdentityState>("monas.identities.v2", {
   activeLabel: null,
 });
 
+// Older UIs appended a signing account on every POST /accounts, but that
+// endpoint replaces the backend's ONE key. Array order records creation order;
+// activeLabel only recorded UI switching and cannot change the backend key.
+// There is no account read endpoint to reconcile against. Retain old private
+// keys for envelope decryption, but persist their demotion so removing the
+// current account never resurrects an overwritten signing key.
+const signingAccounts = store.get().identities.filter((i) => i.isSigningAccount);
+if (signingAccounts.length > 1) {
+  const current = signingAccounts[signingAccounts.length - 1];
+  store.set((prev) => ({
+    identities: prev.identities.map((i) =>
+      i.isSigningAccount && i !== current ? { ...i, isSigningAccount: false } : i,
+    ),
+    activeLabel: current.label,
+  }));
+}
+
 export const useIdentities = () => store.use();
 
 export function getIdentities(): Identity[] {

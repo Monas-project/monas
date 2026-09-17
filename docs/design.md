@@ -465,13 +465,19 @@ crsl-libはMonasのために設計されたCIDネイティブなDAG CRDTライ�
 
 | フィールド | 規則 | 理由 |
 |---|---|---|
-| コンテンツ本体（ciphertext） | LWW — ただし**親から本体を変えたheadの中で**timestamp最大 | 最後の書き込みが正。policyだけを進めたhead（revoke等）は本体を親からコピーしているだけで「書いて」いないので、並行する本物の書き込みに勝ってはならない |
+| コンテンツ本体（ciphertext） | `(body_updated_at, data)` の辞書順 max | 明示的な本文更新でのみ順序を進め、policy-only 更新と Merge は本文と順序をそのまま引き継ぐ。head 自体の timestamp や直近の親との差分では選ばない |
 | `access_policy.min_valid_issued_at` | 全headの**max** | 失効境界は単調にしか進まない。timestampで選ぶと、境界を知らないノードが受理した並行writeが境界を巻き戻す |
 | `access_policy.owner` / `content_id` | 不変（genesisで確定） | — |
 
 payload全体をtimestampで丸ごと選ぶ（純粋なLWW）と、revokeと並行するwriteの一方が必ず消える — writeがtimestampで勝てばrevokeが消え、revokeが勝てば正当なwriteが消える。どちらも「競合していないフィールドの変更が、競合したフィールドの勝敗に巻き込まれる」のが原因で、フィールド別に畳めば両方残る。マージポリシーはプロセスに焼かれておりデータとともには流れないため、**同じContent Networkの全メンバーが同じ規則を持つ**必要がある。
 
 このマージが決めるのは「Mergeノードに何を入れるか」であり、「そのheadを受理してよかったか」ではない。失効境界を知らないメンバーが旧Tokenで受理したwriteは、最新のwriteであれば本体として残る（境界は残るので以後は書けない）。それを弾くにはwriteが自分のTokenを持ち歩き、マージ時に畳んだ境界に対して検証する必要がある — ワイヤ形式の変更を伴うため別issueで追跡する。
+
+`body_updated_at` は本文と同じ payload に保存する論理的な更新順序であり、別 DAG ではない。本文更新ではローカルの単調 timestamp と観測済みの順序 + 1 の大きい方を採る。policy-only 更新、再マージ、再起動で順序を失わず、同値時は ciphertext の辞書順で決定する。観測・マージ・payload の生成・commit は同じ repository lock 内で行う。
+
+同期 export は operation と DAG ノードを payload・parents・genesis・metadata で対応付け、実ノードの timestamp を送る。履歴の位置対応は使用しない。`since_version` はそのノードと祖先を既知とみなし、兄弟枝を省かず親から順に送る。曖昧な対応は推測せずエラーにする。
+
+保存・wire 形式の変更: `body_updated_at` は必須で、旧形式を 0 等へ暗黙補完しない。現行デモは顧客利用前のため、全 state-node を同時更新し、新しいストアから開始してコンテンツを再作成する必要がある。既存ストアを維持する場合の移行は未実装。データ削除やデプロイは本変更では行わない。
 
 コンテンツ本体の意味的なマージ（同じフィールド内での両立）は現時点で未実装であり、研究課題として位置づけられている。
 

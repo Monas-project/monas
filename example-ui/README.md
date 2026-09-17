@@ -51,6 +51,32 @@ send permissive CORS headers.
 
 ## Tests
 
+### Isolated UI regressions (no backend required)
+
+```bash
+npm ci --ignore-scripts
+npx playwright install chromium  # once, if not already installed
+npm run test:regression
+npm run build
+```
+
+This suite starts its own Vite on `127.0.0.1:5198` (fails if occupied). It runs
+actual App/store/flow/API-adapter paths with HTTP fixtures, intercepts all
+backend requests, rejects unknown endpoints and blocks external origins. No
+hosted nodes or account keys are needed or modified. Results/traces go to
+`/tmp/monas-ui-regression-results`. It covers recipient import → edit → reopen,
+owner preview/head checks, revocation reach reporting, and legacy identities.
+These are UI regressions, not cryptographic or distributed-protocol tests.
+
+Legacy identity migration keeps the **last-created signing account**, matching
+`POST /accounts` replacing monas-account's single key. Earlier signing entries
+remain available as envelope-decryption keypairs; removing the current account
+does not promote them. `activeLabel` from old UI switching cannot change the
+backend's key. The account API has no read-current-key endpoint, so a reset or
+externally replaced backend key still requires explicit user recovery.
+
+### Real-stack suites
+
 ```bash
 npm test                 # UI suite (tests/) — ~22s
 npm run test:ui          # same, in the Playwright UI runner

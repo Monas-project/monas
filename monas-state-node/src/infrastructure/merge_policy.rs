@@ -17,11 +17,12 @@
 //!   LWW copies *that* whole, and a legitimate write that was never in
 //!   conflict with anything is silently dropped.
 //!
-//! [`MonasMergePolicy`] merges field by field instead: the body is LWW among
-//! the heads that actually changed it against their parent (a head that only
-//! re-committed its parent's body did not write and must not win a write
-//! race), and `min_valid_issued_at` is the max across all heads. Owner and
-//! content id are fixed at genesis and simply carried.
+//! [`MonasMergePolicy`] merges field by field: the body carries the order of
+//! its last explicit write (`body_updated_at`). Policy-only nodes and merge
+//! nodes carry that order unchanged, so neither can hide a branch's write or
+//! promote an old write using a fresh merge timestamp. Equal write orders use
+//! the body bytes as a deterministic tie-break. `min_valid_issued_at` is the
+//! max across all heads. Owner and content id are fixed at genesis.
 //!
 //! This decides what a merge node *contains*; it does not judge whether a
 //! head should have been accepted. A write a stale member let through under
@@ -39,59 +40,31 @@ use crsl_lib::convergence::policy::{MergePolicy, ResolveInput};
 
 use super::crdt_repository::ContentPayload;
 
-/// Field-wise merge for [`ContentPayload`]: body is LWW among heads that
-/// changed it, `min_valid_issued_at` is the max, the rest is carried.
+/// Field-wise merge: max body-write register and max invalidation policy.
+/// Neither decision depends on the timestamp or parents of a merge node.
 pub struct MonasMergePolicy;
 
 impl MonasMergePolicy {
-    /// Did this head change the body against its parent(s)?
-    ///
-    /// A head with no parent payloads (a genesis, or ancestry the replica
-    /// has not synced) is taken as a change: there is nothing to say it
-    /// isn't, and the alternative — dropping it from the race — could lose a
-    /// real write.
-    fn changed_body(input: &ResolveInput<ContentPayload>) -> bool {
-        input.parent_payloads.is_empty()
-            || input
-                .parent_payloads
-                .iter()
-                .any(|parent| parent.data != input.payload.data)
-    }
-
-    /// The head whose body should win: newest among those that wrote.
     fn body_winner(nodes: &[ResolveInput<ContentPayload>]) -> &ResolveInput<ContentPayload> {
-        let mut writers = nodes.iter().filter(|n| Self::changed_body(n)).peekable();
-        if writers.peek().is_some() {
-            writers
-                .max_by_key(|n| n.timestamp)
-                .expect("peeked non-empty")
-        } else {
-            // Nobody changed the body: every head carries the same one, so
-            // any head's copy is right. Newest, for determinism.
-            nodes
-                .iter()
-                .max_by_key(|n| n.timestamp)
-                .expect("MonasMergePolicy requires at least one candidate node")
-        }
+        nodes
+            .iter()
+            .max_by(|a, b| {
+                a.payload
+                    .body_updated_at
+                    .cmp(&b.payload.body_updated_at)
+                    .then_with(|| a.payload.data.cmp(&b.payload.data))
+            })
+            .expect("MonasMergePolicy requires at least one candidate node")
     }
 
-    /// The policy to carry: the winner's, with the cutoff raised to the max
-    /// seen on any head. A head without a policy (legacy content) contributes
-    /// nothing.
-    fn merged_policy(
-        nodes: &[ResolveInput<ContentPayload>],
-        base: Option<&AccessPolicy>,
-    ) -> Option<AccessPolicy> {
-        let base = base.or_else(|| nodes.iter().find_map(|n| n.payload.access_policy.as_ref()))?;
-        let max_cutoff = nodes
+    /// Policies share immutable owner/content identity. Select the highest
+    /// invalidation value independently of the body, retaining its metadata.
+    fn merged_policy(nodes: &[ResolveInput<ContentPayload>]) -> Option<AccessPolicy> {
+        nodes
             .iter()
             .filter_map(|n| n.payload.access_policy.as_ref())
-            .map(AccessPolicy::min_valid_issued_at)
-            .max()
-            .unwrap_or(0);
-        let mut merged = base.clone();
-        merged.raise_min_valid_issued_at(max_cutoff);
-        Some(merged)
+            .max_by_key(|p| (p.min_valid_issued_at(), p.updated_at()))
+            .cloned()
     }
 }
 
@@ -100,7 +73,8 @@ impl MergePolicy<ContentPayload> for MonasMergePolicy {
         let winner = Self::body_winner(nodes);
         ContentPayload {
             data: winner.payload.data.clone(),
-            access_policy: Self::merged_policy(nodes, winner.payload.access_policy.as_ref()),
+            body_updated_at: winner.payload.body_updated_at,
+            access_policy: Self::merged_policy(nodes),
         }
     }
 
@@ -133,6 +107,7 @@ mod tests {
     fn payload(data: &str, cutoff: u64) -> ContentPayload {
         ContentPayload {
             data: data.as_bytes().to_vec(),
+            body_updated_at: 0,
             access_policy: Some(policy(cutoff)),
         }
     }
@@ -144,12 +119,12 @@ mod tests {
         ts: u64,
         parent: Option<ContentPayload>,
     ) -> ResolveInput<ContentPayload> {
-        ResolveInput::with_parents(
-            cid(label),
-            payload(data, cutoff),
-            ts,
-            parent.into_iter().collect(),
-        )
+        let mut value = payload(data, cutoff);
+        value.body_updated_at = parent
+            .as_ref()
+            .filter(|p| p.data == value.data)
+            .map_or(ts, |p| p.body_updated_at);
+        ResolveInput::with_parents(cid(label), value, ts, parent.into_iter().collect())
     }
 
     fn cutoff_of(p: &ContentPayload) -> u64 {
@@ -238,5 +213,63 @@ mod tests {
         let ba = MonasMergePolicy.resolve(&[b, a]);
 
         assert_eq!(ab, ba);
+    }
+
+    #[test]
+    fn write_register_is_associative_commutative_and_idempotent() {
+        let a = head("a", "old", 300, 10, None);
+        let b = head("b", "latest", 100, 30, None);
+        let c = head("c", "middle", 200, 20, None);
+        let expected = MonasMergePolicy.resolve(&[a.clone(), b.clone(), c.clone()]);
+        assert_eq!(expected.data, b"latest");
+        assert_eq!(expected.body_updated_at, 30);
+        assert_eq!(cutoff_of(&expected), 300);
+        for [x, y, z] in [
+            [a.clone(), b.clone(), c.clone()],
+            [a.clone(), c.clone(), b.clone()],
+            [b.clone(), a.clone(), c.clone()],
+            [b.clone(), c.clone(), a.clone()],
+            [c.clone(), a.clone(), b.clone()],
+            [c, b, a],
+        ] {
+            let xy = MonasMergePolicy.resolve(&[x.clone(), y.clone()]);
+            // Deliberately much newer NODE timestamp, preserving BODY order.
+            let merged = ResolveInput::with_parents(
+                cid("merge"),
+                xy.clone(),
+                9999,
+                vec![x.payload, y.payload],
+            );
+            assert_eq!(MonasMergePolicy.resolve(&[merged.clone(), z]), expected);
+            assert_eq!(MonasMergePolicy.resolve(&[merged.clone(), merged]), xy);
+        }
+    }
+
+    #[test]
+    fn simultaneous_writes_use_body_bytes_not_head_order_or_node_time() {
+        let a = head("a", "aaa", 100, 10, None);
+        let mut b = head("b", "zzz", 200, 10, None);
+        b.timestamp = 1; // it is body_updated_at, not this timestamp, that matters
+        let ab = MonasMergePolicy.resolve(&[a.clone(), b.clone()]);
+        let ba = MonasMergePolicy.resolve(&[b, a]);
+        assert_eq!(ab, ba);
+        assert_eq!(ab.data, b"zzz");
+        assert_eq!(ab.body_updated_at, 10);
+        assert_eq!(cutoff_of(&ab), 200);
+    }
+
+    #[test]
+    fn ancestry_availability_does_not_change_the_body_winner() {
+        let a = head("a", "new", 100, 30, None);
+        let b = head("b", "old", 200, 20, None);
+        let expected = MonasMergePolicy.resolve(&[a.clone(), b.clone()]);
+        let mut with_parents = a;
+        with_parents.parent_payloads = vec![with_parents.payload.clone(), b.payload.clone()];
+        assert_eq!(
+            MonasMergePolicy.resolve(&[with_parents.clone(), b.clone()]),
+            expected
+        );
+        with_parents.parent_payloads.pop();
+        assert_eq!(MonasMergePolicy.resolve(&[with_parents, b]), expected);
     }
 }

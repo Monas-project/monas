@@ -579,7 +579,12 @@ export default function App() {
       // voided tokens until its next sync. Say so — "revoked" alone would
       // overstate what just happened.
       const reach = r?.token_invalidation_reach;
-      if (reach?.relayed) {
+      if (!reach && (r?.token_invalidated_at != null || entry.syncedToStateNode || entry.remoteContentId)) {
+        pushToast(
+          "Token invalidation propagation is unknown — the node returned no reach report. Members that have not synced may still accept writes under old tokens.",
+          "error",
+        );
+      } else if (reach?.relayed) {
         pushToast(
           "The revoke was relayed to a member node; which members enforce the cutoff yet is not known from here. Writes under the old token may land on members that have not synced.",
           "error",
@@ -806,6 +811,7 @@ export default function App() {
         <PreviewModal
           entry={liveEntry(modal.entry.id) ?? modal.entry}
           contentB64Url={modal.contentB64Url}
+          displayedVersionId={modal.entry.localContentId}
           onCheckHead={checkNetworkHead}
           onEdit={(e) => handleEditOpen(e)}
           onClose={() => setModal({ type: "none" })}

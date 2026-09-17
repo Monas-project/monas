@@ -78,7 +78,7 @@ export function IdentityModal({ onClose }: { onClose: () => void }) {
               signing
             </span>
           ) : (
-            <span className="badge local" style={{ marginLeft: 4 }} title="Not registered with monas-account — cannot sign or read the state node">
+            <span className="badge local" style={{ marginLeft: 4 }} title="Not the current monas-account key — cannot sign or read the state node">
               keypair only
             </span>
           )}
@@ -142,7 +142,7 @@ export function IdentityModal({ onClose }: { onClose: () => void }) {
             Other identities
           </div>
           <div className="hint" style={{ marginBottom: 6 }}>
-            Keypair-only identities from an earlier version of this UI. They can
+            Older identities (including replaced signing accounts). They can
             still open envelopes addressed to them, but cannot sign or read the
             state node. Have files shared to your account instead.
           </div>

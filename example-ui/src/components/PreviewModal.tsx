@@ -45,12 +45,15 @@ function classifyVerify(v: VerifyIntegrityOutput): "valid" | "behind" | "no-loca
 export function PreviewModal({
   entry,
   contentB64Url,
+  displayedVersionId,
   onCheckHead,
   onEdit,
   onClose,
 }: {
   entry: Entry;
   contentB64Url: string;
+  /** Identity of the rendered body, fixed when opened (not the last write). */
+  displayedVersionId: string | undefined;
   /** Verified read of the head that also records it on the entry — the
    *  list's sync badge and the status line here read from that record. */
   onCheckHead: (entry: Entry) => Promise<ReadFromStateNodeOutput | null>;
@@ -166,7 +169,7 @@ export function PreviewModal({
   // The one-line answer to "am I looking at the newest version?". Derived
   // from what the entry recorded at the last head check (open, sweep, or the
   // verified read below), so it stays right even while this dialog is idle.
-  const sync = syncStatusOf(entry);
+  const sync = syncStatusOf(entry, displayedVersionId);
   const syncText = describeSync(sync);
   const held = heldVersionId(entry);
   const syncBadgeClass =
@@ -227,7 +230,7 @@ export function PreviewModal({
               <>
                 The Content Network has a <b>newer version</b> than the text above
                 {received
-                  ? " — the owner has edited since sharing"
+                  ? " — this preview is the original shared version, not the current network head"
                   : " — a recipient with write access has edited since your last save"}
                 . <i>Read from state-node</i> shows it
                 {canWrite ? (received ? "; Edit contents starts from it." : "; Pull & edit adopts it into your copy.") : "."}
