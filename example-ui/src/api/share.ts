@@ -88,7 +88,8 @@ export interface RevokeShareOutput {
    *  keeps accepting writes under the voided tokens until its next sync.
    *  The revoke does not wait for that (a writer must not be able to block
    *  it); this is how the UI tells "revoked everywhere" from "revoked, N
-   *  members still to hear". Absent when no state node was involved. */
+   *  members still to hear". Also absent with legacy nodes (unknown reach);
+   *  absence alone does not mean no state node was involved. */
   token_invalidation_reach?: TokenInvalidationReach;
 }
 

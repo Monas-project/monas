@@ -485,7 +485,11 @@ export function revokeFlow(input: {
       exec: async (ctx) => {
         const r = ctx.revoke as shareApi.RevokeShareOutput;
         const reach = r.token_invalidation_reach;
-        if (!reach) return "No state node involved — nothing to propagate";
+        if (!reach) {
+          return r.token_invalidated_at != null || entry.syncedToStateNode || entry.remoteContentId
+            ? "Token invalidation propagation is unknown — the node returned no reach report. Members that have not synced may still accept writes under old tokens."
+            : "No state node involved — nothing to propagate";
+        }
         if (reach.relayed) {
           return (
             "The node we contacted relayed the revoke to a member; which members " +
