@@ -48,27 +48,23 @@ resource "aws_internet_gateway" "main" {
   })
 }
 
-# One elastic IP per NAT gateway (AZ-aware egress for private subnets)
+# One shared NAT gateway for all private subnets to reduce cost
 resource "aws_eip" "nat" {
-  count = 2
-
   domain = "vpc"
 
   tags = merge(local.common_tags, {
-    Name = "monas-nat-eip-${count.index + 1}"
+    Name = "monas-nat-eip"
   })
 
   depends_on = [aws_internet_gateway.main]
 }
 
 resource "aws_nat_gateway" "main" {
-  count = 2
-
-  allocation_id = aws_eip.nat[count.index].id
-  subnet_id     = aws_subnet.public[count.index].id
+  allocation_id = aws_eip.nat.id
+  subnet_id     = aws_subnet.public[0].id
 
   tags = merge(local.common_tags, {
-    Name = "monas-nat-${data.aws_availability_zones.available.names[count.index]}"
+    Name = "monas-nat"
   })
 
   depends_on = [aws_internet_gateway.main]
@@ -95,7 +91,7 @@ resource "aws_route_table_association" "public" {
   route_table_id = aws_route_table.public.id
 }
 
-# Private route tables with NAT egress
+# Private route tables sharing a single NAT gateway
 resource "aws_route_table" "private" {
   count = 2
 
@@ -103,7 +99,7 @@ resource "aws_route_table" "private" {
 
   route {
     cidr_block     = "0.0.0.0/0"
-    nat_gateway_id = aws_nat_gateway.main[count.index].id
+    nat_gateway_id = aws_nat_gateway.main.id
   }
 
   tags = merge(local.common_tags, {
