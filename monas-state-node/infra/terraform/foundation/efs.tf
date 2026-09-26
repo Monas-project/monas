@@ -15,11 +15,11 @@ resource "aws_security_group" "efs" {
   vpc_id      = aws_vpc.main.id
 
   ingress {
-    description = "NFS from public subnets (ECS tasks)"
+    description = "NFS from private subnets (ECS tasks)"
     from_port   = 2049
     to_port     = 2049
     protocol    = "tcp"
-    cidr_blocks = [for s in aws_subnet.public : s.cidr_block]
+    cidr_blocks = [for s in aws_subnet.private : s.cidr_block]
   }
 
   tags = merge(local.common_tags, {
@@ -31,11 +31,11 @@ resource "aws_security_group" "efs" {
   }
 }
 
-# Mount targets in each public subnet
+# Mount targets in each private subnet
 resource "aws_efs_mount_target" "main" {
-  count = length(aws_subnet.public)
+  count = length(aws_subnet.private)
 
   file_system_id  = aws_efs_file_system.main.id
-  subnet_id       = aws_subnet.public[count.index].id
+  subnet_id       = aws_subnet.private[count.index].id
   security_groups = [aws_security_group.efs.id]
 }
