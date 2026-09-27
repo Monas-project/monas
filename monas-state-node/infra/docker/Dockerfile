@@ -29,7 +29,7 @@ RUN if [ "$TARGETPLATFORM" = "linux/amd64" ]; then \
         export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc; \
       fi; \
     fi && \
-    cargo build --release -p monas-state-node --bin state-node --target ${CARGO_TARGET:-$(rustc -vV | grep host | awk '{print $2}')} && \
+    cargo build --locked --release -p monas-state-node --bin state-node --target ${CARGO_TARGET:-$(rustc -vV | grep host | awk '{print $2}')} && \
     cp target/${CARGO_TARGET:-$(rustc -vV | grep host | awk '{print $2}')}/release/state-node /app/state-node
 
 # Runtime stage
