@@ -4,8 +4,13 @@ output "vpc_id" {
 }
 
 output "public_subnet_ids" {
-  description = "Public subnet IDs (for ALB and ECS tasks)"
+  description = "Public subnet IDs (for ALB only)"
   value       = aws_subnet.public[*].id
+}
+
+output "private_subnet_ids" {
+  description = "Private subnet IDs (for ECS tasks and EFS mount targets)"
+  value       = aws_subnet.private[*].id
 }
 
 output "alb_listener_arn" {
@@ -58,7 +63,7 @@ output "node_terraform_vars" {
   description = "Variables to pass to per-node terraform (copy-paste ready)"
   value       = <<-EOT
     vpc_id                           = "${aws_vpc.main.id}"
-    subnet_ids                       = ${jsonencode(aws_subnet.public[*].id)}
+    subnet_ids                       = ${jsonencode(aws_subnet.private[*].id)}
     alb_listener_arn                 = "${aws_lb_listener.https.arn}"
     alb_security_group_id            = "${aws_security_group.alb.id}"
     ecr_image_uri                    = "${aws_ecr_repository.state_node.repository_url}:latest"
