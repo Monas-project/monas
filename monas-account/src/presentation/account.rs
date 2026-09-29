@@ -11,8 +11,7 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 
 use crate::application_service::{
-    AccountKeyStore, AccountService, IssueDelegatedTokenError, IssueDelegatedTokenRequest,
-    SignError,
+    AccountKeyStore, IssueDelegatedTokenError, IssueDelegatedTokenRequest, SignError,
 };
 use crate::domain::delegation::DelegatedCapability;
 use crate::infrastructure::key_pair::KeyAlgorithm;
@@ -86,7 +85,9 @@ async fn create_account(
 ) -> Result<Json<CreateAccountResponse>, (StatusCode, String)> {
     let key_type = parse_key_type(&req.key_type)?;
 
-    let account = AccountService::create(&state.key_store, key_type)
+    let account = state
+        .account_service
+        .create(key_type)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
 
     let public_key_base64 = BASE64_STANDARD.encode(account.public_key_bytes());
@@ -102,7 +103,9 @@ async fn create_account(
 async fn delete_account(
     State(state): State<Arc<AppState>>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    AccountService::delete(&state.key_store)
+    state
+        .account_service
+        .delete()
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -119,12 +122,13 @@ async fn sign_account(
     })?;
 
     let stored = state
+        .account_service
         .key_store
         .load()
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?
         .ok_or_else(|| (StatusCode::NOT_FOUND, "account key not found".to_string()))?;
 
-    let (sig, _rec_id) = AccountService::sign(&state.key_store, &msg).map_err(|e| {
+    let (sig, _rec_id) = state.account_service.sign(&msg).map_err(|e| {
         let status = match e {
             SignError::NotFound => StatusCode::NOT_FOUND,
             SignError::KeyStore(_) | SignError::InvalidKey(_) => StatusCode::BAD_REQUEST,
@@ -180,27 +184,26 @@ async fn delegate_token(
 
     let capabilities = parse_capabilities(&req.capabilities)?;
 
-    let issued = AccountService::issue_delegated_token(
-        &state.key_store,
-        IssueDelegatedTokenRequest {
+    let issued = state
+        .account_service
+        .issue_delegated_token(IssueDelegatedTokenRequest {
             recipient_public_key,
             content_id: req.content_id,
             capabilities,
             ttl_secs: req.ttl_secs,
-        },
-    )
-    .map_err(|e| {
-        let status = match e {
-            IssueDelegatedTokenError::NotFound => StatusCode::NOT_FOUND,
-            IssueDelegatedTokenError::Validation(_) => StatusCode::BAD_REQUEST,
-            IssueDelegatedTokenError::UnsupportedAlgorithm(_) => StatusCode::BAD_REQUEST,
-            IssueDelegatedTokenError::KeyStore(_)
-            | IssueDelegatedTokenError::InvalidKey(_)
-            | IssueDelegatedTokenError::JwtSigning(_)
-            | IssueDelegatedTokenError::Time(_) => StatusCode::INTERNAL_SERVER_ERROR,
-        };
-        (status, e.to_string())
-    })?;
+        })
+        .map_err(|e| {
+            let status = match e {
+                IssueDelegatedTokenError::NotFound => StatusCode::NOT_FOUND,
+                IssueDelegatedTokenError::Validation(_) => StatusCode::BAD_REQUEST,
+                IssueDelegatedTokenError::UnsupportedAlgorithm(_) => StatusCode::BAD_REQUEST,
+                IssueDelegatedTokenError::KeyStore(_)
+                | IssueDelegatedTokenError::InvalidKey(_)
+                | IssueDelegatedTokenError::JwtSigning(_)
+                | IssueDelegatedTokenError::Time(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, e.to_string())
+        })?;
 
     Ok(Json(DelegateTokenResponse {
         delegated_token: issued.delegated_token,

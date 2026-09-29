@@ -1,12 +1,9 @@
-// Integration tests intentionally use the test/dev-only constructors
-// (`MonasController::with_state_node_url` / `with_urls`) marked
-// `#[deprecated]` for production gateways.
+// Integration tests intentionally use the test/dev-only constructor
+// (`MonasController::with_state_node_url`) marked `#[deprecated]`
+// for production gateways.
 #![allow(deprecated)]
 
-use base64::{
-    engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE_NO_PAD},
-    Engine,
-};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use mockito::Server;
 use monas_sdk::models::content::{
     ContentMetadata, CreateContentInput, DeleteContentInput, GetContentInput, UpdateContentInput,
@@ -27,11 +24,8 @@ fn compute_content_id(raw_content: &[u8]) -> String {
 ///
 /// 古い固定値 (e.g. `1_717_171_717`) で署名検証する旧来テスト用のヘルパ。
 /// 本番運用ではこの設定を使わない。
-fn controller_for_legacy_timestamps(
-    state_node_url: String,
-    account_url: String,
-) -> MonasController {
-    let config = MonasConfig::new(state_node_url, account_url)
+fn controller_for_legacy_timestamps(state_node_url: String) -> MonasController {
+    let config = MonasConfig::new(state_node_url)
         // 100 年以上の skew を許容することで、テスト固定 timestamp の絶対値を気にしなくてよくする。
         .with_request_timestamp_skew(Duration::from_secs(60 * 60 * 24 * 365 * 100));
     MonasController::with_config(config).expect("with_config")
@@ -443,26 +437,20 @@ async fn create_content_rolls_back_locally_when_state_node_create_fails_and_can_
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn create_content_uses_account_signature_for_state_node_request() {
+async fn create_content_uses_local_account_signature_for_state_node_request() {
     let _guard = acquire_test_lock();
     let mut state_node_server = Server::new_async().await;
-    let mut account_server = Server::new_async().await;
-
-    let account_sign_mock = account_server
-        .mock("POST", "/accounts/sign")
-        .with_status(200)
-        .with_header("content-type", "application/json")
-        .with_body(
-            r#"{"signature_base64":"c2lnbmVk","public_key_base64":"AQID","algorithm":"P256"}"#,
-        )
-        .expect(1)
-        .create_async()
-        .await;
 
     let create_mock = state_node_server
         .mock("POST", "/content")
-        .match_header("authorization", "user:010203")
-        .match_header("x-request-signature", "c2lnbmVk")
+        .match_header(
+            "authorization",
+            mockito::Matcher::Regex(r"^user:[0-9a-f]+$".into()),
+        )
+        .match_header(
+            "x-request-signature",
+            mockito::Matcher::Regex(r"^[A-Za-z0-9+/]+=*$".into()),
+        )
         .match_header("x-request-timestamp", "1717171717")
         .with_status(200)
         .with_header("content-type", "application/json")
@@ -471,8 +459,7 @@ async fn create_content_uses_account_signature_for_state_node_request() {
         .create_async()
         .await;
 
-    let controller =
-        controller_for_legacy_timestamps(state_node_server.url(), account_server.url());
+    let controller = controller_for_legacy_timestamps(state_node_server.url());
     let auth = StateNodeAuthContext {
         authorization: Some("Bearer old".into()),
         request_signature: Some("old-signature".into()),
@@ -493,53 +480,7 @@ async fn create_content_uses_account_signature_for_state_node_request() {
     );
 
     assert!(response.success, "create_content should succeed");
-    account_sign_mock.assert();
     create_mock.assert();
-    cleanup_content_artifacts();
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn create_content_fails_fast_when_account_key_is_not_p256() {
-    let _guard = acquire_test_lock();
-    let state_node_server = Server::new_async().await;
-    let mut account_server = Server::new_async().await;
-
-    let account_sign_mock = account_server
-        .mock("POST", "/accounts/sign")
-        .with_status(200)
-        .with_header("content-type", "application/json")
-        .with_body(
-            r#"{"signature_base64":"c2lnbmVk","public_key_base64":"AQID","algorithm":"K256"}"#,
-        )
-        .expect(1)
-        .create_async()
-        .await;
-
-    let controller =
-        controller_for_legacy_timestamps(state_node_server.url(), account_server.url());
-    let auth = StateNodeAuthContext {
-        authorization: None,
-        request_signature: None,
-        request_timestamp: Some(1_717_171_717),
-    };
-
-    let response = controller.create_content(
-        CreateContentInput {
-            content: URL_SAFE_NO_PAD.encode(b"account-signing-with-k256"),
-            metadata: Some(ContentMetadata {
-                name: Some("invalid-algorithm.txt".to_string()),
-                content_type: Some("text/plain".to_string()),
-                created_at: None,
-                updated_at: None,
-            }),
-        },
-        Some(&auth),
-    );
-
-    assert!(!response.success, "create_content should fail");
-    assert!(matches!(response.error, Some(ApiError::Validation(_))));
-    account_sign_mock.assert();
-    let _ = state_node_server;
     cleanup_content_artifacts();
 }
 
@@ -697,7 +638,6 @@ async fn update_content_rolls_back_new_version_when_state_node_update_fails() {
 async fn delete_content_uses_account_signature_for_metadata_request() {
     let _guard = acquire_test_lock();
     let mut state_node_server = Server::new_async().await;
-    let mut account_server = Server::new_async().await;
 
     let create_mock = state_node_server
         .mock("POST", "/content")
@@ -708,8 +648,7 @@ async fn delete_content_uses_account_signature_for_metadata_request() {
         .create_async()
         .await;
 
-    let controller =
-        controller_for_legacy_timestamps(state_node_server.url(), account_server.url());
+    let controller = controller_for_legacy_timestamps(state_node_server.url());
     let created = controller
         .create_content(
             CreateContentInput {
@@ -727,40 +666,19 @@ async fn delete_content_uses_account_signature_for_metadata_request() {
         .expect("create should return data");
     create_mock.assert();
 
-    // 署名対象は domain-separated かつ長さ前置の統一形式
-    // (`monas-request-v1:<len>:<op>:<len>:<resource>:<ts>:<len>:<body_digest>`)。
-    // body なしリクエストなので body digest は空。
-    let resource = "bafkdelete-signed";
-    let expected_signing_message = BASE64_STANDARD.encode(
-        format!(
-            "monas-request-v1:6:delete:{}:{}:1818181818:0:",
-            resource.len(),
-            resource
-        )
-        .as_bytes(),
-    );
-
-    let account_sign_mock = account_server
-        .mock("POST", "/accounts/sign")
-        .match_body(mockito::Matcher::PartialJsonString(format!(
-            r#"{{"message_base64":"{expected_signing_message}"}}"#
-        )))
-        .with_status(200)
-        .with_header("content-type", "application/json")
-        .with_body(
-            r#"{"signature_base64":"bWV0YS1zaWc=","public_key_base64":"BAUG","algorithm":"P256"}"#,
-        )
-        .expect(1)
-        .create_async()
-        .await;
-
     let delete_mock = state_node_server
         .mock(
             "DELETE",
             mockito::Matcher::Exact("/content/bafkdelete-signed".to_string()),
         )
-        .match_header("authorization", "user:040506")
-        .match_header("x-request-signature", "bWV0YS1zaWc=")
+        .match_header(
+            "authorization",
+            mockito::Matcher::Regex(r"^user:[0-9a-f]+$".into()),
+        )
+        .match_header(
+            "x-request-signature",
+            mockito::Matcher::Regex(r"^[A-Za-z0-9+/]+=*$".into()),
+        )
         .match_header("x-request-timestamp", "1818181818")
         .with_status(200)
         .expect(1)
@@ -788,7 +706,6 @@ async fn delete_content_uses_account_signature_for_metadata_request() {
         "delete_content should succeed: {:?}",
         response.error
     );
-    account_sign_mock.assert();
     delete_mock.assert();
     cleanup_content_artifacts();
 }
@@ -861,8 +778,7 @@ async fn create_content_returns_timeout_when_state_node_hangs() {
     let addr = listener.local_addr().expect("local_addr");
     let url = format!("http://{addr}");
 
-    let config =
-        MonasConfig::new(url.clone(), url).with_request_timeout(Duration::from_millis(200));
+    let config = MonasConfig::new(url).with_request_timeout(Duration::from_millis(200));
     let controller = MonasController::with_config(config).expect("with_config");
 
     let input = CreateContentInput {
