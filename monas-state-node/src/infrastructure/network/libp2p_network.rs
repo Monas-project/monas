@@ -336,6 +336,7 @@ fn relay_read_error_kind(e: &crate::domain::errors::StateNodeError) -> RelayRead
     use crate::domain::errors::StateNodeError as E;
     match e {
         E::ContentNotFound(_) => RelayReadErrorKind::NotFound,
+        E::ContentDeleted(_) => RelayReadErrorKind::Deleted,
         E::AuthenticationFailed(_) | E::InvalidUcanToken(_) => {
             RelayReadErrorKind::AuthenticationFailed
         }

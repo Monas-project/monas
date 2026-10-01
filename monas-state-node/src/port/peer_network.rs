@@ -38,6 +38,8 @@ pub struct PushBootstrap {
 pub enum RelayReadErrorKind {
     /// The member does not hold the content/version (404).
     NotFound,
+    /// The member holds the content and its history contains a delete (410).
+    Deleted,
     /// The member could not authenticate the forwarded caller (401).
     AuthenticationFailed,
     /// The member authenticated the caller but denied read access (403).

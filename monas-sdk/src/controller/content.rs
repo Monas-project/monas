@@ -286,6 +286,7 @@ impl MonasController {
             401 => ApiResponse::error(ApiError::Unauthorized(message), trace_id),
             403 => ApiResponse::error(ApiError::Forbidden(message), trace_id),
             404 => ApiResponse::error(ApiError::NotFound(message), trace_id),
+            410 => ApiResponse::error(ApiError::Gone(message), trace_id),
             408 => ApiResponse::error(ApiError::Timeout(message), trace_id),
             409 => ApiResponse::error(ApiError::Conflict(message), trace_id),
             _ => ApiResponse::error(ApiError::Internal(message), trace_id),

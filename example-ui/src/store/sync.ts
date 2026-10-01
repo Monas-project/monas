@@ -10,7 +10,7 @@
 // version metadata itself has no trust anchor yet).
 import type { Entry, NetworkHead } from "../types";
 import * as stateApi from "../api/stateNode";
-import { ApiError } from "../api/http";
+import { describeError } from "../api/http";
 import { noteEntry, allEntries } from "./registry";
 
 export type SyncStatus =
@@ -106,8 +106,7 @@ export async function checkNetworkHead(
     return r;
   } catch (e) {
     checking.delete(entry.id);
-    const msg =
-      e instanceof ApiError ? `${e.message}${e.status ? ` (HTTP ${e.status})` : ""}` : (e as Error).message;
+    const msg = describeError(e);
     if (allEntries().some((x) => x.id === entry.id)) {
       noteEntry(entry.id, { networkCheckError: msg });
     }

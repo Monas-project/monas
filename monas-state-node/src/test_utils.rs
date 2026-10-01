@@ -429,6 +429,8 @@ pub struct MockContentRepository {
     /// When true, `get_access_policy` fails — used to test that read
     /// authorization fails closed on policy-store errors.
     pub access_policy_error: Arc<Mutex<bool>>,
+    /// Contents whose history holds a delete operation.
+    pub deleted: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 impl MockContentRepository {
@@ -440,6 +442,7 @@ impl MockContentRepository {
             next_cid: Arc::new(Mutex::new(1)),
             access_policies: Arc::new(Mutex::new(HashMap::new())),
             access_policy_error: Arc::new(Mutex::new(false)),
+            deleted: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
     }
 }
@@ -502,6 +505,28 @@ impl ContentRepository for MockContentRepository {
 
     async fn get_latest(&self, genesis_cid: &str) -> Result<Option<Vec<u8>>> {
         Ok(self.contents.lock().await.get(genesis_cid).cloned())
+    }
+
+    async fn delete_content(&self, genesis_cid: &str, _author: &str) -> Result<CommitResult> {
+        if !self.contents.lock().await.contains_key(genesis_cid) {
+            return Err(anyhow::anyhow!("Content not found: {genesis_cid}"));
+        }
+        self.deleted.lock().await.insert(genesis_cid.to_string());
+        let mut next = self.next_cid.lock().await;
+        let version_cid = format!("version-cid-{}", *next);
+        *next += 1;
+        if let Some(history) = self.history.lock().await.get_mut(genesis_cid) {
+            history.push(version_cid.clone());
+        }
+        Ok(CommitResult {
+            genesis_cid: genesis_cid.to_string(),
+            version_cid,
+            is_new: false,
+        })
+    }
+
+    async fn is_deleted(&self, genesis_cid: &str) -> Result<bool> {
+        Ok(self.deleted.lock().await.contains(genesis_cid))
     }
 
     async fn get_latest_with_version(

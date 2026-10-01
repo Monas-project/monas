@@ -28,6 +28,19 @@ function gatewayBase(): string {
   return loadEndpoints().gateway.replace(/\/+$/, "");
 }
 
+// HTTP 410: the state node refuses content whose history contains a delete.
+// The node and the SDK only say it is gone; the wording lives here.
+export const DELETED_MESSAGE = "削除されました";
+
+/** One-line message for an error, as shown across the app. */
+export function describeError(e: unknown): string {
+  if (e instanceof ApiError) {
+    if (e.status === 410) return DELETED_MESSAGE;
+    return `${e.message}${e.status ? ` (HTTP ${e.status})` : ""}`;
+  }
+  return (e as Error).message;
+}
+
 export function nowUnix(): number {
   return Math.floor(Date.now() / 1000);
 }

@@ -47,6 +47,7 @@ pub(super) fn combine_rollback_failure(
         ApiError::Unauthorized(_) => ApiError::Unauthorized(suffix),
         ApiError::Forbidden(_) => ApiError::Forbidden(suffix),
         ApiError::NotFound(_) => ApiError::NotFound(suffix),
+        ApiError::Gone(_) => ApiError::Gone(suffix),
         ApiError::Conflict(_) => ApiError::Conflict(suffix),
         ApiError::Timeout(_) => ApiError::Timeout(suffix),
         ApiError::Internal(_) => ApiError::Internal(suffix),

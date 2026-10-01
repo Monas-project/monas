@@ -301,7 +301,7 @@ export function deleteFileFlow(input: { entry: Entry }): StepSpec[] {
           remoteContentId: entry.remoteContentId || entry.localContentId!,
         });
         ctx.delete = resp;
-        return "Ciphertext removed; Content Network tombstoned (CRDT history kept for offline nodes)";
+        return "Delete recorded in the CRDT history; members refuse this content once they sync it";
       },
     },
     {

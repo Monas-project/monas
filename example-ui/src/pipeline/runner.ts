@@ -1,5 +1,5 @@
 import { uuid } from "../api/crypto";
-import { ApiError } from "../api/http";
+import { describeError } from "../api/http";
 import type { RunContext, RunView, StepSpec, StepView } from "./types";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -68,10 +68,7 @@ export async function runPipeline(
     } catch (e) {
       const elapsed = Date.now() - started;
       if (spec.minMs && elapsed < spec.minMs) await sleep(spec.minMs - elapsed);
-      const msg =
-        e instanceof ApiError
-          ? `${e.message}${e.status ? ` (HTTP ${e.status})` : ""}`
-          : (e as Error).message;
+      const msg = describeError(e);
       step.status = "error";
       step.error = msg;
       emit();

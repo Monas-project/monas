@@ -204,6 +204,7 @@ impl IntoResponse for StateNodeError {
         let error_message = match &self {
             // Client errors: safe to expose the message
             StateNodeError::ContentNotFound(_) => self.to_string(),
+            StateNodeError::ContentDeleted(_) => "Content deleted".to_string(),
             StateNodeError::ContentAlreadyExists(_) => self.to_string(),
             StateNodeError::NodeNotFound(_) => self.to_string(),
             StateNodeError::InsufficientCapacity { .. } => self.to_string(),

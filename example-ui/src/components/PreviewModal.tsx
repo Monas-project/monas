@@ -3,7 +3,7 @@ import { Modal } from "./Modal";
 import { Eye, Network, Refresh, Check, X, Pencil } from "./icons";
 import type { Entry } from "../types";
 import { base64UrlToUtf8, base64UrlToStandard, short } from "../api/crypto";
-import { ApiError } from "../api/http";
+import { describeError } from "../api/http";
 import {
   getHistory,
   getLatestVersion,
@@ -26,11 +26,7 @@ type AsyncState<T> =
 
 // Same error formatting as the pipeline runner (runner.ts) so messages read
 // consistently across the app.
-function errMsg(e: unknown): string {
-  return e instanceof ApiError
-    ? `${e.message}${e.status ? ` (HTTP ${e.status})` : ""}`
-    : (e as Error).message;
-}
+const errMsg = describeError;
 
 // The SDK's verify-integrity reasons this UI knows how to explain. Matching on
 // the message is brittle but the response has no code field; the strings are

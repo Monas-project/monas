@@ -119,6 +119,20 @@ impl CrslCrdtRepository {
         };
 
         let node = match (&op.kind, op.parents.first()) {
+            // A delete's payload is not in the operation; its node is the one
+            // with the same parents and stamp.
+            (OperationType::Delete, _) => {
+                return repo
+                    .dag
+                    .get_nodes_by_genesis(&op.genesis)
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|cid| repo.dag.get_node(&cid).ok().flatten())
+                    .any(|node| {
+                        node.timestamp() == timestamp && node.parents() == op.parents.as_slice()
+                    });
+            }
             (OperationType::Create(payload), _) => {
                 Node::<ContentPayload, ContentMetadata>::new_genesis(
                     payload.clone(),
@@ -139,9 +153,9 @@ impl CrslCrdtRepository {
                     parent_node.metadata().clone(),
                 )
             }
-            // Delete carries no payload of its own and parentless updates are
-            // resolved at commit time; neither can be reconstructed here, so
-            // fall back to committing and letting the DAG decide.
+            // Parentless updates are resolved at commit time and cannot be
+            // reconstructed here, so fall back to committing and letting the
+            // DAG decide.
             _ => return false,
         };
 
@@ -245,6 +259,42 @@ impl ContentRepository for CrslCrdtRepository {
             version_cid: version_cid.to_string(),
             is_new: false,
         })
+    }
+
+    async fn delete_content(&self, genesis_cid: &str, author: &str) -> Result<CommitResult> {
+        let genesis = Self::parse_cid(genesis_cid)?;
+
+        let mut repo = self.repo.lock();
+        // Attach the delete to the converged head so it covers every branch
+        // this node knows of.
+        let head = Self::converged_head(&mut repo, &genesis)?
+            .ok_or_else(|| anyhow::anyhow!("Content not found: {genesis}"))?;
+        let mut op = Operation::new(genesis, OperationType::Delete, author.to_string());
+        op.parents = vec![head];
+        let version_cid = repo
+            .commit_operation(op)
+            .map_err(|e| anyhow::anyhow!("Failed to commit delete operation: {}", e))?;
+
+        Ok(CommitResult {
+            genesis_cid: genesis_cid.to_string(),
+            version_cid: version_cid.to_string(),
+            is_new: false,
+        })
+    }
+
+    async fn is_deleted(&self, genesis_cid: &str) -> Result<bool> {
+        let Ok(genesis) = Self::parse_cid(genesis_cid) else {
+            return Ok(false);
+        };
+
+        let repo = self.repo.lock();
+        let ops = repo
+            .state
+            .get_operations_by_genesis(&genesis)
+            .map_err(|e| anyhow::anyhow!("Failed to get operations: {}", e))?;
+        Ok(ops
+            .iter()
+            .any(|op| matches!(op.kind, OperationType::Delete)))
     }
 
     async fn get_latest(&self, genesis_cid: &str) -> Result<Option<Vec<u8>>> {
@@ -468,6 +518,7 @@ impl ContentRepository for CrslCrdtRepository {
         }
 
         let mut templates = Vec::new();
+        let mut deletes = Vec::new();
         for (_, op) in indexed_ops {
             let node = match &op.kind {
                 OperationType::Create(payload) => {
@@ -487,10 +538,13 @@ impl ContentRepository for CrslCrdtRepository {
                         parent.metadata().clone(),
                     )
                 }
-                // Delete has no payload and the public content API does not
-                // produce it. Do not guess its historical payload.
+                // A delete carries no payload, and crsl-lib fills its node's
+                // payload from whatever the committing replica held, so it
+                // cannot be rebuilt from the operation. Pair it by parents
+                // (and stamp, when imported) once every other node is claimed.
                 OperationType::Delete => {
-                    anyhow::bail!("Cannot pair delete operation {} with its DAG node", op.id)
+                    deletes.push(op);
+                    continue;
                 }
             };
             templates.push((op, node));
@@ -517,6 +571,39 @@ impl ContentRepository for CrslCrdtRepository {
                 local.push((op, node));
             }
         }
+        // A delete node copies some version's payload, so it can look exactly
+        // like an update node with the same parents. Claim it before content
+        // matching: an imported delete by parents and stamp, a local one by
+        // parents among the nodes no other operation accounts for.
+        let mut pair_delete = |op: crsl_lib::crdt::operation::Operation<Cid, ContentPayload>,
+                               claimed: &mut HashSet<Cid>|
+         -> Result<()> {
+            let candidates: Vec<_> = nodes
+                .iter()
+                .filter(|(cid, node)| {
+                    !claimed.contains(*cid)
+                        && node.parents() == op.parents.as_slice()
+                        && op.node_timestamp.is_none_or(|ts| node.timestamp() == ts)
+                })
+                .map(|(cid, _)| *cid)
+                .collect();
+            anyhow::ensure!(
+                candidates.len() == 1,
+                "Cannot uniquely pair delete operation {} with its DAG node: {} candidates",
+                op.id,
+                candidates.len()
+            );
+            claimed.insert(candidates[0]);
+            paired.push((candidates[0], op));
+            Ok(())
+        };
+        let (stamped_deletes, local_deletes): (Vec<_>, Vec<_>) = deletes
+            .into_iter()
+            .partition(|op| op.node_timestamp.is_some());
+        for op in stamped_deletes {
+            pair_delete(op, &mut claimed)?;
+        }
+        let mut local_claims = Vec::new();
         for (op, node) in local {
             let candidates: Vec<_> = by_structure
                 .get(&node.content_id()?)
@@ -533,8 +620,12 @@ impl ContentRepository for CrslCrdtRepository {
             );
             let cid = candidates[0];
             claimed.insert(cid);
-            paired.push((cid, op));
+            local_claims.push((cid, op));
         }
+        for op in local_deletes {
+            pair_delete(op, &mut claimed)?;
+        }
+        paired.extend(local_claims);
 
         // A receiver holding one branch tip knows its ancestors, not sibling
         // branches. Unknown versions safely request the complete DAG.
