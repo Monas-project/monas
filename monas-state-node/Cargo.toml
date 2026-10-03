@@ -33,6 +33,7 @@ hex = "0.4"
 futures = "0.3"
 tracing = "0.1"
 base64 = "0.21"
+serde_bytes = "0.11"
 bs58 = "0.5"
 uuid = { version = "1.0", features = ["v4"] }
 tokio = { version = "1", features = ["full", "test-util"] }
@@ -98,6 +99,8 @@ features = ["tokio"]
 [dev-dependencies]
 tempfile = "3.8"
 tower = { version = "0.5", features = ["util"] }
+# Same CBOR codec libp2p's request-response uses, to measure the wire size.
+cbor4ii = { version = "0.3", features = ["serde1", "use_std"] }
 
 # ============================================================
 # WASM Support (Future)

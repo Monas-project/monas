@@ -36,7 +36,9 @@ pub enum ContentRequest {
     /// Push CRDT operations to a peer.
     PushOperations {
         genesis_cid: String,
-        /// Serialized operations (JSON-encoded)
+        /// Serialized operations (JSON-encoded). Sent as CBOR byte strings:
+        /// the default `Vec<u8>` encoding (one integer per byte) doubles them.
+        #[serde(with = "byte_strings")]
         operations: Vec<Vec<u8>>,
         /// If set, the receiver is allowed to bootstrap a local
         /// `ContentNetwork` record from this payload (only the first push
@@ -47,8 +49,10 @@ pub enum ContentRequest {
     /// Relay an update request to a member node.
     UpdateContent {
         content_id: String,
+        #[serde(with = "serde_bytes")]
         data: Vec<u8>,
         auth_token: String,
+        #[serde(with = "serde_bytes")]
         request_signature: Vec<u8>,
         timestamp: Option<u64>,
     },
@@ -56,6 +60,7 @@ pub enum ContentRequest {
     DeleteContent {
         content_id: String,
         auth_token: String,
+        #[serde(with = "serde_bytes")]
         request_signature: Vec<u8>,
         timestamp: Option<u64>,
     },
@@ -63,6 +68,7 @@ pub enum ContentRequest {
     InvalidateTokens {
         content_id: String,
         auth_token: String,
+        #[serde(with = "serde_bytes")]
         request_signature: Vec<u8>,
         timestamp: Option<u64>,
     },
@@ -78,6 +84,7 @@ pub enum ContentRequest {
         /// `None` reads the latest version; `Some(v)` a specific version CID.
         version: Option<String>,
         auth_token: String,
+        #[serde(with = "serde_bytes")]
         request_signature: Vec<u8>,
         timestamp: Option<u64>,
     },
@@ -87,6 +94,7 @@ pub enum ContentRequest {
     ReadHistory {
         content_id: String,
         auth_token: String,
+        #[serde(with = "serde_bytes")]
         request_signature: Vec<u8>,
         timestamp: Option<u64>,
     },
@@ -105,13 +113,16 @@ pub enum ContentResponse {
     /// Response to content fetch.
     ContentData {
         content_id: String,
+        #[serde(with = "serde_bytes")]
         data: Vec<u8>,
         version: String,
     },
     /// Response with CRDT operations.
     OperationsData {
         genesis_cid: String,
-        operations: Vec<Vec<u8>>, // Serialized operations
+        /// Serialized operations, as CBOR byte strings (see PushOperations).
+        #[serde(with = "byte_strings")]
+        operations: Vec<Vec<u8>>,
     },
     /// Response to push operations request.
     PushResult {
@@ -142,6 +153,24 @@ pub enum ContentResponse {
     NotFound { content_id: String },
     /// Error response.
     Error { message: String },
+}
+
+/// `Vec<Vec<u8>>` as a sequence of byte strings rather than a sequence of
+/// integer arrays.
+mod byte_strings {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use serde_bytes::ByteBuf;
+
+    pub fn serialize<S: Serializer>(items: &[Vec<u8>], s: S) -> Result<S::Ok, S::Error> {
+        let wrapped: Vec<&serde_bytes::Bytes> =
+            items.iter().map(|b| serde_bytes::Bytes::new(b)).collect();
+        wrapped.serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Vec<u8>>, D::Error> {
+        let items = Vec::<ByteBuf>::deserialize(d)?;
+        Ok(items.into_iter().map(ByteBuf::into_vec).collect())
+    }
 }
 
 /// Legacy codec struct for backward compatibility.

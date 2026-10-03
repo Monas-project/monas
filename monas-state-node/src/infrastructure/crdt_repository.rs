@@ -30,6 +30,11 @@ use std::path::Path;
 /// Contains raw binary content data and an optional access policy.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ContentPayload {
+    /// The ciphertext. Encoded as a base64 string in JSON (operations) and
+    /// as a byte string in CBOR (DAG nodes, whose bytes define the version
+    /// CID). Serde's default — one number per byte — inflates it ~3.6x in
+    /// JSON and ~2x in CBOR, which is what overflowed peer pushes.
+    #[serde(with = "payload_bytes")]
     pub data: Vec<u8>,
     /// Ordering of the last explicit body write, not of the containing node.
     /// Policy-only updates and merges MUST copy this together with `data`.
@@ -37,6 +42,32 @@ pub struct ContentPayload {
     /// order. Deploy this format to all members together with fresh stores.
     pub body_updated_at: u64,
     pub access_policy: Option<AccessPolicy>,
+}
+
+/// Compact encoding for `ContentPayload::data`: base64 text for
+/// human-readable formats (JSON), a native byte string otherwise (CBOR,
+/// bincode). Old stores that wrote a number array are not readable — this
+/// changes version CIDs, so members are redeployed with fresh stores.
+mod payload_bytes {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use serde::{de::Error as _, Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        if s.is_human_readable() {
+            s.serialize_str(&STANDARD.encode(bytes))
+        } else {
+            serde_bytes::serialize(bytes, s)
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        if d.is_human_readable() {
+            let text = String::deserialize(d)?;
+            STANDARD.decode(text).map_err(D::Error::custom)
+        } else {
+            serde_bytes::deserialize(d)
+        }
+    }
 }
 
 /// Type aliases for crsl-lib types.
