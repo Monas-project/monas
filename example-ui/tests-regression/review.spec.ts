@@ -24,7 +24,7 @@ async function boot(page: Page, entries: Entry[] = [], identities = [identity("B
     sessionStorage.setItem("regression-seeded", "yes");
     localStorage.setItem("monas.identities.v2", JSON.stringify({ identities, activeLabel }));
     localStorage.setItem("monas.registry.v3", JSON.stringify(entries));
-    localStorage.setItem("monas.endpoints.v2", JSON.stringify({ gateway: "/api", accountService: "/account-api" }));
+    localStorage.setItem("monas.endpoints.v2", JSON.stringify({ gateway: "/api" }));
   }, { entries, identities, activeLabel });
   await page.route("**/*", async route => {
     const req = route.request();
@@ -34,7 +34,7 @@ async function boot(page: Page, entries: Entry[] = [], identities = [identity("B
       unexpected.push(req.url());
       return route.abort();
     }
-    if (!path.startsWith("/api") && !path.startsWith("/account-api")) return route.continue();
+    if (!path.startsWith("/api")) return route.continue();
     const body = req.postDataJSON();
     requests.push({ path, body, method: req.method() });
     let data: unknown;
@@ -49,6 +49,7 @@ async function boot(page: Page, entries: Entry[] = [], identities = [identity("B
       head = "v2";
       data = { remote_content_id: "network", version_id: "plain-v2" };
     } else if (path === "/api/content/plain-v1") data = { content_id: "plain-v1", content: b64("V1") };
+    else if (path === "/api/account" && req.method() === "POST") data = { key_type: "secp256r1", public_key: "public-created", private_key: "private-created" };
     else {
       unexpected.push(`${req.method()} ${path}`);
       return route.fulfill({ status: 500, body: "Unexpected test request" });
@@ -177,4 +178,21 @@ test("identity keypair-only fallback preserves active legacy identity and all en
   await expect(page.locator(".recipient-row .badge.enc")).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Create account", exact: true })).toBeVisible();
   expect(await page.evaluate(() => JSON.parse(localStorage.getItem("monas.identities.v2")!).identities)).toEqual(ids);
+});
+
+test("Create account asks the gateway for its signing account; nothing is created before that", async ({ page }) => {
+  const gateway = await boot(page, [], [], null as unknown as string);
+  await page.locator(".account-chip").click();
+  await expect(page.getByRole("button", { name: "Create account", exact: true })).toBeVisible();
+  // Opening the app and the dialog must not create a key anywhere.
+  expect(gateway.requests.filter(r => r.path === "/api/account")).toEqual([]);
+
+  await page.getByPlaceholder("e.g. me, alice, bob").fill("me");
+  await page.getByRole("button", { name: "Create account", exact: true }).click();
+  await expect(page.locator(".modal")).toContainText("me");
+  const calls = gateway.requests.filter(r => r.path === "/api/account");
+  expect(calls.map(r => r.method)).toEqual(["POST"]);
+  const stored = await page.evaluate(() => JSON.parse(localStorage.getItem("monas.identities.v2")!).identities);
+  expect(stored).toEqual([{ label: "me", keyType: "secp256r1", publicKeyB64Url: "public-created", privateKeyB64Url: "private-created", isSigningAccount: true }]);
+  expect(gateway.unexpected).toEqual([]);
 });

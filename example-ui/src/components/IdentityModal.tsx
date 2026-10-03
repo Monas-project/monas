@@ -6,11 +6,12 @@ import { useIdentities, addIdentity, removeIdentity } from "../store/identity";
 import { pushToast } from "./Toast";
 import { copyText } from "../sharePackage";
 
-// One device, one account. monas-account holds exactly one signing key: it is
-// what the SDK signs every state-node request with, and the audience of every
-// delegated token a share package brings to this device. So there is nothing
-// to "switch" between — a second Create would overwrite the key in
-// monas-account and silently orphan the first — and a keypair-only identity
+// One device, one account. The gateway's SDK holds exactly one signing key,
+// created only when the user presses Create account here: it is what the SDK
+// signs every state-node request with, and the audience of every delegated
+// token a share package brings to this device. So there is nothing to
+// "switch" between — a second Create would overwrite the key in the gateway
+// and silently orphan the first — and a keypair-only identity
 // (the gateway's stateless /keypair) can open an envelope but can never read
 // or write the state node. The dialog therefore offers exactly one thing:
 // this device's account, and a way to replace it.
@@ -28,11 +29,10 @@ export function IdentityModal({ onClose }: { onClose: () => void }) {
     const name = label.trim() || "me";
     setBusy(true);
     try {
-      // Always P-256: signing requires it, and the HPKE share envelopes are
-      // DHKEM(P-256) — any other curve would mint a key that cannot receive
-      // a share, a dead end this dialog should not offer.
-      const res = await createSigningAccount("secp256r1");
-      // monas-account now signs with the new key, so a previous account entry
+      // The gateway always makes a P-256 key: signing requires it, and the
+      // HPKE share envelopes are DHKEM(P-256).
+      const res = await createSigningAccount();
+      // The gateway now signs with the new key, so a previous account entry
       // would only claim an authority it no longer has. Drop it.
       for (const old of identities) if (old.isSigningAccount) removeIdentity(old.label);
       addIdentity(
@@ -78,7 +78,7 @@ export function IdentityModal({ onClose }: { onClose: () => void }) {
               signing
             </span>
           ) : (
-            <span className="badge local" style={{ marginLeft: 4 }} title="Not the current monas-account key — cannot sign or read the state node">
+            <span className="badge local" style={{ marginLeft: 4 }} title="Not the gateway's current signing key — cannot sign or read the state node">
               keypair only
             </span>
           )}
@@ -117,8 +117,8 @@ export function IdentityModal({ onClose }: { onClose: () => void }) {
   return (
     <Modal title="Identities & keys" icon={<Key />} onClose={onClose} wide>
       <div className="callout">
-        This device has one <b>account</b>: a P-256 key registered with{" "}
-        <b>monas-account</b>. The SDK signs every state-node request with it, and
+        This device has one <b>account</b>: a P-256 key held by this device's{" "}
+        <b>gateway</b>. The SDK signs every state-node request with it, and
         a share package sent to you is bound to it too — so it is both your
         signing key and the key others share to. To receive a file from someone
         on another device, send them your <b>public key</b> (Copy below).
@@ -164,8 +164,9 @@ export function IdentityModal({ onClose }: { onClose: () => void }) {
               onChange={(e) => setLabel(e.target.value)}
             />
             <div className="hint">
-              Sends <code>POST /accounts</code> to monas-account, which generates and
-              keeps the P-256 key; the SDK signs state-node requests with it.
+              Sends <code>POST /account</code> to the gateway, whose SDK generates and
+              keeps the P-256 key and signs state-node requests with it. The
+              gateway never creates this key on its own.
             </div>
           </div>
           <div style={{ display: "flex", justifyContent: "flex-end", paddingBottom: 6 }}>
@@ -178,7 +179,7 @@ export function IdentityModal({ onClose }: { onClose: () => void }) {
       {account && (
         <div className="hint" style={{ marginTop: 14, paddingBottom: 6 }}>
           To start over with a fresh key, remove the account above and create a
-          new one. monas-account keeps only one key, so files created under the
+          new one. The gateway keeps only one key, so files created under the
           old key can no longer be updated or deleted from this device.
         </div>
       )}

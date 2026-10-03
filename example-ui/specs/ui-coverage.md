@@ -8,8 +8,8 @@ rest of the interactive surface cheaply, without content mutations.
 
 ## Preconditions & house rules
 
-- The stack must be running: vite `:5174`, gateway `127.0.0.1:3000`,
-  monas-account `127.0.0.1:4002`; for `tests-e2e/` the gateway's
+- The stack must be running: vite `:5174`, gateway `127.0.0.1:3000`; for
+  `tests-e2e/` the gateway's
   `MONAS_STATE_NODE_URL` must point at a live state node.
 - `tests/seed.spec.ts` runs first. It clears `localStorage`, waits for the
   gateway health dot, and creates the **signing account** `agent-main`.
@@ -67,8 +67,7 @@ Collapsed: `aside.pipeline.collapsed` with a single
 
 **SettingsModal** (`Endpoint`)
 `heading "Endpoint"`, `textbox` (value `/api`) labelled
-`"monas-gateway base URL"`, `textbox` (value `/account-api`) labelled
-`"monas-account base URL (for “create account”)"`,
+`"monas-gateway base URL"`,
 `button "Local (Vite proxy → Docker)"`, `button "Local (direct :3000)"`,
 `button "Reset to proxy"`, `button "Test connection"`, `button "Save"`.
 Labels are **siblings, not `for`-associated** — `getByLabel` will not work.
@@ -115,8 +114,7 @@ correctness. **P2** = polish and a11y.
 No mutation.
 1. Click `button "Settings · endpoint"`.
 2. Expect `heading "Endpoint"` visible and `.modal.wide` present.
-3. Expect gateway input value `/api` and account input value `/account-api`
-   (the `PROXY_DEFAULTS`).
+3. Expect gateway input value `/api` (the `PROXY_DEFAULTS`).
 4. Expect exactly two preset buttons, with
    `"Local (Vite proxy → Docker)"` carrying class `on`.
 
@@ -138,7 +136,7 @@ Verified manually: works.
 2. Expect toast `"Endpoint saved"`.
 3. Expect the modal closes.
 4. Expect `localStorage["monas.endpoints.v2"]` parses to
-   `{gateway:"http://127.0.0.1:3000", accountService:"/account-api"}`.
+   `{gateway:"http://127.0.0.1:3000"}`.
 5. **Cleanup**: reopen, `Reset to proxy`, `Save` — otherwise later scenarios
    run against a different endpoint.
 

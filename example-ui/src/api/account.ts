@@ -1,8 +1,8 @@
-// Keypair generation via the gateway (monas-sdk `generate_keypair`).
-//   POST /keypair  { key_type } → { key_type, public_key, private_key }  (base64url)
-import { gateway, createAccountKey } from "./http";
-import { standardBase64ToBase64Url } from "./crypto";
+import { gateway } from "./http";
 
+// Keys via the gateway (monas-sdk).
+//   POST /keypair  { key_type } → { key_type, public_key, private_key }  (base64url)
+//   POST /account                → { key_type, public_key, private_key }  (base64url)
 export type KeyType = "secp256r1" | "secp256k1";
 
 export interface GenerateKeypairOutput {
@@ -11,8 +11,8 @@ export interface GenerateKeypairOutput {
   private_key: string; // base64url
 }
 
-// Ephemeral keypair (used for sharing recipients). Does NOT register a signing
-// key with the account service.
+// Ephemeral keypair (used for sharing recipients). Does NOT touch the
+// gateway's signing account.
 export function generateKeypair(keyType: KeyType) {
   return gateway<GenerateKeypairOutput>("/keypair", {
     method: "POST",
@@ -20,15 +20,11 @@ export function generateKeypair(keyType: KeyType) {
   });
 }
 
-// Create the signing account directly on monas-account. This both registers
-// the key the SDK uses to sign state-node requests AND returns a keypair we can
-// use as an identity. Keys are converted to base64url for consistency with the
-// gateway/SDK models.
-export async function createSigningAccount(keyType: KeyType): Promise<GenerateKeypairOutput> {
-  const acct = await createAccountKey(keyType === "secp256r1" ? "P256" : "K256");
-  return {
-    key_type: keyType,
-    public_key: standardBase64ToBase64Url(acct.public_key_base64),
-    private_key: standardBase64ToBase64Url(acct.secret_key_base64),
-  };
+// Create this device's signing account. The gateway's SDK replaces its one
+// P-256 signing key with a new one and returns it: the SDK signs every
+// state-node request with it and it is the audience of delegated tokens, and
+// the UI uses the same key to open share envelopes. The gateway never creates
+// this key on its own — only this call does.
+export function createSigningAccount() {
+  return gateway<GenerateKeypairOutput>("/account", { method: "POST" });
 }

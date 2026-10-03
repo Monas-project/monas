@@ -81,19 +81,6 @@ export function SettingsModal({ onClose, onSaved }: { onClose: () => void; onSav
           ))}
         </div>
       </div>
-
-      <div className="field">
-        <label>monas-account base URL (for “create account”)</label>
-        <input
-          className="input"
-          value={cfg.accountService}
-          onChange={(e) => setCfg({ ...cfg, accountService: e.target.value })}
-        />
-        <div className="hint">
-          The UI seeds the P-256 signing key here. Defaults to the{" "}
-          <code>/account-api</code> proxy → monas-account on :4002.
-        </div>
-      </div>
     </Modal>
   );
 }

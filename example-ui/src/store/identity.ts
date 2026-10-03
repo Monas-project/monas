@@ -3,8 +3,9 @@
 // then holds the recipient's private key and can prove the HPKE round-trip.
 //
 // NOTE: the gateway's /keypair is stateless (it just returns a fresh keypair).
-// For content create/update/delete the SDK signs state-node requests via the
-// monas-account service, which must already hold a P-256 key. See the README.
+// For content create/update/delete the SDK signs state-node requests with its
+// signing account, which exists only after the user creates it (POST /account
+// on the gateway). See the README.
 import { createStore } from "./store";
 import type { Identity } from "../types";
 
@@ -18,8 +19,8 @@ const store = createStore<IdentityState>("monas.identities.v2", {
   activeLabel: null,
 });
 
-// Older UIs appended a signing account on every POST /accounts, but that
-// endpoint replaces the backend's ONE key. Array order records creation order;
+// Older UIs appended a signing account on every account creation, but that
+// replaces the backend's ONE key. Array order records creation order;
 // activeLabel only recorded UI switching and cannot change the backend key.
 // There is no account read endpoint to reconcile against. Retain old private
 // keys for envelope decryption, but persist their demotion so removing the
@@ -41,7 +42,7 @@ export function getIdentities(): Identity[] {
   return store.get().identities;
 }
 
-// "You" is this device's signing account: monas-account holds exactly one key,
+// "You" is this device's signing account: the gateway holds exactly one key,
 // and it is the key the SDK signs state-node requests with and the audience of
 // every delegated token issued to this device. Anything else in the list is a
 // legacy keypair-only identity that cannot act on the network.

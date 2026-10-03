@@ -21,7 +21,9 @@ use crate::models::content::{
     CreateContentInput, CreateContentOutput, DeleteContentInput, DeleteContentOutput,
     GetContentInput, GetContentOutput, UpdateContentInput, UpdateContentOutput,
 };
-use crate::models::keypair::{GenerateKeypairInput, GenerateKeypairOutput};
+use crate::models::keypair::{
+    CreateSigningAccountOutput, GenerateKeypairInput, GenerateKeypairOutput,
+};
 use crate::models::share::{
     DecryptSharedContentInput, DecryptSharedContentOutput, RevokeShareInput, RevokeShareOutput,
     ShareContentInput, ShareContentOutput, UpdateSharedContentInput, UpdateSharedContentOutput,
@@ -159,6 +161,16 @@ impl MonasController {
         match tokio::task::spawn_blocking(move || self.update_shared_content(input, auth.as_ref()))
             .await
         {
+            Ok(resp) => resp,
+            Err(e) => map_join_error(e, fallback_trace_id()),
+        }
+    }
+
+    /// `create_signing_account` の async 版。
+    pub async fn create_signing_account_async(
+        self: Arc<Self>,
+    ) -> ApiResponse<CreateSigningAccountOutput> {
+        match tokio::task::spawn_blocking(move || self.create_signing_account()).await {
             Ok(resp) => resp,
             Err(e) => map_join_error(e, fallback_trace_id()),
         }

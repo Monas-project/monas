@@ -17,6 +17,9 @@ use crate::models::state_node::{
     StateNodeUpdateContentResponse,
 };
 
+use monas_account::application_service::{AccountKeyStore, SignError};
+use monas_account::infrastructure::key_pair::KeyAlgorithm;
+
 use monas_content::application_service::content_service::{
     ContentEncryptionKeyStore, ContentRepository, ContentService, CreateContentCommand,
     DeleteContentCommand, DeleteError, FetchError, RestoreDeletedContentCommand,
@@ -65,18 +68,6 @@ struct StoredContentSnapshot {
     content_id: ContentId,
     content: Content,
     cek: ContentEncryptionKey,
-}
-
-#[derive(serde::Serialize)]
-struct AccountSignRequest {
-    message_base64: String,
-}
-
-#[derive(serde::Deserialize)]
-struct AccountSignResponse {
-    signature_base64: String,
-    public_key_base64: String,
-    algorithm: String,
 }
 
 impl MonasController {
@@ -130,38 +121,14 @@ impl MonasController {
         )
     }
 
-    fn map_account_http_status_to_api_response<T>(
-        status: u16,
-        message: String,
-        trace_id: String,
-    ) -> ApiResponse<T> {
-        match status {
-            400 => ApiResponse::error(ApiError::Validation(message), trace_id),
-            404 => ApiResponse::error(ApiError::NotFound(message), trace_id),
-            408 => ApiResponse::error(ApiError::Timeout(message), trace_id),
-            _ => ApiResponse::error(ApiError::Internal(message), trace_id),
+    fn map_sign_error(error: SignError) -> ApiError {
+        match error {
+            SignError::NotFound => ApiError::NotFound("stored account key not found".into()),
+            SignError::KeyStore(err) => {
+                ApiError::Internal(format!("account key store error: {err}"))
+            }
+            SignError::InvalidKey(err) => ApiError::Internal(format!("invalid account key: {err}")),
         }
-    }
-
-    pub(super) fn try_account_http_error<T>(
-        status: u16,
-        body: &str,
-        trace_id: String,
-    ) -> Option<ApiResponse<T>> {
-        if (200..300).contains(&status) {
-            return None;
-        }
-
-        let message = body.trim();
-        Some(Self::map_account_http_status_to_api_response(
-            status,
-            if message.is_empty() {
-                format!("Account service returned HTTP {status}")
-            } else {
-                message.to_string()
-            },
-            trace_id,
-        ))
     }
 
     fn sign_state_node_message_with_account<T>(
@@ -170,57 +137,45 @@ impl MonasController {
         timestamp: u64,
         trace_id: &str,
     ) -> Result<StateNodeAuthContext, ApiResponse<T>> {
-        let sign_url = format!("{}/accounts/sign", self.account_url);
-        let request = AccountSignRequest {
-            message_base64: BASE64_STANDARD.encode(signing_message.as_bytes()),
+        let stored = match self.account_service.key_store.load() {
+            Ok(Some(stored)) => stored,
+            Ok(None) => {
+                return Err(ApiResponse::error(
+                    ApiError::NotFound("stored account key not found".into()),
+                    trace_id.to_string(),
+                ));
+            }
+            Err(e) => {
+                return Err(ApiResponse::error(
+                    ApiError::Internal(format!("account key store error: {e}")),
+                    trace_id.to_string(),
+                ));
+            }
         };
-        let response = self.agent.post(&sign_url).send_json(request).map_err(|e| {
-            ApiResponse::error(
-                ApiError::from_ureq_error("Failed to sign state node request via account", e),
-                trace_id.to_string(),
-            )
-        })?;
-        let status = response.status().as_u16();
-        let body = response.into_body().read_to_string().map_err(|e| {
-            ApiResponse::error(
-                ApiError::Internal(format!("Failed to read account sign response body: {e}")),
-                trace_id.to_string(),
-            )
-        })?;
-        if let Some(response) = Self::try_account_http_error(status, &body, trace_id.to_string()) {
-            return Err(response);
-        }
-
-        let sign_response: AccountSignResponse = serde_json::from_str(&body).map_err(|e| {
-            ApiResponse::error(
-                ApiError::Internal(format!("Invalid account sign response JSON: {e}")),
-                trace_id.to_string(),
-            )
-        })?;
-        if !sign_response.algorithm.eq_ignore_ascii_case("P256") {
+        if stored.algorithm != KeyAlgorithm::P256 {
             return Err(ApiResponse::error(
                 ApiError::Validation(format!(
-                    "Stored account key must be P256 for state node signing, got {}",
-                    sign_response.algorithm
+                    "Stored account key must be P256 for state node signing, got {:?}",
+                    stored.algorithm
                 )),
                 trace_id.to_string(),
             ));
         }
-        let public_key_bytes = BASE64_STANDARD
-            .decode(&sign_response.public_key_base64)
-            .map_err(|e| {
-                ApiResponse::error(
-                    ApiError::Internal(format!(
-                        "Invalid public_key_base64 from account sign response: {e}"
-                    )),
+
+        let (signature, _) = match self.account_service.sign(signing_message.as_bytes()) {
+            Ok(signed) => signed,
+            Err(e) => {
+                return Err(ApiResponse::error(
+                    Self::map_sign_error(e),
                     trace_id.to_string(),
-                )
-            })?;
-        let authorization = format!("user:{}", hex::encode(public_key_bytes));
+                ));
+            }
+        };
+        let authorization = format!("user:{}", hex::encode(stored.public_key));
 
         Ok(StateNodeAuthContext {
             authorization: Some(authorization),
-            request_signature: Some(sign_response.signature_base64),
+            request_signature: Some(BASE64_STANDARD.encode(signature)),
             request_timestamp: Some(timestamp),
         })
     }
@@ -1322,6 +1277,31 @@ mod tests {
             with_body,
             MonasController::build_request_signature_message("update", "c1", 42, None)
         );
+    }
+
+    /// 署名鍵が P-256 でないときは state node へ送る前に拒否する。
+    #[test]
+    #[allow(deprecated)]
+    fn state_node_signing_rejects_non_p256_account_key() {
+        use monas_account::application_service::KeyTypeMapper;
+
+        let controller = MonasController::with_state_node_url("http://127.0.0.1:9");
+        controller
+            .account_service
+            .create(KeyTypeMapper::K256)
+            .expect("overwrite signing key");
+
+        let result: Result<StateNodeAuthContext, ApiResponse<()>> = controller
+            .sign_state_node_message_with_account(
+                "monas-request-v1",
+                MonasController::current_unix_timestamp(),
+                "trace",
+            );
+
+        match result {
+            Err(response) => assert!(matches!(response.error, Some(ApiError::Validation(_)))),
+            Ok(_) => panic!("non-P256 signing key must be rejected"),
+        }
     }
 
     /// 区切り文字を含む値でフィールド境界がずれない(長さ前置のおかげ)。

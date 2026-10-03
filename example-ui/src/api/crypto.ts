@@ -42,11 +42,6 @@ export function base64UrlToStandard(b64url: string): string {
   return bytesToBase64(base64UrlToBytes(b64url));
 }
 
-// monas-account returns keys as standard base64; the gateway/SDK want base64url.
-export function standardBase64ToBase64Url(b64: string): string {
-  return bytesToBase64Url(base64ToBytes(b64));
-}
-
 export async function fileToBase64Url(file: File): Promise<string> {
   return bytesToBase64Url(new Uint8Array(await file.arrayBuffer()));
 }

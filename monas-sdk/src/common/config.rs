@@ -23,7 +23,8 @@ pub enum PersistenceConfig {
 
 /// SDK の設定値。
 ///
-/// State Node / Account の接続先 URL、HTTP タイムアウト、ローカル persistence backend を保持する。
+/// State Node の接続先 URL、HTTP タイムアウト、ローカル persistence backend を保持する。
+/// 署名と委譲は account プロセスへの HTTP ではなく、SDK 内の `AccountService` が行う。
 /// `#[non_exhaustive]` を付けているため、将来フィールドを追加しても SemVer 非破壊。
 ///
 /// # Example
@@ -32,7 +33,7 @@ pub enum PersistenceConfig {
 /// use std::time::Duration;
 /// use monas_sdk::{MonasConfig, MonasController, PersistenceConfig};
 ///
-/// let config = MonasConfig::new("http://127.0.0.1:8080", "http://127.0.0.1:4002")
+/// let config = MonasConfig::new("http://127.0.0.1:8080")
 ///     .with_request_timeout(Duration::from_secs(30))
 ///     .with_persistence_dir(PathBuf::from("/var/lib/monas-sdk"));
 /// let controller = MonasController::with_config(config).expect("open persistence");
@@ -42,8 +43,6 @@ pub enum PersistenceConfig {
 pub struct MonasConfig {
     /// State Node のベース URL
     pub state_node_url: String,
-    /// Account (issuer) のベース URL
-    pub account_url: String,
     /// HTTP 呼び出し全体のタイムアウト (connect + read + write の合計上限)
     pub request_timeout: Duration,
     /// ローカル persistence backend (CEK + Share)
@@ -68,10 +67,9 @@ pub const DEFAULT_REQUEST_TIMESTAMP_SKEW: Duration = Duration::from_secs(60);
 impl MonasConfig {
     /// 最小限の設定で `MonasConfig` を生成する。タイムアウトは `DEFAULT_REQUEST_TIMEOUT`、
     /// persistence は `InMemory` (テスト用既定値)、skew は `DEFAULT_REQUEST_TIMESTAMP_SKEW`。
-    pub fn new(state_node_url: impl Into<String>, account_url: impl Into<String>) -> Self {
+    pub fn new(state_node_url: impl Into<String>) -> Self {
         Self {
             state_node_url: state_node_url.into(),
-            account_url: account_url.into(),
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
             persistence: PersistenceConfig::InMemory,
             request_timestamp_skew: DEFAULT_REQUEST_TIMESTAMP_SKEW,
@@ -112,16 +110,14 @@ mod tests {
 
     #[test]
     fn new_uses_default_timeout() {
-        let cfg = MonasConfig::new("http://a", "http://b");
+        let cfg = MonasConfig::new("http://a");
         assert_eq!(cfg.request_timeout, DEFAULT_REQUEST_TIMEOUT);
         assert_eq!(cfg.state_node_url, "http://a");
-        assert_eq!(cfg.account_url, "http://b");
     }
 
     #[test]
     fn with_request_timeout_overrides() {
-        let cfg =
-            MonasConfig::new("http://a", "http://b").with_request_timeout(Duration::from_secs(1));
+        let cfg = MonasConfig::new("http://a").with_request_timeout(Duration::from_secs(1));
         assert_eq!(cfg.request_timeout, Duration::from_secs(1));
     }
 }

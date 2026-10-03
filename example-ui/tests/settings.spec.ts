@@ -65,8 +65,6 @@ test("S-02b: the modal exposes the documented control set (ARIA snapshot)", asyn
     - textbox: /api
     - button "Local (Vite proxy → Docker)"
     - button "Local (direct :3000)"
-    - text: /monas-account base URL/
-    - textbox: /account-api
     - button "Reset to proxy"
     - button "Test connection"
     - button "Save":
@@ -87,7 +85,6 @@ test("S-04: Save persists to localStorage and closes the modal", async ({ page }
 
   expect(await readStorage(page, ENDPOINT_KEY)).toEqual({
     gateway: "http://127.0.0.1:3000",
-    accountService: "/account-api",
   });
 
   // Cleanup: leave the endpoint back on the proxy so nothing later in the run
@@ -99,7 +96,6 @@ test("S-04: Save persists to localStorage and closes the modal", async ({ page }
   await expect(page.locator(".overlay")).toHaveCount(0);
   expect(await readStorage(page, ENDPOINT_KEY)).toEqual({
     gateway: "/api",
-    accountService: "/account-api",
   });
 });
 
@@ -192,7 +188,6 @@ test("S-07: Test connection probes without persisting an unsaved endpoint", asyn
 
   expect(await readStorage(page, ENDPOINT_KEY)).toEqual({
     gateway: "/api",
-    accountService: "/account-api",
   });
 });
 

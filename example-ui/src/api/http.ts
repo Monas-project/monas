@@ -116,34 +116,3 @@ export async function probeGateway(base?: string): Promise<boolean> {
     return false;
   }
 }
-
-// --- monas-account service (only used to create the signing key) ---
-// This service returns plain JSON (not the SDK ApiResponse envelope) and keys
-// in standard base64.
-export interface AccountCreateResponse {
-  algorithm: string;
-  public_key_base64: string;
-  secret_key_base64: string;
-}
-
-export async function createAccountKey(keyType: "P256" | "K256"): Promise<AccountCreateResponse> {
-  const base = loadEndpoints().accountService.replace(/\/+$/, "");
-  let res: Response;
-  try {
-    res = await fetch(base + "/accounts", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ key_type: keyType }),
-    });
-  } catch (e) {
-    throw new ApiError(
-      0,
-      `Network error reaching the account service (${base}). Is monas-account running? ${
-        (e as Error).message
-      }`,
-    );
-  }
-  const text = await res.text();
-  if (!res.ok) throw new ApiError(res.status, text || res.statusText);
-  return JSON.parse(text) as AccountCreateResponse;
-}

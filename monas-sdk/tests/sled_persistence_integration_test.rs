@@ -47,8 +47,7 @@ fn sled_persistence_opens_without_double_lock() {
     let dir = tmp_dir("opens");
 
     // 1 回目: CEK と Share で同一 DB を共有して open できる
-    let config = MonasConfig::new("http://127.0.0.1:1", "http://127.0.0.1:2")
-        .with_persistence_dir(dir.clone());
+    let config = MonasConfig::new("http://127.0.0.1:1").with_persistence_dir(dir.clone());
     let controller =
         MonasController::with_config(config).expect("first with_config should succeed");
 
@@ -62,8 +61,7 @@ fn sled_persistence_opens_without_double_lock() {
     drop(controller);
 
     // 2 回目: 同一 dir で再度 open できる (排他 flock が drop で解放されている)
-    let config2 = MonasConfig::new("http://127.0.0.1:1", "http://127.0.0.1:2")
-        .with_persistence_dir(dir.clone());
+    let config2 = MonasConfig::new("http://127.0.0.1:1").with_persistence_dir(dir.clone());
     let controller2 =
         MonasController::with_config(config2).expect("second with_config should succeed");
     drop(controller2);
@@ -78,8 +76,7 @@ fn sled_persistence_creates_dir_if_missing() {
     cleanup_dir(&dir);
     assert!(!dir.exists(), "precondition: dir should not exist");
 
-    let config = MonasConfig::new("http://127.0.0.1:1", "http://127.0.0.1:2")
-        .with_persistence_dir(dir.clone());
+    let config = MonasConfig::new("http://127.0.0.1:1").with_persistence_dir(dir.clone());
     let controller = MonasController::with_config(config).expect("with_config should create dir");
     assert!(
         dir.exists(),

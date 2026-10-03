@@ -141,6 +141,6 @@ export interface Identity {
   keyType: KeyType;
   publicKeyB64Url: string;
   privateKeyB64Url: string;
-  /** Registered with monas-account as the signing key (enables content ops). */
+  /** The gateway's signing account key (enables content ops). */
   isSigningAccount?: boolean;
 }

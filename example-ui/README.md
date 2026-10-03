@@ -13,7 +13,7 @@ orchestrates everything server-side:
 ┌──────────────┐    /api/*  (Vite proxy)   ┌───────────────┐  embeds monas-sdk
 │   this UI    │ ────────────────────────▶ │ monas-gateway │ ─┬─▶ encrypt + store (monas-content)
 │ (React+Vite) │      single endpoint      │     :3000     │  ├─▶ state-node  (:8080)
-└──────────────┘                           └───────────────┘  └─▶ sign        (monas-account :4002)
+└──────────────┘                           └───────────────┘  └─▶ sign        (in-process, the SDK's signing account)
 ```
 
 ## Run
@@ -24,14 +24,14 @@ npm install
 npm run dev          # http://localhost:5173
 ```
 
-You also need the gateway (and the services it calls) running, e.g. via your
-local Docker. The gateway defaults to `:3000` and reads:
+You also need the gateway running, e.g. via your local Docker. It signs
+state-node requests itself (no separate account service). The gateway defaults
+to `:3000` and reads:
 
 ```
 MONAS_API_PORT=3000
 MONAS_STATE_NODE_URL=http://127.0.0.1:8080
-MONAS_ACCOUNT_URL=http://127.0.0.1:4002
-MONAS_PERSISTENCE_DIR=...   # recommended; otherwise CEK/shares are in-memory
+MONAS_PERSISTENCE_DIR=...   # recommended; otherwise the signing account, CEKs and shares are in-memory
 ```
 
 ### Endpoint & CORS
@@ -69,7 +69,7 @@ owner preview/head checks, revocation reach reporting, and legacy identities.
 These are UI regressions, not cryptographic or distributed-protocol tests.
 
 Legacy identity migration keeps the **last-created signing account**, matching
-`POST /accounts` replacing monas-account's single key. Earlier signing entries
+`POST /account` replacing the gateway's single key. Earlier signing entries
 remain available as envelope-decryption keypairs; removing the current account
 does not promote them. `activeLabel` from old UI switching cannot change the
 backend's key. The account API has no read-current-key endpoint, so a reset or
@@ -83,7 +83,7 @@ npm run test:ui          # same, in the Playwright UI runner
 npm run test:e2e         # real-stack journeys (tests-e2e/) — minutes
 ```
 
-Both need a running stack. `npm test` only needs vite + gateway + account;
+Both need a running stack. `npm test` only needs vite + gateway;
 `test:e2e` additionally exercises the state-node round trip, so the gateway's
 `MONAS_STATE_NODE_URL` must point at a node that is up — a local cluster
 (`monas-state-node/scripts/start-local-nodes.sh`) or a hosted node.
@@ -109,7 +109,7 @@ identity with the HPKE round-trip proof, share to a pasted external key,
 revoke with envelope reissue), and binary upload + filter views + delete.
 
 `tests-e2e/cross-device.spec.ts` (J-4) is the two-device share: two browser
-contexts, each bound to its **own gateway + monas-account pair**, exchange only
+contexts, each bound to its **own gateway**, exchange only
 what people would paste into a chat — a public key one way, a share package
 the other. The recipient unwraps it, reads the shared version back from *his*
 state node with the delegated token, is refused after the owner revokes a
@@ -117,15 +117,14 @@ third party, reads again with the reissued token, reads the owner's post-share
 edit, **writes his own version** with the token (which the owner reads from
 *her* node and pulls into her copy), is refused the stale package, and — once
 the owner revokes him — has his write refused while her copy keeps his last
-authorised version. Point the second pair at a **different node** so the
-reads prove replication too:
+authorised version. Point the second gateway at a **different node** so
+the reads prove replication too:
 
 ```bash
-MONAS_STATE_NODE_URL=https://node2.monas-demo.net ./scripts/second-device.sh   # :3001 / :4003
+MONAS_STATE_NODE_URL=https://node2.monas-demo.net ./scripts/second-device.sh   # :3001
 ```
 
-vite proxies `/api2` and `/account-api2` to it (`VITE_GATEWAY2_TARGET` /
-`VITE_ACCOUNT2_TARGET` to override).
+vite proxies `/api2` to it (`VITE_GATEWAY2_TARGET` to override).
 
 Modal structure is asserted with **ARIA snapshots** (`toMatchAriaSnapshot`)
 rather than CSS selectors, so the whole control set of a dialog is checked in
@@ -176,7 +175,7 @@ so the suite cannot go non-deterministic on a model update.
 
 | Action            | Gateway call                          | SDK model                         |
 | ----------------- | ------------------------------------- | --------------------------------- |
-| Create account    | `POST /account-api/accounts`          | (monas-account)                   |
+| Create account    | `POST /account`                       | `CreateSigningAccountOutput`      |
 | New file / Upload  | `POST /content`                       | `CreateContent{Input,Output}`     |
 | Open / preview    | `GET /content/{id}`                   | `GetContent{Input,Output}`        |
 | Edit contents     | `PUT /content/{id}`                   | `UpdateContent{Input,Output}`     |
@@ -197,7 +196,7 @@ Notes on the contract:
 - `POST /content`, `PUT/DELETE /content/{id}`, `POST /share/revoke` and the
   `/state/*` calls require an **`X-Request-Timestamp`** header (the gateway
   returns 401 without it). The UI sends the current Unix time; the SDK then
-  signs the state-node request via the account service.
+  signs the state-node request with its signing account.
 - **Two read paths, and they prove different things.** `GET /content/{id}`
   reads the gateway's own local store — convenient, but it never touches the
   network, so it proves nothing about what the state node holds.
@@ -223,17 +222,18 @@ Notes on the contract:
 ## Accounts & the signing key
 
 A device has **one account**. Open the identity chip (top-right) → **Create
-account**: the UI sends `POST /accounts` to **monas-account** (via the
-`/account-api` proxy), which generates and keeps a **P-256** key. The SDK signs
+account**: the UI sends `POST /account` to the **gateway**, whose SDK generates
+and keeps a **P-256** key and returns it. The gateway never creates this key on
+its own — until you create the account, content operations are refused. The SDK signs
 every state-node request with that key (create / edit / delete, and a
 recipient's reads and writes under a delegated token), and it is the key
 other people share *to* — a delegated token's audience is the recipient's
 signing key, so a share addressed to any other key could open its envelope but
 never read or write the state node.
 
-monas-account holds exactly one key, which is why the dialog does not offer a
+The gateway holds exactly one key, which is why the dialog does not offer a
 second account or a keypair-only identity: creating another would overwrite
-the key monas-account signs with and silently orphan the first. To start over,
+the key the gateway signs with and silently orphan the first. To start over,
 remove the account and create a new one (content created under the old key can
 then no longer be updated or deleted from this device).
 

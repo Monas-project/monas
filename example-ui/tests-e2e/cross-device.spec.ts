@@ -10,10 +10,10 @@ import {
 /**
  * Journey 4 — two devices share a file through the state node.
  *
- * "Device" here is a browser context bound to its own gateway + monas-account
- * pair: separate localStorage, separate CEK store, separate signing key. Alice
- * (device A, the default :3000/:4002 pair) creates and shares; Bob (device B,
- * the :3001/:4003 pair behind vite's /api2 proxy — see scripts/second-device.sh)
+ * "Device" here is a browser context bound to its own gateway: separate
+ * localStorage, separate CEK store, separate signing key. Alice (device A,
+ * the default :3000 gateway) creates and shares; Bob (device B, the :3001
+ * gateway behind vite's /api2 proxy — see scripts/second-device.sh)
  * receives. Nothing crosses between them except what a person would paste into
  * a chat: Bob's public key one way, Alice's share package the other.
  *
@@ -23,7 +23,7 @@ import {
  * node with the delegated token in the package. A revoke voids that token;
  * the re-wrapped package carries a fresh one.
  *
- * Requirements: the usual stack (vite :5174, gateway :3000, account :4002)
+ * Requirements: the usual stack (vite :5174, gateway :3000)
  * plus `MONAS_STATE_NODE_URL=https://node2.… ./scripts/second-device.sh`.
  */
 
@@ -56,12 +56,12 @@ async function closeModal(page: Page) {
   await expect(page.locator(".overlay")).toHaveCount(0);
 }
 
-/** Point a browser context at the second gateway/account pair. Endpoints are
+/** Point a browser context at the second gateway. Endpoints are
  *  read from localStorage at load, so set them and reload. */
 async function useSecondDevice(page: Page) {
   await page.evaluate(
     ([key]) =>
-      localStorage.setItem(key, JSON.stringify({ gateway: "/api2", accountService: "/account-api2" })),
+      localStorage.setItem(key, JSON.stringify({ gateway: "/api2" })),
     [ENDPOINT_KEY] as const,
   );
   await page.reload();

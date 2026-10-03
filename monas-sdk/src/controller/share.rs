@@ -1,6 +1,5 @@
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
 use chrono::Utc;
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::common::{
@@ -13,6 +12,9 @@ use crate::models::share::{
     ShareContentOutput, UpdateSharedContentInput, UpdateSharedContentOutput,
 };
 use crate::models::state_node::StateNodeUpdateContentRequest;
+
+use monas_account::application_service::{IssueDelegatedTokenError, IssueDelegatedTokenRequest};
+use monas_account::domain::delegation::DelegatedCapability;
 
 use monas_content::application_service::content_service::{
     ContentEncryptionKeyStore, ContentRepository, DecryptWithCekError, ReencryptContentCommand,
@@ -32,22 +34,6 @@ use monas_content::infrastructure::{key_wrapping::HpkeV1KeyWrapping, MultiStorag
 use super::MonasController;
 
 const DEFAULT_DELEGATION_TTL_SECS: u64 = 3600;
-
-#[derive(Debug, Serialize)]
-struct IssueDelegatedTokenRequest {
-    recipient_public_key_base64: String,
-    content_id: String,
-    capabilities: Vec<String>,
-    ttl_secs: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct IssueDelegatedTokenResponse {
-    delegated_token: String,
-    issued_at: u64,
-    expires_at: u64,
-    jti: String,
-}
 
 /// ShareServiceの型エイリアス（可読性向上のため）。
 ///
@@ -155,14 +141,40 @@ impl MonasController {
         }
     }
 
-    fn permission_to_capabilities(permission: DomainPermission) -> Result<Vec<String>, ApiError> {
+    fn permission_to_capabilities(
+        permission: DomainPermission,
+    ) -> Result<Vec<DelegatedCapability>, ApiError> {
         match permission {
-            DomainPermission::Read => Ok(vec!["read".to_string()]),
-            DomainPermission::Write => Ok(vec!["write".to_string()]),
+            DomainPermission::Read => Ok(vec![DelegatedCapability::Read]),
+            DomainPermission::Write => Ok(vec![DelegatedCapability::Write]),
             // Owner 権限の委譲は現フェーズ対象外。SDK境界で拒否する。
             DomainPermission::Owner => Err(ApiError::Validation(
                 "owner permission is not supported for delegation".into(),
             )),
+        }
+    }
+
+    fn map_delegation_error(error: IssueDelegatedTokenError) -> ApiError {
+        match error {
+            IssueDelegatedTokenError::NotFound => {
+                ApiError::NotFound("stored account key not found".into())
+            }
+            IssueDelegatedTokenError::Validation(message) => ApiError::Validation(message),
+            IssueDelegatedTokenError::UnsupportedAlgorithm(algorithm) => ApiError::Validation(
+                format!("Stored account key must be P256 for delegation, got {algorithm}"),
+            ),
+            IssueDelegatedTokenError::KeyStore(err) => {
+                ApiError::Internal(format!("account key store error: {err}"))
+            }
+            IssueDelegatedTokenError::InvalidKey(err) => {
+                ApiError::Internal(format!("invalid account key: {err}"))
+            }
+            IssueDelegatedTokenError::JwtSigning(err) => {
+                ApiError::Internal(format!("failed to create delegated token: {err}"))
+            }
+            IssueDelegatedTokenError::Time(message) => {
+                ApiError::Internal(format!("failed to get system time: {message}"))
+            }
         }
     }
 
@@ -181,42 +193,27 @@ impl MonasController {
         min_issued_after: Option<u64>,
     ) -> Result<DelegatedAccessToken, ApiError> {
         const MAX_WAIT_SECS: u64 = 5;
-        let issuer_url = format!("{}/issuer/delegate", self.account_url);
         let capabilities = Self::permission_to_capabilities(permission)?;
 
         let mut waited = 0;
         loop {
             let req = IssueDelegatedTokenRequest {
-                recipient_public_key_base64: BASE64_STANDARD.encode(recipient_public_key_bytes),
+                recipient_public_key: recipient_public_key_bytes.to_vec(),
                 content_id: content_id.to_string(),
                 capabilities: capabilities.clone(),
                 ttl_secs: DEFAULT_DELEGATION_TTL_SECS,
             };
 
-            let response = self
-                .agent
-                .post(&issuer_url)
-                .send_json(req)
-                .map_err(|e| ApiError::from_ureq_error("Failed to call issuer API", e))?;
-            let status = response.status().as_u16();
-            let body = response
-                .into_body()
-                .read_to_string()
-                .map_err(|e| ApiError::Internal(format!("Failed to read issuer response: {e}")))?;
-            if let Some(response) = Self::try_account_http_error::<()>(status, &body, String::new())
-            {
-                return Err(response.error.unwrap_or_else(|| {
-                    ApiError::Internal(format!("Issuer API returned HTTP {status}"))
-                }));
-            }
-            let body: IssueDelegatedTokenResponse = serde_json::from_str(&body)
-                .map_err(|e| ApiError::Internal(format!("Invalid issuer API response: {e}")))?;
+            let issued = self
+                .account_service
+                .issue_delegated_token(req)
+                .map_err(Self::map_delegation_error)?;
 
             let token = DelegatedAccessToken {
-                delegated_token: body.delegated_token,
-                issued_at: body.issued_at,
-                expires_at: body.expires_at,
-                jti: body.jti,
+                delegated_token: issued.delegated_token,
+                issued_at: issued.issued_at,
+                expires_at: issued.expires_at,
+                jti: issued.jti,
             };
             match min_issued_after {
                 Some(boundary) if token.issued_at <= boundary => {

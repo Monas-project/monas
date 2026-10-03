@@ -12,13 +12,13 @@ use base64::Engine;
 use p256::elliptic_curve::rand_core::{OsRng, RngCore};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub struct AccountService;
+#[derive(Clone)]
+pub struct AccountService<S> {
+    pub key_store: S,
+}
 
-impl AccountService {
-    pub fn create<S: AccountKeyStore>(
-        store: &S,
-        key_type: KeyTypeMapper,
-    ) -> Result<Account, AccountServiceError> {
+impl<S: AccountKeyStore> AccountService<S> {
+    pub fn create(&self, key_type: KeyTypeMapper) -> Result<Account, AccountServiceError> {
         let algorithm: KeyAlgorithm = key_type.into();
         let generated_key_pair = KeyPairGenerateFactory::generate(algorithm);
         let account = Account::new(generated_key_pair);
@@ -29,20 +29,17 @@ impl AccountService {
             secret_key: account.secret_key_bytes().to_vec(),
         };
 
-        store.save(&stored)?;
+        self.key_store.save(&stored)?;
         Ok(account)
     }
 
-    pub fn delete<S: AccountKeyStore>(store: &S) -> Result<(), AccountServiceError> {
-        store.delete()?;
+    pub fn delete(&self) -> Result<(), AccountServiceError> {
+        self.key_store.delete()?;
         Ok(())
     }
 
-    pub fn sign<S: AccountKeyStore>(
-        store: &S,
-        msg: &[u8],
-    ) -> Result<(Vec<u8>, Option<u8>), SignError> {
-        let stored = store.load()?.ok_or(SignError::NotFound)?;
+    pub fn sign(&self, msg: &[u8]) -> Result<(Vec<u8>, Option<u8>), SignError> {
+        let stored = self.key_store.load()?.ok_or(SignError::NotFound)?;
 
         let key_pair = KeyPairGenerateFactory::from_key_bytes(
             stored.algorithm,
@@ -54,8 +51,8 @@ impl AccountService {
         Ok(account.sign(msg))
     }
 
-    pub fn issue_delegated_token<S: AccountKeyStore>(
-        store: &S,
+    pub fn issue_delegated_token(
+        &self,
         req: IssueDelegatedTokenRequest,
     ) -> Result<IssueDelegatedTokenResult, IssueDelegatedTokenError> {
         if req.content_id.trim().is_empty() {
@@ -81,7 +78,8 @@ impl AccountService {
         }
 
         let recipient_key_id = key_id_from_public_key(&req.recipient_public_key);
-        let stored = store
+        let stored = self
+            .key_store
             .load()
             .map_err(IssueDelegatedTokenError::KeyStore)?
             .ok_or(IssueDelegatedTokenError::NotFound)?;
@@ -188,76 +186,81 @@ mod tests {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
 
+    fn account_service() -> AccountService<InMemoryAccountKeyStore> {
+        AccountService {
+            key_store: InMemoryAccountKeyStore::default(),
+        }
+    }
+
     #[test]
     fn create_k256_stores_valid_account() {
-        let store = InMemoryAccountKeyStore::default();
-        let account = AccountService::create(&store, KeyTypeMapper::K256).unwrap();
+        let service = account_service();
+        let account = service.create(KeyTypeMapper::K256).unwrap();
         assert_eq!(account.public_key_bytes().len(), 65);
         assert_eq!(account.secret_key_bytes().len(), 32);
     }
 
     #[test]
     fn create_p256_stores_valid_account() {
-        let store = InMemoryAccountKeyStore::default();
-        let account = AccountService::create(&store, KeyTypeMapper::P256).unwrap();
+        let service = account_service();
+        let account = service.create(KeyTypeMapper::P256).unwrap();
         assert_eq!(account.public_key_bytes().len(), 65);
         assert_eq!(account.secret_key_bytes().len(), 32);
     }
 
     #[test]
     fn sign_uses_stored_key() {
-        let store = InMemoryAccountKeyStore::default();
-        let account = AccountService::create(&store, KeyTypeMapper::K256).unwrap();
+        let service = account_service();
+        let account = service.create(KeyTypeMapper::K256).unwrap();
         let msg = b"sign-test-message";
-        let (sig_from_service, _rec_id1) = AccountService::sign(&store, msg).unwrap();
+        let (sig_from_service, _rec_id1) = service.sign(msg).unwrap();
         let (sig_from_account, _rec_id2) = account.sign(msg);
         assert_eq!(sig_from_service, sig_from_account);
     }
 
     #[test]
     fn sign_uses_stored_key_p256() {
-        let store = InMemoryAccountKeyStore::default();
-        let account = AccountService::create(&store, KeyTypeMapper::P256).unwrap();
+        let service = account_service();
+        let account = service.create(KeyTypeMapper::P256).unwrap();
         let msg = b"sign-test-message-p256";
-        let (sig_from_service, _rec_id1) = AccountService::sign(&store, msg).unwrap();
+        let (sig_from_service, _rec_id1) = service.sign(msg).unwrap();
         let (sig_from_account, _rec_id2) = account.sign(msg);
         assert_eq!(sig_from_service, sig_from_account);
     }
 
     #[test]
     fn sign_uses_latest_created_key() {
-        let store = InMemoryAccountKeyStore::default();
-        AccountService::create(&store, KeyTypeMapper::K256).unwrap();
+        let service = account_service();
+        service.create(KeyTypeMapper::K256).unwrap();
         let msg = b"override-test-message";
-        let account_latest = AccountService::create(&store, KeyTypeMapper::P256).unwrap();
-        let (sig_from_service, _rec_id1) = AccountService::sign(&store, msg).unwrap();
+        let account_latest = service.create(KeyTypeMapper::P256).unwrap();
+        let (sig_from_service, _rec_id1) = service.sign(msg).unwrap();
         let (sig_from_latest, _rec_id2) = account_latest.sign(msg);
         assert_eq!(sig_from_service, sig_from_latest);
     }
 
     #[test]
     fn sign_returns_not_found_if_key_missing() {
-        let store = InMemoryAccountKeyStore::default();
-        let err = AccountService::sign(&store, b"msg").unwrap_err();
+        let service = account_service();
+        let err = service.sign(b"msg").unwrap_err();
         assert!(matches!(err, SignError::NotFound));
     }
 
     #[test]
     fn delete_removes_stored_key() {
-        let store = InMemoryAccountKeyStore::default();
-        AccountService::create(&store, KeyTypeMapper::K256).unwrap();
-        AccountService::delete(&store).unwrap();
-        let err = AccountService::sign(&store, b"after-delete").unwrap_err();
+        let service = account_service();
+        service.create(KeyTypeMapper::K256).unwrap();
+        service.delete().unwrap();
+        let err = service.sign(b"after-delete").unwrap_err();
         assert!(matches!(err, SignError::NotFound));
     }
 
     #[test]
     fn issue_delegated_token_succeeds_with_p256() {
-        let owner_store = InMemoryAccountKeyStore::default();
-        let recipient_store = InMemoryAccountKeyStore::default();
-        let recipient_account =
-            AccountService::create(&recipient_store, KeyTypeMapper::P256).unwrap();
-        AccountService::create(&owner_store, KeyTypeMapper::P256).unwrap();
+        let owner = account_service();
+        let recipient = account_service();
+        let recipient_account = recipient.create(KeyTypeMapper::P256).unwrap();
+        owner.create(KeyTypeMapper::P256).unwrap();
 
         let req = IssueDelegatedTokenRequest {
             recipient_public_key: recipient_account.public_key_bytes().to_vec(),
@@ -266,7 +269,7 @@ mod tests {
             ttl_secs: 3600,
         };
 
-        let issued = AccountService::issue_delegated_token(&owner_store, req).unwrap();
+        let issued = owner.issue_delegated_token(req).unwrap();
         assert!(!issued.delegated_token.is_empty());
         assert!(issued.expires_at > issued.issued_at);
         assert!(!issued.jti.is_empty());
@@ -282,11 +285,10 @@ mod tests {
 
     #[test]
     fn issue_delegated_token_fails_with_k256_owner_key() {
-        let owner_store = InMemoryAccountKeyStore::default();
-        let recipient_store = InMemoryAccountKeyStore::default();
-        let recipient_account =
-            AccountService::create(&recipient_store, KeyTypeMapper::P256).unwrap();
-        AccountService::create(&owner_store, KeyTypeMapper::K256).unwrap();
+        let owner = account_service();
+        let recipient = account_service();
+        let recipient_account = recipient.create(KeyTypeMapper::P256).unwrap();
+        owner.create(KeyTypeMapper::K256).unwrap();
 
         let req = IssueDelegatedTokenRequest {
             recipient_public_key: recipient_account.public_key_bytes().to_vec(),
@@ -295,7 +297,7 @@ mod tests {
             ttl_secs: 3600,
         };
 
-        let err = AccountService::issue_delegated_token(&owner_store, req).unwrap_err();
+        let err = owner.issue_delegated_token(req).unwrap_err();
         assert!(matches!(
             err,
             IssueDelegatedTokenError::UnsupportedAlgorithm(_)

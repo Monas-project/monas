@@ -1,26 +1,20 @@
 // Endpoint configuration.
 //
 // The UI talks to a single backend: monas-gateway, which embeds monas-sdk and
-// orchestrates everything (encrypt → store → state-node → sign via account).
+// orchestrates everything (encrypt → store → sign → state-node). The SDK holds
+// the signing account in-process; there is no separate account service.
 // By default the gateway is reached through the same-origin Vite proxy
 // (see vite.config.ts), which forwards to your local gateway and avoids CORS.
 // You can repoint it (e.g. at a hosted gateway) from the Settings panel; a
 // cross-origin URL must send permissive CORS headers.
 
 export interface EndpointConfig {
-  /** monas-gateway base URL (the main backend the UI calls). */
+  /** monas-gateway base URL (the only backend the UI calls). */
   gateway: string;
-  /**
-   * monas-account base URL. Used only for "create account" — the UI seeds the
-   * P-256 signing key here, because the gateway's /keypair is stateless and
-   * does not register a signing key with the account service.
-   */
-  accountService: string;
 }
 
 export const PROXY_DEFAULTS: EndpointConfig = {
   gateway: "/api",
-  accountService: "/account-api",
 };
 
 /**
@@ -47,8 +41,10 @@ export function loadEndpoints(): EndpointConfig {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (raw) {
+      // Only `gateway` is read: configs saved by older UIs also carry an
+      // `accountService` URL for the separate account server they called.
       const parsed = JSON.parse(raw) as Partial<EndpointConfig>;
-      return { ...PROXY_DEFAULTS, ...parsed };
+      return { gateway: parsed.gateway ?? PROXY_DEFAULTS.gateway };
     }
   } catch {
     /* ignore malformed config */

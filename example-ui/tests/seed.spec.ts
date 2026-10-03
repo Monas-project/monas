@@ -10,8 +10,8 @@ import { test, expect } from "@playwright/test";
  *    runs unless it is cleared first.
  * 2. Content operations are gated behind a **signing account** — without one,
  *    "New file" refuses to do anything and most of the UI is unreachable.
- *    Creating that account registers a P-256 key with monas-account, which
- *    the SDK then uses to sign state-node requests.
+ *    Creating that account makes the gateway's SDK generate its P-256 key,
+ *    which it then uses to sign state-node requests.
  *
  * Requires the full stack (vite → gateway → 4-node cluster). See README.
  */

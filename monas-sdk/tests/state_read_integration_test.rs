@@ -1,4 +1,4 @@
-// Integration tests intentionally use the test/dev-only `with_urls` constructor.
+// Integration tests intentionally use the test/dev-only `with_state_node_url` constructor.
 #![allow(deprecated)]
 //! `read_content_from_state_node`(検証付き read)の統合テスト。
 //!
@@ -62,6 +62,17 @@ async fn mock_version_data(server: &mut ServerGuard, version: &str, node_bytes: 
         .await
 }
 
+/// 署名アカウントを作った controller。SDK は自分では署名鍵を作らない。
+#[allow(deprecated)]
+fn controller_with_account(state_node_url: String) -> MonasController {
+    let controller = MonasController::with_state_node_url(state_node_url);
+    controller
+        .create_signing_account()
+        .data
+        .expect("create signing account");
+    controller
+}
+
 /// content を作成し、share 経由で実際の AES-GCM 暗号文を入手する
 /// (ciphertext を SDK の外に取り出す公開経路が share envelope しかないため)。
 /// 戻り値: (local_content_id, ciphertext, share 出力, sender/recipient keypair)
@@ -82,15 +93,6 @@ async fn create_and_share(
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(format!(r#"{{"content_id":"{REMOTE_ID}"}}"#))
-        .create_async()
-        .await;
-    let delegate_mock = server
-        .mock("POST", "/issuer/delegate")
-        .with_status(200)
-        .with_header("content-type", "application/json")
-        .with_body(
-            r#"{"delegated_token":"dummy.jwt.token","issued_at":1700000000,"expires_at":1700003600,"jti":"jti-1"}"#,
-        )
         .create_async()
         .await;
 
@@ -141,8 +143,6 @@ async fn create_and_share(
         share_response.error
     );
     let shared = share_response.data.expect("share should return data");
-    delegate_mock.assert();
-
     let ciphertext = URL_SAFE_NO_PAD
         .decode(&shared.key_envelope.ciphertext)
         .expect("envelope ciphertext should be base64url");
@@ -159,7 +159,7 @@ async fn create_and_share(
 async fn creator_reads_own_content_from_state_node() {
     let _guard = acquire_test_lock();
     let mut server = Server::new_async().await;
-    let controller = MonasController::with_urls(server.url(), server.url());
+    let controller = controller_with_account(server.url());
 
     let plaintext = b"state-read-roundtrip";
     let created = create_and_share(&mut server, &controller, plaintext).await;
@@ -201,7 +201,7 @@ async fn creator_reads_own_content_from_state_node() {
 async fn share_recipient_reads_content_after_processing_envelope() {
     let _guard = acquire_test_lock();
     let mut server = Server::new_async().await;
-    let creator = MonasController::with_urls(server.url(), server.url());
+    let creator = controller_with_account(server.url());
 
     let plaintext = b"shared-then-read";
     let created = create_and_share(&mut server, &creator, plaintext).await;
@@ -210,7 +210,7 @@ async fn share_recipient_reads_content_after_processing_envelope() {
     let genesis_cid = recompute_node_cid(&genesis_bytes).unwrap();
 
     // 受信者は別インスタンス(= 別デバイス相当。ローカル content も CEK も無い)
-    let recipient_controller = MonasController::with_urls(server.url(), server.url());
+    let recipient_controller = controller_with_account(server.url());
 
     // KeyEnvelope 未処理の状態では CEK が無く、NotFound で share 処理へ誘導される
     // (read は前後 2 回行うので、mock は 2 ヒットを期待する)
@@ -286,23 +286,13 @@ async fn share_recipient_reads_content_after_processing_envelope() {
 async fn cek_rotation_after_revoke_updates_recipient_and_read() {
     let _guard = acquire_test_lock();
     let mut server = Server::new_async().await;
-    let creator = MonasController::with_urls(server.url(), server.url());
+    let creator = controller_with_account(server.url());
 
     let _create_mock = server
         .mock("POST", "/content")
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(format!(r#"{{"content_id":"{REMOTE_ID}"}}"#))
-        .create_async()
-        .await;
-    let _delegate_mock = server
-        .mock("POST", "/issuer/delegate")
-        .with_status(200)
-        .with_header("content-type", "application/json")
-        .with_body(
-            r#"{"delegated_token":"dummy.jwt.token","issued_at":1700000000,"expires_at":1700003600,"jti":"jti-1"}"#,
-        )
-        .expect_at_least(1)
         .create_async()
         .await;
 
@@ -359,7 +349,7 @@ async fn cek_rotation_after_revoke_updates_recipient_and_read() {
     let shared_surviving = share_surviving.data.unwrap();
 
     // 残存受信者(別デバイス)が旧 CEK の envelope を処理
-    let recipient_controller = MonasController::with_urls(server.url(), server.url());
+    let recipient_controller = controller_with_account(server.url());
     let decrypt_v1 = recipient_controller.decrypt_shared_content(DecryptSharedContentInput {
         content_id: created.content_id.clone(),
         remote_content_id: None,
@@ -533,7 +523,7 @@ async fn cek_rotation_after_revoke_updates_recipient_and_read() {
 async fn read_rejects_tampered_node() {
     let _guard = acquire_test_lock();
     let mut server = Server::new_async().await;
-    let controller = MonasController::with_urls(server.url(), server.url());
+    let controller = controller_with_account(server.url());
 
     let created = create_and_share(&mut server, &controller, b"tamper-target").await;
 
@@ -574,11 +564,11 @@ async fn read_rejects_tampered_node() {
 async fn envelope_sender_auth_rejects_wrong_sender_key() {
     let _guard = acquire_test_lock();
     let mut server = Server::new_async().await;
-    let creator = MonasController::with_urls(server.url(), server.url());
+    let creator = controller_with_account(server.url());
 
     let created = create_and_share(&mut server, &creator, b"sender-auth-target").await;
 
-    let recipient_controller = MonasController::with_urls(server.url(), server.url());
+    let recipient_controller = controller_with_account(server.url());
     let attacker = recipient_controller
         .generate_keypair(GenerateKeypairInput {
             key_type: KeyType::Secp256r1,
@@ -634,12 +624,12 @@ async fn envelope_sender_auth_rejects_wrong_sender_key() {
 async fn share_recipient_reads_a_version_written_after_the_share() {
     let _guard = acquire_test_lock();
     let mut server = Server::new_async().await;
-    let creator = MonasController::with_urls(server.url(), server.url());
+    let creator = controller_with_account(server.url());
 
     let created = create_and_share(&mut server, &creator, b"first version").await;
 
     // 受信者は別インスタンス。envelope を処理して CEK を得る。
-    let recipient_controller = MonasController::with_urls(server.url(), server.url());
+    let recipient_controller = controller_with_account(server.url());
     let decrypt_response = recipient_controller.decrypt_shared_content(DecryptSharedContentInput {
         content_id: created.local_content_id.clone(),
         remote_content_id: None,
@@ -673,15 +663,6 @@ async fn share_recipient_reads_a_version_written_after_the_share() {
     update_mock.assert();
     assert_ne!(updated.version_id, created.local_content_id);
 
-    let delegate_mock = server
-        .mock("POST", "/issuer/delegate")
-        .with_status(200)
-        .with_header("content-type", "application/json")
-        .with_body(
-            r#"{"delegated_token":"dummy.jwt.token","issued_at":1700000001,"expires_at":1700003601,"jti":"jti-2"}"#,
-        )
-        .create_async()
-        .await;
     // 共有し直すのは暗号文を取り出すためだけなので、送信者鍵も宛先も何でも
     // よい(この envelope を処理する受信者はいない)。ACL は編集後の版へ引き
     // 継がれているので、元の受信者への再 share は「共有済み」で拒否される —
@@ -712,7 +693,6 @@ async fn share_recipient_reads_a_version_written_after_the_share() {
     let new_ciphertext = URL_SAFE_NO_PAD
         .decode(&reshared.key_envelope.ciphertext)
         .unwrap();
-    delegate_mock.assert();
 
     let v2_bytes = make_node_bytes(&new_ciphertext, vec![], None);
     let v2_cid = recompute_node_cid(&v2_bytes).unwrap();
@@ -774,7 +754,7 @@ async fn share_recipient_reads_a_version_written_after_the_share() {
 async fn delegated_token_is_issued_for_the_remote_content_id() {
     let _guard = acquire_test_lock();
     let mut server = Server::new_async().await;
-    let controller = MonasController::with_urls(server.url(), server.url());
+    let controller = controller_with_account(server.url());
 
     let create_mock = server
         .mock("POST", "/content")
@@ -801,20 +781,6 @@ async fn delegated_token_is_issued_for_the_remote_content_id() {
     create_mock.assert();
     assert_ne!(created.content_id, REMOTE_ID);
 
-    // The issuer must be asked for the *remote* id, never the local one.
-    let delegate_mock = server
-        .mock("POST", "/issuer/delegate")
-        .match_body(mockito::Matcher::PartialJson(
-            serde_json::json!({ "content_id": REMOTE_ID }),
-        ))
-        .with_status(200)
-        .with_header("content-type", "application/json")
-        .with_body(
-            r#"{"delegated_token":"dummy.jwt.token","issued_at":1700000000,"expires_at":1700003600,"jti":"jti-r"}"#,
-        )
-        .create_async()
-        .await;
-
     let sender = controller
         .generate_keypair(GenerateKeypairInput {
             key_type: KeyType::Secp256r1,
@@ -836,7 +802,24 @@ async fn delegated_token_is_issued_for_the_remote_content_id() {
         permissions: vec![Permission::Read],
     });
     assert!(shared.success, "{:?}", shared.error);
-    delegate_mock.assert();
+
+    // The issued token must name the *remote* id, never the local one.
+    let token = shared
+        .data
+        .and_then(|o| o.delegated_access)
+        .expect("share issues a delegated token")
+        .delegated_token;
+    let claims = String::from_utf8(
+        URL_SAFE_NO_PAD
+            .decode(token.split('.').nth(1).expect("jwt payload"))
+            .expect("base64url payload"),
+    )
+    .unwrap();
+    assert!(claims.contains(REMOTE_ID), "claims: {claims}");
+    assert!(
+        !claims.contains(&created.content_id),
+        "token must not name the local id: {claims}"
+    );
 
     cleanup_content_artifacts();
 }
@@ -849,18 +832,8 @@ async fn delegated_token_is_issued_for_the_remote_content_id() {
 async fn delegated_read_keeps_the_bearer_token_and_signs_with_the_account_key() {
     let _guard = acquire_test_lock();
     let mut server = Server::new_async().await;
-    let controller = MonasController::with_urls(server.url(), server.url());
+    let controller = controller_with_account(server.url());
 
-    let sign_mock = server
-        .mock("POST", "/accounts/sign")
-        .with_status(200)
-        .with_header("content-type", "application/json")
-        .with_body(
-            r#"{"signature_base64":"c2lnbmVk","public_key_base64":"AQID","algorithm":"P256"}"#,
-        )
-        .expect(1)
-        .create_async()
-        .await;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -868,7 +841,10 @@ async fn delegated_read_keeps_the_bearer_token_and_signs_with_the_account_key() 
     let history_mock = server
         .mock("GET", format!("/content/{REMOTE_ID}/history").as_str())
         .match_header("authorization", "Bearer delegated.jwt.token")
-        .match_header("x-request-signature", "c2lnbmVk")
+        .match_header(
+            "x-request-signature",
+            mockito::Matcher::Regex(r"^[A-Za-z0-9+/]+=*$".into()),
+        )
         .match_header("x-request-timestamp", now.to_string().as_str())
         .with_status(200)
         .with_header("content-type", "application/json")
@@ -892,7 +868,6 @@ async fn delegated_read_keeps_the_bearer_token_and_signs_with_the_account_key() 
     );
     assert!(response.success, "{:?}", response.error);
     assert_eq!(response.data.unwrap().latest_version, "v1");
-    sign_mock.assert();
     history_mock.assert();
 }
 
@@ -904,23 +879,13 @@ async fn delegated_read_keeps_the_bearer_token_and_signs_with_the_account_key() 
 async fn a_pre_rotation_envelope_for_an_older_version_id_is_still_refused() {
     let _guard = acquire_test_lock();
     let mut server = Server::new_async().await;
-    let creator = MonasController::with_urls(server.url(), server.url());
+    let creator = controller_with_account(server.url());
 
     let _create_mock = server
         .mock("POST", "/content")
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(format!(r#"{{"content_id":"{REMOTE_ID}"}}"#))
-        .create_async()
-        .await;
-    let _delegate_mock = server
-        .mock("POST", "/issuer/delegate")
-        .with_status(200)
-        .with_header("content-type", "application/json")
-        .with_body(
-            r#"{"delegated_token":"dummy.jwt.token","issued_at":1700000000,"expires_at":1700003600,"jti":"jti-1"}"#,
-        )
-        .expect_at_least(1)
         .create_async()
         .await;
     let _update_mock = server
@@ -975,7 +940,7 @@ async fn a_pre_rotation_envelope_for_an_older_version_id_is_still_refused() {
     let bob_v1 = share(&created.content_id, &bob);
 
     // Bob (another device) processes the epoch-0 envelope for version 1.
-    let bob_device = MonasController::with_urls(server.url(), server.url());
+    let bob_device = controller_with_account(server.url());
     let decrypt = |content_id: &str, envelope: &monas_sdk::models::share::KeyEnvelope| {
         bob_device.decrypt_shared_content(DecryptSharedContentInput {
             content_id: content_id.to_string(),
@@ -1051,10 +1016,10 @@ async fn a_pre_rotation_envelope_for_an_older_version_id_is_still_refused() {
 async fn share_recipient_writes_a_new_version_with_the_delegated_token() {
     let _guard = acquire_test_lock();
     let mut server = Server::new_async().await;
-    let creator = MonasController::with_urls(server.url(), server.url());
+    let creator = controller_with_account(server.url());
     let created = create_and_share(&mut server, &creator, b"owner's first version").await;
 
-    let recipient = MonasController::with_urls(server.url(), server.url());
+    let recipient = controller_with_account(server.url());
     let decrypted = recipient.decrypt_shared_content(DecryptSharedContentInput {
         content_id: created.local_content_id.clone(),
         remote_content_id: Some(REMOTE_ID.into()),
@@ -1070,22 +1035,15 @@ async fn share_recipient_writes_a_new_version_with_the_delegated_token() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let sign_mock = server
-        .mock("POST", "/accounts/sign")
-        .with_status(200)
-        .with_header("content-type", "application/json")
-        .with_body(
-            r#"{"signature_base64":"c2lnbmVk","public_key_base64":"AQID","algorithm":"P256"}"#,
-        )
-        .expect(1)
-        .create_async()
-        .await;
     let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink = captured.clone();
     let put_mock = server
         .mock("PUT", format!("/content/{REMOTE_ID}").as_str())
         .match_header("authorization", "Bearer delegated.jwt.token")
-        .match_header("x-request-signature", "c2lnbmVk")
+        .match_header(
+            "x-request-signature",
+            mockito::Matcher::Regex(r"^[A-Za-z0-9+/]+=*$".into()),
+        )
         .match_header("x-request-timestamp", now.to_string().as_str())
         .match_request(move |req| {
             *sink.lock().unwrap() = req.body().unwrap().clone();
@@ -1112,7 +1070,6 @@ async fn share_recipient_writes_a_new_version_with_the_delegated_token() {
     );
     assert!(written.success, "{:?}", written.error);
     let written = written.data.unwrap();
-    sign_mock.assert();
     put_mock.assert();
 
     // What reached the state node decrypts under the owner's CEK: serve it
@@ -1167,10 +1124,10 @@ async fn share_recipient_writes_a_new_version_with_the_delegated_token() {
 async fn share_recipient_write_requires_a_bearer_token() {
     let _guard = acquire_test_lock();
     let mut server = Server::new_async().await;
-    let creator = MonasController::with_urls(server.url(), server.url());
+    let creator = controller_with_account(server.url());
     let created = create_and_share(&mut server, &creator, b"owner's version").await;
 
-    let recipient = MonasController::with_urls(server.url(), server.url());
+    let recipient = controller_with_account(server.url());
     let decrypted = recipient.decrypt_shared_content(DecryptSharedContentInput {
         content_id: created.local_content_id.clone(),
         remote_content_id: Some(REMOTE_ID.into()),
@@ -1221,7 +1178,7 @@ async fn share_recipient_write_requires_a_bearer_token() {
 async fn share_recipient_write_needs_an_imported_share() {
     let _guard = acquire_test_lock();
     let mut server = Server::new_async().await;
-    let recipient = MonasController::with_urls(server.url(), server.url());
+    let recipient = controller_with_account(server.url());
     let put_mock = server
         .mock("PUT", format!("/content/{REMOTE_ID}").as_str())
         .with_status(200)
@@ -1260,10 +1217,10 @@ async fn share_recipient_write_needs_an_imported_share() {
 async fn a_state_node_refusal_keeps_its_status_and_reason() {
     let _guard = acquire_test_lock();
     let mut server = Server::new_async().await;
-    let creator = MonasController::with_urls(server.url(), server.url());
+    let creator = controller_with_account(server.url());
     let created = create_and_share(&mut server, &creator, b"owner's version").await;
 
-    let recipient = MonasController::with_urls(server.url(), server.url());
+    let recipient = controller_with_account(server.url());
     let decrypted = recipient.decrypt_shared_content(DecryptSharedContentInput {
         content_id: created.local_content_id.clone(),
         remote_content_id: Some(REMOTE_ID.into()),
@@ -1275,15 +1232,6 @@ async fn a_state_node_refusal_keeps_its_status_and_reason() {
     });
     assert!(decrypted.success, "{:?}", decrypted.error);
 
-    let _sign = server
-        .mock("POST", "/accounts/sign")
-        .with_status(200)
-        .with_header("content-type", "application/json")
-        .with_body(
-            r#"{"signature_base64":"c2lnbmVk","public_key_base64":"AQID","algorithm":"P256"}"#,
-        )
-        .create_async()
-        .await;
     let _refused = server
         .mock("PUT", format!("/content/{REMOTE_ID}").as_str())
         .with_status(403)
@@ -1348,7 +1296,7 @@ async fn a_state_node_refusal_keeps_its_status_and_reason() {
 async fn owner_pulls_a_recipients_version_and_revoke_rotates_that_version() {
     let _guard = acquire_test_lock();
     let mut server = Server::new_async().await;
-    let owner = MonasController::with_urls(server.url(), server.url());
+    let owner = controller_with_account(server.url());
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -1359,26 +1307,6 @@ async fn owner_pulls_a_recipients_version_and_revoke_rotates_that_version() {
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(format!(r#"{{"content_id":"{REMOTE_ID}"}}"#))
-        .create_async()
-        .await;
-    let _delegate = server
-        .mock("POST", "/issuer/delegate")
-        .with_status(200)
-        .with_header("content-type", "application/json")
-        .with_body(format!(
-            r#"{{"delegated_token":"dummy.jwt.token","issued_at":{},"expires_at":{},"jti":"jti-x"}}"#,
-            now + 10,
-            now + 3610
-        ))
-        .create_async()
-        .await;
-    let _sign = server
-        .mock("POST", "/accounts/sign")
-        .with_status(200)
-        .with_header("content-type", "application/json")
-        .with_body(
-            r#"{"signature_base64":"c2lnbmVk","public_key_base64":"AQID","algorithm":"P256"}"#,
-        )
         .create_async()
         .await;
     let puts = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
@@ -1451,7 +1379,7 @@ async fn owner_pulls_a_recipients_version_and_revoke_rotates_that_version() {
     let bob_share = share(&created.content_id, &bob_key);
 
     // Bob (another device) imports and writes.
-    let bob = MonasController::with_urls(server.url(), server.url());
+    let bob = controller_with_account(server.url());
     let bob_decrypt = |content_id: &str, envelope: &monas_sdk::models::share::KeyEnvelope| {
         bob.decrypt_shared_content(DecryptSharedContentInput {
             content_id: content_id.to_string(),

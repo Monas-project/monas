@@ -2,7 +2,7 @@ import { test, expect, type Page } from "@playwright/test";
 import { freshApp, waitForGateway, createSigningAccount } from "../tests/helpers";
 
 /**
- * Real-stack user journeys: vite → monas-gateway → monas-account → the live
+ * Real-stack user journeys: vite → monas-gateway (signs in-process) → the live
  * state-node network. Unlike `tests/` (which seeds localStorage and never
  * mutates content), every step here pays the real cost — encrypt → CID →
  * state-node round trip — so this is the suite that proves a fresh user can
@@ -14,7 +14,7 @@ import { freshApp, waitForGateway, createSigningAccount } from "../tests/helpers
  * with what earlier runs left on the network.
  *
  * Requirements: the stack from example-ui/README.md — vite :5174, gateway
- * :3000 (pointed at a reachable state node), monas-account :4002.
+ * :3000 (pointed at a reachable state node).
  */
 
 const nonce = `${Date.now().toString(36)}`;
