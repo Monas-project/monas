@@ -396,10 +396,6 @@ a {
   place-items: center;
   flex: none;
 }
-.file-ic.folder {
-  background: var(--pink-100);
-  color: var(--pink-600);
-}
 .file-ic.file {
   background: #eef0f4;
   color: #6a7180;

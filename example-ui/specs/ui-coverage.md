@@ -2,7 +2,7 @@
 
 Playwright scenarios for the interactive surface that the real-stack journeys
 (`tests-e2e/full-stack.spec.ts`) do **not** need to touch. The journeys walk
-the protocol paths (create account → folder → file → preview → verify → edit →
+the protocol paths (create account → file → preview → verify → edit →
 share → revoke → delete) against real nodes; the scenarios below cover the
 rest of the interactive surface cheaply, without content mutations.
 
@@ -54,7 +54,7 @@ and must be located by `title`, CSS class, or fixed with an `aria-label`
 | Gateway health | `generic "Gateway health (monas-gateway → SDK)"` wrapping `generic "gateway"`; **state lives only in the CSS class** `.dot.up` / `.dot.down` / `.dot` |
 
 **Sidebar** — all `role="button"`, `tabIndex=0` `div.nav-item`
-`button "New file"`, `button "Upload"`, `button "New folder"`,
+`button "New file"`, `button "Upload"`, `button "Import shared"`,
 `button "My Drive"`, `button "Encrypted files"`, `button "On state-node"`,
 `button "Shared"`. Active view = `.nav-item.active`. Counts render inside a
 `span.mono` (text reads e.g. `"Encrypted files0"`).
@@ -92,13 +92,13 @@ text ` · latest`), `.preview-box`, `.kv` rows keyed
 `local content_id` / `Content Network` / `seriesId` / `versions` / `latest version`.
 
 **FileBrowser row menu** — `Open / preview`, `Edit contents`,
-`Share`, `Delete` (`.danger`). Folder rows show `Open folder` instead of
-`Open / preview` and have no `Edit contents` / `Share`.
+`Share`, `Delete` (`.danger`). There are no folders: Monas has no folder
+concept, so the UI lists files flat.
 Badges: `.badge.enc` "enc", `.badge.synced` "synced", `.badge.local` "local",
-`.badge.shared`. Header: `Name`, `Location`, `Size`, `Modified`, ``.
+`.badge.shared`. Header: `Name`, `Type`, `Size`, `Modified`, ``.
 
 **ActionModals** — footers are `Cancel` + one of
-`Encrypt & create` / `Re-encrypt & save` / `Create` / `Rename` / `Delete`.
+`Encrypt & create` / `Re-encrypt & save` / `Delete`.
 Every modal's close **X** is an `.icon-btn` with **no accessible name**.
 
 ---
@@ -221,7 +221,7 @@ triggering a new mutation. Verified manually against a real Create.
 
 ---
 
-## C. Sidebar filter views — completely untested (6 scenarios)
+## C. Sidebar filter views (5 scenarios)
 
 Verified manually: the three filter views switch `.active`, retitle the
 breadcrumb, and swap the empty-state copy correctly.
@@ -232,14 +232,14 @@ No mutation.
    `My Drive` loses it, and `.crumb.last` reads `"Encrypted files"`.
 2. Repeat for `"On state-node"` → crumb `"On state-node"`, and
    `"Shared"` → crumb `"Shared"`.
-3. Click `"My Drive"`; expect `.active` returns to it and the crumb shows the
-   path (`My Drive`).
+3. Click `"My Drive"`; expect `.active` returns to it and the crumb reads
+   `My Drive`.
 
 ### C-14 · Empty filter view shows the "no matching files" copy — P1
 1. With a blank registry, click `"Shared"`.
-2. Expect `.empty h3` = `"No matching files"` (not `"This folder is empty"`)
+2. Expect `.empty h3` = `"No matching files"` (not `"No files yet"`)
    and the body copy beginning `"Nothing matches this view yet."`.
-3. Click `"My Drive"` and expect `.empty h3` = `"This folder is empty"`.
+3. Click `"My Drive"` and expect `.empty h3` = `"No files yet"`.
 
 ### C-15 · Counts reflect the registry — P1 **[fixture]**
 1. With the fixture file present (synced, unshared), expect the
@@ -247,28 +247,18 @@ No mutation.
    `Shared` = `0`.
 2. Assert counts are read from the sidebar, not the file list.
 
-### C-16 · Filter views are flat and drive-wide — P1 **[fixture]**
-This is the behaviour most likely to regress: `entriesIn(path)` vs. the flat
-filter list.
-1. Seed a folder `docs` and move/create the fixture inside it (one extra
-   mutation — or seed `localStorage` directly to avoid the round trip).
-2. From `My Drive` (root) the file is **not** listed.
-3. Click `"Encrypted files"`; expect the file **is** listed even though it
-   lives in `/docs`.
-
-### C-17 · Navigating a folder drops the filter view — P1 **[fixture]**
-`navigateTo()` resets `view` to `{kind:"folder"}`.
-1. Select `"Encrypted files"`.
-2. Click `"My Drive"`.
-3. Expect `.crumb.last` is the path crumb and the `Encrypted files` nav item is
-   no longer `.active`.
-
-### C-18 · Sidebar "New folder" / "Upload" open the right affordance — P0
-1. Click `"New folder"`; expect a modal titled `"New folder"` with label
-   `"Folder name"` and a `Create` button. `Escape`.
+### C-18 · Sidebar "Upload" opens the file chooser; no "New folder" — P0
+1. Expect **no** `"New folder"` button (Monas has no folder concept).
 2. Click `"Upload"`; expect it triggers the hidden `input[type=file]`
    (assert via `page.waitForEvent("filechooser")` — the input is
    `display:none`, so a normal click assertion will not see it).
+
+### C-19 · A registry saved with folders loads flat — P1
+Browsers that used the old folder UI hold folder rows and files whose
+`parentPath` points into them.
+1. Seed `localStorage` with a folder row and a file "inside" it; reload.
+2. Expect exactly one `.row` — the file — and the folder row dropped from
+   storage.
 
 ---
 
@@ -297,7 +287,7 @@ filter list.
 
 ---
 
-## E. FileBrowser rows, menus, navigation (7 scenarios)
+## E. FileBrowser rows and menus (3 scenarios)
 
 ### E-22 · Row menu opens, closes, and offers the right items — P0 **[fixture]**
 Verified manually. No mutation.
@@ -309,57 +299,19 @@ Verified manually. No mutation.
 3. Click elsewhere in `.scroll`; expect the menu closes.
 4. Expect opening a second row's menu closes the first (single `openMenu` id).
 
-### E-23 · Folder rows expose a different menu — P1
-Cheap: folders are localStorage-only, no crypto.
-1. Create folder `docs`.
-2. Open its row menu.
-3. Expect `Open folder`, `Rename`, `Delete` and **no** `Edit contents` /
-   `Open / preview` / `Share`.
-
-### E-24 · Folder navigation and breadcrumbs — P0
-Cheap (folders only).
-1. Create nested folders `docs` then `docs/reports`.
-2. Double-click into each; expect `.crumb.last` tracks the folder name.
-3. Expect the breadcrumb renders ancestors separated by `›`.
-4. Click an **ancestor** crumb; expect navigation back to it.
-5. Click the **last** crumb; expect **nothing happens** — the handler is
-   `i < crumbs.length - 1 && onNavigate(...)`. This is an intentional dead
-   click; assert the path does not change.
-
-### E-25 · Rename a folder rewrites descendant paths — P0
-Cheap and high-risk (`renameFolder` rewrites `parentPath` by string prefix).
-1. Create `docs`, and a subfolder `docs/reports`.
-2. Rename `docs` → `documents`.
-3. Expect toast `"Folder renamed"`.
-4. Navigate into `documents`; expect `reports` is still there (i.e. the
-   descendant's `parentPath` was rewritten, not orphaned).
-5. Edge case worth asserting: rename `docs` → `docs2` when a sibling folder
-   `docs2` already exists, and check the two trees do not merge.
-
-### E-26 · Duplicate names are allowed and stay distinguishable — P1
-`addEntry` does not dedupe.
-1. Create folder `dup`, then create folder `dup` again.
-2. Expect **two** rows named `dup`.
-3. Note for the implementer: `page.locator(".row", {hasText:"dup"})` matches
-   both — tests must use `.first()`/`.nth()` or an id-based selector.
-   Flag as a UX defect if duplicates should be rejected.
-
 ### E-27 · Files have no Rename action — P1 **[fixture]**
 A local-only rename used to exist and never reached the protocol; it was
 removed. Renaming a file is done through `Edit contents`, whose name field is
 carried to the SDK by the update flow.
 1. Open a file row's menu; expect **no** `Rename` item.
-2. Open a folder row's menu; expect `Rename` **is** offered (folders are local
-   organization only).
 
-### E-28 · Double-click opens the right action per row kind — P1 **[fixture]**
-1. Double-click a **file** row; expect the preview modal (an `Open` run
+### E-28 · Double-click opens the preview — P1 **[fixture]**
+1. Double-click a file row; expect the preview modal (an `Open` run
    appears).
-2. Double-click a **folder** row; expect navigation, not a modal.
 
 ---
 
-## F. ActionModals — validation and cancels (5 scenarios)
+## F. ActionModals — validation and cancels (4 scenarios)
 
 All cheap: they assert *before* any mutation is committed.
 
@@ -371,14 +323,8 @@ Verified manually: works (`valid = name.trim().length > 0`).
 4. Type `"   "` (spaces only); expect it stays **disabled**.
 5. Type a valid name; expect it re-enables.
 
-### F-30 · New folder: submit disabled until a name is typed — P0
-1. Sidebar → `New folder`.
-2. Expect the input empty and `Create` **disabled**.
-3. Type spaces only; expect still **disabled**.
-4. Type `docs`; expect enabled.
-
 ### F-31 · Cancel and X and Escape all dismiss without side effects — P0
-For each of `New file`, `New folder`, `Rename` (folder row), `Delete`:
+For each of `New file`, `Delete`:
 1. Open the modal, fill a value.
 2. Dismiss three ways in separate runs: `Cancel` button, the header `.icon-btn`
    X, and `Escape`.
@@ -388,12 +334,10 @@ For each of `New file`, `New folder`, `Rename` (folder row), `Delete`:
    `onMouseDown` on the overlay) **and** that clicking *inside* `.modal` does
    **not** (the inner `onMouseDown` stops propagation).
 
-### F-32 · Delete confirm shows kind-specific copy — P1 **[fixture]**
+### F-32 · Delete confirm shows the protocol effect — P1 **[fixture]**
 1. File row menu → `Delete`; expect the message contains
    `"removes the encrypted blob and tombstones its Content Network"`.
-2. Folder row menu → `Delete`; expect
-   `"and everything inside it"`.
-3. Press `Cancel` in both cases and expect the entry still exists.
+2. Press `Cancel` and expect the entry still exists.
 
 ### F-33 · Byte counter tracks the textarea — P2
 1. Open `New file`; expect the hint reads `0 bytes`.
@@ -600,11 +544,8 @@ Controls found **broken or inert** while clicking through the running app:
    entries in the state-node history and 2 CIDs in the dropdown.
    `entry.versionCount` is a purely local counter. `App.tsx:166`.
 
-5. **Last breadcrumb is intentionally inert** (E-24) — by design
-   (`i < crumbs.length - 1`), documented here so it is not mistaken for a bug.
-
-6. **Duplicate folder/file names are accepted silently** (E-26) — `addEntry`
-   never dedupes, producing indistinguishable sibling rows.
+5. **Duplicate file names are accepted silently** — `addEntry` never dedupes,
+   producing indistinguishable rows.
 
 ### Accessibility defects (P2, worth `aria-label` fixes)
 
@@ -626,10 +567,10 @@ Controls found **broken or inert** while clicking through the running app:
 |---|---|---|
 | `tests/settings.spec.ts` | S-01…S-07 | none |
 | `tests/pipeline.spec.ts` | B-08…B-12 | 1 shared fixture |
-| `tests/sidebar.spec.ts` | C-13…C-18 | folders + 1 fixture |
+| `tests/sidebar.spec.ts` | C-13…C-19 | 1 fixture; seeded legacy registry |
 | `tests/topbar.spec.ts` | D-19…D-21 | none |
-| `tests/browser-rows.spec.ts` | E-22…E-28 | folders + 1 fixture |
-| `tests/action-modals.spec.ts` | F-29…F-33 | none (all pre-commit) |
+| `tests/browser-rows.spec.ts` | E-22, E-27, E-28 | 1 fixture |
+| `tests/action-modals.spec.ts` | F-29, F-31…F-33 | none (all pre-commit) |
 | `tests/share.spec.ts` | G-34…G-39 | 1 fixture + shares |
 | `tests/preview.spec.ts` | H-40…H-44 | 1 fixture + 1 edit |
 | `tests/guards.spec.ts` | I-45…I-49 | cleared storage; 1 small PNG |
@@ -638,4 +579,4 @@ Controls found **broken or inert** while clicking through the running app:
 Run serially (`workers: 1`, already configured) — all specs share one gateway
 and one `localStorage` registry.
 
-**Total: 50 scenarios.**
+**Total: 44 scenarios.**

@@ -17,18 +17,6 @@ export function fmtTime(ts: number): string {
   return new Date(ts).toLocaleDateString();
 }
 
-export function crumbsFor(path: string): { name: string; path: string }[] {
-  const out = [{ name: "My Drive", path: "/" }];
-  if (path === "/") return out;
-  const parts = path.split("/").filter(Boolean);
-  let acc = "";
-  for (const p of parts) {
-    acc += `/${p}`;
-    out.push({ name: p, path: acc });
-  }
-  return out;
-}
-
 export function guessTextMime(mime?: string): boolean {
   if (!mime) return false;
   return (

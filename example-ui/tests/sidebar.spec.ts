@@ -1,5 +1,5 @@
 import { test, expect } from "@playwright/test";
-import { freshApp } from "./helpers";
+import { freshApp, REGISTRY_KEY } from "./helpers";
 
 /**
  * Group C — Sidebar (C-13, C-18).
@@ -24,7 +24,7 @@ test("C-13: filter views switch the active nav item and retitle the breadcrumb",
   const myDrive = navItem(page, "My Drive");
   const crumbLast = page.locator(".crumb.last");
 
-  // Baseline: folder browsing.
+  // Baseline: the full file list.
   await expect(myDrive).toHaveClass(/active/);
   await expect(crumbLast).toHaveText("My Drive");
 
@@ -39,39 +39,21 @@ test("C-13: filter views switch the active nav item and retitle the breadcrumb",
     await expect(myDrive).not.toHaveClass(/active/);
     await expect(crumbLast).toHaveText(crumb);
 
-    // A filter view is drive-wide, so the breadcrumb collapses to a single
-    // title crumb rather than a path.
     await expect(page.locator(".crumb")).toHaveCount(1);
   }
 
-  // Back to folder browsing: `.active` returns and the crumb shows the path.
+  // Back to the full list.
   await page.getByRole("button", { name: "My Drive" }).click();
   await expect(myDrive).toHaveClass(/active/);
   await expect(navItem(page, "Shared")).not.toHaveClass(/active/);
   await expect(crumbLast).toHaveText("My Drive");
 });
 
-test("C-18: sidebar New folder opens the modal and Upload opens the file chooser", async ({
+test("C-18: sidebar Upload opens the file chooser, and there is no New folder", async ({
   page,
 }) => {
-  // --- New folder: a real modal ---
-  await page.getByRole("button", { name: "New folder" }).click();
-
-  const modal = page.locator(".modal");
-  await expect(modal.getByRole("heading", { name: "New folder" })).toBeVisible();
-  await expect(modal).toMatchAriaSnapshot(`
-    - img
-    - heading "New folder" [level=2]
-    - button:
-      - img
-    - text: Folder name
-    - textbox
-    - button "Cancel"
-    - button "Create" [disabled]
-  `);
-
-  await page.keyboard.press("Escape");
-  await expect(page.locator(".overlay")).toHaveCount(0);
+  // Monas has no folder concept, so the UI must not offer one.
+  await expect(page.getByRole("button", { name: "New folder" })).toHaveCount(0);
 
   // --- Upload: triggers the hidden input[type=file] ---
   // The input is `display:none`, so it is never "visible" — the only
@@ -84,4 +66,35 @@ test("C-18: sidebar New folder opens the modal and Upload opens the file chooser
   // Nothing was selected, so no modal and no registry change.
   await expect(page.locator(".overlay")).toHaveCount(0);
   await expect(page.locator(".row")).toHaveCount(0);
+});
+
+test("C-19: a registry saved with folders shows its files flat and drops the folder rows", async ({
+  page,
+}) => {
+  // What a browser that used the old folder UI has in localStorage: a folder
+  // row and a file whose parentPath points into it.
+  await page.evaluate((key) => {
+    const now = Date.now();
+    localStorage.setItem(
+      key,
+      JSON.stringify([
+        {
+          id: "old-folder", kind: "folder", name: "docs", parentPath: "/",
+          sizeBytes: 0, createdAt: now, updatedAt: now,
+          syncedToStateNode: false, versionCount: 0, shares: [],
+        },
+        {
+          id: "old-file", kind: "file", name: "inside.txt", parentPath: "/docs",
+          sizeBytes: 5, mimeType: "text/plain", createdAt: now, updatedAt: now,
+          localContentId: "cid-local", syncedToStateNode: false, versionCount: 1, shares: [],
+        },
+      ]),
+    );
+  }, REGISTRY_KEY);
+  await page.reload();
+
+  await expect(page.locator(".row")).toHaveCount(1);
+  await expect(page.locator(".row .fname")).toHaveText("inside.txt");
+  const stored = await page.evaluate((key) => JSON.parse(localStorage.getItem(key)!), REGISTRY_KEY);
+  expect(stored.map((e: { id: string }) => e.id)).toEqual(["old-file"]);
 });

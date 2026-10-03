@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import type { Entry, View } from "../types";
-import { Folder, Plus, Upload, FileText, Network, Lock, Inbox } from "./icons";
+import { FileIcon, Plus, Upload, FileText, Network, Lock, Inbox } from "./icons";
 
 // A keyboard-accessible, clickable nav row. Reuses the .nav-item styling
 // (which assumes a flex div), so we keep a <div> and add button semantics.
@@ -36,7 +36,6 @@ export function Sidebar({
   view,
   onSelectView,
   onMyDrive,
-  onNewFolder,
   onNewFile,
   onUpload,
   onImportShare,
@@ -45,12 +44,11 @@ export function Sidebar({
   view: View;
   onSelectView: (view: View) => void;
   onMyDrive: () => void;
-  onNewFolder: () => void;
   onNewFile: () => void;
   onUpload: () => void;
   onImportShare: () => void;
 }) {
-  const files = entries.filter((e) => e.kind === "file");
+  const files = entries;
   const synced = files.filter((e) => e.syncedToStateNode).length;
   // Both directions count as "shared": files I handed out and files handed to me.
   const shared = files.filter((e) => e.shares.length > 0 || e.receivedShare).length;
@@ -64,17 +62,14 @@ export function Sidebar({
         <button className="btn" onClick={onUpload}>
           <Upload size={15} /> Upload
         </button>
-        <button className="btn" onClick={onNewFolder}>
-          <Folder size={15} /> New folder
-        </button>
         <button className="btn" onClick={onImportShare} title="Paste a share package someone sent you">
           <Inbox size={15} /> Import shared
         </button>
       </div>
 
       <div className="side-label">Library</div>
-      <NavItem active={view.kind === "folder"} onSelect={onMyDrive}>
-        <Folder size={17} /> My Drive
+      <NavItem active={view.kind === "drive"} onSelect={onMyDrive}>
+        <FileIcon size={17} /> My Drive
       </NavItem>
 
       <div className="side-label">At a glance</div>

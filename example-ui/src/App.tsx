@@ -5,7 +5,7 @@ import { FileBrowser } from "./components/FileBrowser";
 import { PipelinePanel } from "./components/PipelinePanel";
 import { Toasts, pushToast } from "./components/Toast";
 import { Modal } from "./components/Modal";
-import { TextPromptModal, FileEditorModal, ConfirmModal } from "./components/ActionModals";
+import { FileEditorModal, ConfirmModal } from "./components/ActionModals";
 import { IdentityModal } from "./components/IdentityModal";
 import { SettingsModal } from "./components/SettingsModal";
 import { ShareModal, type ShareInput } from "./components/ShareModal";
@@ -14,13 +14,10 @@ import { PreviewModal } from "./components/PreviewModal";
 
 import {
   useEntries,
-  entriesIn,
   addEntry,
   updateEntry,
   removeEntry,
   allEntries,
-  descendantsOf,
-  folderPath,
 } from "./store/registry";
 import { useIdentities, getActive } from "./store/identity";
 import { checkNetworkHead, checkAllNetworkHeads } from "./store/sync";
@@ -44,8 +41,6 @@ import type { Entry, Identity, SharePackage, View } from "./types";
 type Modal =
   | { type: "none" }
   | { type: "newFile" }
-  | { type: "newFolder" }
-  | { type: "rename"; entry: Entry }
   | { type: "edit"; entry: Entry; text: string }
   | { type: "delete"; entry: Entry }
   | { type: "share"; entryId: string }
@@ -79,8 +74,7 @@ export default function App() {
   const { identities } = useIdentities();
   const active = getActive();
 
-  const [path, setPath] = useState("/");
-  const [view, setView] = useState<View>({ kind: "folder" });
+  const [view, setView] = useState<View>({ kind: "drive" });
   const [modal, setModal] = useState<Modal>({ type: "none" });
   const [runs, setRuns] = useState<RunView[]>([]);
   const [collapsed, setCollapsed] = useState(false);
@@ -141,29 +135,17 @@ export default function App() {
     [collapsed, upsertRun],
   );
 
-  // Changing the folder path always implies normal folder browsing, so this
-  // wrapper also drops any active filter view.
-  const navigateTo = useCallback((p: string) => {
-    setPath(p);
-    setView({ kind: "folder" });
-  }, []);
-
-  // What the browser shows: folder view = direct children of `path`; the filter
-  // views are flat, drive-wide file listings. Derived from the reactive
-  // `entries` so it updates live on create/share/sync/delete.
-  const current =
-    view.kind === "folder"
-      ? entriesIn(path)
-      : entries
-          .filter((e) => e.kind === "file")
-          .filter((e) =>
-            view.kind === "all"
-              ? true
-              : view.kind === "synced"
-                ? e.syncedToStateNode
-                : e.shares.length > 0 || !!e.receivedShare,
-          )
-          .sort((a, b) => a.name.localeCompare(b.name));
+  // What the browser shows: every file, or a filtered listing. Derived from
+  // the reactive `entries` so it updates live on create/share/sync/delete.
+  const current = entries
+    .filter((e) =>
+      view.kind === "drive" || view.kind === "all"
+        ? true
+        : view.kind === "synced"
+          ? e.syncedToStateNode
+          : e.shares.length > 0 || !!e.receivedShare,
+    )
+    .sort((a, b) => a.name.localeCompare(b.name));
 
   const liveEntry = (id: string) => allEntries().find((e) => e.id === id);
 
@@ -188,9 +170,7 @@ export default function App() {
       const created = ctx.create as contentApi.CreateContentOutput;
       addEntry({
         id: uuid(),
-        kind: "file",
         name,
-        parentPath: path,
         sizeBytes,
         mimeType,
         createdAt: Date.now(),
@@ -202,9 +182,9 @@ export default function App() {
         shares: [],
         ...(created.remote_content_id ? ownHead(created.content_id) : {}),
       });
-      // Drop back to folder browsing so the new file is visible at `path`
-      // (it wouldn't match an active filter view yet).
-      setView({ kind: "folder" });
+      // Drop back to the full list so the new file is visible (it wouldn't
+      // match an active filter view yet).
+      setView({ kind: "drive" });
       pushToast(`“${name}” encrypted & created`, "success");
     } else {
       pushToast(`Failed to create “${name}”`, "error");
@@ -247,23 +227,6 @@ export default function App() {
     await createFromBytes(file.name, b64, file.size, file.type || mimeFromName(file.name));
   };
 
-  const handleNewFolder = (name: string) => {
-    setModal({ type: "none" });
-    addEntry({
-      id: uuid(),
-      kind: "folder",
-      name,
-      parentPath: path,
-      sizeBytes: 0,
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-      syncedToStateNode: false,
-      versionCount: 0,
-      shares: [],
-    });
-    setView({ kind: "folder" });
-    pushToast(`Folder “${name}” created`, "success");
-  };
 
   const handleEditOpen = async (entry: Entry) => {
     setModal({ type: "loadingEdit" });
@@ -371,10 +334,6 @@ export default function App() {
 
   const handleDelete = async (entry: Entry) => {
     setModal({ type: "none" });
-    if (entry.kind === "folder") {
-      await deleteFolder(entry);
-      return;
-    }
     // A received share is the owner's content; "delete" here only forgets it
     // locally. The gateway keeps the pinned sender key + CEK, which is fine:
     // re-importing the same package simply works again.
@@ -470,9 +429,7 @@ export default function App() {
     } else {
       entry = {
         id: uuid(),
-        kind: "file",
         name: pkg.name,
-        parentPath: "/",
         sizeBytes: pkg.sizeBytes,
         mimeType: pkg.mimeType || res.metadata?.content_type || mimeFromName(pkg.name),
         createdAt: Date.now(),
@@ -486,8 +443,7 @@ export default function App() {
       };
       addEntry(entry);
     }
-    setView({ kind: "folder" });
-    setPath("/");
+    setView({ kind: "drive" });
     pushToast(`“${pkg.name}” unwrapped and added to your Drive`, "success");
     setModal({ type: "preview", entry, contentB64Url: res.content });
     // The envelope carries the version the owner shared; whether that is
@@ -625,79 +581,16 @@ export default function App() {
     setBusy(false);
   };
 
-  // ---- folder helpers -------------------------------------------------
-  function renameFolder(entry: Entry, newName: string) {
-    const oldPath = folderPath(entry.parentPath, entry.name);
-    const newPath = folderPath(entry.parentPath, newName);
-    updateEntry(entry.id, { name: newName });
-    for (const e of allEntries()) {
-      if (e.parentPath === oldPath || e.parentPath.startsWith(oldPath + "/")) {
-        updateEntry(e.id, { parentPath: newPath + e.parentPath.slice(oldPath.length) });
-      }
-    }
-  }
-
-  async function deleteFolder(entry: Entry) {
-    const here = folderPath(entry.parentPath, entry.name);
-    const desc = descendantsOf(here);
-    const files = desc.filter((e) => e.kind === "file");
-    const specs: StepSpec[] = [
-      {
-        title: `Delete ${files.length} encrypted file(s)`,
-        hint: "monas-sdk",
-        kind: "cleanup",
-        minMs: 200,
-        exec: async () => {
-          for (const f of files) {
-            try {
-              await contentApi.deleteContent({
-                localContentId: f.localContentId!,
-                remoteContentId: f.remoteContentId || f.localContentId!,
-              });
-            } catch {
-              /* best effort */
-            }
-          }
-          return `Removed ${files.length} content network(s)`;
-        },
-      },
-      {
-        title: "Remove folder & contents",
-        hint: "registry",
-        kind: "cleanup",
-        minMs: 140,
-        exec: async () => "Folder tree cleared",
-      },
-    ];
-    const { ok } = await run("Delete folder", entry.name, specs);
-    if (ok) {
-      for (const e of desc) removeEntry(e.id);
-      removeEntry(entry.id);
-      pushToast(`Folder “${entry.name}” deleted`, "success");
-    }
-  }
-
-  // Folders are purely local organization, so renaming one never touches the
-  // protocol. Files deliberately have no Rename action: a file's name reaches
-  // the SDK only through an update, so the honest rename path is the name
-  // field in "Edit contents".
-  const handleRename = async (entry: Entry, newName: string) => {
-    setModal({ type: "none" });
-    renameFolder(entry, newName);
-    pushToast("Folder renamed", "success");
-  };
-
   // ---- dispatch from row menu ----------------------------------------
+  // Files deliberately have no Rename action: a file's name reaches the SDK
+  // only through an update, so the honest rename path is the name field in
+  // "Edit contents".
   const onAction = (action: string, entry: Entry) => {
     switch (action) {
-      case "openFolder":
-        return navigateTo(folderPath(entry.parentPath, entry.name));
       case "open":
         return handleOpen(entry);
       case "update":
         return handleEditOpen(entry);
-      case "rename":
-        return setModal({ type: "rename", entry });
       case "share":
         if (!active) {
           pushToast("Create an identity first", "error");
@@ -724,14 +617,13 @@ export default function App() {
           entries={entries}
           view={view}
           onSelectView={setView}
-          onMyDrive={() => navigateTo("/")}
+          onMyDrive={() => setView({ kind: "drive" })}
           onNewFile={() => setModal({ type: "newFile" })}
-          onNewFolder={() => setModal({ type: "newFolder" })}
           onUpload={() => fileInput.current?.click()}
           onImportShare={() => setModal({ type: "importShare" })}
         />
         <main className="main">
-          <FileBrowser path={path} view={view} entries={current} onNavigate={navigateTo} onAction={onAction} />
+          <FileBrowser view={view} entries={current} onAction={onAction} />
         </main>
         <PipelinePanel
           runs={runs}
@@ -756,27 +648,6 @@ export default function App() {
       {modal.type === "newFile" && (
         <FileEditorModal mode="create" onSubmit={handleNewFile} onClose={() => setModal({ type: "none" })} />
       )}
-      {modal.type === "newFolder" && (
-        <TextPromptModal
-          title="New folder"
-          label="Folder name"
-          confirmLabel="Create"
-          kind="folder"
-          onConfirm={handleNewFolder}
-          onClose={() => setModal({ type: "none" })}
-        />
-      )}
-      {modal.type === "rename" && (
-        <TextPromptModal
-          title="Rename folder"
-          label="New name"
-          initial={modal.entry.name}
-          confirmLabel="Rename"
-          kind="rename"
-          onConfirm={(v) => handleRename(modal.entry, v)}
-          onClose={() => setModal({ type: "none" })}
-        />
-      )}
       {modal.type === "loadingEdit" && (
         <Modal title="Loading…" onClose={() => setModal({ type: "none" })}>
           <div className="center-load">
@@ -795,13 +666,11 @@ export default function App() {
       )}
       {modal.type === "delete" && (
         <ConfirmModal
-          title={modal.entry.receivedShare ? "Remove from my Drive" : `Delete ${modal.entry.kind}`}
+          title={modal.entry.receivedShare ? "Remove from my Drive" : "Delete file"}
           message={
             modal.entry.receivedShare
               ? `Remove “${modal.entry.name}” from your Drive? It was shared with you; the owner's file and its Content Network are untouched, and you can import the package again later.`
-              : modal.entry.kind === "folder"
-                ? `Delete “${modal.entry.name}” and everything inside it? Encrypted blobs are removed and the Content Networks are tombstoned.`
-                : `Delete “${modal.entry.name}”? This removes the encrypted blob and tombstones its Content Network on the state-node.`
+              : `Delete “${modal.entry.name}”? This removes the encrypted blob and tombstones its Content Network on the state-node.`
           }
           confirmLabel={modal.entry.receivedShare ? "Remove" : "Delete"}
           onConfirm={() => handleDelete(modal.entry)}

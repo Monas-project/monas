@@ -2,7 +2,7 @@
 
 A minimal, Google-Drive-like web UI for the Monas protocol, built on the
 **monas-sdk** via the **monas-gateway** HTTP API. It lets you **create, open,
-edit, share, revoke and delete** files and folders, and surfaces the
+edit, share, revoke and delete** files, and surfaces the
 encryption + state-node work behind every action in a live **Protocol activity**
 panel (CEK → AES-256-GCM → SHA-256 CID → storage → state-node → HPKE).
 
@@ -106,8 +106,7 @@ and reloads.
 lifecycle (create → preview → verify integrity → verified read → edit →
 old-version read → reload → delete), the sharing lifecycle (share to a local
 identity with the HPKE round-trip proof, share to a pasted external key,
-revoke with envelope reissue), and folders + binary upload + filter views +
-cascade delete.
+revoke with envelope reissue), and binary upload + filter views + delete.
 
 `tests-e2e/cross-device.spec.ts` (J-4) is the two-device share: two browser
 contexts, each bound to its **own gateway + monas-account pair**, exchange only
@@ -371,12 +370,14 @@ that narrate the protocol and read ids out of the response:
 
 ## Notes
 
-- **Folders are logical** (path prefixes). The gateway has no folder/listing
-  concept, so the UI keeps its own file registry in `localStorage`
-  (`monas.registry.v3`). Identities and the endpoint live there too. Clearing
-  site data resets the demo.
-- **Rename** of a file is local-only here (the SDK applies a new name on the
-  next content edit); folder rename re-paths its descendants locally.
+- **No folders.** Monas has no folder concept, so the UI lists files flat
+  rather than invent one that would exist only in this browser. (Registries
+  saved by older builds with folders load flat; the folder rows are dropped.)
+- The gateway has no listing API, so the UI keeps its own file registry in
+  `localStorage` (`monas.registry.v3`). Identities and the endpoint live there
+  too. Clearing site data resets the demo.
+- **Rename** a file through the name field in `Edit contents`; the new name
+  reaches the SDK with that update.
 - Private keys for demo identities are stored in `localStorage` so the HPKE
   round-trip proof can run — fine for a local demo, not for production.
 

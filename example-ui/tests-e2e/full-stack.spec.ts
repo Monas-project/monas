@@ -291,12 +291,9 @@ test("J-2: sharing, external-key sharing, and revoke with envelope reissue", asy
 });
 
 // ---------------------------------------------------------------------------
-// Journey 3 — folders, binary upload, sidebar filters, and cascade delete.
+// Journey 3 — binary upload, sidebar filters, and delete.
 // ---------------------------------------------------------------------------
-test("J-3: folders, image upload, filter views and cascading folder delete", async ({
-  page,
-}) => {
-  const folder = `j3-docs-${nonce}`;
+test("J-3: image upload, filter views and delete", async ({ page }) => {
   const image = `j3-pixel-${nonce}.png`;
   // Smallest valid PNG (1×1, red). Kept tiny so the crypto round trip is fast.
   const PNG_B64 =
@@ -306,16 +303,7 @@ test("J-3: folders, image upload, filter views and cascading folder delete", asy
     await createSigningAccount(page, "j3-main");
   });
 
-  await test.step("create a folder and navigate into it", async () => {
-    await page.getByRole("button", { name: "New folder" }).click();
-    await page.locator(".modal input.input").fill(folder);
-    await page.getByRole("button", { name: "Create" }).click();
-    await expectToast(page, `Folder “${folder}” created`, 15_000);
-    await row(page, folder).dblclick();
-    await expect(page.locator(".crumb.last")).toHaveText(folder);
-  });
-
-  await test.step("upload an image into the folder", async () => {
+  await test.step("upload an image", async () => {
     const chooserPromise = page.waitForEvent("filechooser");
     await page.getByRole("button", { name: "Upload" }).click();
     const chooser = await chooserPromise;
@@ -353,29 +341,16 @@ test("J-3: folders, image upload, filter views and cascading folder delete", asy
       page.locator(".nav-item", { hasText: "Shared" }).locator(".mono"),
     ).toHaveText("0");
 
-    // The synced view lists the image even though we're outside its folder.
     await page.locator(".nav-item", { hasText: "On state-node" }).click();
     await expect(page.locator(".crumb.last")).toHaveText("On state-node");
     await expect(row(page, image)).toBeVisible();
     await page.locator(".nav-item", { hasText: "My Drive" }).click();
   });
 
-  await test.step("renaming the folder keeps its contents reachable", async () => {
-    const renamed = `${folder}-renamed`;
-    await rowAction(page, folder, "Rename");
-    await page.locator(".modal input.input").fill(renamed);
-    await page.getByRole("button", { name: "Rename" }).click();
-    await expectToast(page, "Folder renamed", 15_000);
-    await row(page, renamed).dblclick();
-    await expect(page.locator(".crumb.last")).toHaveText(renamed);
-    await expect(row(page, image)).toBeVisible();
-    await page.locator(".nav-item", { hasText: "My Drive" }).click();
-  });
-
-  await test.step("deleting the folder deletes its encrypted contents too", async () => {
-    await rowAction(page, `${folder}-renamed`, "Delete");
+  await test.step("deleting the image removes it", async () => {
+    await rowAction(page, image, "Delete");
     await page.locator(".modal .btn.danger", { hasText: "Delete" }).click();
-    await expectToast(page, `Folder “${folder}-renamed” deleted`);
+    await expectToast(page, `“${image}” deleted`);
     await expect(page.locator(".row")).toHaveCount(0);
     await expect(
       page.locator(".nav-item", { hasText: "Encrypted files" }).locator(".mono"),

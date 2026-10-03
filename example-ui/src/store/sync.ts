@@ -32,7 +32,7 @@ export function heldVersionId(entry: Entry): string | undefined {
 const checking = new Set<string>();
 
 export function syncStatusOf(entry: Entry, comparedVersionId = heldVersionId(entry)): SyncStatus {
-  if (entry.kind !== "file" || !entry.syncedToStateNode || !entry.remoteContentId) {
+  if (!entry.syncedToStateNode || !entry.remoteContentId) {
     return { kind: "local" };
   }
   if (checking.has(entry.id)) return { kind: "checking" };
@@ -117,7 +117,7 @@ export async function checkNetworkHead(
 /** Check every synced file once, sequentially — the state node rate-limits. */
 export async function checkAllNetworkHeads(): Promise<void> {
   for (const e of allEntries()) {
-    if (e.kind === "file" && e.syncedToStateNode && e.remoteContentId) {
+    if (e.syncedToStateNode && e.remoteContentId) {
       await checkNetworkHead(e);
     }
   }

@@ -67,9 +67,7 @@ export async function seedFileEntry(
       const list = raw ? JSON.parse(raw) : [];
       list.push({
         id: "seeded-file-1",
-        kind: "file",
         name: "probe.txt",
-        parentPath: "/",
         sizeBytes: 16,
         mimeType: "text/plain",
         createdAt: Date.now(),

@@ -1,59 +1,6 @@
 import { useState } from "react";
 import { Modal } from "./Modal";
-import { Folder, Pencil, FileText, Trash, Lock } from "./icons";
-
-export function TextPromptModal({
-  title,
-  label,
-  initial,
-  confirmLabel,
-  kind,
-  busy,
-  onConfirm,
-  onClose,
-}: {
-  title: string;
-  label: string;
-  initial?: string;
-  confirmLabel: string;
-  kind: "folder" | "rename";
-  busy?: boolean;
-  onConfirm: (value: string) => void;
-  onClose: () => void;
-}) {
-  const [value, setValue] = useState(initial || "");
-  const submit = () => value.trim() && onConfirm(value.trim());
-  return (
-    <Modal
-      title={title}
-      icon={kind === "folder" ? <Folder /> : <Pencil />}
-      onClose={onClose}
-      footer={
-        <>
-          <button className="btn" onClick={onClose}>
-            Cancel
-          </button>
-          <button className="btn primary" disabled={!value.trim() || busy} onClick={submit}>
-            {busy ? <span className="spinner" /> : null}
-            {confirmLabel}
-          </button>
-        </>
-      }
-    >
-      <div className="field">
-        <label>{label}</label>
-        <input
-          className="input"
-          autoFocus
-          value={value}
-          onChange={(e) => setValue(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && submit()}
-          placeholder={kind === "folder" ? "Untitled folder" : "name"}
-        />
-      </div>
-    </Modal>
-  );
-}
+import { FileText, Trash, Lock } from "./icons";
 
 export function FileEditorModal({
   mode,

@@ -2,12 +2,13 @@ import { test, expect, type Page } from "@playwright/test";
 import { freshApp, seedFileEntry } from "./helpers";
 
 /**
- * Group F — ActionModals (F-29, F-30, F-31).
+ * Group F — ActionModals (F-29, F-31).
  *
  * All assertions land *before* anything is committed, so no scenario here
- * costs a crypto round trip. F-31 seeds registry entries directly rather than
- * creating real content — it only needs rows to open Rename (folder) and
- * Delete (file) from.
+ * costs a crypto round trip. F-31 seeds a registry entry directly rather than
+ * creating real content — it only needs a row to open Delete from.
+ * (F-30 covered the New folder modal; folders were removed — Monas has no
+ * folder concept.)
  */
 
 test.beforeEach(async ({ page }) => {
@@ -63,65 +64,17 @@ test("F-29: New file — empty or whitespace-only name disables submit", async (
   await expect(page.locator(".row")).toHaveCount(0);
 });
 
-test("F-30: New folder — submit disabled until a real name is typed", async ({
-  page,
-}) => {
-  await page.getByRole("button", { name: "New folder" }).click();
-
-  const modal = page.locator(".modal");
-  const input = modal.locator("input.input");
-  // Scoped to the modal: a bare name="Create" also matches the account chip
-  // ("click to create") in strict mode.
-  const create = modal.getByRole("button", { name: "Create", exact: true });
-
-  await expect(input).toHaveValue("");
-  await expect(input).toHaveAttribute("placeholder", "Untitled folder");
-  await expect(create).toBeDisabled();
-
-  await page.keyboard.type("   ");
-  await expect(create).toBeDisabled();
-
-  await input.fill("docs");
-  await expect(create).toBeEnabled();
-
-  await page.keyboard.press("Escape");
-  await expect(overlay(page)).toHaveCount(0);
-  await expect(page.locator(".row")).toHaveCount(0);
-});
-
 test("F-31: Cancel, X, Escape and backdrop all dismiss without side effects", async ({
   page,
 }) => {
-  // Seeded rows give us Rename and Delete without a crypto round trip.
-  // Rename is folder-only, so seed a folder next to the file.
+  // A seeded row gives us Delete without a crypto round trip.
   await seedFileEntry(page);
-  await seedFileEntry(page, {
-    id: "seeded-folder-1",
-    kind: "folder",
-    name: "docs",
-    sizeBytes: 0,
-    mimeType: null,
-    localContentId: null,
-    remoteContentId: null,
-    syncedToStateNode: false,
-    versionCount: 0,
-  });
-  await expect(page.locator(".row")).toHaveCount(2);
+  await expect(page.locator(".row")).toHaveCount(1);
 
-  /** Open one of the four modals under test. */
+  /** Open one of the modals under test. */
   const openers: Record<string, () => Promise<void>> = {
     "New file": async () => {
       await page.getByRole("button", { name: "New file" }).click();
-    },
-    "New folder": async () => {
-      await page.getByRole("button", { name: "New folder" }).click();
-    },
-    Rename: async () => {
-      await page
-        .locator(".row", { hasText: "docs" })
-        .locator(".row-menu-wrap .icon-btn")
-        .click();
-      await page.locator(".menu button", { hasText: "Rename" }).click();
     },
     Delete: async () => {
       await page
@@ -178,13 +131,10 @@ test("F-31: Cancel, X, Escape and backdrop all dismiss without side effects", as
       // No toast — a dismissal is not an action.
       await expect(page.locator(".toast")).toHaveCount(0);
 
-      // Registry unchanged: still exactly the two seeded rows.
-      await expect(page.locator(".row")).toHaveCount(2);
+      // Registry unchanged: still exactly the seeded row.
+      await expect(page.locator(".row")).toHaveCount(1);
       await expect(
         page.locator(".row .fname", { hasText: "probe.txt" }),
-      ).toHaveCount(1);
-      await expect(
-        page.locator(".row .fname", { hasText: "docs" }),
       ).toHaveCount(1);
     }
   }

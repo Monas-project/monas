@@ -1,6 +1,6 @@
-// The Drive's file/folder list. Neither monas-content nor the state-node expose
-// a queryable listing with names/paths, so the UI keeps its own registry of
-// what it created (persisted locally). This is example-app glue, not protocol.
+// The Drive's file list. Neither monas-content nor the state-node expose a
+// queryable listing with names, so the UI keeps its own registry of what it
+// created (persisted locally). This is example-app glue, not protocol.
 import { createStore } from "./store";
 import type { Entry } from "../types";
 
@@ -11,20 +11,16 @@ import type { Entry } from "../types";
 // clean rather than surfacing entries that only fail on open.
 const store = createStore<Entry[]>("monas.registry.v3", []);
 
+// Registries written before folders were removed may hold folder rows. They
+// never carried Monas content, so drop them; the files that sat "inside" them
+// were only tagged with a path and simply appear in the list.
+const isFolderRow = (e: Entry) => (e as { kind?: string }).kind === "folder";
+if (store.get().some(isFolderRow)) store.set((prev) => prev.filter((e) => !isFolderRow(e)));
+
 export const useEntries = () => store.use();
 
 export function allEntries(): Entry[] {
   return store.get();
-}
-
-export function entriesIn(parentPath: string): Entry[] {
-  return store
-    .get()
-    .filter((e) => e.parentPath === parentPath)
-    .sort((a, b) => {
-      if (a.kind !== b.kind) return a.kind === "folder" ? -1 : 1;
-      return a.name.localeCompare(b.name);
-    });
 }
 
 export function addEntry(entry: Entry) {
@@ -46,15 +42,4 @@ export function noteEntry(id: string, patch: Partial<Entry>) {
 
 export function removeEntry(id: string) {
   store.set((prev) => prev.filter((e) => e.id !== id));
-}
-
-// Recursively collect a folder and everything under it (for cascade delete).
-export function descendantsOf(folderPath: string): Entry[] {
-  return store
-    .get()
-    .filter((e) => e.parentPath === folderPath || e.parentPath.startsWith(folderPath + "/"));
-}
-
-export function folderPath(parentPath: string, name: string): string {
-  return parentPath === "/" ? `/${name}` : `${parentPath}/${name}`;
 }

@@ -1,16 +1,15 @@
 // Shared domain types for the example UI.
 
-export type EntryKind = "file" | "folder";
-
 export type Permission = "read" | "write";
 
 export type KeyType = "secp256r1" | "secp256k1";
 
-// What the file browser is showing. "folder" is normal path-based browsing;
-// the others are flat, drive-wide filtered listings driven from the sidebar.
+// What the file browser is showing. "drive" lists every file; the others are
+// filtered listings driven from the sidebar. There are no folders: Monas has
+// no folder concept, and a UI-only one would suggest otherwise.
 export type View =
-  | { kind: "folder" }
-  | { kind: "all" } // every file, across all folders
+  | { kind: "drive" }
+  | { kind: "all" } // every encrypted file
   | { kind: "synced" } // files registered on a state-node
   | { kind: "shared" }; // files with at least one share
 
@@ -97,8 +96,6 @@ export interface ReceivedShare {
   writtenVersionId?: string;
 }
 
-// One row in the Drive. Folders are purely logical (path prefixes); only files
-// carry Monas content/crypto state.
 export interface NetworkHead {
   /** Node CID of the head version as the state node reports it. Unknown right
    *  after this device wrote the head itself (the write returns plain ids). */
@@ -108,17 +105,16 @@ export interface NetworkHead {
   checkedAt: number;
 }
 
+// One file in the Drive.
 export interface Entry {
   id: string; // local UI id (uuid)
-  kind: EntryKind;
   name: string;
-  parentPath: string; // logical folder path, e.g. "/" or "/Docs"
   sizeBytes: number;
   mimeType?: string;
   createdAt: number;
   updatedAt: number;
 
-  // --- Monas content state (files only) ---
+  // --- Monas content state ---
   localContentId?: string; // SDK content_id (encCid) — used for fetch/share/CEK
   remoteContentId?: string; // state-node Content Network id
   seriesId?: string; // logical series across versions
