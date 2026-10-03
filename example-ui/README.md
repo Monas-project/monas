@@ -328,6 +328,35 @@ stale local plaintext would silently roll the file back. If that pull fails
 the revoke still goes through (a writer must not be able to block
 revocation) and the UI says so.
 
+## File size limit
+
+The UI refuses file bodies over **64 KB** (`MAX_FILE_BYTES` in
+`src/config.ts`) on every path that sends one — New file, Upload, Edit, and a
+recipient's edit — before anything is encrypted or sent to the gateway.
+
+Why: a state node sends a content's **whole version history** to the other
+members in one peer request on create, revoke and delete. A request much past
+~256 KiB is dropped by the peer connection (measured; the exact cause inside
+libp2p is not pinned down). Every revoke and every edit adds another full copy
+of the body to that history.
+
+Measured on the hosted 4-node demo (create → share → revoke → re-share →
+delete from the UI):
+
+| Body | Create | Revoke 403 / delete 410 seen by the recipient | Immediate push to other members |
+|---|---|---|---|
+| 32 KB, 48 KB | ok | ok | ok |
+| 64 KB | ok | ok | the delete push failed to 2 members |
+
+When the immediate push fails the operation still succeeds on the node that
+took it, and the other members catch up on the next periodic sync (~30 s).
+Until then a write sent through one of those members can still be accepted.
+The same happens below 64 KB once a file has accumulated enough versions.
+
+Raising the limit needs the state node to stop sending the whole history in
+one request (send only what the peer lacks, or chunk it); the UI limit is the
+stop-gap until then.
+
 ## What's real vs. illustrative
 
 A single gateway call does the whole orchestration server-side, so the Protocol

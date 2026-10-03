@@ -25,6 +25,8 @@ import {
 import { useIdentities, getActive } from "./store/identity";
 import { checkNetworkHead, checkAllNetworkHeads } from "./store/sync";
 import { probeGateway } from "./api/http";
+import { MAX_FILE_BYTES } from "./config";
+import { fmtBytes } from "./utils";
 import {
   uuid,
   utf8ToBase64Url,
@@ -219,14 +221,28 @@ export default function App() {
     return false;
   };
 
+  // See MAX_FILE_BYTES: larger bodies do not replicate between state nodes.
+  // Refuse before encrypting so nothing reaches the gateway.
+  const withinSizeLimit = (name: string, sizeBytes: number): boolean => {
+    if (sizeBytes <= MAX_FILE_BYTES) return true;
+    pushToast(
+      `“${name}” is ${fmtBytes(sizeBytes)} — files over ${fmtBytes(MAX_FILE_BYTES)} can't be stored in this demo`,
+      "error",
+    );
+    return false;
+  };
+
   const handleNewFile = async (v: { name: string; text: string }) => {
     if (!requireSigningAccount()) return;
+    const sizeBytes = new Blob([v.text]).size;
+    if (!withinSizeLimit(v.name, sizeBytes)) return;
     setModal({ type: "none" });
-    await createFromBytes(v.name, utf8ToBase64Url(v.text), new Blob([v.text]).size, mimeFromName(v.name));
+    await createFromBytes(v.name, utf8ToBase64Url(v.text), sizeBytes, mimeFromName(v.name));
   };
 
   const handleUpload = async (file: File) => {
     if (!requireSigningAccount()) return;
+    if (!withinSizeLimit(file.name, file.size)) return;
     const b64 = await fileToBase64Url(file);
     await createFromBytes(file.name, b64, file.size, file.type || mimeFromName(file.name));
   };
@@ -301,8 +317,9 @@ export default function App() {
   // owner's Content Network under the delegated token. The name field of the
   // editor is local here — a recipient cannot rename the owner's file.
   const handleReceivedEditSave = async (entry: Entry, v: { name: string; text: string }) => {
-    setModal({ type: "none" });
     const sizeBytes = new Blob([v.text]).size;
+    if (!withinSizeLimit(entry.name, sizeBytes)) return;
+    setModal({ type: "none" });
     const specs = flows.updateReceivedFlow({
       entry,
       contentBase64Url: utf8ToBase64Url(v.text),
@@ -325,8 +342,9 @@ export default function App() {
 
   const handleEditSave = async (entry: Entry, v: { name: string; text: string }) => {
     if (entry.receivedShare) return handleReceivedEditSave(entry, v);
-    setModal({ type: "none" });
     const sizeBytes = new Blob([v.text]).size;
+    if (!withinSizeLimit(v.name || entry.name, sizeBytes)) return;
+    setModal({ type: "none" });
     const renamed = v.name && v.name !== entry.name ? v.name : undefined;
     const specs = flows.updateFileFlow({
       entry,

@@ -23,6 +23,19 @@ export const PROXY_DEFAULTS: EndpointConfig = {
   accountService: "/account-api",
 };
 
+/**
+ * Largest file body the UI will encrypt and send (create, upload, edit).
+ *
+ * State nodes push a content's whole history to the other members on create,
+ * revoke and delete, and a push much past ~256 KiB is dropped by the peer
+ * connection. With the ciphertext sent as raw bytes, 64 KB was measured to
+ * create, share, revoke and delete end to end on the hosted 4-node demo.
+ * Each revoke or edit adds a full copy of the body to the history, so larger
+ * bodies — or many versions — can still miss the immediate push and only
+ * reach other members on the next periodic sync. See README "File size limit".
+ */
+export const MAX_FILE_BYTES = 64 * 1024;
+
 export const GATEWAY_PRESETS: { label: string; value: string }[] = [
   { label: "Local (Vite proxy → Docker)", value: "/api" },
   { label: "Local (direct :3000)", value: "http://127.0.0.1:3000" },

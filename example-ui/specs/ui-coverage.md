@@ -524,7 +524,7 @@ by the edit flow, so it does not track what the Content Network actually holds.
 
 ---
 
-## I. Guards, identity, and binary content (5 scenarios)
+## I. Guards, identity, and binary content (6 scenarios)
 
 ### I-45 · Content ops without a signing account are refused — P0
 **Verified manually — works correctly.** Must run with a cleared
@@ -564,6 +564,15 @@ One upload; use a tiny (<1KB) PNG so the crypto cost stays small.
    a `data:image/png;base64,` src.
 4. Run `Read from state-node`; expect the verified-read box shows
    `"(image decrypted and verified — rendered above)"` rather than mojibake.
+
+### I-50 · Bodies over the 64 KB limit are refused before any gateway call — P0
+`MAX_FILE_BYTES` (`src/config.ts`); see README "File size limit".
+1. `Upload` a 64 KB + 1 B file: expect toast `"… can't be stored in this demo"`
+   naming the file and the limit, **no** row and **no** `.run`.
+2. `New file` with a 64 KB + 1 B body: same toast; the editor stays open.
+3. `Edit contents` of an existing file, grown to 64 KB + 1 B: same toast; no
+   new `.run`.
+4. `New file` with exactly 64 KB: a run starts (the limit is inclusive).
 
 ---
 
@@ -624,8 +633,9 @@ Controls found **broken or inert** while clicking through the running app:
 | `tests/share.spec.ts` | G-34…G-39 | 1 fixture + shares |
 | `tests/preview.spec.ts` | H-40…H-44 | 1 fixture + 1 edit |
 | `tests/guards.spec.ts` | I-45…I-49 | cleared storage; 1 small PNG |
+| `tests/size-limit.spec.ts` | I-50 | 1 small create (edit path) |
 
 Run serially (`workers: 1`, already configured) — all specs share one gateway
 and one `localStorage` registry.
 
-**Total: 49 scenarios.**
+**Total: 50 scenarios.**
