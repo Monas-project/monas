@@ -1,0 +1,118 @@
+import { loadEndpoints } from "../config";
+
+// SDK error envelope: { type, message } tagged enum.
+export class ApiError extends Error {
+  constructor(
+    public status: number,
+    message: string,
+    public kind: string = "Internal",
+    public traceId?: string,
+  ) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
+interface SdkApiError {
+  type: string;
+  message: string;
+}
+interface ApiResponse<T> {
+  success: boolean;
+  data?: T;
+  error?: SdkApiError;
+  trace_id: string;
+}
+
+function gatewayBase(): string {
+  return loadEndpoints().gateway.replace(/\/+$/, "");
+}
+
+// HTTP 410: the state node refuses content whose history contains a delete.
+// The node and the SDK only say it is gone; the wording lives here.
+export const DELETED_MESSAGE = "削除されました";
+
+/** One-line message for an error, as shown across the app. */
+export function describeError(e: unknown): string {
+  if (e instanceof ApiError) {
+    if (e.status === 410) return DELETED_MESSAGE;
+    return `${e.message}${e.status ? ` (HTTP ${e.status})` : ""}`;
+  }
+  return (e as Error).message;
+}
+
+export function nowUnix(): number {
+  return Math.floor(Date.now() / 1000);
+}
+
+interface RequestOptions {
+  method?: string;
+  body?: unknown;
+  /** Add an X-Request-Timestamp header (required by state-touching endpoints). */
+  timestamp?: boolean;
+  headers?: Record<string, string>;
+}
+
+// Calls the gateway and unwraps the SDK ApiResponse<T>. Throws ApiError on
+// transport failure or a non-success envelope.
+export async function gateway<T>(path: string, opts: RequestOptions = {}): Promise<T> {
+  const url = gatewayBase() + path;
+  const headers: Record<string, string> = { ...(opts.headers || {}) };
+  let body: BodyInit | undefined;
+  if (opts.body !== undefined) {
+    headers["Content-Type"] = "application/json";
+    body = JSON.stringify(opts.body);
+  }
+  if (opts.timestamp) headers["X-Request-Timestamp"] = String(nowUnix());
+
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: opts.method || (opts.body !== undefined ? "POST" : "GET"),
+      headers,
+      body,
+    });
+  } catch (e) {
+    throw new ApiError(
+      0,
+      `Network error reaching the gateway (${url}). Is monas-gateway running and the endpoint correct? ${
+        (e as Error).message
+      }`,
+    );
+  }
+
+  const text = await res.text();
+  let parsed: ApiResponse<T> | null = null;
+  if (text) {
+    try {
+      parsed = JSON.parse(text) as ApiResponse<T>;
+    } catch {
+      parsed = null;
+    }
+  }
+
+  if (parsed && parsed.success === false && parsed.error) {
+    throw new ApiError(res.status, parsed.error.message, parsed.error.type, parsed.trace_id);
+  }
+  if (!res.ok) {
+    throw new ApiError(res.status, text || res.statusText);
+  }
+  if (parsed && "success" in parsed) {
+    return parsed.data as T;
+  }
+  return undefined as T;
+}
+
+// Health probe for the connection indicator (gateway GET /health → 200).
+// Pass `base` to probe a candidate endpoint without committing it. The
+// Settings dialog needs this: testing an endpoint you have not saved must not
+// change what the rest of the app is talking to.
+export async function probeGateway(base?: string): Promise<boolean> {
+  const target = (base ?? gatewayBase()).replace(/\/+$/, "");
+  try {
+    const res = await fetch(target + "/health", { method: "GET" });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}

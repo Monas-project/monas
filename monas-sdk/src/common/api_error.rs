@@ -17,6 +17,9 @@ pub enum ApiError {
     Forbidden(String),
     /// リソース不存在 (404)
     NotFound(String),
+    /// 削除済み (410)。State Node がコンテンツの履歴に delete を持つとき返す。
+    /// 404(まだ同期が届いていない等)とは区別する。
+    Gone(String),
     /// 競合（同時更新等） (409)
     Conflict(String),
     /// State Nodeとの通信タイムアウト (408)
@@ -32,6 +35,7 @@ impl fmt::Display for ApiError {
             ApiError::Unauthorized(msg) => write!(f, "Unauthorized: {msg}"),
             ApiError::Forbidden(msg) => write!(f, "Forbidden: {msg}"),
             ApiError::NotFound(msg) => write!(f, "Not found: {msg}"),
+            ApiError::Gone(msg) => write!(f, "Gone: {msg}"),
             ApiError::Conflict(msg) => write!(f, "Conflict: {msg}"),
             ApiError::Timeout(msg) => write!(f, "Timeout: {msg}"),
             ApiError::Internal(msg) => write!(f, "Internal error: {msg}"),
@@ -49,6 +53,7 @@ impl ApiError {
             ApiError::Unauthorized(_) => 401,
             ApiError::Forbidden(_) => 403,
             ApiError::NotFound(_) => 404,
+            ApiError::Gone(_) => 410,
             ApiError::Conflict(_) => 409,
             ApiError::Timeout(_) => 408,
             ApiError::Internal(_) => 500,
@@ -79,6 +84,7 @@ mod tests {
         assert_eq!(ApiError::Unauthorized("test".into()).status_code(), 401);
         assert_eq!(ApiError::Forbidden("test".into()).status_code(), 403);
         assert_eq!(ApiError::NotFound("test".into()).status_code(), 404);
+        assert_eq!(ApiError::Gone("test".into()).status_code(), 410);
         assert_eq!(ApiError::Conflict("test".into()).status_code(), 409);
         assert_eq!(ApiError::Timeout("test".into()).status_code(), 408);
         assert_eq!(ApiError::Internal("test".into()).status_code(), 500);

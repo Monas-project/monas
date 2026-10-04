@@ -31,6 +31,16 @@ fn controller_for_legacy_timestamps(state_node_url: String) -> MonasController {
     MonasController::with_config(config).expect("with_config")
 }
 
+/// 署名アカウントを作った controller。SDK は自分では署名鍵を作らない。
+fn controller_with_signing_account(state_node_url: String) -> MonasController {
+    let controller = controller_for_legacy_timestamps(state_node_url);
+    controller
+        .create_signing_account()
+        .data
+        .expect("create signing account");
+    controller
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn create_content_and_get_content_round_trip_succeeds_with_mock_state_node() {
     let _guard = acquire_test_lock();
@@ -459,7 +469,7 @@ async fn create_content_uses_local_account_signature_for_state_node_request() {
         .create_async()
         .await;
 
-    let controller = controller_for_legacy_timestamps(state_node_server.url());
+    let controller = controller_with_signing_account(state_node_server.url());
     let auth = StateNodeAuthContext {
         authorization: Some("Bearer old".into()),
         request_signature: Some("old-signature".into()),
@@ -648,7 +658,7 @@ async fn delete_content_uses_account_signature_for_metadata_request() {
         .create_async()
         .await;
 
-    let controller = controller_for_legacy_timestamps(state_node_server.url());
+    let controller = controller_with_signing_account(state_node_server.url());
     let created = controller
         .create_content(
             CreateContentInput {
@@ -929,5 +939,46 @@ async fn create_content_rejects_far_past_timestamp_with_unauthorized() {
 
     assert!(!response.success);
     assert!(matches!(response.error, Some(ApiError::Unauthorized(_))));
+    cleanup_content_artifacts();
+}
+
+/// 署名アカウントを作るまでは state node へ署名付きリクエストを送らない。
+/// SDK が起動時に勝手に鍵を作っていないことの回帰テスト。
+#[tokio::test(flavor = "multi_thread")]
+async fn create_content_without_signing_account_is_refused_before_contacting_state_node() {
+    let _guard = acquire_test_lock();
+    let mut state_node_server = Server::new_async().await;
+    let never_called = state_node_server
+        .mock("POST", "/content")
+        .expect(0)
+        .create_async()
+        .await;
+
+    let controller = controller_for_legacy_timestamps(state_node_server.url());
+    let response = controller.create_content(
+        CreateContentInput {
+            content: URL_SAFE_NO_PAD.encode(b"no-account"),
+            metadata: Some(ContentMetadata {
+                name: Some("no-account.txt".to_string()),
+                content_type: Some("text/plain".to_string()),
+                created_at: None,
+                updated_at: None,
+            }),
+        },
+        // The gateway always passes a request timestamp, which makes the SDK sign.
+        Some(&StateNodeAuthContext {
+            authorization: None,
+            request_signature: None,
+            request_timestamp: Some(1_717_171_717),
+        }),
+    );
+
+    assert!(!response.success);
+    assert!(
+        matches!(response.error, Some(monas_sdk::ApiError::NotFound(_))),
+        "expected NotFound(stored account key), got {:?}",
+        response.error
+    );
+    never_called.assert();
     cleanup_content_artifacts();
 }

@@ -9,6 +9,7 @@ NODE_ROLE="${NODE_ROLE:-member}"
 BOOTSTRAP_ADDR="${BOOTSTRAP_ADDR:-}"
 BOOTSTRAP_DNS="${BOOTSTRAP_DNS:-}"
 BOOTSTRAP_PEER_ID="${BOOTSTRAP_PEER_ID:-}"
+EXTERNAL_ADDRESS="${EXTERNAL_ADDRESS:-}"
 DISABLE_MDNS="${DISABLE_MDNS:-}"
 
 ARGS=(
@@ -55,4 +56,21 @@ if [ "$NODE_ROLE" != "bootstrap" ]; then
     fi
 fi
 
-exec state-node "${ARGS[@]}"
+# Addresses to announce to peers, comma-separated multiaddrs.
+#
+# By default a node announces only the IPs it listens on. On Fargate a task's
+# IP dies with the task, so a peer that remembered it holds a dead address
+# after any restart — and when two peers both moved while apart, each held
+# only the other's dead IP and they never found each other again. Announcing
+# the service-discovery name (`/dns4/node3.monas.local/tcp/9001`) gives peers
+# an address that stays valid across restarts: libp2p resolves it on every
+# dial.
+if [ -n "$EXTERNAL_ADDRESS" ]; then
+    IFS=',' read -ra EXT <<< "$EXTERNAL_ADDRESS"
+    for a in "${EXT[@]}"; do
+        a="$(echo "$a" | tr -d '[:space:]')"
+        [ -n "$a" ] && ARGS+=(--external-address "$a")
+    done
+fi
+
+exec state-node "${ARGS[@]}" "$@"

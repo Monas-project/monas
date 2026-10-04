@@ -468,6 +468,12 @@ mod tests {
         async fn get_latest(&self, _genesis_cid: &str) -> Result<Option<Vec<u8>>> {
             unimplemented!()
         }
+        async fn delete_content(&self, _genesis_cid: &str, _author: &str) -> Result<CommitResult> {
+            unimplemented!()
+        }
+        async fn is_deleted(&self, _genesis_cid: &str) -> Result<bool> {
+            unimplemented!()
+        }
         async fn get_latest_with_version(
             &self,
             _genesis_cid: &str,

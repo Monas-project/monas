@@ -1,0 +1,5 @@
+# Reviewed false positives (gitleaks high-entropy vault-service-token rule
+# misfiring on long camelCase identifiers, not real secrets).
+#
+# App.tsx:301 is the revoke handler comparing two public-key variable names.
+src/App.tsx:vault-service-token:301

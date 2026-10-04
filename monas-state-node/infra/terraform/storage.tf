@@ -8,7 +8,9 @@ resource "aws_efs_access_point" "node" {
   }
 
   root_directory {
-    path = "/${var.node_name}-v3"
+    # v5 starts fresh: ciphertext is now a byte string (base64 in JSON),
+    # which changes version CIDs. v4 added the body_updated_at field.
+    path = "/${var.node_name}-v5"
 
     creation_info {
       owner_uid   = 1000

@@ -12,6 +12,10 @@ pub enum StateNodeError {
     #[error("Content not found: {0}")]
     ContentNotFound(ContentId),
 
+    /// The content's history contains a delete operation.
+    #[error("Content deleted: {0}")]
+    ContentDeleted(ContentId),
+
     #[error("Content already exists: {0}")]
     ContentAlreadyExists(ContentId),
 
@@ -113,6 +117,7 @@ impl StateNodeError {
     pub fn to_http_status(&self) -> StatusCode {
         match self {
             StateNodeError::ContentNotFound(_) => StatusCode::NOT_FOUND,
+            StateNodeError::ContentDeleted(_) => StatusCode::GONE,
             StateNodeError::ContentAlreadyExists(_) => StatusCode::CONFLICT,
             StateNodeError::PermissionDenied(_) => StatusCode::FORBIDDEN,
             StateNodeError::InvalidUcanToken(_) => StatusCode::UNAUTHORIZED,
@@ -170,6 +175,14 @@ mod tests {
         let err = StateNodeError::ContentNotFound(content_id);
         assert_eq!(err.to_string(), "Content not found: content-1");
         assert_eq!(err.to_http_status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn test_content_deleted_error() {
+        let content_id = ContentId::new("content-1".to_string()).unwrap();
+        let err = StateNodeError::ContentDeleted(content_id);
+        assert_eq!(err.to_string(), "Content deleted: content-1");
+        assert_eq!(err.to_http_status(), StatusCode::GONE);
     }
 
     #[test]

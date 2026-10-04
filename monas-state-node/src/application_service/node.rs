@@ -60,9 +60,13 @@ pub struct StateNodeConfig {
     /// Node ID (optional, generated if not provided).
     pub node_id: Option<String>,
     /// Sync interval in seconds (default: 30).
+    /// Can be set via SYNC_INTERVAL_SECS environment variable.
     pub sync_interval_secs: u64,
     /// Outbox retry interval in seconds (default: 10).
     pub outbox_retry_interval_secs: u64,
+    /// Redundancy check interval in seconds (default: 300).
+    /// Can be set via REDUNDANCY_INTERVAL_SECS environment variable.
+    pub redundancy_interval_secs: u64,
     /// Minimum replication factor for content networks (default: 3).
     /// Can be set via MIN_REPLICATION_FACTOR environment variable.
     pub min_replication_factor: usize,
@@ -79,8 +83,15 @@ impl Default for StateNodeConfig {
             http_addr: "127.0.0.1:8080".parse().unwrap(),
             network_config: Libp2pNetworkConfig::default(),
             node_id: None,
-            sync_interval_secs: 30,
+            sync_interval_secs: std::env::var("SYNC_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30),
             outbox_retry_interval_secs: 10,
+            redundancy_interval_secs: std::env::var("REDUNDANCY_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(300),
             min_replication_factor: std::env::var("MIN_REPLICATION_FACTOR")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -328,6 +339,14 @@ impl StateNode {
             self.node_id(),
             self.config.http_addr
         );
+        // How many tasks can actually run in parallel. On a fractional-vCPU
+        // container this is often 1, which turns any blocking computation into
+        // a whole-process stall.
+        tracing::info!(
+            "tokio runtime: {} worker thread(s), available_parallelism={:?}",
+            tokio::runtime::Handle::current().metrics().num_workers(),
+            std::thread::available_parallelism().map(|n| n.get())
+        );
 
         // Spawn relay request handler
         if let Some(mut relay_rx) = self.network.take_relay_receiver().await {
@@ -539,7 +558,13 @@ impl StateNode {
                 "Started periodic sync task (interval: {}s)",
                 sync_interval.as_secs()
             );
+            // A sync that overran its interval (a peer that would not answer
+            // for hours took each run to 600s) must not be followed by a
+            // back-to-back burst of every tick it missed: node3 ran ~70 syncs
+            // in a row the moment its peer came back. Delay: one run, then
+            // resume the cadence.
             let mut interval = tokio::time::interval(sync_interval);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! {
                     _ = token_sync.cancelled() => {
@@ -547,21 +572,21 @@ impl StateNode {
                         break;
                     }
                     _ = interval.tick() => {
-                        tracing::debug!("Running periodic content sync");
+                        tracing::info!("periodic sync: start");
+                        let started = std::time::Instant::now();
                         match sync_service.sync_all_content().await {
                             Ok(results) => {
                                 let total_applied: usize =
                                     results.iter().map(|(_, r)| r.operations_applied).sum();
-                                if total_applied > 0 {
-                                    tracing::info!(
-                                        "Periodic sync completed: {} operations applied across {} contents",
-                                        total_applied,
-                                        results.len()
-                                    );
-                                }
+                                tracing::info!(
+                                    "periodic sync: done in {:?}, {} operations applied across {} contents",
+                                    started.elapsed(),
+                                    total_applied,
+                                    results.len()
+                                );
                             }
                             Err(e) => {
-                                tracing::warn!("Periodic sync failed: {}", e);
+                                tracing::warn!("periodic sync: failed after {:?}: {}", started.elapsed(), e);
                             }
                         }
                     }
@@ -569,11 +594,16 @@ impl StateNode {
             }
         });
 
-        // Spawn periodic redundancy check task (5 minute interval)
+        // Spawn periodic redundancy check task
+        let redundancy_interval = Duration::from_secs(self.config.redundancy_interval_secs);
         let token_redundancy = token.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(300));
-            tracing::info!("Started periodic redundancy check task (interval: 300s)");
+            let mut interval = tokio::time::interval(redundancy_interval);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tracing::info!(
+                "Started periodic redundancy check task (interval: {}s)",
+                redundancy_interval.as_secs()
+            );
             loop {
                 tokio::select! {
                     _ = token_redundancy.cancelled() => {
@@ -581,18 +611,18 @@ impl StateNode {
                         break;
                     }
                     _ = interval.tick() => {
-                        tracing::debug!("Running periodic redundancy check");
+                        tracing::info!("redundancy check: start");
+                        let started = std::time::Instant::now();
                         match service_for_redundancy.check_all_redundancy().await {
                             Ok(checked) => {
-                                if !checked.is_empty() {
-                                    tracing::info!(
-                                        "Periodic redundancy check completed for {} content networks",
-                                        checked.len()
-                                    );
-                                }
+                                tracing::info!(
+                                    "redundancy check: done in {:?} for {} content networks",
+                                    started.elapsed(),
+                                    checked.len()
+                                );
                             }
                             Err(e) => {
-                                tracing::warn!("Periodic redundancy check failed: {}", e);
+                                tracing::warn!("redundancy check: failed after {:?}: {}", started.elapsed(), e);
                             }
                         }
                     }
@@ -610,6 +640,7 @@ impl StateNode {
                 retry_interval.as_secs()
             );
             let mut interval = tokio::time::interval(retry_interval);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! {
                     _ = token_outbox.cancelled() => {
@@ -617,12 +648,15 @@ impl StateNode {
                         break;
                     }
                     _ = interval.tick() => {
-                        tracing::debug!("Running outbox retry");
+                        let started = std::time::Instant::now();
                         match reliable_publisher.retry_pending().await {
                             Ok(result) => {
-                                if result.delivered > 0 || result.dropped > 0 {
+                                // Quiet when nothing happened; the heartbeat below
+                                // covers liveness. Anything slow is worth a line.
+                                if result.delivered > 0 || result.dropped > 0 || started.elapsed() > Duration::from_secs(1) {
                                     tracing::info!(
-                                        "Outbox retry: {} delivered, {} failed, {} dropped",
+                                        "outbox retry: done in {:?}, {} delivered, {} failed, {} dropped",
+                                        started.elapsed(),
                                         result.delivered,
                                         result.failed,
                                         result.dropped
@@ -630,9 +664,32 @@ impl StateNode {
                                 }
                             }
                             Err(e) => {
-                                tracing::warn!("Outbox retry failed: {}", e);
+                                tracing::warn!("outbox retry: failed after {:?}: {}", started.elapsed(), e);
                             }
                         }
+                    }
+                }
+            }
+        });
+
+        // Liveness heartbeat. The node has been seen pegging the CPU for minutes
+        // with no log output at all; on a 0.5 vCPU task the runtime likely has
+        // a single worker, so one blocking task starves every other one. If
+        // this line stops while CPU is high, the runtime is starved. If it
+        // keeps going, whatever is stuck is blocked on a lock instead.
+        // Deliberately left on the default Burst behaviour: after a stall the
+        // missed beats fire together, and that burst is the signature we look
+        // for in the logs.
+        let token_heartbeat = token.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(10));
+            let mut n: u64 = 0;
+            loop {
+                tokio::select! {
+                    _ = token_heartbeat.cancelled() => break,
+                    _ = interval.tick() => {
+                        n += 1;
+                        tracing::info!("heartbeat #{n}");
                     }
                 }
             }
@@ -679,6 +736,7 @@ mod tests {
         assert!(config.node_id.is_none());
         assert_eq!(config.sync_interval_secs, 30);
         assert_eq!(config.outbox_retry_interval_secs, 10);
+        assert_eq!(config.redundancy_interval_secs, 300);
         assert_eq!(config.min_replication_factor, 3);
         assert_eq!(config.capacity_threshold_bytes, 1_073_741_824);
     }
