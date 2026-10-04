@@ -28,12 +28,10 @@ async fn main() {
     // monas-sdk側でもenvを見るが、ここで明示的に読むことで挙動が分かりやすくなる
     let state_node_url =
         std::env::var("MONAS_STATE_NODE_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".into());
-    let account_url =
-        std::env::var("MONAS_ACCOUNT_URL").unwrap_or_else(|_| "http://127.0.0.1:4002".into());
 
     // 本番運用は MONAS_PERSISTENCE_DIR を必ず設定する。未設定時は in-memory にフォールバックし、
-    // SDK 側で stderr に警告が出る (CEK と share が再起動で揮発する)。
-    let mut config = MonasConfig::new(state_node_url, account_url);
+    // SDK 側で stderr に警告が出る (署名鍵・CEK・share が再起動で揮発する)。
+    let mut config = MonasConfig::new(state_node_url);
     if let Ok(dir) = std::env::var("MONAS_PERSISTENCE_DIR") {
         config = config.with_persistence_dir(dir);
     }

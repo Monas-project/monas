@@ -9,6 +9,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use content::{ContentServiceInstance, DynCekStore};
 use share::{DynPublicKeyDirectory, DynShareRepository, ShareServiceInstance};
 
+use monas_account::application_service::{AccountKeyStore, AccountService, KeyTypeMapper};
+use monas_account::infrastructure::key_store::{InMemoryAccountKeyStore, SledAccountKeyStore};
+
 use crate::common::{ApiError, ApiResponse, MonasConfig, PersistenceConfig, StateNodeAuthContext};
 
 /// プライマリ操作が失敗し、補償 (rollback / restore) も失敗した場合に返すべき
@@ -53,12 +56,52 @@ pub(super) fn combine_rollback_failure(
     }
 }
 
+/// SDK プロセスが持つ署名鍵ストア。
+pub(super) enum AccountKeyStoreKind {
+    InMemory(InMemoryAccountKeyStore),
+    Sled(SledAccountKeyStore),
+}
+
+impl AccountKeyStore for AccountKeyStoreKind {
+    fn save(
+        &self,
+        key: &monas_account::application_service::StoredAccountKey,
+    ) -> Result<(), monas_account::application_service::AccountKeyStoreError> {
+        match self {
+            Self::InMemory(store) => store.save(key),
+            Self::Sled(store) => store.save(key),
+        }
+    }
+
+    fn load(
+        &self,
+    ) -> Result<
+        Option<monas_account::application_service::StoredAccountKey>,
+        monas_account::application_service::AccountKeyStoreError,
+    > {
+        match self {
+            Self::InMemory(store) => store.load(),
+            Self::Sled(store) => store.load(),
+        }
+    }
+
+    fn delete(&self) -> Result<(), monas_account::application_service::AccountKeyStoreError> {
+        match self {
+            Self::InMemory(store) => store.delete(),
+            Self::Sled(store) => store.delete(),
+        }
+    }
+}
+
 /// MonasController - SDK のオーケストレーター
 pub struct MonasController {
     /// State NodeのベースURL
     pub(super) state_node_url: String,
-    /// Account(issuer)のベースURL
-    pub(super) account_url: String,
+    /// 署名と委譲。署名鍵ストアはサービスが持つ。プロセスにつき 1 本。
+    ///
+    /// content の CEK 用 sled とは別ディレクトリに置く。署名鍵とコンテンツ鍵は別の秘密であり、
+    /// sled は path 単位で flock するため同じディレクトリを共有できない。
+    pub(super) account_service: AccountService<AccountKeyStoreKind>,
     /// 全 HTTP 呼び出しで共有する ureq Agent (タイムアウト等を保持)
     pub(super) agent: ureq::Agent,
     /// `X-Request-Timestamp` の許容 skew (Gateway 経由で渡された timestamp が古すぎる/未来すぎる場合 reject)
@@ -237,23 +280,7 @@ impl MonasController {
         note = "test/dev-only constructor: use MonasController::with_config(MonasConfig::new(...).with_persistence_dir(...)) for production gateways"
     )]
     pub fn with_state_node_url(state_node_url: impl Into<String>) -> Self {
-        let url = state_node_url.into();
-        // 開発/テスト互換のため、account_url は明示未指定時に state_node_url と同じ値を使う。
-        Self::with_config(MonasConfig::new(url.clone(), url))
-            .expect("InMemory persistence must not fail to open")
-    }
-
-    /// State Node URL と Account URL を明示してMonasControllerを生成 (in-memory persistence)。
-    ///
-    /// **このコンストラクタは test/開発専用。** 本番 gateway は必ず
-    /// `with_config` + `MonasConfig::with_persistence_dir(...)` を使うこと。
-    /// in-memory persistence のため、再起動で CEK / share / public-key directory が
-    /// 全て揮発する。
-    #[deprecated(
-        note = "test/dev-only constructor: use MonasController::with_config(MonasConfig::new(...).with_persistence_dir(...)) for production gateways"
-    )]
-    pub fn with_urls(state_node_url: impl Into<String>, account_url: impl Into<String>) -> Self {
-        Self::with_config(MonasConfig::new(state_node_url, account_url))
+        Self::with_config(MonasConfig::new(state_node_url))
             .expect("InMemory persistence must not fail to open")
     }
 
@@ -276,11 +303,16 @@ impl MonasController {
         let content_repository = Self::create_content_repository();
         let (cek_store, share_repository, public_key_directory, sender_pin_store) =
             Self::create_persistence(&config.persistence)?;
+        let account_key_store = Self::create_account_key_store(&config.persistence)?;
+        let account_service = AccountService {
+            key_store: account_key_store,
+        };
+        Self::ensure_signing_identity(&account_service)?;
         let agent = Self::build_agent(&config);
 
         Ok(Self {
             state_node_url: config.state_node_url,
-            account_url: config.account_url,
+            account_service,
             agent,
             request_timestamp_skew: config.request_timestamp_skew,
             content_service: Self::create_content_service(
@@ -350,7 +382,7 @@ impl MonasController {
             PersistenceConfig::InMemory => {
                 eprintln!(
                     "monas-sdk: PersistenceConfig::InMemory is in use. \
-                     CEK / share / public-key data are kept in memory only and will be lost on restart. \
+                     Signing key / CEK / share / public-key data are kept in memory only and will be lost on restart. \
                      Use MonasConfig::with_persistence_dir(<path>) for production gateways."
                 );
                 let cek: DynCekStore = Arc::new(InMemoryContentEncryptionKeyStore::default());
@@ -380,6 +412,53 @@ impl MonasController {
                 let sender_pin: DynSenderPinStore = Arc::new(sender_pin);
                 Ok((cek, share, pkd, sender_pin))
             }
+        }
+    }
+
+    /// 署名主体の鍵ストアを作る。
+    ///
+    /// content 用 sled (`dir` 直下) とは別の `dir/account` を開く。同じ path を
+    /// 二度 `sled::open` すると 2 個目が flock で失敗する。
+    fn create_account_key_store(
+        persistence: &PersistenceConfig,
+    ) -> Result<AccountKeyStoreKind, ApiError> {
+        match persistence {
+            PersistenceConfig::InMemory => Ok(AccountKeyStoreKind::InMemory(
+                InMemoryAccountKeyStore::default(),
+            )),
+            PersistenceConfig::Sled { dir } => {
+                let account_dir = dir.join("account");
+                if let Err(e) = std::fs::create_dir_all(&account_dir) {
+                    return Err(ApiError::Internal(format!(
+                        "failed to create account key dir {account_dir:?}: {e}"
+                    )));
+                }
+                let store = SledAccountKeyStore::open(&account_dir).map_err(|e| {
+                    ApiError::Internal(format!(
+                        "failed to open account key store at {account_dir:?}: {e}"
+                    ))
+                })?;
+                Ok(AccountKeyStoreKind::Sled(store))
+            }
+        }
+    }
+
+    /// ストアが空なら P-256 の署名鍵を 1 本作る。
+    ///
+    /// state node のリクエスト署名と委譲トークンは P-256 だけを受け付ける。
+    /// 既に鍵がある場合は上書きしない。`/keypair` が返す鍵とは別物である。
+    fn ensure_signing_identity(
+        service: &AccountService<AccountKeyStoreKind>,
+    ) -> Result<(), ApiError> {
+        match service.key_store.load() {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => service
+                .create(KeyTypeMapper::P256)
+                .map(|_| ())
+                .map_err(|e| ApiError::Internal(format!("failed to create signing identity: {e}"))),
+            Err(e) => Err(ApiError::Internal(format!(
+                "failed to load signing identity: {e}"
+            ))),
         }
     }
 
@@ -595,6 +674,57 @@ mod tests {
         );
         assert!(matches!(combined, ApiError::Internal(_)));
         assert_eq!(combined.status_code(), 500);
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn fresh_controller_provisions_p256_signing_key() {
+        use monas_account::application_service::AccountKeyStore;
+        use monas_account::infrastructure::key_pair::KeyAlgorithm;
+
+        let controller = MonasController::with_state_node_url("http://127.0.0.1:9");
+        let stored = controller
+            .account_service
+            .key_store
+            .load()
+            .expect("load")
+            .expect("signing key");
+        assert_eq!(stored.algorithm, KeyAlgorithm::P256);
+        assert!(!stored.secret_key.is_empty());
+    }
+
+    #[test]
+    fn sled_signing_key_survives_reopen() {
+        use monas_account::application_service::AccountKeyStore;
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("monas-sdk-account-key-{nanos}"));
+        let config = MonasConfig::new("http://127.0.0.1:1").with_persistence_dir(&dir);
+        let first = MonasController::with_config(config).expect("first open");
+        let first_key = first
+            .account_service
+            .key_store
+            .load()
+            .expect("load")
+            .expect("signing key")
+            .public_key;
+        drop(first);
+
+        let config = MonasConfig::new("http://127.0.0.1:1").with_persistence_dir(&dir);
+        let second = MonasController::with_config(config).expect("reopen");
+        let second_key = second
+            .account_service
+            .key_store
+            .load()
+            .expect("load")
+            .expect("signing key")
+            .public_key;
+        assert_eq!(first_key, second_key);
+        drop(second);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

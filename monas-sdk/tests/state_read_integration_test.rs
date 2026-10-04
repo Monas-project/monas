@@ -1,4 +1,4 @@
-// Integration tests intentionally use the test/dev-only `with_urls` constructor.
+// Integration tests intentionally use the test/dev-only `with_state_node_url` constructor.
 #![allow(deprecated)]
 //! `read_content_from_state_node`(検証付き read)の統合テスト。
 //!
@@ -82,15 +82,6 @@ async fn create_and_share(
         .with_body(format!(r#"{{"content_id":"{REMOTE_ID}"}}"#))
         .create_async()
         .await;
-    let delegate_mock = server
-        .mock("POST", "/issuer/delegate")
-        .with_status(200)
-        .with_header("content-type", "application/json")
-        .with_body(
-            r#"{"delegated_token":"dummy.jwt.token","issued_at":1700000000,"expires_at":1700003600,"jti":"jti-1"}"#,
-        )
-        .create_async()
-        .await;
 
     let sender = controller
         .generate_keypair(GenerateKeypairInput {
@@ -138,8 +129,6 @@ async fn create_and_share(
         share_response.error
     );
     let shared = share_response.data.expect("share should return data");
-    delegate_mock.assert();
-
     let ciphertext = URL_SAFE_NO_PAD
         .decode(&shared.key_envelope.ciphertext)
         .expect("envelope ciphertext should be base64url");
@@ -156,7 +145,7 @@ async fn create_and_share(
 async fn creator_reads_own_content_from_state_node() {
     let _guard = acquire_test_lock();
     let mut server = Server::new_async().await;
-    let controller = MonasController::with_urls(server.url(), server.url());
+    let controller = MonasController::with_state_node_url(server.url());
 
     let plaintext = b"state-read-roundtrip";
     let created = create_and_share(&mut server, &controller, plaintext).await;
@@ -197,7 +186,7 @@ async fn creator_reads_own_content_from_state_node() {
 async fn share_recipient_reads_content_after_processing_envelope() {
     let _guard = acquire_test_lock();
     let mut server = Server::new_async().await;
-    let creator = MonasController::with_urls(server.url(), server.url());
+    let creator = MonasController::with_state_node_url(server.url());
 
     let plaintext = b"shared-then-read";
     let created = create_and_share(&mut server, &creator, plaintext).await;
@@ -206,7 +195,7 @@ async fn share_recipient_reads_content_after_processing_envelope() {
     let genesis_cid = recompute_node_cid(&genesis_bytes).unwrap();
 
     // 受信者は別インスタンス(= 別デバイス相当。ローカル content も CEK も無い)
-    let recipient_controller = MonasController::with_urls(server.url(), server.url());
+    let recipient_controller = MonasController::with_state_node_url(server.url());
 
     // KeyEnvelope 未処理の状態では CEK が無く、NotFound で share 処理へ誘導される
     // (read は前後 2 回行うので、mock は 2 ヒットを期待する)
@@ -279,23 +268,13 @@ async fn share_recipient_reads_content_after_processing_envelope() {
 async fn cek_rotation_after_revoke_updates_recipient_and_read() {
     let _guard = acquire_test_lock();
     let mut server = Server::new_async().await;
-    let creator = MonasController::with_urls(server.url(), server.url());
+    let creator = MonasController::with_state_node_url(server.url());
 
     let _create_mock = server
         .mock("POST", "/content")
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(format!(r#"{{"content_id":"{REMOTE_ID}"}}"#))
-        .create_async()
-        .await;
-    let _delegate_mock = server
-        .mock("POST", "/issuer/delegate")
-        .with_status(200)
-        .with_header("content-type", "application/json")
-        .with_body(
-            r#"{"delegated_token":"dummy.jwt.token","issued_at":1700000000,"expires_at":1700003600,"jti":"jti-1"}"#,
-        )
-        .expect_at_least(1)
         .create_async()
         .await;
 
@@ -351,7 +330,7 @@ async fn cek_rotation_after_revoke_updates_recipient_and_read() {
     let shared_surviving = share_surviving.data.unwrap();
 
     // 残存受信者(別デバイス)が旧 CEK の envelope を処理
-    let recipient_controller = MonasController::with_urls(server.url(), server.url());
+    let recipient_controller = MonasController::with_state_node_url(server.url());
     let decrypt_v1 = recipient_controller.decrypt_shared_content(DecryptSharedContentInput {
         content_id: created.content_id.clone(),
         private_key: surviving_recipient.private_key.clone(),
@@ -520,7 +499,7 @@ async fn cek_rotation_after_revoke_updates_recipient_and_read() {
 async fn read_rejects_tampered_node() {
     let _guard = acquire_test_lock();
     let mut server = Server::new_async().await;
-    let controller = MonasController::with_urls(server.url(), server.url());
+    let controller = MonasController::with_state_node_url(server.url());
 
     let created = create_and_share(&mut server, &controller, b"tamper-target").await;
 
@@ -560,11 +539,11 @@ async fn read_rejects_tampered_node() {
 async fn envelope_sender_auth_rejects_wrong_sender_key() {
     let _guard = acquire_test_lock();
     let mut server = Server::new_async().await;
-    let creator = MonasController::with_urls(server.url(), server.url());
+    let creator = MonasController::with_state_node_url(server.url());
 
     let created = create_and_share(&mut server, &creator, b"sender-auth-target").await;
 
-    let recipient_controller = MonasController::with_urls(server.url(), server.url());
+    let recipient_controller = MonasController::with_state_node_url(server.url());
     let attacker = recipient_controller
         .generate_keypair(GenerateKeypairInput {
             key_type: KeyType::Secp256r1,

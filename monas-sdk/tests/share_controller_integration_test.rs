@@ -1,4 +1,4 @@
-// Integration tests intentionally use the test/dev-only `with_urls` constructor.
+// Integration tests intentionally use the test/dev-only `with_state_node_url` constructor.
 #![allow(deprecated)]
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -15,8 +15,8 @@ mod support;
 use support::{acquire_test_lock, cleanup_content_artifacts};
 
 /// テストの固定 timestamp をそのまま使えるよう、skew 許容を十分広げた controller。
-fn controller_with_wide_skew(state_node_url: String, account_url: String) -> MonasController {
-    let config = MonasConfig::new(state_node_url, account_url)
+fn controller_with_wide_skew(state_node_url: String) -> MonasController {
+    let config = MonasConfig::new(state_node_url)
         .with_request_timestamp_skew(Duration::from_secs(60 * 60 * 24 * 365 * 100));
     MonasController::with_config(config).expect("with_config")
 }
@@ -40,17 +40,8 @@ async fn share_content_succeeds_after_content_creation() {
         .with_body(r#"{"content_id":"share-test-remote"}"#)
         .create_async()
         .await;
-    let delegate_mock = server
-        .mock("POST", "/issuer/delegate")
-        .with_status(200)
-        .with_header("content-type", "application/json")
-        .with_body(
-            r#"{"delegated_token":"dummy.jwt.token","issued_at":1700000000,"expires_at":1700003600,"jti":"jti-1"}"#,
-        )
-        .create_async()
-        .await;
 
-    let controller = MonasController::with_urls(server.url(), server.url());
+    let controller = MonasController::with_state_node_url(server.url());
 
     let sender = controller
         .generate_keypair(GenerateKeypairInput {
@@ -127,9 +118,13 @@ async fn share_content_succeeds_after_content_creation() {
         .delegated_access
         .as_ref()
         .expect("delegated_access should exist");
-    assert_eq!(delegated.delegated_token, "dummy.jwt.token");
-    assert_eq!(delegated.jti, "jti-1");
-    delegate_mock.assert();
+    assert_eq!(
+        delegated.delegated_token.split('.').count(),
+        3,
+        "delegated token should be a JWT"
+    );
+    assert!(!delegated.jti.is_empty());
+    assert!(delegated.expires_at > delegated.issued_at);
 
     cleanup_content_artifacts();
 }
@@ -145,22 +140,13 @@ async fn revoke_share_updates_state_node_version() {
         .with_body(r#"{"content_id":"share-test-remote"}"#)
         .create_async()
         .await;
-    let delegate_mock = server
-        .mock("POST", "/issuer/delegate")
-        .with_status(200)
-        .with_header("content-type", "application/json")
-        .with_body(
-            r#"{"delegated_token":"dummy.jwt.token","issued_at":1700000000,"expires_at":1700003600,"jti":"jti-2"}"#,
-        )
-        .create_async()
-        .await;
     let update_mock = server
         .mock("PUT", mockito::Matcher::Regex(r"^/content/.+$".to_string()))
         .with_status(200)
         .create_async()
         .await;
 
-    let controller = MonasController::with_urls(server.url(), server.url());
+    let controller = MonasController::with_state_node_url(server.url());
 
     let sender = controller
         .generate_keypair(GenerateKeypairInput {
@@ -199,8 +185,6 @@ async fn revoke_share_updates_state_node_version() {
         permissions: vec![Permission::Write],
     });
     assert!(share_response.success, "share_content should succeed");
-    delegate_mock.assert();
-
     let revoke_response = controller.revoke_share(
         RevokeShareInput {
             content_id: created.content_id,
@@ -235,15 +219,6 @@ async fn revoke_share_syncs_state_node_by_remote_content_id() {
         .with_body(r#"{"content_id":"remote-series-id"}"#)
         .create_async()
         .await;
-    let delegate_mock = server
-        .mock("POST", "/issuer/delegate")
-        .with_status(200)
-        .with_header("content-type", "application/json")
-        .with_body(
-            r#"{"delegated_token":"dummy.jwt.token","issued_at":1700000000,"expires_at":1700003600,"jti":"jti-3"}"#,
-        )
-        .create_async()
-        .await;
     // Only the remote id path is mocked: a PUT to any other path (e.g. the
     // local content id) would fail the request and the assertion below.
     let update_mock = server
@@ -252,7 +227,7 @@ async fn revoke_share_syncs_state_node_by_remote_content_id() {
         .create_async()
         .await;
 
-    let controller = MonasController::with_urls(server.url(), server.url());
+    let controller = MonasController::with_state_node_url(server.url());
 
     let sender = controller
         .generate_keypair(GenerateKeypairInput {
@@ -291,8 +266,6 @@ async fn revoke_share_syncs_state_node_by_remote_content_id() {
         permissions: vec![Permission::Write],
     });
     assert!(share_response.success, "share_content should succeed");
-    delegate_mock.assert();
-
     let revoke_response = controller.revoke_share(
         RevokeShareInput {
             content_id: created.content_id,
@@ -324,15 +297,6 @@ async fn revoke_share_rolls_back_local_state_when_state_node_sync_fails() {
         .with_body(r#"{"content_id":"share-test-remote"}"#)
         .create_async()
         .await;
-    let delegate_mock = server
-        .mock("POST", "/issuer/delegate")
-        .with_status(200)
-        .with_header("content-type", "application/json")
-        .with_body(
-            r#"{"delegated_token":"dummy.jwt.token","issued_at":1700000000,"expires_at":1700003600,"jti":"jti-rollback"}"#,
-        )
-        .create_async()
-        .await;
     let failing_update_mock = server
         .mock("PUT", mockito::Matcher::Regex(r"^/content/.+$".to_string()))
         .with_status(500)
@@ -348,7 +312,7 @@ async fn revoke_share_rolls_back_local_state_when_state_node_sync_fails() {
         .create_async()
         .await;
 
-    let controller = MonasController::with_urls(server.url(), server.url());
+    let controller = MonasController::with_state_node_url(server.url());
 
     let sender = controller
         .generate_keypair(GenerateKeypairInput {
@@ -388,8 +352,6 @@ async fn revoke_share_rolls_back_local_state_when_state_node_sync_fails() {
     });
     assert!(share_response.success, "share_content should succeed");
     let shared = share_response.data.expect("share should return data");
-    delegate_mock.assert();
-
     let revoke_response = controller.revoke_share(
         RevokeShareInput {
             content_id: created.content_id.clone(),
@@ -467,15 +429,6 @@ async fn revoke_share_rollback_fires_on_inner_share_service_error() {
         .with_body(r#"{"content_id":"share-test-remote"}"#)
         .create_async()
         .await;
-    let delegate_mock = server
-        .mock("POST", "/issuer/delegate")
-        .with_status(200)
-        .with_header("content-type", "application/json")
-        .with_body(
-            r#"{"delegated_token":"dummy.jwt.token","issued_at":1700000000,"expires_at":1700003600,"jti":"jti-inner-rollback"}"#,
-        )
-        .create_async()
-        .await;
     // 1 回目の revoke で PUT が 1 回走る想定
     let first_update_mock = server
         .mock("PUT", mockito::Matcher::Regex(r"^/content/.+$".to_string()))
@@ -484,7 +437,7 @@ async fn revoke_share_rollback_fires_on_inner_share_service_error() {
         .create_async()
         .await;
 
-    let controller = MonasController::with_urls(server.url(), server.url());
+    let controller = MonasController::with_state_node_url(server.url());
 
     let sender = controller
         .generate_keypair(GenerateKeypairInput {
@@ -526,8 +479,6 @@ async fn revoke_share_rollback_fires_on_inner_share_service_error() {
         })
         .data
         .expect("share");
-    delegate_mock.assert();
-
     // 1 回目: 成功
     let first = controller.revoke_share(
         RevokeShareInput {
@@ -579,7 +530,6 @@ async fn revoke_share_rollback_fires_on_inner_share_service_error() {
 async fn revoke_share_invalidates_previously_issued_tokens() {
     let _guard = acquire_test_lock();
     let mut state_node = Server::new_async().await;
-    let mut account = Server::new_async().await;
 
     let create_mock = state_node
         .mock("POST", "/content")
@@ -588,20 +538,13 @@ async fn revoke_share_invalidates_previously_issued_tokens() {
         .with_body(r#"{"content_id":"invalidate-remote"}"#)
         .create_async()
         .await;
-    let delegate_mock = account
-        .mock("POST", "/issuer/delegate")
-        .with_status(200)
-        .with_header("content-type", "application/json")
-        .with_body(
-            r#"{"delegated_token":"dummy.jwt.token","issued_at":1700000000,"expires_at":1700003600,"jti":"jti-invalidate"}"#,
-        )
-        .create_async()
-        .await;
     let invalidate_mock = state_node
         .mock("POST", "/content/invalidate-remote/access/invalidate")
-        // 認証ヘッダは account service の署名結果で置き換わる（Authorization は
-        // 導出された key id になる）ので、ここでは署名済みであることだけ確認する。
-        .match_header("x-request-signature", "c2lnbmVk")
+        // 認証ヘッダは SDK 内の署名鍵から作る。呼び出し元の Bearer は置き換わる。
+        .match_header(
+            "x-request-signature",
+            mockito::Matcher::Regex(r"^[A-Za-z0-9+/]+=*$".into()),
+        )
         .match_header("x-request-timestamp", "1717171717")
         .with_status(200)
         .with_header("content-type", "application/json")
@@ -615,18 +558,8 @@ async fn revoke_share_invalidates_previously_issued_tokens() {
         .expect(1)
         .create_async()
         .await;
-    let sign_mock = account
-        .mock("POST", "/accounts/sign")
-        .with_status(200)
-        .with_header("content-type", "application/json")
-        .with_body(
-            r#"{"signature_base64":"c2lnbmVk","public_key_base64":"BAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMw==","algorithm":"P256"}"#,
-        )
-        .expect_at_least(1)
-        .create_async()
-        .await;
 
-    let controller = controller_with_wide_skew(state_node.url(), account.url());
+    let controller = controller_with_wide_skew(state_node.url());
     let auth = auth_context("Bearer owner");
 
     let sender = controller
@@ -671,8 +604,6 @@ async fn revoke_share_invalidates_previously_issued_tokens() {
             .success,
         "share_content should succeed"
     );
-    delegate_mock.assert();
-
     let revoke_response = controller.revoke_share(
         RevokeShareInput {
             content_id: created.content_id,
@@ -691,8 +622,6 @@ async fn revoke_share_invalidates_previously_issued_tokens() {
 
     invalidate_mock.assert();
     update_mock.assert();
-    sign_mock.assert();
-
     let output = revoke_response.data.expect("revoke should return data");
     assert_eq!(
         output.token_invalidated_at,
@@ -711,22 +640,12 @@ async fn revoke_share_invalidates_previously_issued_tokens() {
 async fn revoke_share_fails_when_token_invalidation_fails() {
     let _guard = acquire_test_lock();
     let mut state_node = Server::new_async().await;
-    let mut account = Server::new_async().await;
 
     let create_mock = state_node
         .mock("POST", "/content")
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(r#"{"content_id":"invalidate-fail-remote"}"#)
-        .create_async()
-        .await;
-    let delegate_mock = account
-        .mock("POST", "/issuer/delegate")
-        .with_status(200)
-        .with_header("content-type", "application/json")
-        .with_body(
-            r#"{"delegated_token":"dummy.jwt.token","issued_at":1700000000,"expires_at":1700003600,"jti":"jti-invalidate-fail"}"#,
-        )
         .create_async()
         .await;
     let invalidate_mock = state_node
@@ -744,18 +663,8 @@ async fn revoke_share_fails_when_token_invalidation_fails() {
         .expect(0)
         .create_async()
         .await;
-    let sign_mock = account
-        .mock("POST", "/accounts/sign")
-        .with_status(200)
-        .with_header("content-type", "application/json")
-        .with_body(
-            r#"{"signature_base64":"c2lnbmVk","public_key_base64":"BAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMw==","algorithm":"P256"}"#,
-        )
-        .expect_at_least(1)
-        .create_async()
-        .await;
 
-    let controller = controller_with_wide_skew(state_node.url(), account.url());
+    let controller = controller_with_wide_skew(state_node.url());
     let auth = auth_context("Bearer owner");
 
     let sender = controller
@@ -798,8 +707,6 @@ async fn revoke_share_fails_when_token_invalidation_fails() {
         })
         .data
         .expect("share should return data");
-    delegate_mock.assert();
-
     let revoke_response = controller.revoke_share(
         RevokeShareInput {
             content_id: created.content_id.clone(),
@@ -816,8 +723,6 @@ async fn revoke_share_fails_when_token_invalidation_fails() {
     );
     invalidate_mock.assert();
     update_mock.assert();
-    sign_mock.assert();
-
     // ローカル状態は一切触っていないので、元の共有はそのまま復号できる。
     let get_shared = controller.decrypt_shared_content(DecryptSharedContentInput {
         content_id: created.content_id.clone(),
@@ -854,16 +759,6 @@ async fn concurrent_revokes_do_not_lose_either_removal() {
         .with_body(r#"{"content_id":"concurrent-revoke-remote"}"#)
         .create_async()
         .await;
-    let _delegate_mock = server
-        .mock("POST", "/issuer/delegate")
-        .with_status(200)
-        .with_header("content-type", "application/json")
-        .with_body(
-            r#"{"delegated_token":"dummy.jwt.token","issued_at":1700000000,"expires_at":1700003600,"jti":"jti-concurrent"}"#,
-        )
-        .expect_at_least(1)
-        .create_async()
-        .await;
     let _update_mock = server
         .mock("PUT", mockito::Matcher::Regex(r"^/content/.+$".to_string()))
         .with_status(200)
@@ -871,7 +766,7 @@ async fn concurrent_revokes_do_not_lose_either_removal() {
         .create_async()
         .await;
 
-    let controller = std::sync::Arc::new(MonasController::with_urls(server.url(), server.url()));
+    let controller = std::sync::Arc::new(MonasController::with_state_node_url(server.url()));
 
     let sender = controller
         .generate_keypair(GenerateKeypairInput {

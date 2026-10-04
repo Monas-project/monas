@@ -22,13 +22,12 @@ impl MonasController {
             KeyType::Secp256r1 => KeyTypeMapper::P256,
         };
 
-        // monas-account は main で HTTP(presentation) 実装に寄せられたため、
-        // SDK からは application_service を直接呼び出す。
-        //
-        // ここでは「鍵生成＝外部へ返す」用途のため、永続化ストアはインメモリ実装を使う。
-        let store = InMemoryAccountKeyStore::default();
+        // 呼び出し元へ返す鍵であり、署名主体の AccountService には書かない。
+        let ephemeral = AccountService {
+            key_store: InMemoryAccountKeyStore::default(),
+        };
 
-        match AccountService::create(&store, key_type_mapper) {
+        match ephemeral.create(key_type_mapper) {
             Ok(account) => {
                 let output = GenerateKeypairOutput {
                     key_type: input.key_type,
@@ -52,7 +51,7 @@ mod tests {
 
     /// テスト用コントローラ。generate_keypair は HTTP を使わないため URL は任意のダミー値でよい。
     fn test_controller() -> MonasController {
-        MonasController::with_urls("http://127.0.0.1:8080", "http://127.0.0.1:4002")
+        MonasController::with_state_node_url("http://127.0.0.1:8080")
     }
 
     #[test]
