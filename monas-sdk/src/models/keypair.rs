@@ -53,6 +53,34 @@ impl std::fmt::Debug for GenerateKeypairOutput {
     }
 }
 
+// ============================================
+// create_signing_account
+// ============================================
+
+/// 署名アカウント作成のレスポンス。
+///
+/// SDK が state node へのリクエスト署名と委譲 Token の発行に使う鍵を作り直し、
+/// その鍵ペアを返す。共有の封筒を開ける・送るときに呼び出し元が同じ鍵を渡せる
+/// よう秘密鍵も返す。鍵種は P-256 固定(state node が P-256 しか受け付けない)。
+#[derive(Clone, Serialize, Deserialize)]
+pub struct CreateSigningAccountOutput {
+    pub key_type: KeyType,
+    /// 公開鍵（base64url, SEC1 非圧縮）
+    pub public_key: String,
+    /// 秘密鍵（base64url）
+    pub private_key: String,
+}
+
+impl std::fmt::Debug for CreateSigningAccountOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreateSigningAccountOutput")
+            .field("key_type", &self.key_type)
+            .field("public_key", &self.public_key)
+            .field("private_key", &"<redacted>")
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

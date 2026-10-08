@@ -62,6 +62,12 @@ pub struct MockPeerNetwork {
     /// Lets tests assert whether a sync requested the full history
     /// (`None`) or an incremental fetch (`Some(version)`).
     pub fetch_operations_since: Arc<Mutex<Vec<Option<String>>>>,
+    /// Peers whose `push_operations` always fails. Lets tests stand in an
+    /// unreachable member and assert how the caller accounts for it.
+    pub push_failures: Arc<Mutex<Vec<String>>>,
+    /// `(peer, genesis_cid)` of every `push_operations` call, in order —
+    /// including the failed ones, so retries are visible.
+    pub push_calls: Arc<Mutex<Vec<(String, String)>>>,
 }
 
 impl MockPeerNetwork {
@@ -87,6 +93,15 @@ impl MockPeerNetwork {
             relay_read_history_result: Arc::new(Mutex::new(None)),
             relay_read_data_error: Arc::new(Mutex::new(None)),
             fetch_operations_since: Arc::new(Mutex::new(Vec::new())),
+            push_failures: Arc::new(Mutex::new(Vec::new())),
+            push_calls: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    pub fn with_push_failures(self, peers: Vec<String>) -> Self {
+        Self {
+            push_failures: Arc::new(Mutex::new(peers)),
+            ..self
         }
     }
 
@@ -227,10 +242,17 @@ impl PeerNetwork for MockPeerNetwork {
 
     async fn push_operations(
         &self,
-        _peer_id: &str,
-        _genesis_cid: &str,
+        peer_id: &str,
+        genesis_cid: &str,
         operations: &[SerializedOperation],
     ) -> Result<usize> {
+        self.push_calls
+            .lock()
+            .await
+            .push((peer_id.to_string(), genesis_cid.to_string()));
+        if self.push_failures.lock().await.iter().any(|p| p == peer_id) {
+            anyhow::bail!("push_operations timed out");
+        }
         Ok(operations.len())
     }
 
@@ -407,6 +429,8 @@ pub struct MockContentRepository {
     /// When true, `get_access_policy` fails — used to test that read
     /// authorization fails closed on policy-store errors.
     pub access_policy_error: Arc<Mutex<bool>>,
+    /// Contents whose history holds a delete operation.
+    pub deleted: Arc<Mutex<std::collections::HashSet<String>>>,
 }
 
 impl MockContentRepository {
@@ -418,6 +442,7 @@ impl MockContentRepository {
             next_cid: Arc::new(Mutex::new(1)),
             access_policies: Arc::new(Mutex::new(HashMap::new())),
             access_policy_error: Arc::new(Mutex::new(false)),
+            deleted: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
     }
 }
@@ -480,6 +505,28 @@ impl ContentRepository for MockContentRepository {
 
     async fn get_latest(&self, genesis_cid: &str) -> Result<Option<Vec<u8>>> {
         Ok(self.contents.lock().await.get(genesis_cid).cloned())
+    }
+
+    async fn delete_content(&self, genesis_cid: &str, _author: &str) -> Result<CommitResult> {
+        if !self.contents.lock().await.contains_key(genesis_cid) {
+            return Err(anyhow::anyhow!("Content not found: {genesis_cid}"));
+        }
+        self.deleted.lock().await.insert(genesis_cid.to_string());
+        let mut next = self.next_cid.lock().await;
+        let version_cid = format!("version-cid-{}", *next);
+        *next += 1;
+        if let Some(history) = self.history.lock().await.get_mut(genesis_cid) {
+            history.push(version_cid.clone());
+        }
+        Ok(CommitResult {
+            genesis_cid: genesis_cid.to_string(),
+            version_cid,
+            is_new: false,
+        })
+    }
+
+    async fn is_deleted(&self, genesis_cid: &str) -> Result<bool> {
+        Ok(self.deleted.lock().await.contains(genesis_cid))
     }
 
     async fn get_latest_with_version(

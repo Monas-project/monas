@@ -90,6 +90,21 @@ pub trait ContentRepository: Send + Sync {
         access_policy: Option<AccessPolicy>,
     ) -> Result<CommitResult>;
 
+    /// Record the deletion of content as a crsl-lib `Delete` operation.
+    ///
+    /// The operation joins the content's history like any other and travels
+    /// to the other members through the normal operation sync. Nothing is
+    /// removed: a content is deleted because its history contains a delete
+    /// (see [`is_deleted`](Self::is_deleted)), not because of a flag.
+    async fn delete_content(&self, genesis_cid: &str, author: &str) -> Result<CommitResult>;
+
+    /// Whether the content's history contains a `Delete` operation.
+    ///
+    /// Derived from the operations every time, so it holds on any replica
+    /// that has received the delete — whether it arrived before or after a
+    /// concurrent write. Content this node does not hold is not deleted.
+    async fn is_deleted(&self, genesis_cid: &str) -> Result<bool>;
+
     /// Get the latest version of content.
     ///
     /// # Arguments

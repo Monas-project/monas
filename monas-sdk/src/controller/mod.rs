@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use content::{ContentServiceInstance, DynCekStore};
 use share::{DynPublicKeyDirectory, DynShareRepository, ShareServiceInstance};
 
-use monas_account::application_service::{AccountKeyStore, AccountService, KeyTypeMapper};
+use monas_account::application_service::{AccountKeyStore, AccountService};
 use monas_account::infrastructure::key_store::{InMemoryAccountKeyStore, SledAccountKeyStore};
 
 use crate::common::{ApiError, ApiResponse, MonasConfig, PersistenceConfig, StateNodeAuthContext};
@@ -50,6 +50,7 @@ pub(super) fn combine_rollback_failure(
         ApiError::Unauthorized(_) => ApiError::Unauthorized(suffix),
         ApiError::Forbidden(_) => ApiError::Forbidden(suffix),
         ApiError::NotFound(_) => ApiError::NotFound(suffix),
+        ApiError::Gone(_) => ApiError::Gone(suffix),
         ApiError::Conflict(_) => ApiError::Conflict(suffix),
         ApiError::Timeout(_) => ApiError::Timeout(suffix),
         ApiError::Internal(_) => ApiError::Internal(suffix),
@@ -98,6 +99,9 @@ pub struct MonasController {
     /// State NodeのベースURL
     pub(super) state_node_url: String,
     /// 署名と委譲。署名鍵ストアはサービスが持つ。プロセスにつき 1 本。
+    ///
+    /// 起動時には鍵を作らない。利用者が `create_signing_account` を呼んだときだけ
+    /// 作られ、それまでの署名・委譲は「署名アカウントが無い」エラーになる。
     ///
     /// content の CEK 用 sled とは別ディレクトリに置く。署名鍵とコンテンツ鍵は別の秘密であり、
     /// sled は path 単位で flock するため同じディレクトリを共有できない。
@@ -307,7 +311,6 @@ impl MonasController {
         let account_service = AccountService {
             key_store: account_key_store,
         };
-        Self::ensure_signing_identity(&account_service)?;
         let agent = Self::build_agent(&config);
 
         Ok(Self {
@@ -331,9 +334,16 @@ impl MonasController {
     }
 
     /// 設定から ureq::Agent を構築するヘルパーメソッド
+    ///
+    /// 非 2xx をエラーにしない: 各呼び出し側が status とレスポンス body から
+    /// `ApiError`(401/403/404/409 …)へ写す(`try_state_node_http_error` /
+    /// `try_account_http_error`)。ureq 既定のままだと 4xx が `send()` の Err に
+    /// なり、body ごと捨てて `Internal`(500)に潰れる — State Node の
+    /// 「Token 失効で 403」が gateway から 500 に見えていた。
     fn build_agent(config: &MonasConfig) -> ureq::Agent {
         let ureq_config = ureq::Agent::config_builder()
             .timeout_global(Some(config.request_timeout))
+            .http_status_as_error(false)
             .build();
         ureq::Agent::new_with_config(ureq_config)
     }
@@ -440,25 +450,6 @@ impl MonasController {
                 })?;
                 Ok(AccountKeyStoreKind::Sled(store))
             }
-        }
-    }
-
-    /// ストアが空なら P-256 の署名鍵を 1 本作る。
-    ///
-    /// state node のリクエスト署名と委譲トークンは P-256 だけを受け付ける。
-    /// 既に鍵がある場合は上書きしない。`/keypair` が返す鍵とは別物である。
-    fn ensure_signing_identity(
-        service: &AccountService<AccountKeyStoreKind>,
-    ) -> Result<(), ApiError> {
-        match service.key_store.load() {
-            Ok(Some(_)) => Ok(()),
-            Ok(None) => service
-                .create(KeyTypeMapper::P256)
-                .map(|_| ())
-                .map_err(|e| ApiError::Internal(format!("failed to create signing identity: {e}"))),
-            Err(e) => Err(ApiError::Internal(format!(
-                "failed to load signing identity: {e}"
-            ))),
         }
     }
 
@@ -676,21 +667,18 @@ mod tests {
         assert_eq!(combined.status_code(), 500);
     }
 
+    /// 起動しただけでは署名鍵を作らない。作るのは利用者の create_signing_account だけ。
     #[test]
     #[allow(deprecated)]
-    fn fresh_controller_provisions_p256_signing_key() {
+    fn fresh_controller_has_no_signing_key() {
         use monas_account::application_service::AccountKeyStore;
-        use monas_account::infrastructure::key_pair::KeyAlgorithm;
 
         let controller = MonasController::with_state_node_url("http://127.0.0.1:9");
-        let stored = controller
-            .account_service
-            .key_store
-            .load()
-            .expect("load")
-            .expect("signing key");
-        assert_eq!(stored.algorithm, KeyAlgorithm::P256);
-        assert!(!stored.secret_key.is_empty());
+        let stored = controller.account_service.key_store.load().expect("load");
+        assert!(
+            stored.is_none(),
+            "SDK must not create a signing key on its own"
+        );
     }
 
     #[test]
@@ -704,6 +692,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("monas-sdk-account-key-{nanos}"));
         let config = MonasConfig::new("http://127.0.0.1:1").with_persistence_dir(&dir);
         let first = MonasController::with_config(config).expect("first open");
+        first
+            .create_signing_account()
+            .data
+            .expect("create signing account");
         let first_key = first
             .account_service
             .key_store

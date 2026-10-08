@@ -16,7 +16,7 @@ use crate::port::auth_token::{AuthToken, RequestMetadata};
 use crate::port::authentication_service::AuthenticationService;
 use crate::port::authorization_service::{AuthorizationRequest, AuthorizationService};
 use crate::port::consumed_request_store::{ConsumedRequestStore, InMemoryConsumedRequestStore};
-use crate::port::content_repository::ContentRepository;
+use crate::port::content_repository::{ContentRepository, SerializedOperation};
 use crate::port::event_publisher::EventPublisher;
 use crate::port::peer_network::{PeerNetwork, RelayReadError, RelayReadErrorKind};
 use crate::port::persistence::{
@@ -36,6 +36,36 @@ pub enum ApplyOutcome {
     /// Event was applied and content sync is needed for the given content_id.
     /// The node should call sync_from_peers for this content.
     NeedsSync { content_id: String },
+}
+
+/// Outcome of `invalidate_tokens`: the new cutoff, plus how far it got.
+///
+/// The cutoff is committed to this node's CRDT before the call returns, and
+/// every member that took the push enforces it at once. A member that did
+/// not — down, unreachable, or slow — keeps its previous policy until the
+/// periodic sync catches it up, and **until then it will accept a write
+/// under a token this revoke was meant to void** (its authorization is a
+/// local decision on its own view). The service does not make the revoke
+/// wait for, or fail on, that: a writer must never be able to block a
+/// revocation, and eventual convergence is the CRDT's contract. What it does
+/// do is say so, so the caller can tell "revoked everywhere" from "revoked,
+/// N members still to hear".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidateTokensOutcome {
+    /// Tokens issued at or before this instant are void.
+    pub new_min_valid_issued_at: u64,
+    /// Members this node knows of (excluding itself) that were pushed the new
+    /// policy and acknowledged it.
+    pub notified_members: Vec<String>,
+    /// Members the push did not reach after a retry, with the last error.
+    /// Empty means every known member enforces the cutoff now — unless
+    /// `relayed`, in which case nothing is known.
+    pub unreached_members: Vec<(String, String)>,
+    /// This node did not hold the genesis and relayed the request to a
+    /// member. The relay protocol carries only success, so the member lists
+    /// above are unknown (empty), and `new_min_valid_issued_at` is this
+    /// node's clock, not the committed value.
+    pub relayed: bool,
 }
 
 /// Configuration for StateNodeService redundancy management.
@@ -743,6 +773,17 @@ where
             StateNodeError::AuthorizationFailed(message)
         } else if message.contains("Authentication failed") {
             StateNodeError::AuthenticationFailed(message)
+        } else if message.contains("Content deleted") {
+            // The member's verdict, not a transport failure: keep it a 410.
+            // The relay protocol only carries the message text.
+            match message
+                .rsplit("Content deleted: ")
+                .next()
+                .and_then(|id| ContentId::new(id.trim().to_string()).ok())
+            {
+                Some(id) => StateNodeError::ContentDeleted(id),
+                None => StateNodeError::NetworkError(NetworkError::ConnectionFailed(message)),
+            }
         } else {
             StateNodeError::NetworkError(NetworkError::ConnectionFailed(message))
         }
@@ -782,6 +823,15 @@ where
                 }
                 Err(e) => {
                     let err_msg = e.to_string();
+                    // A member that holds the content and found a delete in
+                    // its history has decided; no other member can undo that.
+                    if err_msg.contains("Content deleted") {
+                        if let err @ StateNodeError::ContentDeleted(_) =
+                            Self::classify_relay_error(err_msg.clone())
+                        {
+                            return Err(err);
+                        }
+                    }
                     if err_msg.contains("Authorization failed")
                         || err_msg.contains("Authentication failed")
                     {
@@ -889,6 +939,26 @@ where
             .unwrap_or(false)
     }
 
+    /// Refuse any request on content whose history contains a delete.
+    ///
+    /// Computed from this node's operations on every call — no flag is kept.
+    /// A replica that has not yet received the delete still answers; once the
+    /// delete arrives through the ordinary sync, it refuses too, whether the
+    /// delete landed before or after a concurrent write.
+    async fn ensure_not_deleted(&self, content_id: &str) -> Result<(), StateNodeError> {
+        let deleted = self
+            .crdt_repo
+            .is_deleted(content_id)
+            .await
+            .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
+        if deleted {
+            return Err(StateNodeError::ContentDeleted(ContentId::new(
+                content_id.to_string(),
+            )?));
+        }
+        Ok(())
+    }
+
     /// Authorize a read against the content's access policy (bug #93 hardened
     /// read path).
     ///
@@ -913,6 +983,10 @@ where
         let identity = self
             .authenticate_for_read(token, request_signature, timestamp, content_id)
             .await?;
+
+        // Only after authentication: an anonymous caller must not learn
+        // whether a content id existed and was deleted.
+        self.ensure_not_deleted(content_id).await?;
 
         // Fail closed: an error loading the policy must deny, not fall through
         // to the "no policy" allow below.
@@ -1153,6 +1227,11 @@ where
         authoritative: bool,
     ) -> ControlFlow<RelayReadError> {
         match err.kind {
+            // A member that holds the content found a delete in its history.
+            // Like an attested auth verdict, no other member can change it —
+            // and an unproven peer cannot fabricate one without first passing
+            // the caller's authentication, so it is final either way.
+            RelayReadErrorKind::Deleted => ControlFlow::Break(err),
             RelayReadErrorKind::AuthenticationFailed | RelayReadErrorKind::AuthorizationFailed => {
                 if authoritative {
                     return ControlFlow::Break(err);
@@ -1191,6 +1270,10 @@ where
         match err.kind {
             RelayReadErrorKind::NotFound => match ContentId::new(content_id.to_string()) {
                 Ok(cid) => StateNodeError::ContentNotFound(cid),
+                Err(_) => StateNodeError::StorageError(err.message),
+            },
+            RelayReadErrorKind::Deleted => match ContentId::new(content_id.to_string()) {
+                Ok(cid) => StateNodeError::ContentDeleted(cid),
                 Err(_) => StateNodeError::StorageError(err.message),
             },
             RelayReadErrorKind::AuthenticationFailed => {
@@ -1516,6 +1599,8 @@ where
             )
             .await?;
 
+            self.ensure_not_deleted(content_id).await?;
+
             let authz_request = AuthorizationRequest {
                 identity,
                 resource: content_id_vo.clone(),
@@ -1538,13 +1623,20 @@ where
                 ));
             }
 
-            // 3. Delete the ContentNetwork
-            self.content_repo
-                .write()
+            // 3. Record the delete as an operation in the content's history.
+            //    Nothing is removed: the ContentNetwork record stays so the
+            //    periodic sync keeps running and carries the delete to members
+            //    that were offline. From now on every request on this content
+            //    is refused because its history contains the delete.
+            self.crdt_repo
+                .delete_content(content_id, &self.local_node_id)
                 .await
-                .delete_content_network(content_id)
-                .await
-                .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
+                .map_err(|e| StateNodeError::CrdtError(CrdtError::StorageError(e.to_string())))?;
+
+            // Push the operations to the other members right away, best
+            // effort — exactly like a revoke. A member the push misses keeps
+            // answering until its next sync brings the delete.
+            self.push_operations_to_members(content_id).await;
 
             // 4. Create and publish ContentDeleted event
             let event = Event::ContentDeleted {
@@ -1699,6 +1791,8 @@ where
             )
             .await?;
 
+            self.ensure_not_deleted(content_id).await?;
+
             let authz_request = AuthorizationRequest {
                 identity,
                 resource: content_id_vo.clone(),
@@ -1830,7 +1924,7 @@ where
         token: &AuthToken,
         request_signature: Option<&[u8]>,
         timestamp: Option<u64>,
-    ) -> Result<u64, StateNodeError> {
+    ) -> Result<InvalidateTokensOutcome, StateNodeError> {
         self.invalidate_tokens_inner(content_id, token, request_signature, timestamp, false)
             .await
     }
@@ -1844,7 +1938,7 @@ where
         token: &AuthToken,
         request_signature: Option<&[u8]>,
         timestamp: Option<u64>,
-    ) -> Result<u64, StateNodeError> {
+    ) -> Result<InvalidateTokensOutcome, StateNodeError> {
         self.invalidate_tokens_inner(content_id, token, request_signature, timestamp, true)
             .await
     }
@@ -1856,7 +1950,7 @@ where
         request_signature: Option<&[u8]>,
         timestamp: Option<u64>,
         from_relay: bool,
-    ) -> Result<u64, StateNodeError> {
+    ) -> Result<InvalidateTokensOutcome, StateNodeError> {
         // 1. Ensure auth services are configured
         let auth_service = self.auth_service.as_ref().ok_or_else(|| {
             StateNodeError::InvalidConfiguration("Authentication not configured".to_string())
@@ -1901,6 +1995,8 @@ where
         // create-time relay node, lacks it and must relay instead.
         if self.can_commit_locally(content_id).await {
             // Local path: we hold the genesis
+            self.ensure_not_deleted(content_id).await?;
+
             // 4. Get access policy from CRDT
             let mut policy = self
                 .crdt_repo
@@ -1947,8 +2043,17 @@ where
                 }
             }
 
-            // 9. Push CRDT operations to other member nodes
-            {
+            // 9. Push CRDT operations to the other members — and account for
+            //    every one of them. Until a member has this policy it still
+            //    authorizes writes against its old cutoff, and its authorization
+            //    is local (`update_content_inner` commits on the member's own
+            //    view), so a member the push does not reach is a member that
+            //    will accept a write under a token this call just voided, right
+            //    up to its next sync. The revoke must not fail on that — a
+            //    writer must never be able to hold up a revocation — but the
+            //    caller must be able to see it, which "warn and return the
+            //    timestamp" did not allow. See `InvalidateTokensOutcome`.
+            let (notified_members, unreached_members) = {
                 let operations = self
                     .crdt_repo
                     .get_operations(content_id, None)
@@ -1957,34 +2062,48 @@ where
                         StateNodeError::CrdtError(CrdtError::StorageError(e.to_string()))
                     })?;
 
-                // Push to the members we know about. When we hold the genesis
-                // but have no local ContentNetwork record (a rare transient
-                // state under genesis-based routing), there is no member list to
-                // push to here; gossip/sync still propagates the change.
+                // The members we know about. When we hold the genesis but have
+                // no local ContentNetwork record (a rare transient state under
+                // genesis-based routing) there is no member list to push to;
+                // gossip/sync still propagates the change, and the outcome
+                // honestly reports nobody notified.
                 let members = network
                     .as_ref()
                     .map(|n| n.member_nodes_as_strings())
                     .unwrap_or_default();
+                let mut notified = Vec::new();
+                let mut unreached = Vec::new();
                 if !operations.is_empty() {
                     for member_id in &members {
                         if member_id == &self.local_node_id {
                             continue;
                         }
-                        if let Err(e) = self
-                            .peer_network
-                            .push_operations(member_id, content_id, &operations)
+                        match self
+                            .push_invalidation_with_retry(member_id, content_id, &operations)
                             .await
                         {
-                            tracing::warn!(
-                                "Failed to push invalidation operations to member {}: {} (will rely on sync)",
-                                member_id, e
-                            );
+                            Ok(()) => notified.push(member_id.clone()),
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to push invalidation operations to member {}: {} \
+                                     (it will enforce the cutoff only after its next sync)",
+                                    member_id,
+                                    e
+                                );
+                                unreached.push((member_id.clone(), e));
+                            }
                         }
                     }
                 }
-            }
+                (notified, unreached)
+            };
 
-            Ok(new_min)
+            Ok(InvalidateTokensOutcome {
+                new_min_valid_issued_at: new_min,
+                notified_members,
+                unreached_members,
+                relayed: false,
+            })
         } else {
             // Relay path: we are not a member.
             //
@@ -2019,8 +2138,90 @@ where
             .await?;
 
             // For relay path, we don't know the exact new_min_valid_issued_at
-            // Return current timestamp as approximate value
-            Ok(crate::domain::events::current_timestamp())
+            // (the relay protocol only carries success), nor which members the
+            // committing node reached. Return the current timestamp as an
+            // approximation and no propagation facts — the caller sees
+            // "nothing confirmed" rather than a false "everyone notified".
+            Ok(InvalidateTokensOutcome {
+                new_min_valid_issued_at: crate::domain::events::current_timestamp(),
+                notified_members: Vec::new(),
+                unreached_members: Vec::new(),
+                relayed: true,
+            })
+        }
+    }
+
+    /// One push of the invalidation operations to a member, retried once.
+    ///
+    /// The retry is for the transient case (a request that timed out or a
+    /// connection that dropped mid-flight); a member that is genuinely down
+    /// fails both and is reported as unreached. Two attempts, not more: the
+    /// revoke is on the owner's critical path and the periodic sync is the
+    /// backstop for anything slower than this.
+    async fn push_invalidation_with_retry(
+        &self,
+        member_id: &str,
+        content_id: &str,
+        operations: &[SerializedOperation],
+    ) -> std::result::Result<(), String> {
+        let mut last_err = String::new();
+        for attempt in 0..2 {
+            match self
+                .peer_network
+                .push_operations(member_id, content_id, operations)
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    last_err = e.to_string();
+                    if attempt == 0 {
+                        tracing::debug!(
+                            "push_operations to {} failed ({}), retrying once",
+                            member_id,
+                            last_err
+                        );
+                    }
+                }
+            }
+        }
+        Err(last_err)
+    }
+
+    /// Push this content's operations to every other member we know of,
+    /// best effort. Used after a delete so members refuse the content without
+    /// waiting for their periodic sync; a member it misses catches up there.
+    async fn push_operations_to_members(&self, content_id: &str) {
+        let operations = match self.crdt_repo.get_operations(content_id, None).await {
+            Ok(ops) if !ops.is_empty() => ops,
+            Ok(_) => return,
+            Err(e) => {
+                tracing::warn!("Failed to export operations for {}: {}", content_id, e);
+                return;
+            }
+        };
+        let members = self
+            .content_repo
+            .read()
+            .await
+            .get_content_network(content_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|n| n.member_nodes_as_strings())
+            .unwrap_or_default();
+        for member_id in members.iter().filter(|m| *m != &self.local_node_id) {
+            if let Err(e) = self
+                .push_invalidation_with_retry(member_id, content_id, &operations)
+                .await
+            {
+                tracing::warn!(
+                    "Failed to push operations for {} to member {}: {} \
+                     (it will refuse the content only after its next sync)",
+                    content_id,
+                    member_id,
+                    e
+                );
+            }
         }
     }
 
@@ -2090,6 +2291,8 @@ where
             Some(&crate::port::auth_token::add_members_signing_body(count)),
         )
         .await?;
+
+        self.ensure_not_deleted(content_id).await?;
 
         let authz_request = AuthorizationRequest {
             identity,
@@ -2232,6 +2435,12 @@ where
 
         // Only check if we're a member
         if !network.has_member_str(&self.local_node_id) {
+            return Ok(());
+        }
+
+        // A deleted content is no longer served, so there is nothing to keep
+        // redundant; adding members would only copy it further.
+        if self.crdt_repo.is_deleted(content_id).await.unwrap_or(false) {
             return Ok(());
         }
 
@@ -2739,36 +2948,13 @@ where
                     return Ok(ApplyOutcome::Ignored);
                 }
 
-                // Delete the local ContentNetwork if it exists
-                // This handles the case where an offline node receives the deletion event
-                // NOTE: We acquire read and write locks separately to avoid holding the
-                // read guard across the write acquisition, which would deadlock since
-                // tokio::sync::RwLock is non-reentrant.
-                let exists = self
-                    .content_repo
-                    .read()
-                    .await
-                    .get_content_network(content_id)
-                    .await
-                    .ok()
-                    .flatten()
-                    .is_some();
-
-                if exists {
-                    self.content_repo
-                        .write()
-                        .await
-                        .delete_content_network(content_id)
-                        .await
-                        .map_err(|e| StateNodeError::StorageError(e.to_string()))?;
-                    tracing::info!(
-                        "Content {} deleted by node {}, removed local ContentNetwork",
-                        content_id,
-                        deleted_by_node_id
-                    );
-                }
-
-                Ok(ApplyOutcome::Applied)
+                // The event itself proves nothing — anyone can claim a delete.
+                // The delete takes effect here only when its operation arrives
+                // through the ordinary sync; ask for that sync now. The record
+                // is kept so the periodic sync keeps covering this content.
+                Ok(ApplyOutcome::NeedsSync {
+                    content_id: content_id.clone(),
+                })
             }
 
             _ => Ok(ApplyOutcome::Ignored),
@@ -3412,6 +3598,144 @@ mod tests {
             }
             _ => panic!("Expected ContentUpdated event"),
         }
+    }
+
+    /// Owner-side revoke, one member unreachable. The cutoff still commits
+    /// (a writer must never be able to block a revocation), but the outcome
+    /// must name the member that did not get it: until its next sync that
+    /// member will accept a write under a token this call just voided.
+    #[tokio::test]
+    async fn invalidate_tokens_reports_members_the_cutoff_did_not_reach() {
+        use crate::domain::access_policy::AccessPolicy;
+
+        let node_registry = MockNodeRegistry::new();
+        let content_repo = Arc::new(RwLock::new(
+            MockContentNetworkRepository::new().with_network(create_test_network(
+                "content-1",
+                vec!["node-1", "node-2", "node-3"],
+            )),
+        ));
+        let peer_network = Arc::new(
+            MockPeerNetwork::new()
+                .with_local_peer_id("node-1")
+                .with_push_failures(vec!["node-3".to_string()]),
+        );
+        let event_publisher = MockEventPublisher::new();
+        let crdt_repo = Arc::new(MockContentRepository::new());
+        crdt_repo
+            .contents
+            .lock()
+            .await
+            .insert("content-1".to_string(), b"data".to_vec());
+        // The caller (TestAuthService maps the token string to the identity)
+        // must be the owner.
+        let owner = Identity::user("test-user".to_string()).unwrap();
+        crdt_repo.access_policies.lock().await.insert(
+            "content-1".to_string(),
+            AccessPolicy::new(ContentId::new("content-1".to_string()).unwrap(), owner),
+        );
+        // Something to push: the mock returns whatever operations it holds.
+        crdt_repo.operations.lock().await.push(SerializedOperation {
+            data: vec![1],
+            genesis_cid: "content-1".to_string(),
+            author: "node-1".to_string(),
+            timestamp: 1,
+            node_timestamp: 1,
+        });
+
+        let service: TestService = StateNodeService::new(
+            node_registry,
+            content_repo,
+            peer_network.clone(),
+            event_publisher,
+            crdt_repo,
+            "node-1".to_string(),
+        )
+        .with_authentication_service(TestAuthService)
+        .with_authorization_service(AllowAllAuthorizationService);
+
+        let outcome = service
+            .invalidate_tokens(
+                "content-1",
+                &test_token(),
+                Some(&test_request_signature()),
+                test_timestamp(),
+            )
+            .await
+            .expect("revoke must succeed even with an unreachable member");
+
+        assert!(!outcome.relayed);
+        assert!(outcome.new_min_valid_issued_at > 0);
+        assert_eq!(outcome.notified_members, vec!["node-2".to_string()]);
+        assert_eq!(outcome.unreached_members.len(), 1);
+        assert_eq!(outcome.unreached_members[0].0, "node-3");
+        assert!(outcome.unreached_members[0].1.contains("timed out"));
+
+        // node-3 was retried once; node-2 needed one push; self never pushed.
+        let calls = peer_network.push_calls.lock().await;
+        let to = |p: &str| calls.iter().filter(|(peer, _)| peer == p).count();
+        assert_eq!(to("node-2"), 1);
+        assert_eq!(to("node-3"), 2);
+        assert_eq!(to("node-1"), 0);
+    }
+
+    /// Every member reached: the outcome says so, and says nothing was
+    /// left behind — this is the only case the UI may call "revoked
+    /// everywhere".
+    #[tokio::test]
+    async fn invalidate_tokens_reports_all_members_notified() {
+        use crate::domain::access_policy::AccessPolicy;
+
+        let node_registry = MockNodeRegistry::new();
+        let content_repo = Arc::new(RwLock::new(
+            MockContentNetworkRepository::new()
+                .with_network(create_test_network("content-1", vec!["node-1", "node-2"])),
+        ));
+        let peer_network = Arc::new(MockPeerNetwork::new().with_local_peer_id("node-1"));
+        let event_publisher = MockEventPublisher::new();
+        let crdt_repo = Arc::new(MockContentRepository::new());
+        crdt_repo
+            .contents
+            .lock()
+            .await
+            .insert("content-1".to_string(), b"data".to_vec());
+        let owner = Identity::user("test-user".to_string()).unwrap();
+        crdt_repo.access_policies.lock().await.insert(
+            "content-1".to_string(),
+            AccessPolicy::new(ContentId::new("content-1".to_string()).unwrap(), owner),
+        );
+        crdt_repo.operations.lock().await.push(SerializedOperation {
+            data: vec![1],
+            genesis_cid: "content-1".to_string(),
+            author: "node-1".to_string(),
+            timestamp: 1,
+            node_timestamp: 1,
+        });
+
+        let service: TestService = StateNodeService::new(
+            node_registry,
+            content_repo,
+            peer_network,
+            event_publisher,
+            crdt_repo,
+            "node-1".to_string(),
+        )
+        .with_authentication_service(TestAuthService)
+        .with_authorization_service(AllowAllAuthorizationService);
+
+        let outcome = service
+            .invalidate_tokens(
+                "content-1",
+                &test_token(),
+                Some(&test_request_signature()),
+                test_timestamp(),
+            )
+            .await
+            .unwrap();
+
+        assert!(!outcome.relayed);
+        assert_eq!(outcome.notified_members, vec!["node-2".to_string()]);
+        assert!(outcome.unreached_members.is_empty());
     }
 
     #[tokio::test]
@@ -4601,6 +4925,149 @@ mod tests {
                 .is_some(),
             "our record must survive"
         );
+    }
+
+    /// Service with content-1 owned by test-user, member set node-1/node-2.
+    async fn deletable_content_service() -> TestService {
+        use crate::domain::access_policy::AccessPolicy;
+
+        let content_repo = Arc::new(RwLock::new(
+            MockContentNetworkRepository::new()
+                .with_network(create_test_network("content-1", vec!["node-1", "node-2"])),
+        ));
+        let crdt_repo = Arc::new(MockContentRepository::new());
+        crdt_repo
+            .contents
+            .lock()
+            .await
+            .insert("content-1".to_string(), b"data".to_vec());
+        let owner = Identity::user("test-user".to_string()).unwrap();
+        crdt_repo.access_policies.lock().await.insert(
+            "content-1".to_string(),
+            AccessPolicy::new(ContentId::new("content-1".to_string()).unwrap(), owner),
+        );
+        crdt_repo.operations.lock().await.push(SerializedOperation {
+            data: vec![1],
+            genesis_cid: "content-1".to_string(),
+            author: "node-1".to_string(),
+            timestamp: 1,
+            node_timestamp: 1,
+        });
+        StateNodeService::new(
+            MockNodeRegistry::new(),
+            content_repo,
+            Arc::new(MockPeerNetwork::new().with_local_peer_id("node-1")),
+            MockEventPublisher::new(),
+            crdt_repo,
+            "node-1".to_string(),
+        )
+        .with_authentication_service(TestAuthService)
+        .with_authorization_service(AllowAllAuthorizationService)
+    }
+
+    /// Deleting records a delete operation, keeps the member record (so the
+    /// periodic sync still runs) and pushes the operations to the other member.
+    /// Afterwards read, write, share, revoke and a second delete are all 410.
+    #[tokio::test]
+    async fn after_delete_every_entry_point_answers_content_deleted() {
+        let service = deletable_content_service().await;
+        let token = test_token();
+        let sig = test_request_signature();
+
+        service
+            .delete_content("content-1", Some(&token), Some(&sig), test_timestamp())
+            .await
+            .unwrap();
+
+        assert!(service.crdt_repo.is_deleted("content-1").await.unwrap());
+        assert!(
+            service
+                .get_content_network_for_test("content-1")
+                .await
+                .unwrap()
+                .is_some(),
+            "the member record must stay so the delete keeps syncing"
+        );
+        assert!(service
+            .peer_network
+            .push_calls
+            .lock()
+            .await
+            .contains(&("node-2".to_string(), "content-1".to_string())));
+
+        let gone = |r: Result<(), StateNodeError>, what: &str| match r {
+            Err(StateNodeError::ContentDeleted(_)) => {}
+            other => panic!("{what}: expected ContentDeleted, got {other:?}"),
+        };
+        gone(
+            service
+                .authorize_read(&token, Some(&sig), test_timestamp(), "content-1")
+                .await,
+            "read",
+        );
+        gone(
+            service
+                .update_content(
+                    "content-1",
+                    b"x",
+                    Some(&token),
+                    Some(&sig),
+                    test_timestamp(),
+                )
+                .await
+                .map(|_| ()),
+            "write",
+        );
+        gone(
+            service
+                .add_member_to_content("content-1", 1, Some(&token), Some(&sig), test_timestamp())
+                .await
+                .map(|_| ()),
+            "share",
+        );
+        gone(
+            service
+                .invalidate_tokens("content-1", &token, Some(&sig), test_timestamp())
+                .await
+                .map(|_| ()),
+            "revoke",
+        );
+        // A fresh request (new timestamp), so replay protection is not what
+        // refuses it.
+        let later = test_timestamp().map(|t| t + 1_000);
+        gone(
+            service
+                .delete_content("content-1", Some(&token), Some(&sig), later)
+                .await
+                .map(|_| ()),
+            "second delete",
+        );
+    }
+
+    /// A ContentDeleted event from a member does not delete anything by
+    /// itself; it only asks for a sync that may bring the delete operation.
+    #[tokio::test]
+    async fn content_deleted_event_requests_a_sync_and_keeps_the_record() {
+        let service = deletable_content_service().await;
+        let event = Event::ContentDeleted {
+            content_id: "content-1".to_string(),
+            deleted_by_node_id: "node-2".to_string(),
+            timestamp: 12345,
+        };
+        let outcome = service
+            .handle_sync_event(&event, Some("node-2"))
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, ApplyOutcome::NeedsSync { .. }),
+            "{outcome:?}"
+        );
+        assert!(service
+            .get_content_network_for_test("content-1")
+            .await
+            .unwrap()
+            .is_some());
+        assert!(!service.crdt_repo.is_deleted("content-1").await.unwrap());
     }
 
     /// A non-member cannot rewrite the member set of a network we already hold.
