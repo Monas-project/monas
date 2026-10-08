@@ -272,7 +272,18 @@ export default function App() {
       setModal({ type: "edit", entry, text: base64UrlToUtf8(text) });
     } catch (e) {
       pushToast(`Could not load contents: ${(e as Error).message}`, "error");
-      setModal({ type: "edit", entry, text: "" });
+      if (entry.receivedShare) {
+        // Left as before on purpose: tests-e2e/cross-device.spec.ts relies on a
+        // recipient whose token was voided still reaching the editor, to show
+        // the state node refusing the write.
+        setModal({ type: "edit", entry, text: "" });
+      } else {
+        // The owner's editor must not open empty: saving would replace the
+        // file with whatever is typed over nothing, and when the failed step
+        // was the pull it would also discard a recipient's version the pull
+        // was meant to bring in.
+        setModal({ type: "none" });
+      }
     }
   };
 
