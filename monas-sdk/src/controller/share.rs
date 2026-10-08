@@ -1099,7 +1099,7 @@ impl MonasController {
         // `update_content` を使うので、ここに `user:` で来るのは呼び出し側の誤り。
         let bearer = auth
             .and_then(|ctx| ctx.authorization.as_deref())
-            .filter(|value| value.len() > 7 && value[..7].eq_ignore_ascii_case("bearer "));
+            .filter(|value| has_bearer_prefix(value));
         let Some(bearer) = bearer else {
             return ApiResponse::error(
                 ApiError::Unauthorized(
@@ -1198,5 +1198,46 @@ impl MonasController {
             },
             trace_id,
         )
+    }
+}
+
+/// `Authorization` が `Bearer <token>` の形か。
+///
+/// 先頭 7 バイトを `value[..7]` で切ると、7 バイト目がマルチバイト文字の途中に
+/// あたる値(非 ASCII)で char 境界違反のパニックになる。`str::get` は境界を
+/// 外れると `None` を返すので、そのまま「Bearer ではない」として扱える。
+fn has_bearer_prefix(value: &str) -> bool {
+    value.len() > 7
+        && value
+            .get(..7)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("bearer "))
+}
+
+#[cfg(test)]
+mod bearer_prefix_tests {
+    use super::has_bearer_prefix;
+
+    #[test]
+    fn accepts_a_bearer_token_in_any_case() {
+        assert!(has_bearer_prefix("Bearer abc"));
+        assert!(has_bearer_prefix("bearer abc"));
+        assert!(has_bearer_prefix("BEARER abc"));
+    }
+
+    #[test]
+    fn rejects_other_schemes_and_a_bare_prefix() {
+        assert!(!has_bearer_prefix("user:deadbeef"));
+        assert!(!has_bearer_prefix("Bearer "));
+        assert!(!has_bearer_prefix(""));
+    }
+
+    /// 先頭 7 バイトの境界が文字の途中になる値でパニックしない。
+    /// "Bear"(4 バイト) + "éé"(各 2 バイト)では、バイト 7 が 2 つ目の "é" の中に
+    /// 入る。旧実装の `value[..7]` はここで char 境界違反になる。
+    #[test]
+    fn does_not_panic_when_byte_seven_is_inside_a_character() {
+        assert!(!has_bearer_prefix("Bearéé token"));
+        assert!(!has_bearer_prefix("Bearéétoken"));
+        assert!(!has_bearer_prefix("日本語のトークン"));
     }
 }
