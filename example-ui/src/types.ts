@@ -51,6 +51,11 @@ export interface ShareGrant {
    *  this grant's envelope. The recipient must process the new envelope
    *  before it can decrypt again. */
   reissuedAt?: number;
+  /** Set when this grant's delegated token was reissued without a key
+   *  rotation: its permission changed, or another recipient's downgrade
+   *  voided every earlier token. The envelope still opens; the old package
+   *  can no longer read from or write to the state node. */
+  tokenReissuedAt?: number;
 }
 
 // Everything a recipient on another device needs to unwrap and read a share.

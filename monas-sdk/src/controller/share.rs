@@ -8,8 +8,9 @@ use crate::common::{
 };
 use crate::models::share::{
     DecryptSharedContentInput, DecryptSharedContentOutput, DelegatedAccessToken, KeyEnvelope,
-    Permission, ReissuedKeyEnvelope, RevokeShareInput, RevokeShareOutput, ShareContentInput,
-    ShareContentOutput, UpdateSharedContentInput, UpdateSharedContentOutput,
+    Permission, ReissuedDelegatedToken, ReissuedKeyEnvelope, RevokeShareInput, RevokeShareOutput,
+    ShareContentInput, ShareContentOutput, UpdateSharePermissionInput, UpdateSharePermissionOutput,
+    UpdateSharedContentInput, UpdateSharedContentOutput,
 };
 use crate::models::state_node::StateNodeUpdateContentRequest;
 
@@ -22,6 +23,7 @@ use monas_content::application_service::content_service::{
 };
 use monas_content::application_service::share_service::{
     GrantShareCommand, RevokeShareCommand, ShareApplicationError, ShareRepository, ShareService,
+    UpdateSharePermissionCommand,
 };
 use monas_content::domain::content::{Content, ContentEncryptionKey};
 use monas_content::domain::content_id::ContentId;
@@ -248,6 +250,15 @@ impl MonasController {
             ShareApplicationError::MissingContentEncryptionKey => {
                 ApiError::Internal("Missing content encryption key".into())
             }
+            ShareApplicationError::Share(
+                monas_content::domain::share::share::ShareError::AlreadyShared,
+            ) => ApiError::Conflict(
+                "this recipient already has a share on the content; change its permission instead"
+                    .into(),
+            ),
+            ShareApplicationError::Share(
+                monas_content::domain::share::share::ShareError::RecipientNotFound,
+            ) => ApiError::NotFound("this recipient has no share on the content".into()),
             ShareApplicationError::Share(err) => {
                 ApiError::Internal(format!("Share domain error: {err:?}"))
             }
@@ -776,6 +787,184 @@ impl MonasController {
         };
 
         ApiResponse::success(output, trace_id)
+    }
+
+    /// 既存の共有先の権限を read ⇄ write で変更する。
+    ///
+    /// `share_content` を同じ受信者へ呼ぶと `AlreadyShared` になり、これまでは
+    /// revoke → 再共有(CEK ローテーションと再暗号化を伴う)でしか変えられな
+    /// かった。権限は委譲 Token にだけ載り、KeyEnvelope(CEK)は権限と無関係な
+    /// ので、ここでは CEK を回さない。
+    ///
+    /// - 昇格(read → write)・変更なし: ACL を更新し、新しい権限で Token を
+    ///   発行するだけ。古い read Token はそのまま有効でも害はない。
+    /// - 降格(write → read): 受信者の手元にある write Token を止めなければ
+    ///   意味がない。State Node は Token を個別に失効できない(`min_valid_issued_at`
+    ///   による一括失効のみ)ので、revoke と同じく先に境界を進め、境界より後の
+    ///   iat で、この受信者には read の、他の受信者には各自の権限の Token を
+    ///   発行し直して返す。
+    ///
+    /// revoke と同じロックで直列化する(どちらも ACL の load-modify-save)。
+    pub fn update_share_permission(
+        &self,
+        input: UpdateSharePermissionInput,
+        auth: Option<&StateNodeAuthContext>,
+    ) -> ApiResponse<UpdateSharePermissionOutput> {
+        let trace_id = generate_trace_id();
+
+        for (field, value) in [
+            ("content_id", input.content_id.as_str()),
+            ("recipient_public_key", input.recipient_public_key.as_str()),
+        ] {
+            if let Err(e) = Self::validate_non_empty(field, value) {
+                return ApiResponse::error(e, trace_id);
+            }
+        }
+        let permission = match Self::resolve_permission(&input.permissions) {
+            Ok(p) => p,
+            Err(e) => return ApiResponse::error(e, trace_id),
+        };
+        let recipient_public_key_bytes =
+            match Self::decode_base64url_field("recipient_public_key", &input.recipient_public_key)
+            {
+                Ok(v) => v,
+                Err(e) => return ApiResponse::error(e, trace_id),
+            };
+        let recipient_key_id = Self::compute_key_id_from_public_key(&recipient_public_key_bytes);
+        let content_id = ContentId::new(input.content_id.clone());
+        let state_node_content_id = input
+            .remote_content_id
+            .clone()
+            .unwrap_or_else(|| input.content_id.clone());
+
+        let _guard = self.content_revoke_locks.lock(content_id.as_str());
+
+        // 現在の権限(降格かどうかの判定)。共有されていない相手はここで弾く。
+        let previous = match self.share_service.share_repository.load(&content_id) {
+            Ok(share) => share
+                .and_then(|s| s.permissions_of(&recipient_key_id).map(|p| p.to_vec()))
+                .and_then(|p| Self::resolve_domain_permission(&p)),
+            Err(e) => {
+                return ApiResponse::error(
+                    ApiError::Internal(format!("Share repository error: {e}")),
+                    trace_id,
+                )
+            }
+        };
+        let Some(previous) = previous else {
+            return ApiResponse::error(
+                ApiError::NotFound(
+                    "this recipient has no share on the content; share it first".into(),
+                ),
+                trace_id,
+            );
+        };
+        let downgrade = matches!(previous, DomainPermission::Write)
+            && matches!(permission, DomainPermission::Read);
+
+        // 降格のときだけ、ACL を変える前に既発行 Token を一括失効させる
+        // (revoke と同じ順序: 失効が先なら、後段が失敗しても余分な失効が残るだけ)。
+        let (token_invalidated_at, token_invalidation_reach) = if downgrade && auth.is_some() {
+            match self.send_invalidate_to_state_node::<UpdateSharePermissionOutput>(
+                &state_node_content_id,
+                auth,
+                trace_id.clone(),
+            ) {
+                Ok(Some((at, reach))) => (Some(at), reach),
+                Ok(None) => (None, None),
+                Err(response) => return response,
+            }
+        } else {
+            (None, None)
+        };
+
+        let result =
+            match self
+                .share_service
+                .update_share_permission(UpdateSharePermissionCommand {
+                    content_id: content_id.clone(),
+                    recipient_key_id: recipient_key_id.clone(),
+                    permission: permission.clone(),
+                }) {
+                Ok(r) => r,
+                Err(e) => return ApiResponse::error(Self::map_share_error(e), trace_id),
+            };
+
+        let delegated_access = match self.issue_delegated_token(
+            &state_node_content_id,
+            &recipient_public_key_bytes,
+            permission,
+            token_invalidated_at,
+        ) {
+            Ok(t) => t,
+            Err(e) => return ApiResponse::error(e, trace_id),
+        };
+
+        // 失効させた場合は、他の受信者の Token も巻き添えで無効になっている。
+        let reissued_tokens = if token_invalidated_at.is_some() {
+            self.share_service
+                .share_repository
+                .load(&content_id)
+                .ok()
+                .flatten()
+                .map(|share| {
+                    let mut others: Vec<_> = share
+                        .recipients()
+                        .iter()
+                        .filter(|(kid, _)| **kid != recipient_key_id)
+                        .filter_map(|(kid, r)| {
+                            Self::resolve_domain_permission(r.permissions())
+                                .map(|p| (kid.clone(), p))
+                        })
+                        .collect();
+                    others.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+                    others
+                        .into_iter()
+                        .map(|(kid, p)| {
+                            let delegated_access = self
+                                .share_service
+                                .public_key_directory
+                                .find_public_key(&kid)
+                                .ok()
+                                .flatten()
+                                .and_then(|pk| {
+                                    self.issue_delegated_token(
+                                        &state_node_content_id,
+                                        &pk,
+                                        p,
+                                        token_invalidated_at,
+                                    )
+                                    .ok()
+                                });
+                            ReissuedDelegatedToken {
+                                recipient_key_id: Self::encode_key_id_base64url(&kid),
+                                delegated_access,
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        let permissions = match result.current.first() {
+            Some(DomainPermission::Write) => vec![Permission::Write],
+            _ => vec![Permission::Read],
+        };
+        ApiResponse::success(
+            UpdateSharePermissionOutput {
+                content_id: input.content_id,
+                recipient_public_key: input.recipient_public_key,
+                recipient_key_id: Self::encode_key_id_base64url(&result.recipient_key_id),
+                permissions,
+                delegated_access,
+                reissued_tokens,
+                token_invalidated_at,
+                token_invalidation_reach,
+            },
+            trace_id,
+        )
     }
 
     /// 共有されたコンテンツ payload を復号する

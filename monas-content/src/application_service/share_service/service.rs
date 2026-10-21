@@ -6,7 +6,8 @@ use crate::domain::share::{
 
 use super::{
     GrantShareCommand, GrantShareResult, PublicKeyDirectory, RevokeShareCommand, RevokeShareResult,
-    ShareApplicationError, ShareRepository,
+    ShareApplicationError, ShareRepository, UpdateSharePermissionCommand,
+    UpdateSharePermissionResult,
 };
 
 /// コンテンツ共有ユースケースのアプリケーションサービス。
@@ -250,6 +251,52 @@ where
             content_id: cmd.content_id,
             recipient_key_id: cmd.recipient_key_id,
             envelopes,
+        })
+    }
+
+    /// 既存の受信者の権限を変更する(ACL のみ)。
+    ///
+    /// - 受信者が共有されていない場合は `Share(RecipientNotFound)`。
+    /// - CEK・鍵世代・KeyEnvelope は変えない。権限は委譲 Token に載るので、
+    ///   Token の再発行(と降格時の旧 Token 失効)は呼び出し側(SDK)が行う。
+    pub fn update_share_permission(
+        &self,
+        cmd: UpdateSharePermissionCommand,
+    ) -> Result<UpdateSharePermissionResult, ShareApplicationError> {
+        let content = self
+            .content_repository
+            .find_by_id(&cmd.content_id)
+            .map_err(ShareApplicationError::ContentRepository)?
+            .ok_or(ShareApplicationError::ContentNotFound)?;
+        if content.is_deleted() {
+            return Err(ShareApplicationError::ContentDeleted);
+        }
+
+        let mut share = self
+            .share_repository
+            .load(&cmd.content_id)
+            .map_err(ShareApplicationError::ShareRepository)?
+            .ok_or(ShareApplicationError::Share(
+                crate::domain::share::share::ShareError::RecipientNotFound,
+            ))?;
+
+        let previous = share
+            .permissions_of(&cmd.recipient_key_id)
+            .map(|p| p.to_vec())
+            .unwrap_or_default();
+        share
+            .update_recipient_permissions(&cmd.recipient_key_id, vec![cmd.permission.clone()])
+            .map_err(ShareApplicationError::Share)?;
+
+        self.share_repository
+            .save(&share)
+            .map_err(ShareApplicationError::ShareRepository)?;
+
+        Ok(UpdateSharePermissionResult {
+            content_id: cmd.content_id,
+            recipient_key_id: cmd.recipient_key_id,
+            previous,
+            current: vec![cmd.permission],
         })
     }
 
@@ -1230,6 +1277,80 @@ mod tests {
             .revoke_share(cmd)
             .expect_err("revoke_share should fail when share does not exist");
         assert!(matches!(err, ShareApplicationError::ContentNotFound));
+    }
+
+    #[test]
+    fn update_share_permission_changes_acl_without_touching_epoch() {
+        let (content_repo, content_storage) = TestContentRepository::new();
+        let (key_store, _key_storage) = TestKeyStore::new();
+        let (share_repo, share_storage) = TestShareRepository::new();
+        let public_key_dir = TestPublicKeyDirectory::default();
+        let key_wrapper = TestKeyWrapper;
+
+        let content_id = cid();
+        let kid = KeyId::new(vec![9, 9, 9]);
+        content_storage.lock().unwrap().insert(
+            content_id.as_str().to_string(),
+            build_content(&content_id, Some(encrypted()), false),
+        );
+        let mut share = Share::new(content_id.clone());
+        share.grant_read(kid.clone()).expect("grant_read");
+        share_storage
+            .lock()
+            .unwrap()
+            .insert(content_id.as_str().to_string(), share);
+
+        let service = build_service(
+            share_repo,
+            content_repo,
+            key_store,
+            public_key_dir,
+            key_wrapper,
+        );
+        let result = service
+            .update_share_permission(super::UpdateSharePermissionCommand {
+                content_id: content_id.clone(),
+                recipient_key_id: kid.clone(),
+                permission: Permission::Write,
+            })
+            .expect("update should succeed");
+        assert_eq!(result.previous, vec![Permission::Read]);
+        assert_eq!(result.current, vec![Permission::Write]);
+
+        let guard = share_storage.lock().unwrap();
+        let stored = guard.get(content_id.as_str()).expect("share kept");
+        assert_eq!(stored.permissions_of(&kid), Some(&[Permission::Write][..]));
+        assert_eq!(stored.key_epoch(), 0, "a permission change must not rotate");
+    }
+
+    #[test]
+    fn update_share_permission_fails_for_unknown_recipient() {
+        let (content_repo, content_storage) = TestContentRepository::new();
+        let (key_store, _key_storage) = TestKeyStore::new();
+        let (share_repo, _share_storage) = TestShareRepository::new();
+        let content_id = cid();
+        content_storage.lock().unwrap().insert(
+            content_id.as_str().to_string(),
+            build_content(&content_id, Some(encrypted()), false),
+        );
+        let service = build_service(
+            share_repo,
+            content_repo,
+            key_store,
+            TestPublicKeyDirectory::default(),
+            TestKeyWrapper,
+        );
+        let err = service
+            .update_share_permission(super::UpdateSharePermissionCommand {
+                content_id,
+                recipient_key_id: KeyId::new(vec![1]),
+                permission: Permission::Read,
+            })
+            .expect_err("unknown recipient");
+        assert!(matches!(
+            err,
+            ShareApplicationError::Share(ShareError::RecipientNotFound)
+        ));
     }
 
     #[test]

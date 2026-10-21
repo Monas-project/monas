@@ -462,11 +462,13 @@ export default function App() {
     void checkNetworkHead(entry);
   };
 
-  const handleShare = async (entry: Entry, input: ShareInput) => {
+  // Share-dialog handlers resolve to whether the action succeeded, so the
+  // dialog can show the package that just became deliverable (and only then).
+  const handleShare = async (entry: Entry, input: ShareInput): Promise<boolean> => {
     if (!active) {
       pushToast("Create an identity first", "error");
       setModal({ type: "identity" });
-      return;
+      return false;
     }
     setBusy(true);
     const specs = flows.shareFlow({
@@ -501,10 +503,51 @@ export default function App() {
       pushToast("Share failed", "error");
     }
     setBusy(false);
+    return ok && !!ctx.share;
   };
 
-  const handleRevoke = async (entry: Entry, recipientPublicKeyB64Url: string) => {
-    if (!active) return;
+  // read ⇄ write for an existing recipient. No key rotation: only the
+  // delegated token carries the permission, so only tokens are replaced.
+  const handleChangePermission = async (
+    entry: Entry,
+    recipientPublicKeyB64Url: string,
+    permissions: shareApi.Permission[],
+  ): Promise<boolean> => {
+    setBusy(true);
+    const specs = flows.changePermissionFlow({ entry, recipientPublicKeyB64Url, permissions });
+    const { ok, ctx } = await run("Change permission", entry.name, specs);
+    const r = ctx.permission as shareApi.UpdateSharePermissionOutput | undefined;
+    if (ok && r) {
+      const now = Date.now();
+      const others = new Map((r.reissued_tokens ?? []).map((t) => [t.recipient_key_id, t]));
+      const shares = entry.shares.map((s) => {
+        if (s.recipientPublicKeyB64Url === recipientPublicKeyB64Url) {
+          return { ...s, permissions: r.permissions, delegatedAccess: r.delegated_access, tokenReissuedAt: now };
+        }
+        const fresh = others.get(s.recipientKeyId);
+        return fresh
+          ? { ...s, delegatedAccess: fresh.delegated_access ?? undefined, tokenReissuedAt: now }
+          : s;
+      });
+      updateEntry(entry.id, { shares });
+      const target = shares.find((s) => s.recipientPublicKeyB64Url === recipientPublicKeyB64Url);
+      pushToast(
+        `${target?.recipientLabel || "Recipient"} now has ${r.permissions.join(" + ")} — send them the new package`,
+        "success",
+      );
+      const missing = (r.reissued_tokens ?? []).filter((t) => !t.delegated_access).length;
+      if (missing > 0) {
+        pushToast(`${missing} other recipient(s) got no fresh token and can no longer reach the state node`, "error");
+      }
+    } else {
+      pushToast("Permission change failed", "error");
+    }
+    setBusy(false);
+    return ok && !!r;
+  };
+
+  const handleRevoke = async (entry: Entry, recipientPublicKeyB64Url: string): Promise<boolean> => {
+    if (!active) return false;
     setBusy(true);
     const specs = flows.revokeFlow({ entry, identity: active, recipientPublicKeyB64Url });
     const { ok, ctx } = await run("Revoke", entry.name, specs);
@@ -590,6 +633,7 @@ export default function App() {
       pushToast("Revoke failed", "error");
     }
     setBusy(false);
+    return ok;
   };
 
   // ---- dispatch from row menu ----------------------------------------
@@ -694,6 +738,7 @@ export default function App() {
           busy={busy}
           onShare={handleShare}
           onRevoke={handleRevoke}
+          onChangePermission={handleChangePermission}
           onClose={() => setModal({ type: "none" })}
         />
       )}

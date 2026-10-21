@@ -662,6 +662,31 @@ textarea.input:focus {
   background: var(--pink-50);
   color: var(--pink-700);
 }
+.seg.sm {
+  gap: 4px;
+  flex: none;
+}
+.seg.sm button {
+  padding: 4px 8px;
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+.seg button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+.hint.existing-recipient {
+  color: var(--pink-700);
+}
+.link-btn {
+  border: 0;
+  background: none;
+  padding: 0;
+  color: var(--pink-700);
+  font-size: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
 
 .callout {
   background: var(--bg-subtle);

@@ -7,6 +7,7 @@ use monas_sdk::models::content::{ContentMetadata, CreateContentInput};
 use monas_sdk::models::keypair::{GenerateKeypairInput, KeyType};
 use monas_sdk::models::share::{
     DecryptSharedContentInput, Permission, RevokeShareInput, ShareContentInput,
+    UpdateSharePermissionInput,
 };
 use monas_sdk::{MonasConfig, MonasController, StateNodeAuthContext};
 use std::time::Duration;
@@ -1150,5 +1151,262 @@ async fn share_acl_survives_an_edit_so_a_later_revoke_reissues_to_earlier_recipi
             .collect::<Vec<_>>()
     );
 
+    cleanup_content_artifacts();
+}
+
+// ============================================
+// update_share_permission
+// ============================================
+
+/// JWT の payload から capability 名(`read` / `write`)を取り出す。
+fn token_capabilities(jwt: &str) -> Vec<String> {
+    let payload = jwt.split('.').nth(1).expect("jwt payload");
+    let bytes = URL_SAFE_NO_PAD.decode(payload).expect("payload base64url");
+    let value: serde_json::Value = serde_json::from_slice(&bytes).expect("payload json");
+    let text = value.to_string();
+    ["read", "write"]
+        .iter()
+        .filter(|c| text.contains(&format!("\"{c}\"")))
+        .map(|c| c.to_string())
+        .collect()
+}
+
+struct PermissionFixture {
+    controller: MonasController,
+    content_id: String,
+    sender: monas_sdk::models::keypair::GenerateKeypairOutput,
+    target: monas_sdk::models::keypair::GenerateKeypairOutput,
+    other: monas_sdk::models::keypair::GenerateKeypairOutput,
+}
+
+/// `target` を `initial` 権限で、`other` を read で共有した状態を作る。
+async fn permission_fixture(
+    state_node: &mut mockito::ServerGuard,
+    initial: Permission,
+) -> PermissionFixture {
+    state_node
+        .mock("POST", "/content")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"content_id":"perm-remote"}"#)
+        .create_async()
+        .await;
+    let controller = controller_with_wide_skew(state_node.url());
+    let kp = || {
+        controller
+            .generate_keypair(GenerateKeypairInput {
+                key_type: KeyType::Secp256r1,
+            })
+            .data
+            .expect("keypair")
+    };
+    let (sender, target, other) = (kp(), kp(), kp());
+    let created = controller
+        .create_content(
+            CreateContentInput {
+                content: URL_SAFE_NO_PAD.encode(b"permission-target"),
+                metadata: Some(ContentMetadata {
+                    name: Some("perm.txt".to_string()),
+                    content_type: Some("text/plain".to_string()),
+                    created_at: None,
+                    updated_at: None,
+                }),
+            },
+            None,
+        )
+        .data
+        .expect("create");
+    for (who, perm) in [(&target, initial), (&other, Permission::Read)] {
+        let r = controller.share_content(ShareContentInput {
+            content_id: created.content_id.clone(),
+            remote_content_id: Some("perm-remote".into()),
+            sender_public_key: sender.public_key.clone(),
+            sender_private_key: sender.private_key.clone(),
+            recipient_public_key: who.public_key.clone(),
+            permissions: vec![perm],
+        });
+        assert!(r.success, "share: {:?}", r.error);
+    }
+    PermissionFixture {
+        controller,
+        content_id: created.content_id,
+        sender,
+        target,
+        other,
+    }
+}
+
+/// 同じ相手への再共有は「権限を変更して」と分かる 409 で返す(以前は 500 の
+/// `Share domain error: AlreadyShared` で、UI は "Share failed" としか出せなかった)。
+#[tokio::test(flavor = "multi_thread")]
+async fn resharing_to_an_existing_recipient_is_a_conflict() {
+    let _guard = acquire_test_lock();
+    let mut state_node = Server::new_async().await;
+    let f = permission_fixture(&mut state_node, Permission::Read).await;
+    let r = f.controller.share_content(ShareContentInput {
+        content_id: f.content_id.clone(),
+        remote_content_id: Some("perm-remote".into()),
+        sender_public_key: f.sender.public_key.clone(),
+        sender_private_key: f.sender.private_key.clone(),
+        recipient_public_key: f.target.public_key.clone(),
+        permissions: vec![Permission::Write],
+    });
+    assert!(!r.success);
+    assert!(
+        matches!(r.error, Some(monas_sdk::ApiError::Conflict(_))),
+        "{:?}",
+        r.error
+    );
+    cleanup_content_artifacts();
+}
+
+/// 昇格(read → write): revoke せずに通る。Token 失効も CEK ローテーションも
+/// しない(state node へは何も送らない)。新しい Token は write を持つ。
+#[tokio::test(flavor = "multi_thread")]
+async fn upgrading_read_to_write_reissues_a_write_token_without_rotation() {
+    let _guard = acquire_test_lock();
+    let mut state_node = Server::new_async().await;
+    let f = permission_fixture(&mut state_node, Permission::Read).await;
+    let invalidate_mock = state_node
+        .mock("POST", "/content/perm-remote/access/invalidate")
+        .expect(0)
+        .create_async()
+        .await;
+    let put_mock = state_node
+        .mock("PUT", mockito::Matcher::Any)
+        .expect(0)
+        .create_async()
+        .await;
+
+    let r = f.controller.update_share_permission(
+        UpdateSharePermissionInput {
+            content_id: f.content_id.clone(),
+            remote_content_id: Some("perm-remote".into()),
+            recipient_public_key: f.target.public_key.clone(),
+            permissions: vec![Permission::Read, Permission::Write],
+        },
+        Some(&auth_context("Bearer owner")),
+    );
+    assert!(r.success, "{:?}", r.error);
+    let out = r.data.expect("data");
+    assert_eq!(out.permissions, vec![Permission::Write]);
+    assert_eq!(
+        token_capabilities(&out.delegated_access.delegated_token),
+        vec!["write"]
+    );
+    assert!(out.token_invalidated_at.is_none());
+    assert!(out.reissued_tokens.is_empty());
+    invalidate_mock.assert();
+    put_mock.assert();
+
+    // 変更は ACL に残る: 続けて降格方向の判定に使われる(もう一度 write にしても
+    // 失効は起きない = 現在 write と認識されている)。
+    let again = f.controller.update_share_permission(
+        UpdateSharePermissionInput {
+            content_id: f.content_id.clone(),
+            remote_content_id: Some("perm-remote".into()),
+            recipient_public_key: f.target.public_key.clone(),
+            permissions: vec![Permission::Write],
+        },
+        Some(&auth_context("Bearer owner")),
+    );
+    assert!(again.success, "{:?}", again.error);
+    invalidate_mock.assert();
+    cleanup_content_artifacts();
+}
+
+/// 降格(write → read): 受信者の手元の write Token を止めるため境界を進める。
+/// 新しい Token は read のみで境界より後の iat。巻き添えで失効した他の
+/// 受信者にも各自の権限で Token を発行し直す。CEK は回さない(PUT なし)。
+#[tokio::test(flavor = "multi_thread")]
+async fn downgrading_write_to_read_invalidates_and_reissues_tokens() {
+    let _guard = acquire_test_lock();
+    let mut state_node = Server::new_async().await;
+    let f = permission_fixture(&mut state_node, Permission::Write).await;
+    let boundary = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let invalidate_mock = state_node
+        .mock("POST", "/content/perm-remote/access/invalidate")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(format!(
+            r#"{{"content_id":"perm-remote","new_min_valid_issued_at":{boundary},"notified_members":["n2"],"unreached_members":[],"relayed":false}}"#
+        ))
+        .expect(1)
+        .create_async()
+        .await;
+    let put_mock = state_node
+        .mock("PUT", mockito::Matcher::Any)
+        .expect(0)
+        .create_async()
+        .await;
+
+    let r = f.controller.update_share_permission(
+        UpdateSharePermissionInput {
+            content_id: f.content_id.clone(),
+            remote_content_id: Some("perm-remote".into()),
+            recipient_public_key: f.target.public_key.clone(),
+            permissions: vec![Permission::Read],
+        },
+        Some(&auth_context("Bearer owner")),
+    );
+    assert!(r.success, "{:?}", r.error);
+    invalidate_mock.assert();
+    put_mock.assert();
+    let out = r.data.expect("data");
+    assert_eq!(out.permissions, vec![Permission::Read]);
+    assert_eq!(
+        token_capabilities(&out.delegated_access.delegated_token),
+        vec!["read"]
+    );
+    assert!(out.delegated_access.issued_at > boundary);
+    assert_eq!(out.token_invalidated_at, Some(boundary));
+    assert_eq!(
+        out.token_invalidation_reach.map(|r| r.notified_members),
+        Some(vec!["n2".to_string()])
+    );
+    assert_eq!(out.reissued_tokens.len(), 1, "the other recipient");
+    let other_token = out.reissued_tokens[0]
+        .delegated_access
+        .as_ref()
+        .expect("other recipient gets a fresh token");
+    assert!(other_token.issued_at > boundary);
+    assert_eq!(
+        token_capabilities(&other_token.delegated_token),
+        vec!["read"]
+    );
+    let _ = &f.other;
+    cleanup_content_artifacts();
+}
+
+/// 共有していない相手の権限変更は 404(黙って新規共有にはしない)。
+#[tokio::test(flavor = "multi_thread")]
+async fn updating_permission_of_an_unshared_key_is_not_found() {
+    let _guard = acquire_test_lock();
+    let mut state_node = Server::new_async().await;
+    let f = permission_fixture(&mut state_node, Permission::Read).await;
+    let stranger = f
+        .controller
+        .generate_keypair(GenerateKeypairInput {
+            key_type: KeyType::Secp256r1,
+        })
+        .data
+        .expect("keypair");
+    let r = f.controller.update_share_permission(
+        UpdateSharePermissionInput {
+            content_id: f.content_id.clone(),
+            remote_content_id: Some("perm-remote".into()),
+            recipient_public_key: stranger.public_key,
+            permissions: vec![Permission::Write],
+        },
+        Some(&auth_context("Bearer owner")),
+    );
+    assert!(
+        matches!(r.error, Some(monas_sdk::ApiError::NotFound(_))),
+        "{:?}",
+        r.error
+    );
     cleanup_content_artifacts();
 }
