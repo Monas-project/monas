@@ -493,6 +493,9 @@ export default function App() {
             recipientKeyId: g.recipient_key_id,
             senderPublicKeyB64Url: g.sender_public_key,
             envelope: g.key_envelope,
+            // The envelope is bound to the version it was wrapped for; a
+            // later edit moves entry.localContentId but not this.
+            envelopeContentId: g.content_id,
             delegatedAccess: g.delegated_access,
             grantedAt: Date.now(),
           },
@@ -504,6 +507,32 @@ export default function App() {
     }
     setBusy(false);
     return ok && !!ctx.share;
+  };
+
+  // How far a token cutoff (revoke, or a write → read downgrade) got. A
+  // member authorizes against its own copy of the policy, so a member the
+  // cutoff did not reach keeps accepting the voided tokens until it syncs.
+  const reportCutoffReach = (
+    reach: shareApi.TokenInvalidationReach | undefined,
+    action: "revoke" | "downgrade",
+  ) => {
+    const what = action === "revoke" ? "the revoked token" : "the old write token";
+    if (!reach) {
+      pushToast(
+        "Token invalidation propagation is unknown — the node returned no reach report. Members that have not synced may still accept writes under old tokens.",
+        "error",
+      );
+    } else if (reach.relayed) {
+      pushToast(
+        `The ${action} was relayed to a member node; which members enforce the cutoff yet is not known from here. Writes under ${what} may land on members that have not synced.`,
+        "error",
+      );
+    } else if (reach.unreached_members.length > 0) {
+      pushToast(
+        `Cutoff did not reach ${reach.unreached_members.length} member node(s). Until they sync (~30 s), a write under ${what} can still land there.`,
+        "error",
+      );
+    }
   };
 
   // read ⇄ write for an existing recipient. No key rotation: only the
@@ -535,6 +564,10 @@ export default function App() {
         `${target?.recipientLabel || "Recipient"} now has ${r.permissions.join(" + ")} — send them the new package`,
         "success",
       );
+      // A downgrade stops the old write token only on members the cutoff
+      // reached; the rest accept it until their next sync. Same report as
+      // revoke, so "downgraded" does not overstate what just happened.
+      if (r.token_invalidated_at != null) reportCutoffReach(r.token_invalidation_reach, "downgrade");
       const missing = (r.reissued_tokens ?? []).filter((t) => !t.delegated_access).length;
       if (missing > 0) {
         pushToast(`${missing} other recipient(s) got no fresh token and can no longer reach the state node`, "error");
@@ -568,6 +601,9 @@ export default function App() {
             ? {
                 ...s,
                 envelope: fresh.key_envelope,
+                // Re-wrapped for the version the revoke rotated (after the
+                // head pull, possibly a recipient's newer one).
+                ...(r ? { envelopeContentId: r.content_id } : {}),
                 delegatedAccess: fresh.delegated_access ?? undefined,
                 reissuedAt: Date.now(),
               }
@@ -606,22 +642,8 @@ export default function App() {
       // policy; a member it did not reach still accepts writes under the
       // voided tokens until its next sync. Say so — "revoked" alone would
       // overstate what just happened.
-      const reach = r?.token_invalidation_reach;
-      if (!reach && (r?.token_invalidated_at != null || entry.syncedToStateNode || entry.remoteContentId)) {
-        pushToast(
-          "Token invalidation propagation is unknown — the node returned no reach report. Members that have not synced may still accept writes under old tokens.",
-          "error",
-        );
-      } else if (reach?.relayed) {
-        pushToast(
-          "The revoke was relayed to a member node; which members enforce the cutoff yet is not known from here. Writes under the old token may land on members that have not synced.",
-          "error",
-        );
-      } else if (reach && reach.unreached_members.length > 0) {
-        pushToast(
-          `Cutoff did not reach ${reach.unreached_members.length} member node(s). Until they sync (~30 s), a write under the revoked token can still land there.`,
-          "error",
-        );
+      if (r?.token_invalidated_at != null || entry.syncedToStateNode || entry.remoteContentId) {
+        reportCutoffReach(r?.token_invalidation_reach, "revoke");
       }
       if (stale > 0) {
         pushToast(

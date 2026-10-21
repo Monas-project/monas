@@ -878,6 +878,20 @@ impl MonasController {
             (None, None)
         };
 
+        // 対象者の Token を ACL 更新より先に発行する。発行が失敗したとき ACL が
+        // 元の権限のまま残るので、再試行は同じ判定(降格なら失効 + 他受信者への
+        // 再発行)をやり直す。先に ACL を保存すると、再試行は「read → read」に
+        // 見えて、最初の失効で無効になった他受信者の Token を返さなくなる。
+        let delegated_access = match self.issue_delegated_token(
+            &state_node_content_id,
+            &recipient_public_key_bytes,
+            permission.clone(),
+            token_invalidated_at,
+        ) {
+            Ok(t) => t,
+            Err(e) => return ApiResponse::error(e, trace_id),
+        };
+
         let result =
             match self
                 .share_service
@@ -889,16 +903,6 @@ impl MonasController {
                 Ok(r) => r,
                 Err(e) => return ApiResponse::error(Self::map_share_error(e), trace_id),
             };
-
-        let delegated_access = match self.issue_delegated_token(
-            &state_node_content_id,
-            &recipient_public_key_bytes,
-            permission,
-            token_invalidated_at,
-        ) {
-            Ok(t) => t,
-            Err(e) => return ApiResponse::error(e, trace_id),
-        };
 
         // 失効させた場合は、他の受信者の Token も巻き添えで無効になっている。
         let reissued_tokens = if token_invalidated_at.is_some() {

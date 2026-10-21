@@ -465,9 +465,16 @@ export function changePermissionFlow(input: {
       exec: async (ctx) => {
         const r = ctx.permission as shareApi.UpdateSharePermissionOutput;
         const others = r.reissued_tokens?.length ?? 0;
-        return downgrade
-          ? `The old write token is void; ${others} other recipient(s) got a fresh token. Send each recipient their new package.`
-          : "The envelope still opens; send the recipient the new package so they hold the write token.";
+        if (!downgrade) {
+          return "The envelope still opens; send the recipient the new package so they hold the write token.";
+        }
+        // Only a member that took the cutoff refuses the old write token.
+        const reach = r.token_invalidation_reach;
+        const where =
+          reach && !reach.relayed && reach.unreached_members.length === 0
+            ? "The old write token is void on every member"
+            : "Members that took the cutoff refuse the old write token; others accept it until they sync (~30 s)";
+        return `${where}. ${others} other recipient(s) got a fresh token. Send each recipient their new package.`;
       },
     },
   ];

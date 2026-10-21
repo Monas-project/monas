@@ -1410,3 +1410,73 @@ async fn updating_permission_of_an_unshared_key_is_not_found() {
     );
     cleanup_content_artifacts();
 }
+
+/// 降格で失効させた後に対象者の Token 発行が失敗したら、ACL を write へ戻す。
+/// 戻さないと、再試行は「read → read」と判定されて失効も他受信者への再発行も
+/// せず、最初の失効で無効になった他受信者の Token が返らないまま残る。
+#[tokio::test(flavor = "multi_thread")]
+async fn downgrade_retry_after_token_issuance_failure_still_reissues_other_tokens() {
+    let _guard = acquire_test_lock();
+    let mut state_node = Server::new_async().await;
+    let f = permission_fixture(&mut state_node, Permission::Write).await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    // 境界が SDK の時計より 60 秒先: 待ち上限を超えるので Token 発行が失敗する。
+    let skewed = state_node
+        .mock("POST", "/content/perm-remote/access/invalidate")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(format!(
+            r#"{{"content_id":"perm-remote","new_min_valid_issued_at":{}}}"#,
+            now + 60
+        ))
+        .expect(1)
+        .create_async()
+        .await;
+    let input = UpdateSharePermissionInput {
+        content_id: f.content_id.clone(),
+        remote_content_id: Some("perm-remote".into()),
+        recipient_public_key: f.target.public_key.clone(),
+        permissions: vec![Permission::Read],
+    };
+    let failed = f
+        .controller
+        .update_share_permission(input.clone(), Some(&auth_context("Bearer owner")));
+    assert!(
+        !failed.success,
+        "issuance must fail with a far-future cutoff"
+    );
+    skewed.assert();
+    skewed.remove_async().await;
+
+    let fixed = state_node
+        .mock("POST", "/content/perm-remote/access/invalidate")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(format!(
+            r#"{{"content_id":"perm-remote","new_min_valid_issued_at":{now}}}"#
+        ))
+        .expect(1)
+        .create_async()
+        .await;
+    let retry = f
+        .controller
+        .update_share_permission(input, Some(&auth_context("Bearer owner")));
+    assert!(retry.success, "{:?}", retry.error);
+    fixed.assert();
+    let out = retry.data.expect("data");
+    assert_eq!(
+        out.token_invalidated_at,
+        Some(now),
+        "retry must redo the downgrade"
+    );
+    assert_eq!(
+        out.reissued_tokens.len(),
+        1,
+        "the other recipient's token is reissued"
+    );
+    assert!(out.reissued_tokens[0].delegated_access.is_some());
+    cleanup_content_artifacts();
+}

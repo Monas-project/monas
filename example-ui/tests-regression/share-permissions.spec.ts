@@ -22,7 +22,7 @@ const fileEntry = (shares: ShareGrant[]): Entry => ({
   versionCount: 1, shares,
 } as Entry);
 
-async function boot(page: Page, entries: Entry[]) {
+async function boot(page: Page, entries: Entry[], permissionExtra: Record<string, unknown> = {}) {
   const requests: { path: string; body: any }[] = [];
   const unexpected: string[] = [];
   await page.addInitScript(({ entries, owner }) => {
@@ -45,14 +45,15 @@ async function boot(page: Page, entries: Entry[]) {
     if (path === "/api/state/read") data = { content_id: "network", local_content_id: "plain-v1", version: "v1", content: "VjE" };
     else if (path === "/api/share") {
       const who = String(body.recipient_public_key).replace("public-", "");
-      data = { content_id: "plain-v1", recipient_public_key: body.recipient_public_key, sender_public_key: "public-owner", sender_key_id: "owner-kid", recipient_key_id: `kid-${who}`, key_envelope: envelope, delegated_access: token(`${who}-1`) };
+      data = { content_id: entries[0]?.localContentId ?? "plain-v1", recipient_public_key: body.recipient_public_key, sender_public_key: "public-owner", sender_key_id: "owner-kid", recipient_key_id: `kid-${who}`, key_envelope: envelope, delegated_access: token(`${who}-1`) };
     } else if (path === "/api/share/permission") {
       const who = String(body.recipient_public_key).replace("public-", "");
       const downgrade = !body.permissions.includes("write");
       data = {
         content_id: "plain-v1", recipient_public_key: body.recipient_public_key, recipient_key_id: `kid-${who}`,
         permissions: downgrade ? ["read"] : ["write"], delegated_access: token(`${who}-2`),
-        ...(downgrade ? { token_invalidated_at: 50, reissued_tokens: [{ recipient_key_id: "kid-carol", delegated_access: token("carol-2") }] } : {}),
+        ...(downgrade ? { token_invalidated_at: 50, token_invalidation_reach: { notified_members: ["n2"], unreached_members: [], relayed: false }, reissued_tokens: [{ recipient_key_id: "kid-carol", delegated_access: token("carol-2") }] } : {}),
+        ...permissionExtra,
       };
     } else { unexpected.push(`${req.method()} ${path}`); return route.fulfill({ status: 500, body: "Unexpected test request" }); }
     return route.fulfill({ json: { success: true, data, trace_id: "test" } });
@@ -124,4 +125,63 @@ test("downgrading from a row needs no revoke; other recipients' replaced tokens 
   expect(byLabel.carol.delegatedAccess?.jti).toBe("carol-2");
   expect(byLabel.carol.tokenReissuedAt).toBeTruthy();
   expect(gateway.unexpected).toEqual([]);
+});
+
+// After an owner edit the entry's id moves to the new version, but a grant's
+// envelope stays bound (HPKE info/AAD) to the version it was wrapped for. The
+// package must name that version, or Import shared cannot unwrap it — which
+// after a downgrade (all earlier tokens void) would lock the recipient out.
+test("a package after a permission change names the version its envelope was wrapped for", async ({ page }) => {
+  const edited = fileEntry([{ ...grant("bob", ["read"]), envelopeContentId: "plain-v1" } as ShareGrant]);
+  edited.localContentId = "plain-v2";
+  const gateway = await boot(page, [edited]);
+  await openShare(page);
+  const bob = page.locator(".recipient-row").filter({ hasText: "bob" });
+  await bob.locator(".seg").getByRole("button", { name: "read + write" }).click();
+  await expect(page.locator(".run-status").first()).toHaveText("complete");
+  const pkg = JSON.parse(await page.locator(".share-package textarea").inputValue());
+  expect(pkg.content_id).toBe("plain-v1");
+  expect(pkg.delegated_access.jti).toBe("bob-2");
+  // the ACL is addressed by the current version
+  expect(gateway.requests.find(r => r.path === "/api/share/permission")!.body.content_id).toBe("plain-v2");
+  expect(gateway.unexpected).toEqual([]);
+});
+
+test("a new share records the version its envelope is bound to", async ({ page }) => {
+  const entry = fileEntry([]);
+  entry.localContentId = "plain-v2";
+  await boot(page, [entry]);
+  await openShare(page);
+  await page.getByPlaceholder("P-256 public key, base64url (from the gateway /keypair)").fill("public-bob");
+  await page.getByRole("button", { name: "Wrap CEK & share" }).click();
+  await expect(page.locator(".share-package textarea")).toBeVisible();
+  expect((await stored(page))[0].envelopeContentId).toBe("plain-v2");
+});
+
+// A downgrade only stops the old write token on members the cutoff reached.
+// Like revoke, say so instead of reporting a plain success.
+const reachCases = [
+  { name: "unreached", extra: { token_invalidation_reach: { notified_members: [], unreached_members: [{ node_id: "node-2", error: "offline" }], relayed: false } }, toast: /did not reach 1 member/ },
+  { name: "relayed", extra: { token_invalidation_reach: { notified_members: [], unreached_members: [], relayed: true } }, toast: /relayed to a member/ },
+  { name: "unknown", extra: { token_invalidation_reach: undefined }, toast: /propagation is unknown/ },
+];
+for (const c of reachCases) {
+  test(`downgrade with ${c.name} cutoff propagation warns, and the flow does not claim the old token is void everywhere`, async ({ page }) => {
+    const gateway = await boot(page, [fileEntry([grant("bob", ["read", "write"])])], c.extra);
+    await openShare(page);
+    const bob = page.locator(".recipient-row").filter({ hasText: "bob" });
+    await bob.locator(".seg").getByRole("button", { name: "read", exact: true }).click();
+    await expect(page.locator(".run-status").first()).toHaveText("complete");
+    await expect(page.locator(".toast.error")).toContainText(c.toast);
+    await expect(page.locator(".step").filter({ hasText: "Content key unchanged" })).not.toContainText("old write token is void");
+    expect(gateway.unexpected).toEqual([]);
+  });
+}
+
+test("downgrade reached every member: no warning", async ({ page }) => {
+  await boot(page, [fileEntry([grant("bob", ["read", "write"])])]);
+  await openShare(page);
+  await page.locator(".recipient-row").filter({ hasText: "bob" }).locator(".seg").getByRole("button", { name: "read", exact: true }).click();
+  await expect(page.locator(".run-status").first()).toHaveText("complete");
+  await expect(page.locator(".toast.error")).toHaveCount(0);
 });
