@@ -119,16 +119,23 @@ where
 
     /// 以前の形式(plainCid をキー)で保存された共有設定を、系列IDのキーへ移す。
     ///
-    /// 本文の編集・head の取り込みで plainCid が変わる直前に呼ぶ。以前は
-    /// 編集のたびに共有設定を新しい plainCid へコピーしていたので、最新の設定は
-    /// 「今の plainCid」のキーにある。plainCid が変わってからではそれを
-    /// 見つけられなくなるため、変わる前に移しておく。
+    /// 本文の編集・head の取り込みで plainCid が `content_id` から変わるときに
+    /// 呼ぶ。以前は plainCid が変わるたびに共有設定を新しい plainCid へコピー
+    /// していた(`carry_share_acl`)。移すのは、その作りが次に使ったはずの設定:
     ///
-    /// 系列IDのキーに既にあれば何もしない(移行済み。古い plainCid のキーに
+    /// - 編集(`adopted` = None): `content_id` の設定。編集後の plainCid に
+    ///   設定があっても、それは本文を以前と同じに戻したときの古い設定。
+    /// - head の取り込み(`adopted` = 取り込み先の plainCid): 取り込み先に
+    ///   設定があればそちら。以前の作りは取り込み先の設定を残していたので、
+    ///   別のタブ・端末がその plainCid で変更した設定であり、`content_id`
+    ///   (古いタブが持っていた plainCid)の設定より新しい。
+    ///
+    /// 系列IDのキーに既にあれば何もしない(移行済み。plainCid のキーに
     /// 残っている設定は以後読まれない)。
     pub fn migrate_legacy_share(
         &self,
         content_id: &crate::domain::content_id::ContentId,
+        adopted: Option<&crate::domain::content_id::ContentId>,
     ) -> Result<(), ShareApplicationError> {
         let Some(content) = self
             .content_repository
@@ -145,9 +152,23 @@ where
         {
             return Ok(());
         }
-        if let Some(share) = self.load_share_of(&content)? {
+        let from_adopted = match adopted {
+            Some(adopted) => self
+                .share_repository
+                .load_legacy(adopted)
+                .map_err(ShareApplicationError::ShareRepository)?,
+            None => None,
+        };
+        let legacy = match from_adopted {
+            Some(share) => Some(share),
+            None => self
+                .share_repository
+                .load_legacy(content.raw_id())
+                .map_err(ShareApplicationError::ShareRepository)?,
+        };
+        if let Some(share) = legacy {
             self.share_repository
-                .save(&share)
+                .save(&share.with_new_content_id(content.series_id().clone()))
                 .map_err(ShareApplicationError::ShareRepository)?;
         }
         Ok(())
@@ -1583,7 +1604,7 @@ mod tests {
         assert_eq!(before.content_id(), v2.series_id());
 
         // plainCid が変わる前(編集・head の取り込みの直前)に移す。
-        service.migrate_legacy_share(v2.raw_id()).unwrap();
+        service.migrate_legacy_share(v2.raw_id(), None).unwrap();
         let migrated = share_storage
             .lock()
             .unwrap()
@@ -1606,8 +1627,63 @@ mod tests {
             .lock()
             .unwrap()
             .insert(v2.series_id().as_str().to_string(), changed);
-        service.migrate_legacy_share(v2.raw_id()).unwrap();
+        service.migrate_legacy_share(v2.raw_id(), None).unwrap();
         let after = service.get_share(v2.raw_id().clone()).unwrap().unwrap();
         assert!(after.recipients().is_empty());
+    }
+
+    /// head の取り込み(plainCid が `from` → `adopted` に変わる)での移行は、
+    /// 取り込み先に以前の形式の設定があればそちらを使う。以前の作りは取り込み先に
+    /// 設定があればそれを残していた(`carry_share_acl`)ので、取り込み先の設定の
+    /// 方が新しい。例: 古いタブが v1 のまま、別のタブで v2 に編集して Carol を
+    /// 追加していた場合、v1 の設定を移すと Carol が消える。
+    #[test]
+    fn head_adoption_migrates_the_adopted_plain_cids_legacy_share_first() {
+        use crate::infrastructure::content_id::Sha256ContentIdGenerator;
+        let (content_repo, _content_storage) = TestContentRepository::new();
+        let (key_store, _key_storage) = TestKeyStore::new();
+        let (share_repo, share_storage) = TestShareRepository::new();
+        let legacy = share_repo.legacy.clone();
+        let service = build_service(
+            share_repo,
+            content_repo.clone(),
+            key_store,
+            TestPublicKeyDirectory::default(),
+            TestKeyWrapper,
+        );
+
+        let v1 = build_content(&cid(), Some(encrypted()), false);
+        let (v2, _) = v1
+            .adopt_version(b"body B".to_vec(), encrypted(), &Sha256ContentIdGenerator)
+            .unwrap();
+        content_repo.save(v1.raw_id(), &v1).unwrap();
+        content_repo.save(v2.raw_id(), &v2).unwrap();
+
+        let (bob, carol) = (KeyId::new(vec![7]), KeyId::new(vec![8]));
+        let mut at_v1 = Share::new(v1.raw_id().clone());
+        at_v1.grant_read(bob.clone()).unwrap();
+        let mut at_v2 = at_v1.with_new_content_id(v2.raw_id().clone());
+        at_v2.grant_read(carol.clone()).unwrap();
+        legacy
+            .lock()
+            .unwrap()
+            .insert(v1.raw_id().as_str().to_string(), at_v1);
+        legacy
+            .lock()
+            .unwrap()
+            .insert(v2.raw_id().as_str().to_string(), at_v2);
+
+        service
+            .migrate_legacy_share(v1.raw_id(), Some(v2.raw_id()))
+            .unwrap();
+        let migrated = share_storage
+            .lock()
+            .unwrap()
+            .get(v1.series_id().as_str())
+            .cloned()
+            .expect("migrated");
+        assert!(migrated.recipients().contains_key(&carol));
+        assert!(migrated.recipients().contains_key(&bob));
+        assert_eq!(migrated.content_id(), v1.series_id());
     }
 }

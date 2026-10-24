@@ -507,7 +507,7 @@ impl MonasController {
                 )
             })?;
         if adopted.content_id != local {
-            self.migrate_legacy_share(&local);
+            self.migrate_legacy_share(&local, Some(&adopted.content_id));
         }
 
         Ok(AdoptedHead {

@@ -1105,7 +1105,7 @@ impl MonasController {
         // 失敗しても更新自体は成立している(ローカル・State Node とも新しい版)
         // ので巻き戻さない。次の share / revoke で「受信者がいない」として現れる。
         if result.content_id.as_str() != base_version_id {
-            self.migrate_legacy_share(&ContentId::new(base_version_id.clone()));
+            self.migrate_legacy_share(&ContentId::new(base_version_id.clone()), None);
         }
 
         let output = UpdateContentOutput {
@@ -1120,17 +1120,19 @@ impl MonasController {
 
     /// 以前の形式(plainCid のキー)の共有設定を系列ID のキーへ移す(best effort)。
     /// `update_content` と `adopt_remote_head` で plainCid が変わるときに、
-    /// 変わる前の plainCid を渡して呼ぶ。
+    /// 変わる前の plainCid(`from`)を渡して呼ぶ。head の取り込みでは取り込み先の
+    /// plainCid(`adopted`)も渡す(どちらの設定を移すかは
+    /// `ShareService::migrate_legacy_share`)。
     ///
     /// 以前は共有設定を plainCid ごとに持ち、編集のたびに新しい plainCid へ
     /// コピーしていた。本文を以前と同じ内容に戻すと plainCid も以前と同じになり、
     /// そこに残っていた古い設定(降格・取り消しの前)を拾っていた。今は
     /// ファイル単位で 1 つだけ持つので、コピーは不要。
-    pub(super) fn migrate_legacy_share(&self, from: &ContentId) {
+    pub(super) fn migrate_legacy_share(&self, from: &ContentId, adopted: Option<&ContentId>) {
         // 「系列ID のキーに無ければ保存」なので、並行する share / revoke /
         // 権限変更の保存を古い設定で上書きしないよう同じロックを取る。
         let _guard = self.content_revoke_locks.lock(&self.share_lock_key(from));
-        let _ = self.share_service.migrate_legacy_share(from);
+        let _ = self.share_service.migrate_legacy_share(from, adopted);
     }
 
     /// コンテンツを削除する。
