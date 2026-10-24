@@ -48,7 +48,8 @@ export interface ShareGrant {
   /** The content version the envelope was wrapped for. HPKE binds the wrap
    *  to it (info/AAD), so a package must name this version, not the entry's
    *  current one — after an owner edit the two differ. Absent on grants
-   *  saved before this was recorded. */
+   *  saved before this was recorded; the registry pins those to the entry's
+   *  id just before that id next moves (`applyPatch` in store/registry.ts). */
   envelopeContentId?: string;
   delegatedAccess?: DelegatedAccessToken;
   grantedAt: number;

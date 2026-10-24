@@ -283,6 +283,23 @@ impl MonasController {
         }
     }
 
+    /// 共有設定を読み書きする操作(share / revoke / 権限変更 / 旧形式の移行)を
+    /// 直列化するキー = そのファイルの系列ID。
+    ///
+    /// 共有設定はファイル単位で 1 つなので、plainCid でロックすると、編集前と
+    /// 編集後の plainCid から同じ設定を同時に load-modify-save でき、後勝ちで
+    /// 片方の変更(降格・取り消し)が消える。コンテンツ記録が無ければ
+    /// `content_id` をそのまま使う(後段の処理が NotFound で止まる)。
+    pub(super) fn share_lock_key(&self, content_id: &ContentId) -> String {
+        self.share_service
+            .content_repository
+            .find_by_id(content_id)
+            .ok()
+            .flatten()
+            .map(|content| content.series_id().as_str().to_string())
+            .unwrap_or_else(|| content_id.as_str().to_string())
+    }
+
     fn capture_revoke_share_snapshot(
         &self,
         content_id: &ContentId,
@@ -399,6 +416,12 @@ impl MonasController {
             Ok(p) => p,
             Err(e) => return ApiResponse::error(e, trace_id),
         };
+
+        // 共有設定の load-modify-save なので revoke・権限変更と同じロックで直列化する
+        // (Token 発行失敗時の巻き戻しまで保持する)。
+        let _guard = self
+            .content_revoke_locks
+            .lock(&self.share_lock_key(&content_id));
 
         // 6. ShareService::grant_shareを呼び出し
         // これにより、以下が実行されます：
@@ -554,7 +577,7 @@ impl MonasController {
         };
         let content_id = ContentId::new(local_content_id.clone());
 
-        // この content への revoke を直列化する。revoke は ACL・CEK・ローカル
+        // このファイル(系列ID)への revoke を直列化する。revoke は ACL・CEK・ローカル
         // ciphertext・state node 状態にまたがる load-modify-save で、どこにも
         // version CAS が無い。`MonasController` は gateway から `Arc` 共有され
         // 同時に呼ばれるため、ロックが無いと 2 つの revoke が同じ Share を読んで
@@ -569,7 +592,9 @@ impl MonasController {
         // これでは防げず、state node 側の CAS が必要になる(現状の制約)。
         // ガードを drop するとエントリは表から消えるので、revoke した content の
         // 数だけレジストリが伸び続けることはない。
-        let _revoke_guard = self.content_revoke_locks.lock(content_id.as_str());
+        let _revoke_guard = self
+            .content_revoke_locks
+            .lock(&self.share_lock_key(&content_id));
 
         let snapshot = match self.capture_revoke_share_snapshot(&content_id) {
             Ok(snapshot) => snapshot,
@@ -835,7 +860,9 @@ impl MonasController {
             .clone()
             .unwrap_or_else(|| input.content_id.clone());
 
-        let _guard = self.content_revoke_locks.lock(content_id.as_str());
+        let _guard = self
+            .content_revoke_locks
+            .lock(&self.share_lock_key(&content_id));
 
         // 現在の権限(降格かどうかの判定)。共有されていない相手はここで弾く。
         let previous = match self.share_service.get_share(content_id.clone()) {
@@ -1424,5 +1451,139 @@ mod bearer_prefix_tests {
         assert!(!has_bearer_prefix("Bearéé token"));
         assert!(!has_bearer_prefix("Bearéétoken"));
         assert!(!has_bearer_prefix("日本語のトークン"));
+    }
+}
+
+#[cfg(test)]
+mod share_lock_tests {
+    use crate::models::content::{ContentMetadata, CreateContentInput, UpdateContentInput};
+    use crate::models::keypair::{GenerateKeypairInput, KeyType};
+    use crate::models::share::{Permission, ShareContentInput, UpdateSharePermissionInput};
+    use crate::{MonasConfig, MonasController, StateNodeAuthContext};
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use std::time::Duration;
+
+    /// 同じファイルの別の plainCid(編集前のタブと編集後のタブ)からの権限変更も
+    /// 1 つのロックで直列化される。共有設定はファイル(系列ID)単位で 1 つなので、
+    /// plainCid ごとのロックでは同じ設定を同時に load-modify-save でき、後勝ちで
+    /// 片方の変更が消える。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn permission_changes_through_two_plain_cids_of_one_file_share_one_lock() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/content")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"content_id":"lock-remote"}"#)
+            .create_async()
+            .await;
+        server
+            .mock("PUT", "/content/lock-remote")
+            .with_status(200)
+            .create_async()
+            .await;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("monas-sdk-share-lock-{nanos}"));
+        let config = MonasConfig::new(server.url())
+            .with_persistence_dir(&dir)
+            .with_request_timestamp_skew(Duration::from_secs(60 * 60 * 24 * 365 * 100));
+        let controller = MonasController::with_config(config).expect("controller");
+        controller
+            .create_signing_account()
+            .data
+            .expect("signing account");
+        let kp = || {
+            controller
+                .generate_keypair(GenerateKeypairInput {
+                    key_type: KeyType::Secp256r1,
+                })
+                .data
+                .expect("keypair")
+        };
+        let (sender, bob) = (kp(), kp());
+
+        let created = controller
+            .create_content(
+                CreateContentInput {
+                    content: URL_SAFE_NO_PAD.encode(b"lock A"),
+                    metadata: Some(ContentMetadata {
+                        name: Some("lock.txt".to_string()),
+                        content_type: Some("text/plain".to_string()),
+                        created_at: None,
+                        updated_at: None,
+                    }),
+                },
+                None,
+            )
+            .data
+            .expect("create");
+        assert!(
+            controller
+                .share_content(ShareContentInput {
+                    content_id: created.content_id.clone(),
+                    remote_content_id: Some("lock-remote".into()),
+                    sender_public_key: sender.public_key.clone(),
+                    sender_private_key: sender.private_key.clone(),
+                    recipient_public_key: bob.public_key.clone(),
+                    permissions: vec![Permission::Read],
+                })
+                .success
+        );
+        let auth = StateNodeAuthContext {
+            authorization: Some("Bearer owner".into()),
+            request_signature: Some("caller-signature".into()),
+            request_timestamp: Some(1_717_171_717),
+        };
+        let edited = controller
+            .update_content(
+                UpdateContentInput {
+                    local_content_id: created.content_id.clone(),
+                    remote_content_id: "lock-remote".to_string(),
+                    content: URL_SAFE_NO_PAD.encode(b"lock B"),
+                    metadata: None,
+                },
+                Some(&auth),
+            )
+            .data
+            .expect("update");
+        assert_ne!(edited.version_id, created.content_id);
+
+        // 編集前の plainCid(= 系列ID)側の操作がロックを持っている間は、
+        // 編集後の plainCid からの権限変更も待たされる。
+        let held =
+            controller
+                .content_revoke_locks
+                .lock(&controller.share_lock_key(
+                    &monas_content::domain::content_id::ContentId::new(created.content_id.clone()),
+                ));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let runtime = tokio::runtime::Handle::current();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let _runtime = runtime.enter();
+                let r = controller.update_share_permission(
+                    UpdateSharePermissionInput {
+                        content_id: edited.version_id.clone(),
+                        remote_content_id: Some("lock-remote".into()),
+                        recipient_public_key: bob.public_key.clone(),
+                        permissions: vec![Permission::Write],
+                    },
+                    None,
+                );
+                tx.send(r.success).unwrap();
+            });
+            assert!(
+                rx.recv_timeout(Duration::from_millis(500)).is_err(),
+                "a permission change through another plainCid of the same file must wait"
+            );
+            drop(held);
+            assert!(rx.recv_timeout(Duration::from_secs(20)).expect("finishes"));
+        });
+        drop(controller);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -43,6 +43,8 @@ async function boot(page: Page, entries: Entry[], permissionExtra: Record<string
     let data: unknown;
     if (path === "/api/health") return route.fulfill({ status: 200, body: "" });
     if (path === "/api/state/read") data = { content_id: "network", local_content_id: "plain-v1", version: "v1", content: "VjE" };
+    else if (path === "/api/state/pull") data = { content_id: "network", local_content_id: "plain-v1", version: "v1", adopted: false, content: "VjE" };
+    else if (path === "/api/content/plain-v1" && req.method() === "PUT") data = { series_id: "plain-v1", previous_version_id: "plain-v1", version_id: "plain-v2" };
     else if (path === "/api/share") {
       const who = String(body.recipient_public_key).replace("public-", "");
       data = { content_id: entries[0]?.localContentId ?? "plain-v1", recipient_public_key: body.recipient_public_key, sender_public_key: "public-owner", sender_key_id: "owner-kid", recipient_key_id: `kid-${who}`, key_envelope: envelope, delegated_access: token(`${who}-1`) };
@@ -144,6 +146,25 @@ test("a package after a permission change names the version its envelope was wra
   expect(pkg.delegated_access.jti).toBe("bob-2");
   // the ACL is addressed by the current version
   expect(gateway.requests.find(r => r.path === "/api/share/permission")!.body.content_id).toBe("plain-v2");
+  expect(gateway.unexpected).toEqual([]);
+});
+
+// A grant saved before envelopeContentId was recorded falls back to the
+// entry's current id. That is right only until the next owner edit, so the
+// edit must pin the id the envelope was wrapped for before it moves.
+test("an owner edit pins a legacy grant to the version its envelope was wrapped for", async ({ page }) => {
+  const gateway = await boot(page, [fileEntry([grant("bob", ["read"])])]);
+  await page.locator(".row-menu-wrap > button").click();
+  await page.locator(".menu").getByRole("button", { name: "Edit contents", exact: true }).click();
+  await expect(page.locator(".modal textarea")).toHaveValue("V1");
+  await page.locator(".modal textarea").fill("V2");
+  await page.getByRole("button", { name: "Re-encrypt & save" }).click();
+  await expect.poll(() => page.evaluate(() => JSON.parse(localStorage.getItem("monas.registry.v3")!)[0].localContentId)).toBe("plain-v2");
+  expect((await stored(page))[0].envelopeContentId).toBe("plain-v1");
+  await openShare(page);
+  await page.locator(".recipient-row").filter({ hasText: "bob" }).getByRole("button", { name: "Copy package" }).click();
+  const pkg = JSON.parse(await page.locator(".share-package textarea").inputValue());
+  expect(pkg.content_id).toBe("plain-v1");
   expect(gateway.unexpected).toEqual([]);
 });
 

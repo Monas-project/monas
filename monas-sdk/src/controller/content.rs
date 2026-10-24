@@ -1127,6 +1127,9 @@ impl MonasController {
     /// そこに残っていた古い設定(降格・取り消しの前)を拾っていた。今は
     /// ファイル単位で 1 つだけ持つので、コピーは不要。
     pub(super) fn migrate_legacy_share(&self, from: &ContentId) {
+        // 「系列ID のキーに無ければ保存」なので、並行する share / revoke /
+        // 権限変更の保存を古い設定で上書きしないよう同じロックを取る。
+        let _guard = self.content_revoke_locks.lock(&self.share_lock_key(from));
         let _ = self.share_service.migrate_legacy_share(from);
     }
 
