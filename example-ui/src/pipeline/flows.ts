@@ -11,7 +11,7 @@ import * as shareApi from "../api/share";
 import * as stateApi from "../api/stateNode";
 import { byteLengthOfBase64Url, short } from "../api/crypto";
 import type { Entry, Identity, Permission, SharePackage } from "../types";
-import type { StepSpec } from "./types";
+import { StepWarning, type StepSpec } from "./types";
 
 function fmtBytes(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -470,11 +470,14 @@ export function changePermissionFlow(input: {
         }
         // Only a member that took the cutoff refuses the old write token.
         const reach = r.token_invalidation_reach;
-        const where =
-          reach && !reach.relayed && reach.unreached_members.length === 0
-            ? "The old write token is void on every member"
-            : "Members that took the cutoff refuse the old write token; others accept it until they sync (~30 s)";
-        return `${where}. ${others} other recipient(s) got a fresh token. Send each recipient their new package.`;
+        const tail = `${others} other recipient(s) got a fresh token. Send each recipient their new package.`;
+        if (reach && !reach.relayed && reach.unreached_members.length === 0) {
+          return `The old write token is void on every member. ${tail}`;
+        }
+        // The downgrade succeeded; only how far the cutoff reached is open.
+        throw new StepWarning(
+          `Members that took the cutoff refuse the old write token; others accept it until they sync (~30 s). ${tail}`,
+        );
       },
     },
   ];
@@ -533,22 +536,26 @@ export function revokeFlow(input: {
       hint: "members · best-effort push",
       kind: "state",
       minMs: 200,
-      // The revoke itself succeeded; this step going red must not fail the
-      // run or skip the envelope reissue that follows.
+      // The revoke itself succeeded: incomplete propagation is a warning
+      // (StepWarning, amber). `optional` keeps any real failure here from
+      // failing the run or skipping the envelope reissue that follows.
       optional: true,
       exec: async (ctx) => {
         const r = ctx.revoke as shareApi.RevokeShareOutput;
         const reach = r.token_invalidation_reach;
         if (!reach) {
-          return r.token_invalidated_at != null || entry.syncedToStateNode || entry.remoteContentId
-            ? "Token invalidation propagation is unknown — the node returned no reach report. Members that have not synced may still accept writes under old tokens."
-            : "No state node involved — nothing to propagate";
+          if (r.token_invalidated_at != null || entry.syncedToStateNode || entry.remoteContentId) {
+            throw new StepWarning(
+              "Token invalidation propagation is unknown — the node returned no reach report. Members that have not synced may still accept writes under old tokens.",
+            );
+          }
+          return "No state node involved — nothing to propagate";
         }
         if (reach.relayed) {
-          return (
+          throw new StepWarning(
             "The node we contacted relayed the revoke to a member; which members " +
-            "have the cutoff is not known from here. Until their next sync, members " +
-            "without it may still accept writes under the old tokens."
+              "have the cutoff is not known from here. Until their next sync, members " +
+              "without it may still accept writes under the old tokens.",
           );
         }
         const n = reach.notified_members.length;
@@ -560,7 +567,7 @@ export function revokeFlow(input: {
         const who = reach.unreached_members
           .map((m) => `${short(m.node_id, 8, 4)} (${m.error})`)
           .join(", ");
-        throw new Error(
+        throw new StepWarning(
           `${reach.unreached_members.length} member(s) did not get the cutoff: ${who}. ` +
             `Until they sync (~30 s), a write under the revoked token can still land there. ` +
             `${n} member(s) acknowledged.`,

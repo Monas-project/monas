@@ -126,9 +126,13 @@ for (const scenario of reachCases) {
     await page.getByRole("button", { name: "Revoke", exact: true }).click();
     await expect(page.locator(".run-status")).toHaveText("complete");
     // Soft assertions catch flow and App toast independently in a RED run.
-    await expect.soft(page.locator(".step").filter({ hasText: "Cutoff propagation" })).toContainText(scenario.detail);
-    if (scenario.toast) await expect.soft(page.locator(".toast.error")).toContainText(scenario.toast);
-    else await expect(page.locator(".toast.error")).toHaveCount(0);
+    const step = page.locator(".step").filter({ hasText: "Cutoff propagation" });
+    await expect.soft(step).toContainText(scenario.detail);
+    // The revoke succeeded: incomplete propagation is a warning (amber), never an error (red).
+    await expect.soft(step).toHaveClass(scenario.toast ? /\bwarning\b/ : /\bdone\b/);
+    if (scenario.toast) await expect.soft(page.locator(".toast.warning")).toContainText(scenario.toast);
+    else await expect(page.locator(".toast.warning")).toHaveCount(0);
+    await expect(page.locator(".toast.error")).toHaveCount(0);
     await expect(page.locator(".modal").getByRole("button", { name: "Revoke", exact: true })).toHaveCount(0);
     expect(gateway.unexpected).toEqual([]);
   });

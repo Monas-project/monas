@@ -193,8 +193,12 @@ for (const c of reachCases) {
     const bob = page.locator(".recipient-row").filter({ hasText: "bob" });
     await bob.locator(".seg").getByRole("button", { name: "read", exact: true }).click();
     await expect(page.locator(".run-status").first()).toHaveText("complete");
-    await expect(page.locator(".toast.error")).toContainText(c.toast);
-    await expect(page.locator(".step").filter({ hasText: "Content key unchanged" })).not.toContainText("old write token is void");
+    // The downgrade succeeded: incomplete propagation is a warning (amber), never an error (red).
+    await expect(page.locator(".toast.warning")).toContainText(c.toast);
+    await expect(page.locator(".toast.error")).toHaveCount(0);
+    const step = page.locator(".step").filter({ hasText: "Content key unchanged" });
+    await expect(step).not.toContainText("old write token is void");
+    await expect(step).toHaveClass(/\bwarning\b/);
     expect(gateway.unexpected).toEqual([]);
   });
 }
@@ -205,4 +209,6 @@ test("downgrade reached every member: no warning", async ({ page }) => {
   await page.locator(".recipient-row").filter({ hasText: "bob" }).locator(".seg").getByRole("button", { name: "read", exact: true }).click();
   await expect(page.locator(".run-status").first()).toHaveText("complete");
   await expect(page.locator(".toast.error")).toHaveCount(0);
+  await expect(page.locator(".toast.warning")).toHaveCount(0);
+  await expect(page.locator(".step").filter({ hasText: "Content key unchanged" })).toHaveClass(/\bdone\b/);
 });

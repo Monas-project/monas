@@ -5,6 +5,7 @@ function StepNode({ step }: { step: StepView }) {
   if (step.status === "running") return <span className="spinner" />;
   if (step.status === "done") return <Check size={13} />;
   if (step.status === "error") return <X size={13} />;
+  if (step.status === "warning") return <b style={{ fontSize: 11 }}>!</b>;
   return iconForKind(step.kind, 12);
 }
 
@@ -22,7 +23,7 @@ function StepRow({ step }: { step: StepView }) {
           <span className="hint">{step.hint}</span>
         </div>
         {step.detail && step.status !== "error" && (
-          <div className="detail">{step.detail}</div>
+          <div className={step.status === "warning" ? "detail warn" : "detail"}>{step.detail}</div>
         )}
         {step.error && (
           <div className="detail err">

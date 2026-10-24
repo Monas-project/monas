@@ -1,6 +1,6 @@
 import { uuid } from "../api/crypto";
 import { describeError } from "../api/http";
-import type { RunContext, RunView, StepSpec, StepView } from "./types";
+import { StepWarning, type RunContext, type RunView, type StepSpec, type StepView } from "./types";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -68,6 +68,12 @@ export async function runPipeline(
     } catch (e) {
       const elapsed = Date.now() - started;
       if (spec.minMs && elapsed < spec.minMs) await sleep(spec.minMs - elapsed);
+      if (e instanceof StepWarning) {
+        step.status = "warning";
+        step.detail = e.message;
+        emit();
+        continue;
+      }
       const msg = describeError(e);
       step.status = "error";
       step.error = msg;

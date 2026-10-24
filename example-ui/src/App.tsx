@@ -520,17 +520,17 @@ export default function App() {
     if (!reach) {
       pushToast(
         "Token invalidation propagation is unknown — the node returned no reach report. Members that have not synced may still accept writes under old tokens.",
-        "error",
+        "warning",
       );
     } else if (reach.relayed) {
       pushToast(
         `The ${action} was relayed to a member node; which members enforce the cutoff yet is not known from here. Writes under ${what} may land on members that have not synced.`,
-        "error",
+        "warning",
       );
     } else if (reach.unreached_members.length > 0) {
       pushToast(
         `Cutoff did not reach ${reach.unreached_members.length} member node(s). Until they sync (~30 s), a write under ${what} can still land there.`,
-        "error",
+        "warning",
       );
     }
   };
