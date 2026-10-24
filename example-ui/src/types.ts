@@ -45,12 +45,23 @@ export interface ShareGrant {
    *  the recipient needs this, not the (self-asserted) sender_key_id. */
   senderPublicKeyB64Url: string;
   envelope: KeyEnvelopeData;
+  /** The content version the envelope was wrapped for. HPKE binds the wrap
+   *  to it (info/AAD), so a package must name this version, not the entry's
+   *  current one — after an owner edit the two differ. Absent on grants
+   *  saved before this was recorded; the registry pins those to the entry's
+   *  id just before that id next moves (`applyPatch` in store/registry.ts). */
+  envelopeContentId?: string;
   delegatedAccess?: DelegatedAccessToken;
   grantedAt: number;
   /** Set when a revoke of *another* recipient rotated the CEK and reissued
    *  this grant's envelope. The recipient must process the new envelope
    *  before it can decrypt again. */
   reissuedAt?: number;
+  /** Set when this grant's delegated token was reissued without a key
+   *  rotation: its permission changed, or another recipient's downgrade
+   *  voided every earlier token. The envelope still opens; the old package
+   *  can no longer read from or write to the state node. */
+  tokenReissuedAt?: number;
 }
 
 // Everything a recipient on another device needs to unwrap and read a share.

@@ -1,12 +1,14 @@
 use crate::application_service::content_service::{ContentEncryptionKeyStore, ContentRepository};
 use crate::domain::content::encryption::ContentEncryptionKey;
+use crate::domain::content::Content;
 use crate::domain::share::{
     encryption::KeyWrapping, key_envelope::KeyWrapAlgorithm, KeyEnvelope, Share,
 };
 
 use super::{
     GrantShareCommand, GrantShareResult, PublicKeyDirectory, RevokeShareCommand, RevokeShareResult,
-    ShareApplicationError, ShareRepository,
+    ShareApplicationError, ShareRepository, UpdateSharePermissionCommand,
+    UpdateSharePermissionResult,
 };
 
 /// コンテンツ共有ユースケースのアプリケーションサービス。
@@ -71,16 +73,84 @@ where
         ))
     }
 
+    /// `content` のファイルに対する共有設定を読む。
+    ///
+    /// 共有設定は系列ID(`series_id`)ごとに 1 つ。系列IDのキーに無いときだけ、
+    /// 以前の形式(その時点の plainCid をキーにしたもの)を読み、系列IDに
+    /// 付け替えて返す。保存は呼び出し側の save で系列IDのキーへ行われる。
+    fn load_share_of(&self, content: &Content) -> Result<Option<Share>, ShareApplicationError> {
+        let series_id = content.series_id();
+        if let Some(share) = self
+            .share_repository
+            .load(series_id)
+            .map_err(ShareApplicationError::ShareRepository)?
+        {
+            return Ok(Some(share));
+        }
+        Ok(self
+            .share_repository
+            .load_legacy(content.raw_id())
+            .map_err(ShareApplicationError::ShareRepository)?
+            .map(|legacy| legacy.with_new_content_id(series_id.clone())))
+    }
+
     /// 指定されたコンテンツに対する現在の共有状態（ACL）を取得する。
     ///
+    /// - `content_id` は plainCid(ローカルのコンテンツ記録の ID)。共有設定は
+    ///   そのコンテンツの系列ID で引く。
+    /// - コンテンツ記録が無い場合は、`content_id` を系列ID とみなして引く。
     /// - Share がまだ一度も保存されていない場合は Ok(None) を返す。
     pub fn get_share(
         &self,
         content_id: crate::domain::content_id::ContentId,
     ) -> Result<Option<Share>, ShareApplicationError> {
-        self.share_repository
-            .load(&content_id)
-            .map_err(ShareApplicationError::ShareRepository)
+        match self
+            .content_repository
+            .find_by_id(&content_id)
+            .map_err(ShareApplicationError::ContentRepository)?
+        {
+            Some(content) => self.load_share_of(&content),
+            None => self
+                .share_repository
+                .load(&content_id)
+                .map_err(ShareApplicationError::ShareRepository),
+        }
+    }
+
+    /// 以前の形式(plainCid をキー)で保存された共有設定を、系列IDのキーへ移す。
+    ///
+    /// 本文の編集・head の取り込みで plainCid が変わる直前に呼ぶ。以前は
+    /// 編集のたびに共有設定を新しい plainCid へコピーしていたので、最新の設定は
+    /// 「今の plainCid」のキーにある。plainCid が変わってからではそれを
+    /// 見つけられなくなるため、変わる前に移しておく。
+    ///
+    /// 系列IDのキーに既にあれば何もしない(移行済み。古い plainCid のキーに
+    /// 残っている設定は以後読まれない)。
+    pub fn migrate_legacy_share(
+        &self,
+        content_id: &crate::domain::content_id::ContentId,
+    ) -> Result<(), ShareApplicationError> {
+        let Some(content) = self
+            .content_repository
+            .find_by_id(content_id)
+            .map_err(ShareApplicationError::ContentRepository)?
+        else {
+            return Ok(());
+        };
+        if self
+            .share_repository
+            .load(content.series_id())
+            .map_err(ShareApplicationError::ShareRepository)?
+            .is_some()
+        {
+            return Ok(());
+        }
+        if let Some(share) = self.load_share_of(&content)? {
+            self.share_repository
+                .save(&share)
+                .map_err(ShareApplicationError::ShareRepository)?;
+        }
+        Ok(())
     }
 
     /// 1 人の受信者に対して共有を付与し、その受信者向けの KeyEnvelope を生成する。
@@ -116,12 +186,10 @@ where
             .public_key_directory
             .compute_key_id(&cmd.recipient_public_key);
 
-        // 4. Share をロード
+        // 4. Share をロード(共有設定はファイル単位 = 系列ID のキー)
         let mut share = self
-            .share_repository
-            .load(&cmd.content_id)
-            .map_err(ShareApplicationError::ShareRepository)?
-            .unwrap_or_else(|| Share::new(cmd.content_id.clone()));
+            .load_share_of(&content)?
+            .unwrap_or_else(|| Share::new(content.series_id().clone()));
 
         // 5. Share のドメインルール検証
         let event = match cmd.permission {
@@ -214,9 +282,7 @@ where
         // 3. Share をロードして ACL を更新。CEK は rotation 済み(呼び出し側が
         //    reencrypt を先に実行している)なので鍵世代も進める。
         let mut share = self
-            .share_repository
-            .load(&cmd.content_id)
-            .map_err(ShareApplicationError::ShareRepository)?
+            .load_share_of(&content)?
             .ok_or(ShareApplicationError::ContentNotFound)?;
 
         share
@@ -250,6 +316,50 @@ where
             content_id: cmd.content_id,
             recipient_key_id: cmd.recipient_key_id,
             envelopes,
+        })
+    }
+
+    /// 既存の受信者の権限を変更する(ACL のみ)。
+    ///
+    /// - 受信者が共有されていない場合は `Share(RecipientNotFound)`。
+    /// - CEK・鍵世代・KeyEnvelope は変えない。権限は委譲 Token に載るので、
+    ///   Token の再発行(と降格時の旧 Token 失効)は呼び出し側(SDK)が行う。
+    pub fn update_share_permission(
+        &self,
+        cmd: UpdateSharePermissionCommand,
+    ) -> Result<UpdateSharePermissionResult, ShareApplicationError> {
+        let content = self
+            .content_repository
+            .find_by_id(&cmd.content_id)
+            .map_err(ShareApplicationError::ContentRepository)?
+            .ok_or(ShareApplicationError::ContentNotFound)?;
+        if content.is_deleted() {
+            return Err(ShareApplicationError::ContentDeleted);
+        }
+
+        let mut share = self
+            .load_share_of(&content)?
+            .ok_or(ShareApplicationError::Share(
+                crate::domain::share::share::ShareError::RecipientNotFound,
+            ))?;
+
+        let previous = share
+            .permissions_of(&cmd.recipient_key_id)
+            .map(|p| p.to_vec())
+            .unwrap_or_default();
+        share
+            .update_recipient_permissions(&cmd.recipient_key_id, vec![cmd.permission.clone()])
+            .map_err(ShareApplicationError::Share)?;
+
+        self.share_repository
+            .save(&share)
+            .map_err(ShareApplicationError::ShareRepository)?;
+
+        Ok(UpdateSharePermissionResult {
+            content_id: cmd.content_id,
+            recipient_key_id: cmd.recipient_key_id,
+            previous,
+            current: vec![cmd.permission],
         })
     }
 
@@ -315,6 +425,8 @@ mod tests {
     #[derive(Clone)]
     struct TestShareRepository {
         inner: Arc<Mutex<HashMap<String, Share>>>,
+        /// 以前の形式(plainCid をキー)で保存されていた共有設定。
+        legacy: Arc<Mutex<HashMap<String, Share>>>,
     }
 
     impl TestShareRepository {
@@ -323,6 +435,7 @@ mod tests {
             (
                 Self {
                     inner: inner.clone(),
+                    legacy: Arc::new(Mutex::new(HashMap::new())),
                 },
                 inner,
             )
@@ -347,6 +460,18 @@ mod tests {
 
             guard.insert(share.content_id().as_str().to_string(), share.clone());
             Ok(())
+        }
+
+        fn load_legacy(
+            &self,
+            plain_content_id: &ContentId,
+        ) -> Result<Option<Share>, ShareRepositoryError> {
+            Ok(self
+                .legacy
+                .lock()
+                .unwrap()
+                .get(plain_content_id.as_str())
+                .cloned())
         }
     }
 
@@ -1233,6 +1358,80 @@ mod tests {
     }
 
     #[test]
+    fn update_share_permission_changes_acl_without_touching_epoch() {
+        let (content_repo, content_storage) = TestContentRepository::new();
+        let (key_store, _key_storage) = TestKeyStore::new();
+        let (share_repo, share_storage) = TestShareRepository::new();
+        let public_key_dir = TestPublicKeyDirectory::default();
+        let key_wrapper = TestKeyWrapper;
+
+        let content_id = cid();
+        let kid = KeyId::new(vec![9, 9, 9]);
+        content_storage.lock().unwrap().insert(
+            content_id.as_str().to_string(),
+            build_content(&content_id, Some(encrypted()), false),
+        );
+        let mut share = Share::new(content_id.clone());
+        share.grant_read(kid.clone()).expect("grant_read");
+        share_storage
+            .lock()
+            .unwrap()
+            .insert(content_id.as_str().to_string(), share);
+
+        let service = build_service(
+            share_repo,
+            content_repo,
+            key_store,
+            public_key_dir,
+            key_wrapper,
+        );
+        let result = service
+            .update_share_permission(super::UpdateSharePermissionCommand {
+                content_id: content_id.clone(),
+                recipient_key_id: kid.clone(),
+                permission: Permission::Write,
+            })
+            .expect("update should succeed");
+        assert_eq!(result.previous, vec![Permission::Read]);
+        assert_eq!(result.current, vec![Permission::Write]);
+
+        let guard = share_storage.lock().unwrap();
+        let stored = guard.get(content_id.as_str()).expect("share kept");
+        assert_eq!(stored.permissions_of(&kid), Some(&[Permission::Write][..]));
+        assert_eq!(stored.key_epoch(), 0, "a permission change must not rotate");
+    }
+
+    #[test]
+    fn update_share_permission_fails_for_unknown_recipient() {
+        let (content_repo, content_storage) = TestContentRepository::new();
+        let (key_store, _key_storage) = TestKeyStore::new();
+        let (share_repo, _share_storage) = TestShareRepository::new();
+        let content_id = cid();
+        content_storage.lock().unwrap().insert(
+            content_id.as_str().to_string(),
+            build_content(&content_id, Some(encrypted()), false),
+        );
+        let service = build_service(
+            share_repo,
+            content_repo,
+            key_store,
+            TestPublicKeyDirectory::default(),
+            TestKeyWrapper,
+        );
+        let err = service
+            .update_share_permission(super::UpdateSharePermissionCommand {
+                content_id,
+                recipient_key_id: KeyId::new(vec![1]),
+                permission: Permission::Read,
+            })
+            .expect_err("unknown recipient");
+        assert!(matches!(
+            err,
+            ShareApplicationError::Share(ShareError::RecipientNotFound)
+        ));
+    }
+
+    #[test]
     fn get_share_returns_none_when_not_saved() {
         let (content_repo, _content_storage) = TestContentRepository::new();
         let (key_store, _key_storage) = TestKeyStore::new();
@@ -1284,5 +1483,131 @@ mod tests {
             .expect("get_share should succeed")
             .expect("share should exist");
         assert_eq!(result.recipients().len(), 1);
+    }
+
+    /// 共有設定は系列ID のキーで持つ。plainCid が変わっても(編集しても)同じ
+    /// 共有設定を使い、本文を以前と同じ内容に戻しても古い設定を拾わない。
+    #[test]
+    fn share_is_keyed_by_series_so_a_reverted_body_keeps_the_latest_acl() {
+        use crate::infrastructure::content_id::Sha256ContentIdGenerator;
+        let (content_repo, _content_storage) = TestContentRepository::new();
+        let (key_store, _key_storage) = TestKeyStore::new();
+        let (share_repo, share_storage) = TestShareRepository::new();
+        let service = build_service(
+            share_repo,
+            content_repo.clone(),
+            key_store,
+            TestPublicKeyDirectory::default(),
+            TestKeyWrapper,
+        );
+
+        let v1 = build_content(&cid(), Some(encrypted()), false);
+        let (v2, _) = v1
+            .adopt_version(b"body B".to_vec(), encrypted(), &Sha256ContentIdGenerator)
+            .unwrap();
+        assert_ne!(v2.raw_id(), v1.raw_id());
+        content_repo.save(v1.raw_id(), &v1).unwrap();
+        content_repo.save(v2.raw_id(), &v2).unwrap();
+
+        let bob = KeyId::new(vec![7]);
+        let mut share = Share::new(v1.series_id().clone());
+        share.grant_write(bob.clone()).unwrap();
+        share_storage
+            .lock()
+            .unwrap()
+            .insert(v1.series_id().as_str().to_string(), share);
+
+        // v2 の plainCid で降格する。
+        service
+            .update_share_permission(super::UpdateSharePermissionCommand {
+                content_id: v2.raw_id().clone(),
+                recipient_key_id: bob.clone(),
+                permission: Permission::Read,
+            })
+            .unwrap();
+
+        // 本文を v1 と同じ内容に戻した(plainCid が v1 と同じ)ときも降格したまま。
+        let reverted = service
+            .get_share(v1.raw_id().clone())
+            .unwrap()
+            .expect("share");
+        assert_eq!(reverted.permissions_of(&bob), Some(&[Permission::Read][..]));
+        assert_eq!(share_storage.lock().unwrap().len(), 1, "one share per file");
+    }
+
+    /// 以前の形式のデータ: 編集のたびに共有設定を新しい plainCid へコピーして
+    /// いたので、作成時の plainCid(= 系列ID)のキーには編集前の古い設定が、
+    /// 今の plainCid のキーに最新の設定がある。移すのは今の plainCid の方。
+    #[test]
+    fn legacy_share_is_taken_from_the_current_plain_cid_and_migrated_once() {
+        use crate::infrastructure::content_id::Sha256ContentIdGenerator;
+        let (content_repo, _content_storage) = TestContentRepository::new();
+        let (key_store, _key_storage) = TestKeyStore::new();
+        let (share_repo, share_storage) = TestShareRepository::new();
+        let legacy = share_repo.legacy.clone();
+        let service = build_service(
+            share_repo,
+            content_repo.clone(),
+            key_store,
+            TestPublicKeyDirectory::default(),
+            TestKeyWrapper,
+        );
+
+        let v1 = build_content(&cid(), Some(encrypted()), false);
+        let (v2, _) = v1
+            .adopt_version(b"body B".to_vec(), encrypted(), &Sha256ContentIdGenerator)
+            .unwrap();
+        content_repo.save(v1.raw_id(), &v1).unwrap();
+        content_repo.save(v2.raw_id(), &v2).unwrap();
+
+        let bob = KeyId::new(vec![7]);
+        let mut stale = Share::new(v1.raw_id().clone());
+        stale.grant_write(bob.clone()).unwrap();
+        let mut current = Share::new(v2.raw_id().clone());
+        current.grant_read(bob.clone()).unwrap();
+        legacy
+            .lock()
+            .unwrap()
+            .insert(v1.raw_id().as_str().to_string(), stale);
+        legacy
+            .lock()
+            .unwrap()
+            .insert(v2.raw_id().as_str().to_string(), current);
+
+        // 移す前でも、今の plainCid から引けば最新の設定が見える。
+        let before = service
+            .get_share(v2.raw_id().clone())
+            .unwrap()
+            .expect("legacy share");
+        assert_eq!(before.permissions_of(&bob), Some(&[Permission::Read][..]));
+        assert_eq!(before.content_id(), v2.series_id());
+
+        // plainCid が変わる前(編集・head の取り込みの直前)に移す。
+        service.migrate_legacy_share(v2.raw_id()).unwrap();
+        let migrated = share_storage
+            .lock()
+            .unwrap()
+            .get(v2.series_id().as_str())
+            .cloned()
+            .expect("migrated to the series key");
+        assert_eq!(migrated.permissions_of(&bob), Some(&[Permission::Read][..]));
+
+        // 移した後は、作成時の plainCid から引いても古い設定は出ない。
+        let reverted = service
+            .get_share(v1.raw_id().clone())
+            .unwrap()
+            .expect("share");
+        assert_eq!(reverted.permissions_of(&bob), Some(&[Permission::Read][..]));
+
+        // 2 回目は何もしない(移した後の変更を以前の形式で上書きしない)。
+        let mut changed = migrated.clone();
+        changed.revoke(&bob).unwrap();
+        share_storage
+            .lock()
+            .unwrap()
+            .insert(v2.series_id().as_str().to_string(), changed);
+        service.migrate_legacy_share(v2.raw_id()).unwrap();
+        let after = service.get_share(v2.raw_id().clone()).unwrap().unwrap();
+        assert!(after.recipients().is_empty());
     }
 }

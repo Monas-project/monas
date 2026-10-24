@@ -27,9 +27,25 @@ export function addEntry(entry: Entry) {
   store.set((prev) => [...prev, entry]);
 }
 
+// A grant's envelope opens only for the id it was wrapped for. Grants saved
+// before `envelopeContentId` was recorded fall back to the entry's current
+// id, which is right until that id moves (owner edit, head pull, revoke).
+// Pin it to the id the entry had just before the move, so packages built
+// afterwards still name the id the envelope is bound to.
+function applyPatch(e: Entry, patch: Partial<Entry>): Entry {
+  const next = { ...e, ...patch };
+  const moved = patch.localContentId !== undefined && patch.localContentId !== e.localContentId;
+  if (!moved || !e.localContentId || e.receivedShare) return next;
+  const from = e.localContentId;
+  return {
+    ...next,
+    shares: next.shares.map((s) => (s.envelopeContentId ? s : { ...s, envelopeContentId: from })),
+  };
+}
+
 export function updateEntry(id: string, patch: Partial<Entry>) {
   store.set((prev) =>
-    prev.map((e) => (e.id === id ? { ...e, ...patch, updatedAt: Date.now() } : e)),
+    prev.map((e) => (e.id === id ? { ...applyPatch(e, patch), updatedAt: Date.now() } : e)),
   );
 }
 
@@ -37,7 +53,7 @@ export function updateEntry(id: string, patch: Partial<Entry>) {
 // records the patch without touching `updatedAt`, so the Modified column
 // keeps meaning "when the content last changed".
 export function noteEntry(id: string, patch: Partial<Entry>) {
-  store.set((prev) => prev.map((e) => (e.id === id ? { ...e, ...patch } : e)));
+  store.set((prev) => prev.map((e) => (e.id === id ? applyPatch(e, patch) : e)));
 }
 
 export function removeEntry(id: string) {

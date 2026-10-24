@@ -182,6 +182,59 @@ pub struct ReissuedKeyEnvelope {
 }
 
 // ============================================
+// update_share_permission
+// ============================================
+
+/// 既存の共有先の権限を変更するリクエスト。
+///
+/// 再共有(`share_content`)は同じ受信者に `AlreadyShared` で失敗するので、
+/// read ⇄ write の切り替えはこちらで行う。CEK は回さない(権限は委譲 Token
+/// にだけ載る)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateSharePermissionInput {
+    /// SDK ローカルの版ID(ACL はこの ID で保存されている)
+    pub content_id: String,
+    /// State Node の系列ID。Token の resource と、降格時の Token 失効先。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_content_id: Option<String>,
+    pub recipient_public_key: String,
+    pub permissions: Vec<Permission>,
+}
+
+/// 権限変更レスポンス。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateSharePermissionOutput {
+    pub content_id: String,
+    pub recipient_public_key: String,
+    pub recipient_key_id: String,
+    /// 変更後の権限(`read` / `write`)
+    pub permissions: Vec<Permission>,
+    /// 変更後の権限で発行し直した、この受信者向けの委譲 Token。
+    pub delegated_access: DelegatedAccessToken,
+    /// 降格(write → read)では古い write Token を止めるため State Node の
+    /// `min_valid_issued_at` を進める。それで失効した他の受信者の Token を
+    /// 発行し直したもの。昇格・変更なしでは空。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reissued_tokens: Vec<ReissuedDelegatedToken>,
+    /// 降格で進めた `min_valid_issued_at`。失効させていなければ `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_invalidated_at: Option<u64>,
+    /// 失効境界がメンバーへどこまで届いたか(`RevokeShareOutput` と同じ意味)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_invalidation_reach: Option<TokenInvalidationReach>,
+}
+
+/// 権限変更に伴う失効で、他の受信者向けに発行し直した委譲 Token。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReissuedDelegatedToken {
+    /// 受信者 key id(base64url)
+    pub recipient_key_id: String,
+    /// 発行に失敗した場合は `None`(その受信者は owner から再度受け取る必要がある)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegated_access: Option<DelegatedAccessToken>,
+}
+
+// ============================================
 // decrypt_shared_content
 // ============================================
 

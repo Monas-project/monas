@@ -6,23 +6,46 @@ use crate::domain::share::{KeyId, Share, ShareError};
 
 /// 共有状態（ACL）を永続化するためのポート。
 ///
-/// - key: `content_id`
-/// - value: そのコンテンツに対する `Share`
+/// - key: コンテンツの系列ID(`Content::series_id`)。`Share::content_id` もこの値。
+/// - value: そのコンテンツ(ファイル)に対する `Share`
+///
+/// 共有設定はファイル単位で 1 つ。plainCid(平文のコンテンツアドレス)ごとに
+/// 持つと、本文を以前と同じ内容に戻したときにその plainCid に残っていた古い
+/// 設定を拾ってしまう(降格・取り消しが戻る)。
 pub trait ShareRepository {
-    fn load(&self, content_id: &ContentId) -> Result<Option<Share>, ShareRepositoryError>;
+    fn load(&self, series_id: &ContentId) -> Result<Option<Share>, ShareRepositoryError>;
 
     fn save(&self, share: &Share) -> Result<(), ShareRepositoryError>;
+
+    /// 系列IDで保存するようになる前の、plainCid をキーにした共有設定を読む。
+    ///
+    /// 既存の永続化データを一度だけ移すためにだけ使う
+    /// (`ShareService` が系列IDのキーに無いときに読み、系列IDで保存し直す)。
+    /// 旧形式のデータを持ち得ない実装(インメモリ等)は既定の `None` のままでよい。
+    fn load_legacy(
+        &self,
+        _plain_content_id: &ContentId,
+    ) -> Result<Option<Share>, ShareRepositoryError> {
+        Ok(None)
+    }
 }
 
 /// `Arc<dyn ShareRepository + Send + Sync>` を `ShareService` の型パラメータに
 /// 直接渡せるようにする blanket impl。
 impl<T: ShareRepository + ?Sized> ShareRepository for std::sync::Arc<T> {
-    fn load(&self, content_id: &ContentId) -> Result<Option<Share>, ShareRepositoryError> {
-        (**self).load(content_id)
+    fn load(&self, series_id: &ContentId) -> Result<Option<Share>, ShareRepositoryError> {
+        (**self).load(series_id)
     }
 
     fn save(&self, share: &Share) -> Result<(), ShareRepositoryError> {
         (**self).save(share)
+    }
+
+    fn load_legacy(
+        &self,
+        plain_content_id: &ContentId,
+    ) -> Result<Option<Share>, ShareRepositoryError> {
+        (**self).load_legacy(plain_content_id)
     }
 }
 

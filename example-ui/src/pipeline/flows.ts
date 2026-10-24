@@ -426,6 +426,60 @@ export function importShareFlow(input: {
   ];
 }
 
+// ------------------------------------------------------ change permission
+// read ⇄ write for a recipient who already has a share. The permission lives
+// only in the delegated token, so the CEK is not rotated and the envelope
+// keeps opening; the recipient needs the new package for the new token.
+export function changePermissionFlow(input: {
+  entry: Entry;
+  recipientPublicKeyB64Url: string;
+  permissions: Permission[];
+}): StepSpec[] {
+  const { entry } = input;
+  const downgrade = !input.permissions.includes("write");
+  return [
+    {
+      title: "Update permission & reissue token · gateway call",
+      hint: downgrade ? "min_valid_issued_at · JWT" : "JWT · P-256",
+      kind: "state",
+      minMs: 180,
+      exec: async (ctx) => {
+        const r = await shareApi.updateSharePermission({
+          contentId: entry.localContentId!,
+          remoteContentId: entry.remoteContentId,
+          recipientPublicKeyB64Url: input.recipientPublicKeyB64Url,
+          permissions: input.permissions,
+        });
+        ctx.permission = r;
+        return (
+          `Now ${r.permissions.join(", ")} · token jti ${short(r.delegated_access.jti, 6, 4)}` +
+          (r.token_invalidated_at ? ` · earlier tokens void (cutoff ${r.token_invalidated_at})` : "")
+        );
+      },
+    },
+    {
+      title: "Content key unchanged",
+      hint: "no rotation",
+      kind: "key",
+      minMs: 140,
+      exec: async (ctx) => {
+        const r = ctx.permission as shareApi.UpdateSharePermissionOutput;
+        const others = r.reissued_tokens?.length ?? 0;
+        if (!downgrade) {
+          return "The envelope still opens; send the recipient the new package so they hold the write token.";
+        }
+        // Only a member that took the cutoff refuses the old write token.
+        const reach = r.token_invalidation_reach;
+        const where =
+          reach && !reach.relayed && reach.unreached_members.length === 0
+            ? "The old write token is void on every member"
+            : "Members that took the cutoff refuse the old write token; others accept it until they sync (~30 s)";
+        return `${where}. ${others} other recipient(s) got a fresh token. Send each recipient their new package.`;
+      },
+    },
+  ];
+}
+
 // ---------------------------------------------------------------- revoke
 export function revokeFlow(input: {
   entry: Entry;

@@ -127,6 +127,47 @@ export function revokeShare(input: {
   });
 }
 
+export interface ReissuedDelegatedToken {
+  recipient_key_id: string;
+  /** Absent only if issuance failed. */
+  delegated_access?: DelegatedAccessToken;
+}
+
+export interface UpdateSharePermissionOutput {
+  content_id: string;
+  recipient_public_key: string;
+  recipient_key_id: string;
+  permissions: Permission[];
+  /** The recipient's new token, carrying the new permission. */
+  delegated_access: DelegatedAccessToken;
+  /** Only on a downgrade (write → read): the node voided every earlier
+   *  token so the old write token stops working, and these are the other
+   *  recipients' replacements. */
+  reissued_tokens?: ReissuedDelegatedToken[];
+  token_invalidated_at?: number;
+  token_invalidation_reach?: TokenInvalidationReach;
+}
+
+/** Change an existing recipient's permission (read ⇄ write) without a
+ *  revoke: no key rotation, only a new delegated token. */
+export function updateSharePermission(input: {
+  contentId: string;
+  remoteContentId?: string;
+  recipientPublicKeyB64Url: string;
+  permissions: Permission[];
+}) {
+  return gateway<UpdateSharePermissionOutput>("/share/permission", {
+    method: "POST",
+    timestamp: true,
+    body: {
+      content_id: input.contentId,
+      remote_content_id: input.remoteContentId,
+      recipient_public_key: input.recipientPublicKeyB64Url,
+      permissions: input.permissions,
+    },
+  });
+}
+
 export interface UpdateSharedContentOutput {
   remote_content_id: string;
   /** Plain content id of the version this device wrote — the id the
