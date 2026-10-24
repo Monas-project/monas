@@ -506,7 +506,9 @@ impl MonasController {
                     trace_id.clone(),
                 )
             })?;
-        self.carry_share_acl(&local, &adopted.content_id);
+        if adopted.content_id != local {
+            self.migrate_legacy_share(&local);
+        }
 
         Ok(AdoptedHead {
             local_content_id: adopted.content_id,

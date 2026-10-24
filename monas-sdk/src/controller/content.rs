@@ -1098,17 +1098,14 @@ impl MonasController {
             return response;
         }
 
-        // 共有 ACL は版IDに紐づいて保存されている。新しい版へ引き継がないと、
-        // 編集した瞬間に既存の受信者が(SDK から見て)いなくなる: その後の share
-        // で作られる Share は新しい受信者だけを含み、誰かを revoke すると
-        // CEK はローテーションされるのに既存受信者には envelope も Token も
-        // 再発行されず、静かに締め出される。CEK 自体は content 層が新しい版へ
-        // コピーしているので、ACL も同じ扱いにする。
+        // 共有設定はファイル(系列ID)単位なので、plainCid が変わっても引き継ぐ
+        // 必要は無い。以前の形式(plainCid のキー)で保存されていた設定だけは、
+        // 編集前の plainCid のキーにしか無いので、ここで系列ID のキーへ移す。
         //
         // 失敗しても更新自体は成立している(ローカル・State Node とも新しい版)
         // ので巻き戻さない。次の share / revoke で「受信者がいない」として現れる。
         if result.content_id.as_str() != base_version_id {
-            self.carry_share_acl(&ContentId::new(base_version_id.clone()), &result.content_id);
+            self.migrate_legacy_share(&ContentId::new(base_version_id.clone()));
         }
 
         let output = UpdateContentOutput {
@@ -1121,21 +1118,16 @@ impl MonasController {
         ApiResponse::success(output, trace_id)
     }
 
-    /// 版IDに紐づく共有 ACL を新しい版IDへ引き継ぐ(best effort)。
-    /// `update_content` と `adopt_remote_head` で版IDが変わるときに呼ぶ。
+    /// 以前の形式(plainCid のキー)の共有設定を系列ID のキーへ移す(best effort)。
+    /// `update_content` と `adopt_remote_head` で plainCid が変わるときに、
+    /// 変わる前の plainCid を渡して呼ぶ。
     ///
-    /// `to` に既に ACL があれば触らない: その ACL は `from` のものを引き継いだ
-    /// 後に変更された(受信者の追加・取り消し)より新しい状態であり、古い方で
-    /// 上書きすると後から加えた受信者が消える(head を取り込んだ後に古い版IDで
-    /// もう一度取り込む、といった再入で起きる)。
-    pub(super) fn carry_share_acl(&self, from: &ContentId, to: &ContentId) {
-        let share_repository = &self.share_service.share_repository;
-        if let Ok(Some(_)) = share_repository.load(to) {
-            return;
-        }
-        if let Ok(Some(share)) = share_repository.load(from) {
-            let _ = share_repository.save(&share.with_new_content_id(to.clone()));
-        }
+    /// 以前は共有設定を plainCid ごとに持ち、編集のたびに新しい plainCid へ
+    /// コピーしていた。本文を以前と同じ内容に戻すと plainCid も以前と同じになり、
+    /// そこに残っていた古い設定(降格・取り消しの前)を拾っていた。今は
+    /// ファイル単位で 1 つだけ持つので、コピーは不要。
+    pub(super) fn migrate_legacy_share(&self, from: &ContentId) {
+        let _ = self.share_service.migrate_legacy_share(from);
     }
 
     /// コンテンツを削除する。

@@ -1480,3 +1480,217 @@ async fn downgrade_retry_after_token_issuance_failure_still_reissues_other_token
     assert!(out.reissued_tokens[0].delegated_access.is_some());
     cleanup_content_artifacts();
 }
+
+// ============================================
+// 本文を以前と同じ内容に戻したとき(plainCid が過去と同じになる)
+// ============================================
+
+/// 受信者の KeyId(base64url)。SDK の出力と同じ計算(公開鍵の SHA-256 先頭 16 byte)。
+fn key_id_of(kp: &monas_sdk::models::keypair::GenerateKeypairOutput) -> String {
+    use sha2::{Digest, Sha256};
+    let pk = URL_SAFE_NO_PAD.decode(&kp.public_key).unwrap();
+    URL_SAFE_NO_PAD.encode(&Sha256::digest(&pk)[..16])
+}
+
+struct RevertFixture {
+    controller: MonasController,
+    created_id: String,
+    sender: monas_sdk::models::keypair::GenerateKeypairOutput,
+    bob: monas_sdk::models::keypair::GenerateKeypairOutput,
+    carol: monas_sdk::models::keypair::GenerateKeypairOutput,
+}
+
+/// 本文 "body A" で作成し、Bob と Carol に `initial` で共有した状態を作る。
+/// state node は作成・更新・失効をすべて受け付ける。
+async fn revert_fixture(
+    state_node: &mut mockito::ServerGuard,
+    initial: Permission,
+) -> RevertFixture {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    state_node
+        .mock("POST", "/content")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"content_id":"revert-remote"}"#)
+        .create_async()
+        .await;
+    state_node
+        .mock("PUT", "/content/revert-remote")
+        .with_status(200)
+        .create_async()
+        .await;
+    state_node
+        .mock("POST", "/content/revert-remote/access/invalidate")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(format!(
+            r#"{{"content_id":"revert-remote","new_min_valid_issued_at":{now}}}"#
+        ))
+        .create_async()
+        .await;
+    let controller = controller_with_wide_skew(state_node.url());
+    let kp = || {
+        controller
+            .generate_keypair(GenerateKeypairInput {
+                key_type: KeyType::Secp256r1,
+            })
+            .data
+            .expect("keypair")
+    };
+    let (sender, bob, carol) = (kp(), kp(), kp());
+    let created = controller
+        .create_content(
+            CreateContentInput {
+                content: URL_SAFE_NO_PAD.encode(b"body A"),
+                metadata: Some(ContentMetadata {
+                    name: Some("revert.txt".to_string()),
+                    content_type: Some("text/plain".to_string()),
+                    created_at: None,
+                    updated_at: None,
+                }),
+            },
+            None,
+        )
+        .data
+        .expect("create");
+    for who in [&bob, &carol] {
+        let r = controller.share_content(ShareContentInput {
+            content_id: created.content_id.clone(),
+            remote_content_id: Some("revert-remote".into()),
+            sender_public_key: sender.public_key.clone(),
+            sender_private_key: sender.private_key.clone(),
+            recipient_public_key: who.public_key.clone(),
+            permissions: vec![initial],
+        });
+        assert!(r.success, "share: {:?}", r.error);
+    }
+    RevertFixture {
+        controller,
+        created_id: created.content_id,
+        sender,
+        bob,
+        carol,
+    }
+}
+
+impl RevertFixture {
+    fn edit(&self, from: &str, body: &[u8]) -> String {
+        self.controller
+            .update_content(
+                monas_sdk::models::content::UpdateContentInput {
+                    local_content_id: from.to_string(),
+                    remote_content_id: "revert-remote".to_string(),
+                    content: URL_SAFE_NO_PAD.encode(body),
+                    metadata: None,
+                },
+                Some(&auth_context("Bearer owner")),
+            )
+            .data
+            .expect("update")
+            .version_id
+    }
+
+    fn downgrade(
+        &self,
+        content_id: &str,
+        who: &monas_sdk::models::keypair::GenerateKeypairOutput,
+    ) -> monas_sdk::models::share::UpdateSharePermissionOutput {
+        let r = self.controller.update_share_permission(
+            UpdateSharePermissionInput {
+                content_id: content_id.to_string(),
+                remote_content_id: Some("revert-remote".into()),
+                recipient_public_key: who.public_key.clone(),
+                permissions: vec![Permission::Read],
+            },
+            Some(&auth_context("Bearer owner")),
+        );
+        assert!(r.success, "downgrade: {:?}", r.error);
+        r.data.expect("data")
+    }
+
+    fn revoke(
+        &self,
+        content_id: &str,
+        who: &monas_sdk::models::keypair::GenerateKeypairOutput,
+    ) -> monas_sdk::models::share::RevokeShareOutput {
+        let r = self.controller.revoke_share(
+            RevokeShareInput {
+                content_id: content_id.to_string(),
+                remote_content_id: Some("revert-remote".into()),
+                sender_public_key: self.sender.public_key.clone(),
+                sender_private_key: self.sender.private_key.clone(),
+                recipient_public_key: who.public_key.clone(),
+            },
+            Some(&auth_context("Bearer owner")),
+        );
+        assert!(r.success, "revoke: {:?}", r.error);
+        r.data.expect("data")
+    }
+}
+
+/// 降格のあとに本文を元に戻しても、降格は戻らない。
+///
+/// 共有設定を plainCid ごとに持っていた頃は、本文を "body A" に戻すと plainCid が
+/// 作成時と同じになり、作成時の plainCid に残っていた「Bob = write」を拾っていた。
+/// その状態で Carol を降格すると、巻き添えで再発行される Bob の Token が write になる。
+#[tokio::test(flavor = "multi_thread")]
+async fn reverting_the_body_does_not_revive_a_downgraded_recipients_write() {
+    let _guard = acquire_test_lock();
+    let mut state_node = Server::new_async().await;
+    let f = revert_fixture(&mut state_node, Permission::Write).await;
+
+    let v2 = f.edit(&f.created_id, b"body B");
+    f.downgrade(&v2, &f.bob);
+    let reverted = f.edit(&v2, b"body A");
+    assert_eq!(reverted, f.created_id, "same body, same plainCid");
+
+    let out = f.downgrade(&reverted, &f.carol);
+    let bob = out
+        .reissued_tokens
+        .iter()
+        .find(|t| t.recipient_key_id == key_id_of(&f.bob))
+        .expect("bob's token is reissued after the cutoff");
+    assert_eq!(
+        token_capabilities(
+            &bob.delegated_access
+                .as_ref()
+                .expect("bob token")
+                .delegated_token
+        ),
+        vec!["read"],
+        "bob was downgraded before the body was reverted"
+    );
+    cleanup_content_artifacts();
+}
+
+/// 取り消しのあとに本文を元に戻しても、取り消した相手は共有先に戻らない。
+///
+/// plainCid ごとの共有設定では、戻した plainCid に残っていた「Bob と Carol」を
+/// 拾うので、続けて Bob を取り消すと、取り消し済みの Carol に新しい CEK の
+/// envelope が再発行されていた(読めなくしたはずの相手が再び読める)。
+#[tokio::test(flavor = "multi_thread")]
+async fn reverting_the_body_does_not_reissue_to_a_revoked_recipient() {
+    let _guard = acquire_test_lock();
+    let mut state_node = Server::new_async().await;
+    let f = revert_fixture(&mut state_node, Permission::Read).await;
+
+    let v2 = f.edit(&f.created_id, b"body B");
+    let revoked = f.revoke(&v2, &f.carol);
+    let reverted = f.edit(&revoked.content_id, b"body A");
+    assert_eq!(reverted, f.created_id, "same body, same plainCid");
+
+    let out = f.revoke(&reverted, &f.bob);
+    let reissued: Vec<_> = out
+        .reissued_envelopes
+        .iter()
+        .map(|e| e.recipient_key_id.clone())
+        .collect();
+    assert!(
+        !reissued.contains(&key_id_of(&f.carol)),
+        "carol was revoked before the body was reverted; reissued to {reissued:?}"
+    );
+    cleanup_content_artifacts();
+}

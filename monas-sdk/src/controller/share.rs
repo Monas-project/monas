@@ -289,9 +289,8 @@ impl MonasController {
     ) -> Result<RevokeShareLocalSnapshot, ApiError> {
         let share = self
             .share_service
-            .share_repository
-            .load(content_id)
-            .map_err(|e| ApiError::Internal(format!("Share repository error: {e}")))?
+            .get_share(content_id.clone())
+            .map_err(Self::map_share_error)?
             .ok_or_else(|| ApiError::NotFound("Content not found for sharing".into()))?;
 
         let content = self
@@ -526,7 +525,7 @@ impl MonasController {
         //    自身が見ていた最新状態を失う)。State Node 連携なしなら不要。
         //
         //    取り込みで版IDが変われば、以後はその版IDに対して revoke する
-        //    (ACL は取り込み時に引き継がれている)。
+        //    (共有設定はファイル単位なので版IDが変わっても同じものを使う)。
         //
         //    取り込みに失敗しても revoke は止めない: head が壊れている・自分の
         //    CEK で開けない(正規でない書き手が何か置いた)場合こそ取り消して
@@ -737,8 +736,7 @@ impl MonasController {
         // の `delegated_access` を `None` にして返す。
         let survivors_permissions = self
             .share_service
-            .share_repository
-            .load(&result.content_id)
+            .get_share(result.content_id.clone())
             .ok()
             .flatten();
         let reissued_envelopes = result
@@ -840,16 +838,11 @@ impl MonasController {
         let _guard = self.content_revoke_locks.lock(content_id.as_str());
 
         // 現在の権限(降格かどうかの判定)。共有されていない相手はここで弾く。
-        let previous = match self.share_service.share_repository.load(&content_id) {
+        let previous = match self.share_service.get_share(content_id.clone()) {
             Ok(share) => share
                 .and_then(|s| s.permissions_of(&recipient_key_id).map(|p| p.to_vec()))
                 .and_then(|p| Self::resolve_domain_permission(&p)),
-            Err(e) => {
-                return ApiResponse::error(
-                    ApiError::Internal(format!("Share repository error: {e}")),
-                    trace_id,
-                )
-            }
+            Err(e) => return ApiResponse::error(Self::map_share_error(e), trace_id),
         };
         let Some(previous) = previous else {
             return ApiResponse::error(
@@ -907,8 +900,7 @@ impl MonasController {
         // 失効させた場合は、他の受信者の Token も巻き添えで無効になっている。
         let reissued_tokens = if token_invalidated_at.is_some() {
             self.share_service
-                .share_repository
-                .load(&content_id)
+                .get_share(content_id.clone())
                 .ok()
                 .flatten()
                 .map(|share| {

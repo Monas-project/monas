@@ -38,12 +38,17 @@ impl ShareRepository for InMemoryShareRepository {
 
 /// sled を用いた ShareRepository 実装。
 ///
-/// - キー: `"share:{content_id.as_str()}"`（UTF-8 文字列）
+/// - キー: `"share-series:{series_id}"`（UTF-8 文字列）
 /// - 値: `Share` を JSON でシリアライズしたバイト列
+/// - 以前の形式のキー `"share:{plainCid}"` は `load_legacy` で読むだけで、書かない。
+///
+/// 以前の形式と別のプレフィックスにしているのは、系列ID が作成時の plainCid と
+/// 同じ値だから。同じ `"share:"` だと、作成時の plainCid のキーに残っている古い
+/// 共有設定(編集前のもの)を、系列ID の最新の設定と区別できない。
 ///
 /// NOTE:
 /// - CEK ストアなど、他の sled ベースストアと**同じ DB ファイルを共有してもよい**ことを想定し、
-///   `"share:"` プレフィックスによりキー空間を分離している。
+///   プレフィックスによりキー空間を分離している。
 #[derive(Clone)]
 pub struct SledShareRepository {
     db: sled::Db,
@@ -65,9 +70,8 @@ impl SledShareRepository {
     }
 }
 
-impl ShareRepository for SledShareRepository {
-    fn load(&self, content_id: &ContentId) -> Result<Option<Share>, ShareRepositoryError> {
-        let sled_key = format!("share:{}", content_id.as_str());
+impl SledShareRepository {
+    fn load_key(&self, sled_key: String) -> Result<Option<Share>, ShareRepositoryError> {
         let opt = self
             .db
             .get(sled_key)
@@ -81,9 +85,15 @@ impl ShareRepository for SledShareRepository {
             Ok(None)
         }
     }
+}
+
+impl ShareRepository for SledShareRepository {
+    fn load(&self, series_id: &ContentId) -> Result<Option<Share>, ShareRepositoryError> {
+        self.load_key(format!("share-series:{}", series_id.as_str()))
+    }
 
     fn save(&self, share: &Share) -> Result<(), ShareRepositoryError> {
-        let key = format!("share:{}", share.content_id().as_str());
+        let key = format!("share-series:{}", share.content_id().as_str());
         let value =
             serde_json::to_vec(share).map_err(|e| ShareRepositoryError::Storage(e.to_string()))?;
 
@@ -95,5 +105,55 @@ impl ShareRepository for SledShareRepository {
             .map_err(|e| ShareRepositoryError::Storage(e.to_string()))?;
 
         Ok(())
+    }
+
+    fn load_legacy(
+        &self,
+        plain_content_id: &ContentId,
+    ) -> Result<Option<Share>, ShareRepositoryError> {
+        self.load_key(format!("share:{}", plain_content_id.as_str()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn share_with(content_id: &str, key: u8) -> Share {
+        let mut share = Share::new(ContentId::new(content_id.into()));
+        share
+            .grant_read(crate::domain::share::KeyId::new(vec![key]))
+            .unwrap();
+        share
+    }
+
+    /// 以前の形式(`share:{plainCid}`)は `load` では読まず、`load_legacy` でだけ読む。
+    /// 系列ID は作成時の plainCid と同じ値なので、`load` が `share:` を読むと、
+    /// 作成時の plainCid に残った編集前の設定を最新として返してしまう。
+    #[test]
+    fn legacy_plain_cid_keys_are_read_only_through_load_legacy() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = SledShareRepository::open(dir.path()).unwrap();
+        let legacy = share_with("v1", 1);
+        repo.db
+            .insert("share:v1", serde_json::to_vec(&legacy).unwrap())
+            .unwrap();
+
+        let id = ContentId::new("v1".into());
+        assert!(repo.load(&id).unwrap().is_none());
+        let read = repo.load_legacy(&id).unwrap().expect("legacy share");
+        assert_eq!(read.recipients().len(), 1);
+
+        let current = share_with("v1", 2);
+        repo.save(&current).unwrap();
+        let loaded = repo.load(&id).unwrap().expect("series share");
+        assert!(loaded
+            .recipients()
+            .contains_key(&crate::domain::share::KeyId::new(vec![2])));
+        // 書き込みは新しいキーにだけ行き、以前の形式のキーは変わらない。
+        let still_legacy = repo.load_legacy(&id).unwrap().unwrap();
+        assert!(still_legacy
+            .recipients()
+            .contains_key(&crate::domain::share::KeyId::new(vec![1])));
     }
 }
