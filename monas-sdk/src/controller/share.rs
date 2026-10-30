@@ -283,23 +283,6 @@ impl MonasController {
         }
     }
 
-    /// 共有設定を読み書きする操作(share / revoke / 権限変更 / 旧形式の移行)を
-    /// 直列化するキー = そのファイルの系列ID。
-    ///
-    /// 共有設定はファイル単位で 1 つなので、plainCid でロックすると、編集前と
-    /// 編集後の plainCid から同じ設定を同時に load-modify-save でき、後勝ちで
-    /// 片方の変更(降格・取り消し)が消える。コンテンツ記録が無ければ
-    /// `content_id` をそのまま使う(後段の処理が NotFound で止まる)。
-    pub(super) fn share_lock_key(&self, content_id: &ContentId) -> String {
-        self.share_service
-            .content_repository
-            .find_by_id(content_id)
-            .ok()
-            .flatten()
-            .map(|content| content.series_id().as_str().to_string())
-            .unwrap_or_else(|| content_id.as_str().to_string())
-    }
-
     fn capture_revoke_share_snapshot(
         &self,
         content_id: &ContentId,
@@ -340,7 +323,7 @@ impl MonasController {
             .save(&snapshot.share)
             .map_err(|e| ApiError::Internal(format!("Share repository restore error: {e}")))?;
 
-        let content_id = snapshot.content.raw_id().clone();
+        let content_id = snapshot.content.series_id().clone();
         self.share_service
             .content_repository
             .save(&content_id, &snapshot.content)
@@ -371,7 +354,7 @@ impl MonasController {
 
         // 1. 入力のバリデーション
         for (field, value) in [
-            ("content_id", input.content_id.as_str()),
+            ("file_id", input.file_id.as_str()),
             ("sender_public_key", input.sender_public_key.as_str()),
             ("sender_private_key", input.sender_private_key.as_str()),
             ("recipient_public_key", input.recipient_public_key.as_str()),
@@ -381,8 +364,8 @@ impl MonasController {
             }
         }
 
-        // 2. ContentIdに変換
-        let content_id = ContentId::new(input.content_id.clone());
+        // 2. ファイルのキー
+        let content_id = ContentId::new(input.file_id.clone());
 
         // 3. 送信者の公開鍵をデコードしてsender_key_idを計算
         let sender_public_key_bytes =
@@ -417,11 +400,9 @@ impl MonasController {
             Err(e) => return ApiResponse::error(e, trace_id),
         };
 
-        // 共有設定の load-modify-save なので revoke・権限変更と同じロックで直列化する
-        // (Token 発行失敗時の巻き戻しまで保持する)。
-        let _guard = self
-            .content_revoke_locks
-            .lock(&self.share_lock_key(&content_id));
+        // 共有設定の load-modify-save なので revoke・権限変更と同じロック
+        // (ファイルのキー)で直列化する(Token 発行失敗時の巻き戻しまで保持する)。
+        let _guard = self.content_revoke_locks.lock(content_id.as_str());
 
         // 6. ShareService::grant_shareを呼び出し
         // これにより、以下が実行されます：
@@ -442,21 +423,15 @@ impl MonasController {
             }
         };
 
-        // Token の resource は State Node が知っている系列ID。ローカル版IDで
-        // 発行すると受信者の read/write が capability 不一致で拒否される。
-        let token_content_id = input
-            .remote_content_id
-            .as_deref()
-            .unwrap_or(&input.content_id)
-            .to_string();
-        let delegated_access = match self.issue_delegated_token(
-            &token_content_id,
-            &recipient_public_key_bytes,
-            permission,
-            None,
-        ) {
-            Ok(token) => token,
-            Err(e) => {
+        // Token の resource は State Node が知っている系列ID。State Node に
+        // 登録していないローカル専用のファイルには Token を発行しない
+        // (ファイルのキーは端末の外に出さない)。
+        let delegated_access = match input.remote_content_id.as_deref().map(|remote| {
+            self.issue_delegated_token(remote, &recipient_public_key_bytes, permission, None)
+        }) {
+            None => None,
+            Some(Ok(token)) => Some(token),
+            Some(Err(e)) => {
                 let rollback_cmd = RevokeShareCommand {
                     content_id: content_id.clone(),
                     sender_key_id: sender_key_id_for_output.clone(),
@@ -490,13 +465,13 @@ impl MonasController {
         // Shareを作成し、State Nodeに送信する必要がある
 
         let output = ShareContentOutput {
-            content_id: input.content_id,
+            content_id: result.envelope.content_id().as_str().to_string(),
             recipient_public_key: input.recipient_public_key,
             sender_public_key: input.sender_public_key,
             sender_key_id: sender_key_id_b64,
             recipient_key_id: recipient_key_id_b64,
             key_envelope,
-            delegated_access: Some(delegated_access),
+            delegated_access,
             shared_at: Some(Utc::now().to_rfc3339()),
         };
 
@@ -531,7 +506,7 @@ impl MonasController {
 
         // 1. 入力のバリデーション
         for (field, value) in [
-            ("content_id", input.content_id.as_str()),
+            ("file_id", input.file_id.as_str()),
             ("sender_public_key", input.sender_public_key.as_str()),
             ("sender_private_key", input.sender_private_key.as_str()),
             ("recipient_public_key", input.recipient_public_key.as_str()),
@@ -540,6 +515,24 @@ impl MonasController {
                 return ApiResponse::error(e, trace_id);
             }
         }
+        let content_id = ContentId::new(input.file_id.clone());
+
+        // このファイルへの revoke を直列化する(ロックのキーはファイルのキー)。
+        // revoke は ACL・CEK・ローカル ciphertext・state node 状態にまたがる
+        // load-modify-save で、どこにも version CAS が無い。`MonasController` は
+        // gateway から `Arc` 共有され同時に呼ばれるため、ロックが無いと 2 つの
+        // revoke が同じ Share を読んで後勝ちで save し、片方の受信者削除が消える
+        // (lost update)。異なる CEK が同じ key_epoch として配られる問題も同じ原因。
+        //
+        // head の取り込みと snapshot 取得より前にロックを取る: 後にすると、読んだ
+        // snapshot がロック取得までの間に古くなり、失敗時の巻き戻しが他方の結果を
+        // 上書きしてしまう。
+        //
+        // ロックはプロセス内のみ。複数 gateway プロセスからの並行 revoke は
+        // これでは防げず、state node 側の CAS が必要になる(現状の制約)。
+        // ガードを drop するとエントリは表から消えるので、revoke した content の
+        // 数だけレジストリが伸び続けることはない。
+        let _revoke_guard = self.content_revoke_locks.lock(content_id.as_str());
 
         // 2. State Node の head を取り込んでから始める。write を委譲した受信者が
         //    書いた版はローカルに無く、後段の reencrypt はローカル平文から
@@ -547,54 +540,29 @@ impl MonasController {
         //    巻き戻す(取り消す相手の版であっても、他の残存受信者や owner
         //    自身が見ていた最新状態を失う)。State Node 連携なしなら不要。
         //
-        //    取り込みで版IDが変われば、以後はその版IDに対して revoke する
-        //    (共有設定はファイル単位なので版IDが変わっても同じものを使う)。
+        //    取り込みは同じファイルの記録を進めるだけで、ファイルのキーは
+        //    変わらない。
         //
         //    取り込みに失敗しても revoke は止めない: head が壊れている・自分の
         //    CEK で開けない(正規でない書き手が何か置いた)場合こそ取り消して
         //    ローテーションしたいのであり、書き手が取り消しを妨げられては
         //    ならない。代わりに `head_pull_error` で報告する。
         let mut head_pull_error = None;
-        let local_content_id = match (input.remote_content_id.as_deref(), auth) {
-            (Some(remote), Some(_)) => match self.adopt_remote_head::<RevokeShareOutput>(
+        if let (Some(remote), Some(_)) = (input.remote_content_id.as_deref(), auth) {
+            if let Err(response) = self.adopt_remote_head::<RevokeShareOutput>(
                 remote,
-                &input.content_id,
+                &input.file_id,
                 auth,
                 trace_id.clone(),
             ) {
-                Ok(head) => head.local_content_id.as_str().to_string(),
-                Err(response) => {
-                    head_pull_error = Some(
-                        response
-                            .error
-                            .map(|e| e.to_string())
-                            .unwrap_or_else(|| "unknown error".to_string()),
-                    );
-                    input.content_id.clone()
-                }
-            },
-            _ => input.content_id.clone(),
-        };
-        let content_id = ContentId::new(local_content_id.clone());
-
-        // このファイル(系列ID)への revoke を直列化する。revoke は ACL・CEK・ローカル
-        // ciphertext・state node 状態にまたがる load-modify-save で、どこにも
-        // version CAS が無い。`MonasController` は gateway から `Arc` 共有され
-        // 同時に呼ばれるため、ロックが無いと 2 つの revoke が同じ Share を読んで
-        // 後勝ちで save し、片方の受信者削除が消える(lost update)。
-        // 異なる CEK が同じ key_epoch として配られる問題も同じ原因。
-        //
-        // snapshot 取得より前にロックを取る: 後にすると、読んだ snapshot が
-        // ロック取得までの間に古くなり、失敗時の巻き戻しが他方の結果を
-        // 上書きしてしまう。
-        //
-        // ロックはプロセス内のみ。複数 gateway プロセスからの並行 revoke は
-        // これでは防げず、state node 側の CAS が必要になる(現状の制約)。
-        // ガードを drop するとエントリは表から消えるので、revoke した content の
-        // 数だけレジストリが伸び続けることはない。
-        let _revoke_guard = self
-            .content_revoke_locks
-            .lock(&self.share_lock_key(&content_id));
+                head_pull_error = Some(
+                    response
+                        .error
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| "unknown error".to_string()),
+                );
+            }
+        }
 
         let snapshot = match self.capture_revoke_share_snapshot(&content_id) {
             Ok(snapshot) => snapshot,
@@ -636,27 +604,26 @@ impl MonasController {
         //      害は「残存受信者が Token を再発行してもらう必要がある」ことに留まる
         //      (これは CEK ローテーション時にどのみち必要になる)。
         //
-        //      state node 連携なし(`auth` が None、ローカル専用テスト等)の場合は
-        //      失効させる対象の Token も存在しないので何もしない。
-        let state_node_content_id = input
-            .remote_content_id
-            .as_deref()
-            .unwrap_or(&input.content_id)
-            .to_string();
-        let (token_invalidated_at, token_invalidation_reach) = if auth.is_some() {
-            match self.send_invalidate_to_state_node::<RevokeShareOutput>(
-                &state_node_content_id,
-                auth,
-                trace_id.clone(),
-            ) {
-                Ok(Some((at, reach))) => (Some(at), reach),
-                Ok(None) => (None, None),
-                // ここはまだローカル状態を一切変更していないので巻き戻し不要。
-                Err(response) => return response,
-            }
-        } else {
-            (None, None)
-        };
+        //      state node 連携なし(`auth` が None、ローカル専用テスト等)や、
+        //      State Node に登録していないファイル(`remote_content_id` が None)
+        //      の場合は失効させる対象の Token も存在しないので何もしない。
+        //      ファイルのキーは端末の外に出さないので、代わりに送ることはない。
+        let state_node_content_id = input.remote_content_id.clone();
+        let (token_invalidated_at, token_invalidation_reach) =
+            if let (Some(remote), Some(_)) = (state_node_content_id.as_deref(), auth) {
+                match self.send_invalidate_to_state_node::<RevokeShareOutput>(
+                    remote,
+                    auth,
+                    trace_id.clone(),
+                ) {
+                    Ok(Some((at, reach))) => (Some(at), reach),
+                    Ok(None) => (None, None),
+                    // ここはまだローカル状態を一切変更していないので巻き戻し不要。
+                    Err(response) => return response,
+                }
+            } else {
+                (None, None)
+            };
 
         // 4. まず CEK をローテーションして再暗号化する。
         //    ShareService::revoke_share は「その時点の CEK・ciphertext」で残存受信者向け
@@ -725,13 +692,15 @@ impl MonasController {
         };
 
         // State Node は系列ID（remote_content_id）でコンテンツを管理する。
-        // ローカル版IDしか送らないと State Node 側で未知のコンテンツ扱いになる。
-        if let Some(response) = self.send_update_to_state_node(
-            &state_node_content_id,
-            &reencryption.encrypted_content,
-            auth,
-            trace_id.clone(),
-        ) {
+        // State Node に登録していないファイルは送る先が無い。
+        if let Some(response) = state_node_content_id.as_deref().and_then(|remote| {
+            self.send_update_to_state_node(
+                remote,
+                &reencryption.encrypted_content,
+                auth,
+                trace_id.clone(),
+            )
+        }) {
             if let Err(restore_err) = self.restore_revoke_share_snapshot(&snapshot) {
                 let primary = response.error.clone().unwrap_or_else(|| {
                     ApiError::Internal("unknown state node update failure".into())
@@ -761,7 +730,7 @@ impl MonasController {
         // の `delegated_access` を `None` にして返す。
         let survivors_permissions = self
             .share_service
-            .get_share(result.content_id.clone())
+            .get_share(ContentId::new(input.file_id.clone()))
             .ok()
             .flatten();
         let reissued_envelopes = result
@@ -783,7 +752,7 @@ impl MonasController {
                     })
                     .and_then(|(pk, permission)| {
                         self.issue_delegated_token(
-                            &state_node_content_id,
+                            state_node_content_id.as_deref()?,
                             &pk,
                             permission,
                             token_invalidated_at,
@@ -836,7 +805,11 @@ impl MonasController {
         let trace_id = generate_trace_id();
 
         for (field, value) in [
-            ("content_id", input.content_id.as_str()),
+            ("file_id", input.file_id.as_str()),
+            (
+                "remote_content_id",
+                input.remote_content_id.as_deref().unwrap_or(""),
+            ),
             ("recipient_public_key", input.recipient_public_key.as_str()),
         ] {
             if let Err(e) = Self::validate_non_empty(field, value) {
@@ -854,15 +827,11 @@ impl MonasController {
                 Err(e) => return ApiResponse::error(e, trace_id),
             };
         let recipient_key_id = Self::compute_key_id_from_public_key(&recipient_public_key_bytes);
-        let content_id = ContentId::new(input.content_id.clone());
-        let state_node_content_id = input
-            .remote_content_id
-            .clone()
-            .unwrap_or_else(|| input.content_id.clone());
+        let content_id = ContentId::new(input.file_id.clone());
+        // 権限は Token にだけ載るので、State Node の系列ID は必須(上で検証済み)。
+        let state_node_content_id = input.remote_content_id.clone().unwrap_or_default();
 
-        let _guard = self
-            .content_revoke_locks
-            .lock(&self.share_lock_key(&content_id));
+        let _guard = self.content_revoke_locks.lock(content_id.as_str());
 
         // 現在の権限(降格かどうかの判定)。共有されていない相手はここで弾く。
         let previous = match self.share_service.get_share(content_id.clone()) {
@@ -977,7 +946,7 @@ impl MonasController {
         };
         ApiResponse::success(
             UpdateSharePermissionOutput {
-                content_id: input.content_id,
+                content_id: result.content_id.as_str().to_string(),
                 recipient_public_key: input.recipient_public_key,
                 recipient_key_id: Self::encode_key_id_base64url(&result.recipient_key_id),
                 permissions,
@@ -1290,8 +1259,8 @@ impl MonasController {
     /// 失効している場合は State Node が 401/403 で拒否し、そのまま返す。
     ///
     /// 新しい版の `local_content_id`(平文 CID)は owner と同じ規則で導出して
-    /// 返す。owner 側はこの版を読むとき、自分のローカル版IDとは一致しないので
-    /// `accept_any_version` で読む必要がある。
+    /// 返す。owner 側はこの版を読むとき、ファイルの記録の今の版(plainCid)とは
+    /// 一致しないので、`accept_any_version` で読むか pull で取り込む必要がある。
     pub fn update_shared_content(
         &self,
         input: UpdateSharedContentInput,
@@ -1451,139 +1420,5 @@ mod bearer_prefix_tests {
         assert!(!has_bearer_prefix("Bearéé token"));
         assert!(!has_bearer_prefix("Bearéétoken"));
         assert!(!has_bearer_prefix("日本語のトークン"));
-    }
-}
-
-#[cfg(test)]
-mod share_lock_tests {
-    use crate::models::content::{ContentMetadata, CreateContentInput, UpdateContentInput};
-    use crate::models::keypair::{GenerateKeypairInput, KeyType};
-    use crate::models::share::{Permission, ShareContentInput, UpdateSharePermissionInput};
-    use crate::{MonasConfig, MonasController, StateNodeAuthContext};
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use base64::Engine;
-    use std::time::Duration;
-
-    /// 同じファイルの別の plainCid(編集前のタブと編集後のタブ)からの権限変更も
-    /// 1 つのロックで直列化される。共有設定はファイル(系列ID)単位で 1 つなので、
-    /// plainCid ごとのロックでは同じ設定を同時に load-modify-save でき、後勝ちで
-    /// 片方の変更が消える。
-    #[tokio::test(flavor = "multi_thread")]
-    async fn permission_changes_through_two_plain_cids_of_one_file_share_one_lock() {
-        let mut server = mockito::Server::new_async().await;
-        server
-            .mock("POST", "/content")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(r#"{"content_id":"lock-remote"}"#)
-            .create_async()
-            .await;
-        server
-            .mock("PUT", "/content/lock-remote")
-            .with_status(200)
-            .create_async()
-            .await;
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("monas-sdk-share-lock-{nanos}"));
-        let config = MonasConfig::new(server.url())
-            .with_persistence_dir(&dir)
-            .with_request_timestamp_skew(Duration::from_secs(60 * 60 * 24 * 365 * 100));
-        let controller = MonasController::with_config(config).expect("controller");
-        controller
-            .create_signing_account()
-            .data
-            .expect("signing account");
-        let kp = || {
-            controller
-                .generate_keypair(GenerateKeypairInput {
-                    key_type: KeyType::Secp256r1,
-                })
-                .data
-                .expect("keypair")
-        };
-        let (sender, bob) = (kp(), kp());
-
-        let created = controller
-            .create_content(
-                CreateContentInput {
-                    content: URL_SAFE_NO_PAD.encode(b"lock A"),
-                    metadata: Some(ContentMetadata {
-                        name: Some("lock.txt".to_string()),
-                        content_type: Some("text/plain".to_string()),
-                        created_at: None,
-                        updated_at: None,
-                    }),
-                },
-                None,
-            )
-            .data
-            .expect("create");
-        assert!(
-            controller
-                .share_content(ShareContentInput {
-                    content_id: created.content_id.clone(),
-                    remote_content_id: Some("lock-remote".into()),
-                    sender_public_key: sender.public_key.clone(),
-                    sender_private_key: sender.private_key.clone(),
-                    recipient_public_key: bob.public_key.clone(),
-                    permissions: vec![Permission::Read],
-                })
-                .success
-        );
-        let auth = StateNodeAuthContext {
-            authorization: Some("Bearer owner".into()),
-            request_signature: Some("caller-signature".into()),
-            request_timestamp: Some(1_717_171_717),
-        };
-        let edited = controller
-            .update_content(
-                UpdateContentInput {
-                    local_content_id: created.content_id.clone(),
-                    remote_content_id: "lock-remote".to_string(),
-                    content: URL_SAFE_NO_PAD.encode(b"lock B"),
-                    metadata: None,
-                },
-                Some(&auth),
-            )
-            .data
-            .expect("update");
-        assert_ne!(edited.version_id, created.content_id);
-
-        // 編集前の plainCid(= 系列ID)側の操作がロックを持っている間は、
-        // 編集後の plainCid からの権限変更も待たされる。
-        let held =
-            controller
-                .content_revoke_locks
-                .lock(&controller.share_lock_key(
-                    &monas_content::domain::content_id::ContentId::new(created.content_id.clone()),
-                ));
-        let (tx, rx) = std::sync::mpsc::channel();
-        let runtime = tokio::runtime::Handle::current();
-        std::thread::scope(|scope| {
-            scope.spawn(|| {
-                let _runtime = runtime.enter();
-                let r = controller.update_share_permission(
-                    UpdateSharePermissionInput {
-                        content_id: edited.version_id.clone(),
-                        remote_content_id: Some("lock-remote".into()),
-                        recipient_public_key: bob.public_key.clone(),
-                        permissions: vec![Permission::Write],
-                    },
-                    None,
-                );
-                tx.send(r.success).unwrap();
-            });
-            assert!(
-                rx.recv_timeout(Duration::from_millis(500)).is_err(),
-                "a permission change through another plainCid of the same file must wait"
-            );
-            drop(held);
-            assert!(rx.recv_timeout(Duration::from_secs(20)).expect("finishes"));
-        });
-        drop(controller);
-        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -121,7 +121,7 @@ async fn verify_integrity_rejects_stale_timestamp_with_unauthorized() {
             content_id: "test-content".into(),
             content: URL_SAFE_NO_PAD.encode(b"hello"),
             expected_version: Some("v1".into()),
-            local_content_id: None,
+            file_id: None,
         },
         Some(&auth),
     );
@@ -206,7 +206,7 @@ async fn verify_integrity_returns_api_error_when_history_cannot_be_fetched() {
             content_id: "test-content".into(),
             content: URL_SAFE_NO_PAD.encode(b"hello"),
             expected_version: None,
-            local_content_id: None,
+            file_id: None,
         },
         None,
     );
@@ -237,7 +237,7 @@ async fn verify_integrity_returns_api_error_when_version_cannot_be_fetched() {
             content_id: "test-content".into(),
             content: URL_SAFE_NO_PAD.encode(b"hello"),
             expected_version: Some("v1".into()),
-            local_content_id: None,
+            file_id: None,
         },
         None,
     );
@@ -282,7 +282,7 @@ async fn verify_integrity_keeps_false_only_for_actual_content_mismatch() {
             content_id: "test-content".into(),
             content: URL_SAFE_NO_PAD.encode(b"hello"),
             expected_version: Some(version_cid.clone()),
-            local_content_id: None,
+            file_id: None,
         },
         None,
     );
@@ -346,7 +346,7 @@ async fn verify_integrity_rejects_forged_node_with_self_reported_version() {
             content_id: "test-content".into(),
             content: URL_SAFE_NO_PAD.encode(b"hello"),
             expected_version: Some(real_version.clone()),
-            local_content_id: None,
+            file_id: None,
         },
         None,
     );
@@ -386,7 +386,7 @@ async fn verify_integrity_returns_api_error_for_invalid_state_node_base64() {
             content_id: "test-content".into(),
             content: URL_SAFE_NO_PAD.encode(b"hello"),
             expected_version: Some("v1".into()),
-            local_content_id: None,
+            file_id: None,
         },
         None,
     );

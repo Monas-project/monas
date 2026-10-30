@@ -11,7 +11,7 @@ export function buildSharePackage(entry: Entry, grant: ShareGrant): SharePackage
     name: entry.name,
     mimeType: entry.mimeType,
     sizeBytes: entry.sizeBytes,
-    content_id: grant.envelopeContentId ?? entry.localContentId!,
+    content_id: grant.envelopeContentId,
     remote_content_id: entry.remoteContentId,
     sender_public_key: grant.senderPublicKeyB64Url,
     recipient_public_key: grant.recipientPublicKeyB64Url,

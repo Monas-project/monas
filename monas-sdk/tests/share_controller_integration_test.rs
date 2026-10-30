@@ -90,8 +90,8 @@ async fn share_content_succeeds_after_content_creation() {
     create_mock.assert();
 
     let share_response = controller.share_content(ShareContentInput {
-        content_id: created.content_id.clone(),
-        remote_content_id: None,
+        file_id: created.file_id.clone(),
+        remote_content_id: created.remote_content_id.clone(),
         sender_public_key: sender.public_key.clone(),
         sender_private_key: sender.private_key.clone(),
         recipient_public_key: recipient.public_key.clone(),
@@ -196,8 +196,8 @@ async fn revoke_share_updates_state_node_version() {
     create_mock.assert();
 
     let share_response = controller.share_content(ShareContentInput {
-        content_id: created.content_id.clone(),
-        remote_content_id: None,
+        file_id: created.file_id.clone(),
+        remote_content_id: created.remote_content_id.clone(),
         sender_public_key: sender.public_key.clone(),
         sender_private_key: sender.private_key.clone(),
         recipient_public_key: recipient.public_key.clone(),
@@ -206,8 +206,8 @@ async fn revoke_share_updates_state_node_version() {
     assert!(share_response.success, "share_content should succeed");
     let revoke_response = controller.revoke_share(
         RevokeShareInput {
-            content_id: created.content_id,
-            remote_content_id: None,
+            file_id: created.file_id,
+            remote_content_id: created.remote_content_id.clone(),
             sender_public_key: sender.public_key.clone(),
             sender_private_key: sender.private_key.clone(),
             recipient_public_key: recipient.public_key,
@@ -278,7 +278,7 @@ async fn revoke_share_syncs_state_node_by_remote_content_id() {
     create_mock.assert();
 
     let share_response = controller.share_content(ShareContentInput {
-        content_id: created.content_id.clone(),
+        file_id: created.file_id.clone(),
         remote_content_id: None,
         sender_public_key: sender.public_key.clone(),
         sender_private_key: sender.private_key.clone(),
@@ -288,7 +288,7 @@ async fn revoke_share_syncs_state_node_by_remote_content_id() {
     assert!(share_response.success, "share_content should succeed");
     let revoke_response = controller.revoke_share(
         RevokeShareInput {
-            content_id: created.content_id,
+            file_id: created.file_id,
             remote_content_id: Some("remote-series-id".to_string()),
             sender_public_key: sender.public_key.clone(),
             sender_private_key: sender.private_key.clone(),
@@ -364,8 +364,8 @@ async fn revoke_share_rolls_back_local_state_when_state_node_sync_fails() {
     create_mock.assert();
 
     let share_response = controller.share_content(ShareContentInput {
-        content_id: created.content_id.clone(),
-        remote_content_id: None,
+        file_id: created.file_id.clone(),
+        remote_content_id: created.remote_content_id.clone(),
         sender_public_key: sender.public_key.clone(),
         sender_private_key: sender.private_key.clone(),
         recipient_public_key: recipient.public_key.clone(),
@@ -375,8 +375,8 @@ async fn revoke_share_rolls_back_local_state_when_state_node_sync_fails() {
     let shared = share_response.data.expect("share should return data");
     let revoke_response = controller.revoke_share(
         RevokeShareInput {
-            content_id: created.content_id.clone(),
-            remote_content_id: None,
+            file_id: created.file_id.clone(),
+            remote_content_id: created.remote_content_id.clone(),
             sender_public_key: sender.public_key.clone(),
             sender_private_key: sender.private_key.clone(),
             recipient_public_key: recipient.public_key.clone(),
@@ -415,8 +415,8 @@ async fn revoke_share_rolls_back_local_state_when_state_node_sync_fails() {
 
     let second_revoke_response = controller.revoke_share(
         RevokeShareInput {
-            content_id: created.content_id,
-            remote_content_id: None,
+            file_id: created.file_id,
+            remote_content_id: created.remote_content_id.clone(),
             sender_public_key: sender.public_key.clone(),
             sender_private_key: sender.private_key.clone(),
             recipient_public_key: recipient.public_key,
@@ -493,8 +493,8 @@ async fn revoke_share_rollback_fires_on_inner_share_service_error() {
 
     let _ = controller
         .share_content(ShareContentInput {
-            content_id: created.content_id.clone(),
-            remote_content_id: None,
+            file_id: created.file_id.clone(),
+            remote_content_id: created.remote_content_id.clone(),
             sender_public_key: sender.public_key.clone(),
             sender_private_key: sender.private_key.clone(),
             recipient_public_key: recipient.public_key.clone(),
@@ -505,8 +505,8 @@ async fn revoke_share_rollback_fires_on_inner_share_service_error() {
     // 1 回目: 成功
     let first = controller.revoke_share(
         RevokeShareInput {
-            content_id: created.content_id.clone(),
-            remote_content_id: None,
+            file_id: created.file_id.clone(),
+            remote_content_id: created.remote_content_id.clone(),
             sender_public_key: sender.public_key.clone(),
             sender_private_key: sender.private_key.clone(),
             recipient_public_key: recipient.public_key.clone(),
@@ -525,8 +525,8 @@ async fn revoke_share_rollback_fires_on_inner_share_service_error() {
     // (panic/deadlock せず、失敗として返ることを検証)。
     let second = controller.revoke_share(
         RevokeShareInput {
-            content_id: created.content_id,
-            remote_content_id: None,
+            file_id: created.file_id,
+            remote_content_id: created.remote_content_id.clone(),
             sender_public_key: sender.public_key.clone(),
             sender_private_key: sender.private_key.clone(),
             recipient_public_key: recipient.public_key,
@@ -618,7 +618,7 @@ async fn revoke_share_invalidates_previously_issued_tokens() {
     assert!(
         controller
             .share_content(ShareContentInput {
-                content_id: created.content_id.clone(),
+                file_id: created.file_id.clone(),
                 remote_content_id: None,
                 sender_public_key: sender.public_key.clone(),
                 sender_private_key: sender.private_key.clone(),
@@ -630,7 +630,7 @@ async fn revoke_share_invalidates_previously_issued_tokens() {
     );
     let revoke_response = controller.revoke_share(
         RevokeShareInput {
-            content_id: created.content_id,
+            file_id: created.file_id,
             remote_content_id: Some("invalidate-remote".to_string()),
             sender_public_key: sender.public_key.clone(),
             sender_private_key: sender.private_key.clone(),
@@ -734,7 +734,7 @@ async fn revoke_share_fails_when_token_invalidation_fails() {
 
     let shared = controller
         .share_content(ShareContentInput {
-            content_id: created.content_id.clone(),
+            file_id: created.file_id.clone(),
             remote_content_id: None,
             sender_public_key: sender.public_key.clone(),
             sender_private_key: sender.private_key.clone(),
@@ -745,7 +745,7 @@ async fn revoke_share_fails_when_token_invalidation_fails() {
         .expect("share should return data");
     let revoke_response = controller.revoke_share(
         RevokeShareInput {
-            content_id: created.content_id.clone(),
+            file_id: created.file_id.clone(),
             remote_content_id: Some("invalidate-fail-remote".to_string()),
             sender_public_key: sender.public_key.clone(),
             sender_private_key: sender.private_key.clone(),
@@ -844,7 +844,7 @@ async fn concurrent_revokes_do_not_lose_either_removal() {
         assert!(
             controller
                 .share_content(ShareContentInput {
-                    content_id: created.content_id.clone(),
+                    file_id: created.file_id.clone(),
                     remote_content_id: None,
                     sender_public_key: sender.public_key.clone(),
                     sender_private_key: sender.private_key.clone(),
@@ -861,7 +861,7 @@ async fn concurrent_revokes_do_not_lose_either_removal() {
         .into_iter()
         .map(|recipient| {
             let controller = controller.clone();
-            let content_id = created.content_id.clone();
+            let file_id = created.file_id.clone();
             let sender_public_key = sender.public_key.clone();
             let sender_private_key = sender.private_key.clone();
             let recipient_public_key = recipient.public_key.clone();
@@ -870,7 +870,7 @@ async fn concurrent_revokes_do_not_lose_either_removal() {
             tokio::task::spawn_blocking(move || {
                 controller.revoke_share(
                     RevokeShareInput {
-                        content_id,
+                        file_id,
                         remote_content_id: None,
                         sender_public_key,
                         sender_private_key,
@@ -895,7 +895,7 @@ async fn concurrent_revokes_do_not_lose_either_removal() {
     // 片方の削除が lost update で消えていれば、その受信者は復号できてしまう。
     for (label, recipient) in [("a", &recipient_a), ("b", &recipient_b)] {
         let shared_again = controller.share_content(ShareContentInput {
-            content_id: created.content_id.clone(),
+            file_id: created.file_id.clone(),
             remote_content_id: None,
             sender_public_key: sender.public_key.clone(),
             sender_private_key: sender.private_key.clone(),
@@ -988,7 +988,7 @@ async fn revoke_reissues_a_valid_token_for_each_surviving_recipient() {
         (&revoked, vec![Permission::Read]),
     ] {
         let shared = controller.share_content(ShareContentInput {
-            content_id: created.content_id.clone(),
+            file_id: created.file_id.clone(),
             remote_content_id: Some("reissue-remote".to_string()),
             sender_public_key: sender.public_key.clone(),
             sender_private_key: sender.private_key.clone(),
@@ -1000,7 +1000,7 @@ async fn revoke_reissues_a_valid_token_for_each_surviving_recipient() {
 
     let revoke_response = controller.revoke_share(
         RevokeShareInput {
-            content_id: created.content_id,
+            file_id: created.file_id,
             remote_content_id: Some("reissue-remote".to_string()),
             sender_public_key: sender.public_key.clone(),
             sender_private_key: sender.private_key.clone(),
@@ -1091,7 +1091,7 @@ async fn share_acl_survives_an_edit_so_a_later_revoke_reissues_to_earlier_recipi
     let share = |content_id: &str,
                  recipient: &monas_sdk::models::keypair::GenerateKeypairOutput| {
         controller.share_content(ShareContentInput {
-            content_id: content_id.to_string(),
+            file_id: content_id.to_string(),
             remote_content_id: Some("acl-remote".to_string()),
             sender_public_key: sender.public_key.clone(),
             sender_private_key: sender.private_key.clone(),
@@ -1099,13 +1099,13 @@ async fn share_acl_survives_an_edit_so_a_later_revoke_reissues_to_earlier_recipi
             permissions: vec![Permission::Read],
         })
     };
-    assert!(share(&created.content_id, &bob).success);
+    assert!(share(&created.file_id, &bob).success);
 
     // The owner edits: a new version id.
     let updated = controller
         .update_content(
             monas_sdk::models::content::UpdateContentInput {
-                local_content_id: created.content_id.clone(),
+                file_id: created.file_id.clone(),
                 remote_content_id: "acl-remote".to_string(),
                 content: URL_SAFE_NO_PAD.encode(b"acl v2 after edit"),
                 metadata: None,
@@ -1116,12 +1116,12 @@ async fn share_acl_survives_an_edit_so_a_later_revoke_reissues_to_earlier_recipi
         .expect("update");
     assert_ne!(updated.version_id, created.content_id);
 
-    // Share the new version to carol, then revoke her.
-    assert!(share(&updated.version_id, &carol).success);
+    // Share the file (now at the new version) to carol, then revoke her.
+    assert!(share(&updated.file_id, &carol).success);
     let revoke = controller
         .revoke_share(
             RevokeShareInput {
-                content_id: updated.version_id.clone(),
+                file_id: updated.file_id.clone(),
                 remote_content_id: Some("acl-remote".to_string()),
                 sender_public_key: sender.public_key.clone(),
                 sender_private_key: sender.private_key.clone(),
@@ -1173,7 +1173,7 @@ fn token_capabilities(jwt: &str) -> Vec<String> {
 
 struct PermissionFixture {
     controller: MonasController,
-    content_id: String,
+    file_id: String,
     sender: monas_sdk::models::keypair::GenerateKeypairOutput,
     target: monas_sdk::models::keypair::GenerateKeypairOutput,
     other: monas_sdk::models::keypair::GenerateKeypairOutput,
@@ -1218,7 +1218,7 @@ async fn permission_fixture(
         .expect("create");
     for (who, perm) in [(&target, initial), (&other, Permission::Read)] {
         let r = controller.share_content(ShareContentInput {
-            content_id: created.content_id.clone(),
+            file_id: created.file_id.clone(),
             remote_content_id: Some("perm-remote".into()),
             sender_public_key: sender.public_key.clone(),
             sender_private_key: sender.private_key.clone(),
@@ -1229,7 +1229,7 @@ async fn permission_fixture(
     }
     PermissionFixture {
         controller,
-        content_id: created.content_id,
+        file_id: created.file_id,
         sender,
         target,
         other,
@@ -1244,7 +1244,7 @@ async fn resharing_to_an_existing_recipient_is_a_conflict() {
     let mut state_node = Server::new_async().await;
     let f = permission_fixture(&mut state_node, Permission::Read).await;
     let r = f.controller.share_content(ShareContentInput {
-        content_id: f.content_id.clone(),
+        file_id: f.file_id.clone(),
         remote_content_id: Some("perm-remote".into()),
         sender_public_key: f.sender.public_key.clone(),
         sender_private_key: f.sender.private_key.clone(),
@@ -1280,7 +1280,7 @@ async fn upgrading_read_to_write_reissues_a_write_token_without_rotation() {
 
     let r = f.controller.update_share_permission(
         UpdateSharePermissionInput {
-            content_id: f.content_id.clone(),
+            file_id: f.file_id.clone(),
             remote_content_id: Some("perm-remote".into()),
             recipient_public_key: f.target.public_key.clone(),
             permissions: vec![Permission::Read, Permission::Write],
@@ -1303,7 +1303,7 @@ async fn upgrading_read_to_write_reissues_a_write_token_without_rotation() {
     // 失効は起きない = 現在 write と認識されている)。
     let again = f.controller.update_share_permission(
         UpdateSharePermissionInput {
-            content_id: f.content_id.clone(),
+            file_id: f.file_id.clone(),
             remote_content_id: Some("perm-remote".into()),
             recipient_public_key: f.target.public_key.clone(),
             permissions: vec![Permission::Write],
@@ -1345,7 +1345,7 @@ async fn downgrading_write_to_read_invalidates_and_reissues_tokens() {
 
     let r = f.controller.update_share_permission(
         UpdateSharePermissionInput {
-            content_id: f.content_id.clone(),
+            file_id: f.file_id.clone(),
             remote_content_id: Some("perm-remote".into()),
             recipient_public_key: f.target.public_key.clone(),
             permissions: vec![Permission::Read],
@@ -1396,7 +1396,7 @@ async fn updating_permission_of_an_unshared_key_is_not_found() {
         .expect("keypair");
     let r = f.controller.update_share_permission(
         UpdateSharePermissionInput {
-            content_id: f.content_id.clone(),
+            file_id: f.file_id.clone(),
             remote_content_id: Some("perm-remote".into()),
             recipient_public_key: stranger.public_key,
             permissions: vec![Permission::Write],
@@ -1436,7 +1436,7 @@ async fn downgrade_retry_after_token_issuance_failure_still_reissues_other_token
         .create_async()
         .await;
     let input = UpdateSharePermissionInput {
-        content_id: f.content_id.clone(),
+        file_id: f.file_id.clone(),
         remote_content_id: Some("perm-remote".into()),
         recipient_public_key: f.target.public_key.clone(),
         permissions: vec![Permission::Read],
@@ -1494,6 +1494,9 @@ fn key_id_of(kp: &monas_sdk::models::keypair::GenerateKeypairOutput) -> String {
 
 struct RevertFixture {
     controller: MonasController,
+    /// ファイルのキー(owner 側の操作の対象)
+    file_id: String,
+    /// 作成時の版の plainCid
     created_id: String,
     sender: monas_sdk::models::keypair::GenerateKeypairOutput,
     bob: monas_sdk::models::keypair::GenerateKeypairOutput,
@@ -1558,7 +1561,7 @@ async fn revert_fixture(
         .expect("create");
     for who in [&bob, &carol] {
         let r = controller.share_content(ShareContentInput {
-            content_id: created.content_id.clone(),
+            file_id: created.file_id.clone(),
             remote_content_id: Some("revert-remote".into()),
             sender_public_key: sender.public_key.clone(),
             sender_private_key: sender.private_key.clone(),
@@ -1569,6 +1572,7 @@ async fn revert_fixture(
     }
     RevertFixture {
         controller,
+        file_id: created.file_id,
         created_id: created.content_id,
         sender,
         bob,
@@ -1577,11 +1581,12 @@ async fn revert_fixture(
 }
 
 impl RevertFixture {
-    fn edit(&self, from: &str, body: &[u8]) -> String {
+    /// 本文を編集し、新しい版の plainCid を返す。
+    fn edit(&self, body: &[u8]) -> String {
         self.controller
             .update_content(
                 monas_sdk::models::content::UpdateContentInput {
-                    local_content_id: from.to_string(),
+                    file_id: self.file_id.clone(),
                     remote_content_id: "revert-remote".to_string(),
                     content: URL_SAFE_NO_PAD.encode(body),
                     metadata: None,
@@ -1595,12 +1600,11 @@ impl RevertFixture {
 
     fn downgrade(
         &self,
-        content_id: &str,
         who: &monas_sdk::models::keypair::GenerateKeypairOutput,
     ) -> monas_sdk::models::share::UpdateSharePermissionOutput {
         let r = self.controller.update_share_permission(
             UpdateSharePermissionInput {
-                content_id: content_id.to_string(),
+                file_id: self.file_id.clone(),
                 remote_content_id: Some("revert-remote".into()),
                 recipient_public_key: who.public_key.clone(),
                 permissions: vec![Permission::Read],
@@ -1613,12 +1617,11 @@ impl RevertFixture {
 
     fn revoke(
         &self,
-        content_id: &str,
         who: &monas_sdk::models::keypair::GenerateKeypairOutput,
     ) -> monas_sdk::models::share::RevokeShareOutput {
         let r = self.controller.revoke_share(
             RevokeShareInput {
-                content_id: content_id.to_string(),
+                file_id: self.file_id.clone(),
                 remote_content_id: Some("revert-remote".into()),
                 sender_public_key: self.sender.public_key.clone(),
                 sender_private_key: self.sender.private_key.clone(),
@@ -1635,6 +1638,7 @@ impl RevertFixture {
 ///
 /// 共有設定を plainCid ごとに持っていた頃は、本文を "body A" に戻すと plainCid が
 /// 作成時と同じになり、作成時の plainCid に残っていた「Bob = write」を拾っていた。
+/// 今は共有設定をファイルのキーで 1 件だけ持つ。
 /// その状態で Carol を降格すると、巻き添えで再発行される Bob の Token が write になる。
 #[tokio::test(flavor = "multi_thread")]
 async fn reverting_the_body_does_not_revive_a_downgraded_recipients_write() {
@@ -1642,12 +1646,12 @@ async fn reverting_the_body_does_not_revive_a_downgraded_recipients_write() {
     let mut state_node = Server::new_async().await;
     let f = revert_fixture(&mut state_node, Permission::Write).await;
 
-    let v2 = f.edit(&f.created_id, b"body B");
-    f.downgrade(&v2, &f.bob);
-    let reverted = f.edit(&v2, b"body A");
+    f.edit(b"body B");
+    f.downgrade(&f.bob);
+    let reverted = f.edit(b"body A");
     assert_eq!(reverted, f.created_id, "same body, same plainCid");
 
-    let out = f.downgrade(&reverted, &f.carol);
+    let out = f.downgrade(&f.carol);
     let bob = out
         .reissued_tokens
         .iter()
@@ -1677,12 +1681,12 @@ async fn reverting_the_body_does_not_reissue_to_a_revoked_recipient() {
     let mut state_node = Server::new_async().await;
     let f = revert_fixture(&mut state_node, Permission::Read).await;
 
-    let v2 = f.edit(&f.created_id, b"body B");
-    let revoked = f.revoke(&v2, &f.carol);
-    let reverted = f.edit(&revoked.content_id, b"body A");
+    f.edit(b"body B");
+    f.revoke(&f.carol);
+    let reverted = f.edit(b"body A");
     assert_eq!(reverted, f.created_id, "same body, same plainCid");
 
-    let out = f.revoke(&reverted, &f.bob);
+    let out = f.revoke(&f.bob);
     let reissued: Vec<_> = out
         .reissued_envelopes
         .iter()

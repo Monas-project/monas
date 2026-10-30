@@ -104,7 +104,7 @@ export function updateFileFlow(input: {
       minMs: 160,
       exec: async (ctx) => {
         const resp = await contentApi.updateContent({
-          localContentId: entry.localContentId!,
+          fileId: entry.fileId!,
           remoteContentId: entry.remoteContentId || entry.localContentId!,
           contentBase64Url: input.contentBase64Url,
           name: input.name ?? entry.name,
@@ -120,7 +120,7 @@ export function updateFileFlow(input: {
       minMs: 200,
       exec: async (ctx) => {
         const r = ctx.update as contentApi.UpdateContentOutput;
-        return `new version ${short(r.version_id)} · series ${short(r.series_id)}`;
+        return `new version ${short(r.version_id)} (was ${short(r.previous_version_id)})`;
       },
     },
     {
@@ -193,7 +193,7 @@ export function openFileFlow(input: { entry: Entry }): StepSpec[] {
       kind: "verify",
       minMs: 200,
       exec: async (ctx) => {
-        const resp = await contentApi.getContent(entry.localContentId!);
+        const resp = await contentApi.getContent(entry.fileId!);
         ctx.get = resp;
         const n = byteLengthOfBase64Url(resp.content);
         return `${fmtBytes(n)} of plaintext recovered with the CEK`;
@@ -261,7 +261,7 @@ export function readFromStateNodeFlow(input: {
       exec: async (ctx) => {
         const resp = await stateApi.readFromStateNode({
           contentId: entry.remoteContentId || entry.localContentId!,
-          localContentId: entry.localContentId!,
+          ...stateApi.readerOf(entry),
           version: input.version,
         });
         ctx.read = resp;
@@ -297,7 +297,7 @@ export function deleteFileFlow(input: { entry: Entry }): StepSpec[] {
       minMs: 200,
       exec: async (ctx) => {
         const resp = await contentApi.deleteContent({
-          localContentId: entry.localContentId!,
+          fileId: entry.fileId!,
           remoteContentId: entry.remoteContentId || entry.localContentId!,
         });
         ctx.delete = resp;
@@ -331,7 +331,7 @@ export function shareFlow(input: {
       minMs: 180,
       exec: async (ctx) => {
         const grant = await shareApi.shareContent({
-          contentId: entry.localContentId!,
+          fileId: entry.fileId!,
           remoteContentId: entry.remoteContentId,
           senderPublicKeyB64Url: identity.publicKeyB64Url,
           senderPrivateKeyB64Url: identity.privateKeyB64Url,
@@ -353,7 +353,7 @@ export function shareFlow(input: {
       exec: async (ctx) => {
         const g = ctx.share as shareApi.ShareContentOutput;
         if (g.delegated_access) return `AuthToken issued · jti ${short(g.delegated_access.jti, 6, 4)}`;
-        return `Capability: ${input.permissions.join(", ")} on monas://content/${short(entry.localContentId!, 6, 4)}`;
+        return `Capability: ${input.permissions.join(", ")} on monas://content/${short(entry.remoteContentId ?? "(local only)", 6, 4)}`;
       },
     },
     {
@@ -445,7 +445,7 @@ export function changePermissionFlow(input: {
       minMs: 180,
       exec: async (ctx) => {
         const r = await shareApi.updateSharePermission({
-          contentId: entry.localContentId!,
+          fileId: entry.fileId!,
           remoteContentId: entry.remoteContentId,
           recipientPublicKeyB64Url: input.recipientPublicKeyB64Url,
           permissions: input.permissions,
@@ -510,7 +510,7 @@ export function revokeFlow(input: {
       minMs: 180,
       exec: async (ctx) => {
         const r = await shareApi.revokeShare({
-          contentId: entry.localContentId!,
+          fileId: entry.fileId!,
           remoteContentId: entry.remoteContentId,
           senderPublicKeyB64Url: identity.publicKeyB64Url,
           senderPrivateKeyB64Url: identity.privateKeyB64Url,

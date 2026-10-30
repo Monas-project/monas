@@ -47,10 +47,8 @@ export interface ShareGrant {
   envelope: KeyEnvelopeData;
   /** The content version the envelope was wrapped for. HPKE binds the wrap
    *  to it (info/AAD), so a package must name this version, not the entry's
-   *  current one — after an owner edit the two differ. Absent on grants
-   *  saved before this was recorded; the registry pins those to the entry's
-   *  id just before that id next moves (`applyPatch` in store/registry.ts). */
-  envelopeContentId?: string;
+   *  current one — after an owner edit the two differ. */
+  envelopeContentId: string;
   delegatedAccess?: DelegatedAccessToken;
   grantedAt: number;
   /** Set when a revoke of *another* recipient rotated the CEK and reissued
@@ -126,9 +124,17 @@ export interface Entry {
   updatedAt: number;
 
   // --- Monas content state ---
-  localContentId?: string; // SDK content_id (encCid) — used for fetch/share/CEK
+  /** Owner files: the SDK's file key. Every owner-side operation (open,
+   *  edit, delete, share, permission change, revoke, pull) addresses the file
+   *  by it. Fixed at creation — edits, revokes and pulls do not change it —
+   *  and device-local: it never goes into a package or to the state node.
+   *  Absent on received shares. */
+  fileId?: string;
+  /** Plain content id (SHA-256 of the body) of the version this device holds.
+   *  Compared with the network head for the sync badge; a package names the
+   *  version its envelope was wrapped for (`ShareGrant.envelopeContentId`). */
+  localContentId?: string;
   remoteContentId?: string; // state-node Content Network id
-  seriesId?: string; // logical series across versions
   syncedToStateNode: boolean;
   versionCount: number;
   /** What the Content Network's head looked like when this device last

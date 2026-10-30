@@ -141,7 +141,7 @@ async fn get_content(
     StatusCode,
     Json<ApiResponse<monas_sdk::models::content::GetContentOutput>>,
 ) {
-    let input = GetContentInput { content_id: id };
+    let input = GetContentInput { file_id: id };
     api_json(Arc::clone(&state.controller).get_content_async(input).await)
 }
 
@@ -154,7 +154,7 @@ async fn update_content(
     StatusCode,
     Json<ApiResponse<monas_sdk::models::content::UpdateContentOutput>>,
 ) {
-    input.local_content_id = id;
+    input.file_id = id;
     let auth = match build_state_node_auth_context(&headers) {
         Ok(auth) => auth,
         Err(error) => return auth_error_json(error),
@@ -175,7 +175,7 @@ async fn delete_content(
     StatusCode,
     Json<ApiResponse<monas_sdk::models::content::DeleteContentOutput>>,
 ) {
-    input.local_content_id = id;
+    input.file_id = id;
     let auth = match build_state_node_auth_context(&headers) {
         Ok(auth) => auth,
         Err(error) => return auth_error_json(error),

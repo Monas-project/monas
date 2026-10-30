@@ -175,6 +175,7 @@ export default function App() {
         mimeType,
         createdAt: Date.now(),
         updatedAt: Date.now(),
+        fileId: created.file_id,
         localContentId: created.content_id,
         remoteContentId: created.remote_content_id || undefined,
         syncedToStateNode: !!created.remote_content_id,
@@ -252,7 +253,7 @@ export default function App() {
         // overwriting it.
         const pulled = await stateApi.pullFromStateNode({
           contentId: entry.remoteContentId,
-          localContentId: entry.localContentId!,
+          fileId: entry.fileId!,
         });
         if (pulled.adopted) {
           updateEntry(entry.id, {
@@ -267,7 +268,7 @@ export default function App() {
         }
         text = pulled.content;
       } else {
-        text = (await contentApi.getContent(entry.localContentId!)).content;
+        text = (await contentApi.getContent(entry.fileId!)).content;
       }
       setModal({ type: "edit", entry, text: base64UrlToUtf8(text) });
     } catch (e) {
@@ -331,7 +332,6 @@ export default function App() {
       const upd = ctx.update as contentApi.UpdateContentOutput;
       updateEntry(entry.id, {
         localContentId: upd.version_id,
-        seriesId: upd.series_id,
         sizeBytes,
         versionCount: entry.versionCount + 1,
         ...(renamed ? { name: renamed } : {}),

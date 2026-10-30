@@ -33,4 +33,15 @@ pub trait ContentIdGenerator {
     /// - state-node 側で `plain_cid` と `ciphertext` だけから整合性検証ができることを意図する。
     /// - 平文そのものを state-node に渡さない前提。
     fn generate_encrypted(&self, plain_cid: &ContentId, ciphertext: &[u8]) -> ContentId;
+
+    /// ファイルのキー(`series_id`)を生成する。
+    ///
+    /// 例: `series_id = H(初回の plainCid || 0x00 || 作成時刻)`
+    ///
+    /// - 作成時に 1 回だけ決め、編集・再暗号化・最新版の取り込みでは変えない。
+    ///   端末側の記録・CEK・共有設定はこのキーでファイルごとに 1 件だけ持つ。
+    /// - 本文だけから決めると、同じ本文で作った別のファイルが同じキーになる
+    ///   (記録・CEK・共有設定が混ざる)。作成時刻を含めて区別する。
+    /// - 平文のハッシュを含むので、端末の外(state node・package)には出さない。
+    fn generate_series(&self, initial_plain_cid: &ContentId, created_at: u64) -> ContentId;
 }

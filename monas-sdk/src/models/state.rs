@@ -69,6 +69,13 @@ pub struct GetHistoryOutput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadContentFromStateNodeInput {
     pub content_id: String,
+    /// owner が自分のファイルを読むときの、そのファイルのキー
+    /// (`CreateContentOutput::file_id`)。CEK と、照合する plainCid(今の版)は
+    /// そのファイルの記録から取る。`local_content_id` とどちらか一方を指定する。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<String>,
+    /// share 受信者が読むときの、共有された版の plainCid(CEK の選択と照合に使う)。
+    #[serde(default)]
     pub local_content_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
@@ -110,14 +117,14 @@ pub struct ReadContentFromStateNodeOutput {
 pub struct PullContentFromStateNodeInput {
     /// State Node の系列ID。
     pub content_id: String,
-    /// 現在のローカル版ID(CEK とローカルレコードの選択に使う)。
-    pub local_content_id: String,
+    /// 取り込み先のファイルのキー(`CreateContentOutput::file_id`)。
+    pub file_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PullContentFromStateNodeOutput {
     pub content_id: String,
-    /// 取り込み後のローカル版ID。head が既にローカル版なら入力と同じ。
+    /// 取り込み後の今の版の plainCid。
     pub local_content_id: String,
     /// 読んだ版 CID(検証済み)。
     pub version: String,
@@ -139,12 +146,12 @@ pub struct VerifyIntegrityInput {
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_version: Option<String>,
-    /// SDK ローカルの版ID。指定すると、State Node が返す暗号文をローカルに
-    /// 保存された暗号文とバイト比較して検証する（State Node は暗号文を保持
-    /// するため、平文である `content` とは直接比較できない）。未指定の場合は
-    /// 従来どおり `content` のバイト列と直接比較する。
+    /// 対象ファイルのキー(`CreateContentOutput::file_id`)。指定すると、State
+    /// Node が返す暗号文をそのファイルの記録の暗号文とバイト比較して検証する
+    /// （State Node は暗号文を保持するため、平文である `content` とは直接比較
+    /// できない）。未指定の場合は従来どおり `content` のバイト列と直接比較する。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub local_content_id: Option<String>,
+    pub file_id: Option<String>,
 }
 
 /// 整合性検証レスポンス

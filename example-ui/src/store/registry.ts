@@ -4,12 +4,12 @@
 import { createStore } from "./store";
 import type { Entry } from "../types";
 
-// v3: content encryption moved from AES-256-CTR to AES-256-GCM and KeyEnvelope
-// gained `key_epoch`, so every v2 entry points at ciphertext the backend can no
-// longer decrypt and every v2 share grant carries an envelope the recipient now
-// rejects. There is nothing to migrate — the ids are dead — so this starts
-// clean rather than surfacing entries that only fail on open.
-const store = createStore<Entry[]>("monas.registry.v3", []);
+// v4: owner files are addressed by the SDK's file key (`Entry.fileId`), not
+// by the plain content id, and the gateway keeps its records under that key.
+// A v3 entry has no file key the gateway knows, so there is nothing to
+// migrate; this starts clean rather than surfacing entries that only fail on
+// open.
+const store = createStore<Entry[]>("monas.registry.v4", []);
 
 // Registries written before folders were removed may hold folder rows. They
 // never carried Monas content, so drop them; the files that sat "inside" them
@@ -27,25 +27,9 @@ export function addEntry(entry: Entry) {
   store.set((prev) => [...prev, entry]);
 }
 
-// A grant's envelope opens only for the id it was wrapped for. Grants saved
-// before `envelopeContentId` was recorded fall back to the entry's current
-// id, which is right until that id moves (owner edit, head pull, revoke).
-// Pin it to the id the entry had just before the move, so packages built
-// afterwards still name the id the envelope is bound to.
-function applyPatch(e: Entry, patch: Partial<Entry>): Entry {
-  const next = { ...e, ...patch };
-  const moved = patch.localContentId !== undefined && patch.localContentId !== e.localContentId;
-  if (!moved || !e.localContentId || e.receivedShare) return next;
-  const from = e.localContentId;
-  return {
-    ...next,
-    shares: next.shares.map((s) => (s.envelopeContentId ? s : { ...s, envelopeContentId: from })),
-  };
-}
-
 export function updateEntry(id: string, patch: Partial<Entry>) {
   store.set((prev) =>
-    prev.map((e) => (e.id === id ? { ...applyPatch(e, patch), updatedAt: Date.now() } : e)),
+    prev.map((e) => (e.id === id ? { ...e, ...patch, updatedAt: Date.now() } : e)),
   );
 }
 
@@ -53,7 +37,7 @@ export function updateEntry(id: string, patch: Partial<Entry>) {
 // records the patch without touching `updatedAt`, so the Modified column
 // keeps meaning "when the content last changed".
 export function noteEntry(id: string, patch: Partial<Entry>) {
-  store.set((prev) => prev.map((e) => (e.id === id ? applyPatch(e, patch) : e)));
+  store.set((prev) => prev.map((e) => (e.id === id ? { ...e, ...patch } : e)));
 }
 
 export function removeEntry(id: string) {

@@ -276,8 +276,14 @@ CIDはMonasにおいて複数の役割を担う。
 |-----------|----------|------|
 | `plainCid` | sha256(raw_content) | コンテンツの論理的同一性 |
 | `encCid` | sha256(plainCid ∥ 0x00 ∥ ciphertext) | 暗号文の整合性検証 |
-| `seriesCid` | 初回のplainCid | コンテンツ系列の追跡 |
+| `seriesCid` | sha256(初回のplainCid ∥ 0x00 ∥ 作成時刻) | 端末側でのファイルの識別 |
 | `versionCid` | CRDT操作のCID | バージョン履歴 |
+
+`seriesCid`（SDKの`file_id`）はファイルの作成時に1回だけ決め、編集・再暗号化・最新版の取り込みでは変えない。端末側の記録・CEK・共有設定は、これをキーにファイルごとに1件だけ持つ。`plainCid`はキーにせず、今の版の値として記録に持つ（KeyEnvelopeのAADと、復号した平文からの改ざん検出に使う）。
+
+- `plainCid`をキーにすると、本文を以前と同じ内容に戻したときに古い共有設定（降格・取り消しの前）を拾い、同じ本文で作った別のファイルと記録・CEK・共有設定が混ざる。
+- 作成時刻はプロセス内で単調に増える値を使う。同じ本文のファイルを続けて作っても重ならない。
+- 平文のハッシュを含むので、端末の外（state node、share package、委譲Token）には出さない。state nodeとのやりとりはContent Networkの系列ID（`remote_content_id`）で行う。
 
 state-nodeはencCidとversionCidのみを保持する。これにより：
 - 平文を知らなくても履歴の真正性を検証できる

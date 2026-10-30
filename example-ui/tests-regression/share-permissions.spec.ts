@@ -14,11 +14,12 @@ const envelope = { enc: "fixture", wrapped_cek: "fixture", ciphertext: "fixture-
 const token = (jti: string) => ({ delegated_token: `token-${jti}`, issued_at: 10, expires_at: 4102444800, jti });
 const grant = (who: string, permissions: ("read" | "write")[]): ShareGrant => ({
   recipientPublicKeyB64Url: `public-${who}`, recipientLabel: who, permissions, senderKeyId: "owner-kid",
-  recipientKeyId: `kid-${who}`, senderPublicKeyB64Url: "public-owner", envelope, delegatedAccess: token(`${who}-1`), grantedAt: 1,
+  recipientKeyId: `kid-${who}`, senderPublicKeyB64Url: "public-owner", envelope, envelopeContentId: "plain-v1",
+  delegatedAccess: token(`${who}-1`), grantedAt: 1,
 });
 const fileEntry = (shares: ShareGrant[]): Entry => ({
   id: "owner-file", kind: "file", name: "owner.txt", parentPath: "/", sizeBytes: 2, mimeType: "text/plain",
-  createdAt: 1, updatedAt: 1, localContentId: "plain-v1", remoteContentId: "network", syncedToStateNode: true,
+  createdAt: 1, updatedAt: 1, fileId: "file-1", localContentId: "plain-v1", remoteContentId: "network", syncedToStateNode: true,
   versionCount: 1, shares,
 } as Entry);
 
@@ -29,7 +30,7 @@ async function boot(page: Page, entries: Entry[], permissionExtra: Record<string
     if (sessionStorage.getItem("seeded")) return;
     sessionStorage.setItem("seeded", "yes");
     localStorage.setItem("monas.identities.v2", JSON.stringify({ identities: [owner], activeLabel: "owner" }));
-    localStorage.setItem("monas.registry.v3", JSON.stringify(entries));
+    localStorage.setItem("monas.registry.v4", JSON.stringify(entries));
     localStorage.setItem("monas.endpoints.v2", JSON.stringify({ gateway: "/api" }));
   }, { entries, owner });
   await page.route("**/*", async route => {
@@ -44,7 +45,7 @@ async function boot(page: Page, entries: Entry[], permissionExtra: Record<string
     if (path === "/api/health") return route.fulfill({ status: 200, body: "" });
     if (path === "/api/state/read") data = { content_id: "network", local_content_id: "plain-v1", version: "v1", content: "VjE" };
     else if (path === "/api/state/pull") data = { content_id: "network", local_content_id: "plain-v1", version: "v1", adopted: false, content: "VjE" };
-    else if (path === "/api/content/plain-v1" && req.method() === "PUT") data = { series_id: "plain-v1", previous_version_id: "plain-v1", version_id: "plain-v2" };
+    else if (path === "/api/content/file-1" && req.method() === "PUT") data = { file_id: "file-1", previous_version_id: "plain-v1", version_id: "plain-v2" };
     else if (path === "/api/share") {
       const who = String(body.recipient_public_key).replace("public-", "");
       data = { content_id: entries[0]?.localContentId ?? "plain-v1", recipient_public_key: body.recipient_public_key, sender_public_key: "public-owner", sender_key_id: "owner-kid", recipient_key_id: `kid-${who}`, key_envelope: envelope, delegated_access: token(`${who}-1`) };
@@ -69,7 +70,7 @@ async function openShare(page: Page) {
   await page.locator(".menu").getByRole("button", { name: "Share", exact: true }).click();
   await expect(page.getByRole("heading", { name: /^Share/ })).toBeVisible();
 }
-const stored = (page: Page) => page.evaluate(() => JSON.parse(localStorage.getItem("monas.registry.v3")!)[0].shares as ShareGrant[]);
+const stored = (page: Page) => page.evaluate(() => JSON.parse(localStorage.getItem("monas.registry.v4")!)[0].shares as ShareGrant[]);
 
 test("the package shows after sharing, and does not come back when the dialog is reopened", async ({ page }) => {
   const gateway = await boot(page, [fileEntry([])]);
@@ -102,7 +103,7 @@ test("pasting a key that already has a share offers revoke and permission change
   await expect(page.locator(".share-package textarea")).toBeVisible();
   const calls = gateway.requests.filter(r => r.path.startsWith("/api/share"));
   expect(calls.map(r => r.path)).toEqual(["/api/share/permission"]);
-  expect(calls[0].body).toMatchObject({ content_id: "plain-v1", remote_content_id: "network", recipient_public_key: "public-bob", permissions: ["read", "write"] });
+  expect(calls[0].body).toMatchObject({ file_id: "file-1", remote_content_id: "network", recipient_public_key: "public-bob", permissions: ["read", "write"] });
   const shares = await stored(page);
   expect(shares[0].permissions).toEqual(["write"]);
   expect(shares[0].delegatedAccess?.jti).toBe("bob-2");
@@ -144,27 +145,31 @@ test("a package after a permission change names the version its envelope was wra
   const pkg = JSON.parse(await page.locator(".share-package textarea").inputValue());
   expect(pkg.content_id).toBe("plain-v1");
   expect(pkg.delegated_access.jti).toBe("bob-2");
-  // the ACL is addressed by the current version
-  expect(gateway.requests.find(r => r.path === "/api/share/permission")!.body.content_id).toBe("plain-v2");
+  // the share settings are addressed by the file key, which no edit moves
+  expect(gateway.requests.find(r => r.path === "/api/share/permission")!.body.file_id).toBe("file-1");
   expect(gateway.unexpected).toEqual([]);
 });
 
-// A grant saved before envelopeContentId was recorded falls back to the
-// entry's current id. That is right only until the next owner edit, so the
-// edit must pin the id the envelope was wrapped for before it moves.
-test("an owner edit pins a legacy grant to the version its envelope was wrapped for", async ({ page }) => {
+// An owner edit moves the entry's plain id, not the file key: the edit and
+// later share operations address the file by its key, and a package still
+// names the version its envelope was wrapped for. The file key is
+// device-local and never goes into a package.
+test("an owner edit keeps addressing the file by its key; packages name the envelope's version", async ({ page }) => {
   const gateway = await boot(page, [fileEntry([grant("bob", ["read"])])]);
   await page.locator(".row-menu-wrap > button").click();
   await page.locator(".menu").getByRole("button", { name: "Edit contents", exact: true }).click();
   await expect(page.locator(".modal textarea")).toHaveValue("V1");
   await page.locator(".modal textarea").fill("V2");
   await page.getByRole("button", { name: "Re-encrypt & save" }).click();
-  await expect.poll(() => page.evaluate(() => JSON.parse(localStorage.getItem("monas.registry.v3")!)[0].localContentId)).toBe("plain-v2");
-  expect((await stored(page))[0].envelopeContentId).toBe("plain-v1");
+  await expect.poll(() => page.evaluate(() => JSON.parse(localStorage.getItem("monas.registry.v4")!)[0].localContentId)).toBe("plain-v2");
+  const put = gateway.requests.find(r => r.path === "/api/content/file-1")!;
+  expect(put.body.file_id).toBe("file-1");
+  expect(gateway.requests.find(r => r.path === "/api/state/pull")!.body.file_id).toBe("file-1");
   await openShare(page);
   await page.locator(".recipient-row").filter({ hasText: "bob" }).getByRole("button", { name: "Copy package" }).click();
-  const pkg = JSON.parse(await page.locator(".share-package textarea").inputValue());
-  expect(pkg.content_id).toBe("plain-v1");
+  const text = await page.locator(".share-package textarea").inputValue();
+  expect(JSON.parse(text).content_id).toBe("plain-v1");
+  expect(text).not.toContain("file-1");
   expect(gateway.unexpected).toEqual([]);
 });
 
