@@ -37,12 +37,14 @@ pub struct KeyEnvelope {
 /// コンテンツ共有リクエスト
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShareContentInput {
-    pub content_id: String,
+    /// 対象ファイルのキー(`CreateContentOutput::file_id`)。包む CEK・暗号文・
+    /// envelope の content_id(plainCid)は、このファイルの今の版のもの。
+    pub file_id: String,
     /// State Node へ登録済みの系列ID(`UpdateContentInput` / `RevokeShareInput` と
     /// 同じ区別)。委譲 Token の resource はこれで発行される: State Node は
-    /// `monas://content/<系列ID>` で capability を照合するので、ローカル版ID
-    /// で発行した Token は受信者の read/write に使えない。未指定なら
-    /// `content_id`(State Node 未登録のローカル専用コンテンツ向け)。
+    /// `monas://content/<系列ID>` で capability を照合する。未指定なら
+    /// (State Node 未登録のローカル専用コンテンツ)Token は発行しない。
+    /// ファイルのキーは端末の外に出さないので、代わりに使うことはない。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_content_id: Option<String>,
     /// 送信者の公開鍵（base64url） - sender_key_idを計算するために使用
@@ -63,6 +65,7 @@ fn default_permissions() -> Vec<Permission> {
 /// コンテンツ共有レスポンス
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShareContentOutput {
+    /// envelope が指す版の plainCid(今の版)。
     pub content_id: String,
     pub recipient_public_key: String,
     /// 送信者の公開鍵（base64url）。受信者はこれを `decrypt_shared_content` に
@@ -93,11 +96,10 @@ pub struct DelegatedAccessToken {
 /// 共有取り消しリクエスト
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RevokeShareInput {
-    /// SDK ローカルの版ID（ACL・CEK・再暗号化はローカルIDで処理される）
-    pub content_id: String,
-    /// State Node へ送る系列ID。未指定の場合は `content_id` を使う（後方互換）。
-    /// State Node はローカル版IDを知らないため、State Node に登録済みの
-    /// コンテンツでは必ず指定すること（`UpdateContentInput` と同じ区別）。
+    /// 対象ファイルのキー(`CreateContentOutput::file_id`)
+    pub file_id: String,
+    /// State Node へ送る系列ID。未指定ならローカル専用コンテンツとして扱い、
+    /// State Node への失効・再暗号化後の書き込み・Token の再発行をしない。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_content_id: Option<String>,
     /// 送信者の公開鍵（base64url） - sender_key_idを計算するために使用
@@ -111,6 +113,7 @@ pub struct RevokeShareInput {
 /// 共有取り消しレスポンス
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RevokeShareOutput {
+    /// 再暗号化後の今の版の plainCid(再発行 envelope が指す版)。
     pub content_id: String,
     pub recipient_public_key: String,
     pub revoked: bool,
@@ -177,6 +180,62 @@ pub struct ReissuedKeyEnvelope {
     /// 新しい envelope と一緒に届けなければ、その受信者は復号はできても
     /// State Node からは読めない。発行に失敗した場合は `None`(envelope の
     /// 再発行自体は成立している)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegated_access: Option<DelegatedAccessToken>,
+}
+
+// ============================================
+// update_share_permission
+// ============================================
+
+/// 既存の共有先の権限を変更するリクエスト。
+///
+/// 再共有(`share_content`)は同じ受信者に `AlreadyShared` で失敗するので、
+/// read ⇄ write の切り替えはこちらで行う。CEK は回さない(権限は委譲 Token
+/// にだけ載る)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateSharePermissionInput {
+    /// 対象ファイルのキー(`CreateContentOutput::file_id`)
+    pub file_id: String,
+    /// State Node の系列ID。Token の resource と、降格時の Token 失効先。
+    /// 権限は Token にだけ載るので必須(未指定は Validation エラー)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_content_id: Option<String>,
+    pub recipient_public_key: String,
+    pub permissions: Vec<Permission>,
+}
+
+/// 権限変更レスポンス。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateSharePermissionOutput {
+    /// 今の版の plainCid。
+    pub content_id: String,
+    pub recipient_public_key: String,
+    pub recipient_key_id: String,
+    /// 変更後の権限(`read` / `write`)
+    pub permissions: Vec<Permission>,
+    /// 変更後の権限で発行し直した、この受信者向けの委譲 Token。
+    pub delegated_access: DelegatedAccessToken,
+    /// 降格(write → read)では古い write Token を止めるため State Node の
+    /// `min_valid_issued_at` を進める。それで失効した他の受信者の Token を
+    /// 発行し直したもの。権限が変わらない要求(降格の応答を失ったあとの
+    /// やり直しなど)でも、失効はせずに同じく他の受信者分を返す。昇格では空。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reissued_tokens: Vec<ReissuedDelegatedToken>,
+    /// 降格で進めた `min_valid_issued_at`。失効させていなければ `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_invalidated_at: Option<u64>,
+    /// 失効境界がメンバーへどこまで届いたか(`RevokeShareOutput` と同じ意味)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_invalidation_reach: Option<TokenInvalidationReach>,
+}
+
+/// 権限変更に伴う失効で、他の受信者向けに発行し直した委譲 Token。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReissuedDelegatedToken {
+    /// 受信者 key id(base64url)
+    pub recipient_key_id: String,
+    /// 発行に失敗した場合は `None`(その受信者は owner から再度受け取る必要がある)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delegated_access: Option<DelegatedAccessToken>,
 }
@@ -274,7 +333,7 @@ mod tests {
     #[test]
     fn test_share_content_input_default_permissions() {
         let json = r#"{
-            "content_id": "test_id",
+            "file_id": "test_id",
             "sender_public_key": "sender_pub",
             "sender_private_key": "sender_priv",
             "recipient_public_key": "recipient_key"
@@ -286,7 +345,7 @@ mod tests {
     #[test]
     fn test_share_content_input_with_permissions() {
         let json = r#"{
-            "content_id": "test_id",
+            "file_id": "test_id",
             "sender_public_key": "sender_pub",
             "sender_private_key": "sender_priv",
             "recipient_public_key": "recipient_key",

@@ -15,7 +15,11 @@ export type StepKind =
   | "verify" // decrypt / round-trip check
   | "cleanup"; // delete / revoke
 
-export type StepStatus = "pending" | "running" | "done" | "error" | "skipped";
+export type StepStatus = "pending" | "running" | "done" | "warning" | "error" | "skipped";
+
+/** Thrown by a step whose work succeeded but whose outcome needs attention
+ *  (shown amber, not red). Does not fail the run. */
+export class StepWarning extends Error {}
 
 export interface StepView {
   id: string;

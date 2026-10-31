@@ -40,3 +40,25 @@ pub struct RevokeShareResult {
     pub recipient_key_id: KeyId,
     pub envelopes: Vec<KeyEnvelope>,
 }
+
+/// 既存受信者の権限を変更するユースケースの入力。
+///
+/// CEK・ciphertext は変えない(権限は委譲 Token にだけ載るため、KeyEnvelope は
+/// そのまま有効)。
+#[derive(Debug)]
+pub struct UpdateSharePermissionCommand {
+    pub content_id: ContentId,
+    pub recipient_key_id: KeyId,
+    pub permission: Permission,
+}
+
+/// 権限変更ユースケースの出力。
+#[derive(Debug)]
+pub struct UpdateSharePermissionResult {
+    pub content_id: ContentId,
+    pub recipient_key_id: KeyId,
+    /// 変更前の権限。
+    pub previous: Vec<Permission>,
+    /// 変更後の権限。
+    pub current: Vec<Permission>,
+}

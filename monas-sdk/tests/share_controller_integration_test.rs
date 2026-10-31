@@ -7,6 +7,7 @@ use monas_sdk::models::content::{ContentMetadata, CreateContentInput};
 use monas_sdk::models::keypair::{GenerateKeypairInput, KeyType};
 use monas_sdk::models::share::{
     DecryptSharedContentInput, Permission, RevokeShareInput, ShareContentInput,
+    UpdateSharePermissionInput,
 };
 use monas_sdk::{MonasConfig, MonasController, StateNodeAuthContext};
 use std::time::Duration;
@@ -89,8 +90,8 @@ async fn share_content_succeeds_after_content_creation() {
     create_mock.assert();
 
     let share_response = controller.share_content(ShareContentInput {
-        content_id: created.content_id.clone(),
-        remote_content_id: None,
+        file_id: created.file_id.clone(),
+        remote_content_id: created.remote_content_id.clone(),
         sender_public_key: sender.public_key.clone(),
         sender_private_key: sender.private_key.clone(),
         recipient_public_key: recipient.public_key.clone(),
@@ -195,8 +196,8 @@ async fn revoke_share_updates_state_node_version() {
     create_mock.assert();
 
     let share_response = controller.share_content(ShareContentInput {
-        content_id: created.content_id.clone(),
-        remote_content_id: None,
+        file_id: created.file_id.clone(),
+        remote_content_id: created.remote_content_id.clone(),
         sender_public_key: sender.public_key.clone(),
         sender_private_key: sender.private_key.clone(),
         recipient_public_key: recipient.public_key.clone(),
@@ -205,8 +206,8 @@ async fn revoke_share_updates_state_node_version() {
     assert!(share_response.success, "share_content should succeed");
     let revoke_response = controller.revoke_share(
         RevokeShareInput {
-            content_id: created.content_id,
-            remote_content_id: None,
+            file_id: created.file_id,
+            remote_content_id: created.remote_content_id.clone(),
             sender_public_key: sender.public_key.clone(),
             sender_private_key: sender.private_key.clone(),
             recipient_public_key: recipient.public_key,
@@ -277,7 +278,7 @@ async fn revoke_share_syncs_state_node_by_remote_content_id() {
     create_mock.assert();
 
     let share_response = controller.share_content(ShareContentInput {
-        content_id: created.content_id.clone(),
+        file_id: created.file_id.clone(),
         remote_content_id: None,
         sender_public_key: sender.public_key.clone(),
         sender_private_key: sender.private_key.clone(),
@@ -287,7 +288,7 @@ async fn revoke_share_syncs_state_node_by_remote_content_id() {
     assert!(share_response.success, "share_content should succeed");
     let revoke_response = controller.revoke_share(
         RevokeShareInput {
-            content_id: created.content_id,
+            file_id: created.file_id,
             remote_content_id: Some("remote-series-id".to_string()),
             sender_public_key: sender.public_key.clone(),
             sender_private_key: sender.private_key.clone(),
@@ -363,8 +364,8 @@ async fn revoke_share_rolls_back_local_state_when_state_node_sync_fails() {
     create_mock.assert();
 
     let share_response = controller.share_content(ShareContentInput {
-        content_id: created.content_id.clone(),
-        remote_content_id: None,
+        file_id: created.file_id.clone(),
+        remote_content_id: created.remote_content_id.clone(),
         sender_public_key: sender.public_key.clone(),
         sender_private_key: sender.private_key.clone(),
         recipient_public_key: recipient.public_key.clone(),
@@ -374,8 +375,8 @@ async fn revoke_share_rolls_back_local_state_when_state_node_sync_fails() {
     let shared = share_response.data.expect("share should return data");
     let revoke_response = controller.revoke_share(
         RevokeShareInput {
-            content_id: created.content_id.clone(),
-            remote_content_id: None,
+            file_id: created.file_id.clone(),
+            remote_content_id: created.remote_content_id.clone(),
             sender_public_key: sender.public_key.clone(),
             sender_private_key: sender.private_key.clone(),
             recipient_public_key: recipient.public_key.clone(),
@@ -414,8 +415,8 @@ async fn revoke_share_rolls_back_local_state_when_state_node_sync_fails() {
 
     let second_revoke_response = controller.revoke_share(
         RevokeShareInput {
-            content_id: created.content_id,
-            remote_content_id: None,
+            file_id: created.file_id,
+            remote_content_id: created.remote_content_id.clone(),
             sender_public_key: sender.public_key.clone(),
             sender_private_key: sender.private_key.clone(),
             recipient_public_key: recipient.public_key,
@@ -492,8 +493,8 @@ async fn revoke_share_rollback_fires_on_inner_share_service_error() {
 
     let _ = controller
         .share_content(ShareContentInput {
-            content_id: created.content_id.clone(),
-            remote_content_id: None,
+            file_id: created.file_id.clone(),
+            remote_content_id: created.remote_content_id.clone(),
             sender_public_key: sender.public_key.clone(),
             sender_private_key: sender.private_key.clone(),
             recipient_public_key: recipient.public_key.clone(),
@@ -504,8 +505,8 @@ async fn revoke_share_rollback_fires_on_inner_share_service_error() {
     // 1 回目: 成功
     let first = controller.revoke_share(
         RevokeShareInput {
-            content_id: created.content_id.clone(),
-            remote_content_id: None,
+            file_id: created.file_id.clone(),
+            remote_content_id: created.remote_content_id.clone(),
             sender_public_key: sender.public_key.clone(),
             sender_private_key: sender.private_key.clone(),
             recipient_public_key: recipient.public_key.clone(),
@@ -524,8 +525,8 @@ async fn revoke_share_rollback_fires_on_inner_share_service_error() {
     // (panic/deadlock せず、失敗として返ることを検証)。
     let second = controller.revoke_share(
         RevokeShareInput {
-            content_id: created.content_id,
-            remote_content_id: None,
+            file_id: created.file_id,
+            remote_content_id: created.remote_content_id.clone(),
             sender_public_key: sender.public_key.clone(),
             sender_private_key: sender.private_key.clone(),
             recipient_public_key: recipient.public_key,
@@ -617,7 +618,7 @@ async fn revoke_share_invalidates_previously_issued_tokens() {
     assert!(
         controller
             .share_content(ShareContentInput {
-                content_id: created.content_id.clone(),
+                file_id: created.file_id.clone(),
                 remote_content_id: None,
                 sender_public_key: sender.public_key.clone(),
                 sender_private_key: sender.private_key.clone(),
@@ -629,7 +630,7 @@ async fn revoke_share_invalidates_previously_issued_tokens() {
     );
     let revoke_response = controller.revoke_share(
         RevokeShareInput {
-            content_id: created.content_id,
+            file_id: created.file_id,
             remote_content_id: Some("invalidate-remote".to_string()),
             sender_public_key: sender.public_key.clone(),
             sender_private_key: sender.private_key.clone(),
@@ -733,7 +734,7 @@ async fn revoke_share_fails_when_token_invalidation_fails() {
 
     let shared = controller
         .share_content(ShareContentInput {
-            content_id: created.content_id.clone(),
+            file_id: created.file_id.clone(),
             remote_content_id: None,
             sender_public_key: sender.public_key.clone(),
             sender_private_key: sender.private_key.clone(),
@@ -744,7 +745,7 @@ async fn revoke_share_fails_when_token_invalidation_fails() {
         .expect("share should return data");
     let revoke_response = controller.revoke_share(
         RevokeShareInput {
-            content_id: created.content_id.clone(),
+            file_id: created.file_id.clone(),
             remote_content_id: Some("invalidate-fail-remote".to_string()),
             sender_public_key: sender.public_key.clone(),
             sender_private_key: sender.private_key.clone(),
@@ -843,7 +844,7 @@ async fn concurrent_revokes_do_not_lose_either_removal() {
         assert!(
             controller
                 .share_content(ShareContentInput {
-                    content_id: created.content_id.clone(),
+                    file_id: created.file_id.clone(),
                     remote_content_id: None,
                     sender_public_key: sender.public_key.clone(),
                     sender_private_key: sender.private_key.clone(),
@@ -860,7 +861,7 @@ async fn concurrent_revokes_do_not_lose_either_removal() {
         .into_iter()
         .map(|recipient| {
             let controller = controller.clone();
-            let content_id = created.content_id.clone();
+            let file_id = created.file_id.clone();
             let sender_public_key = sender.public_key.clone();
             let sender_private_key = sender.private_key.clone();
             let recipient_public_key = recipient.public_key.clone();
@@ -869,7 +870,7 @@ async fn concurrent_revokes_do_not_lose_either_removal() {
             tokio::task::spawn_blocking(move || {
                 controller.revoke_share(
                     RevokeShareInput {
-                        content_id,
+                        file_id,
                         remote_content_id: None,
                         sender_public_key,
                         sender_private_key,
@@ -894,7 +895,7 @@ async fn concurrent_revokes_do_not_lose_either_removal() {
     // 片方の削除が lost update で消えていれば、その受信者は復号できてしまう。
     for (label, recipient) in [("a", &recipient_a), ("b", &recipient_b)] {
         let shared_again = controller.share_content(ShareContentInput {
-            content_id: created.content_id.clone(),
+            file_id: created.file_id.clone(),
             remote_content_id: None,
             sender_public_key: sender.public_key.clone(),
             sender_private_key: sender.private_key.clone(),
@@ -987,7 +988,7 @@ async fn revoke_reissues_a_valid_token_for_each_surviving_recipient() {
         (&revoked, vec![Permission::Read]),
     ] {
         let shared = controller.share_content(ShareContentInput {
-            content_id: created.content_id.clone(),
+            file_id: created.file_id.clone(),
             remote_content_id: Some("reissue-remote".to_string()),
             sender_public_key: sender.public_key.clone(),
             sender_private_key: sender.private_key.clone(),
@@ -999,7 +1000,7 @@ async fn revoke_reissues_a_valid_token_for_each_surviving_recipient() {
 
     let revoke_response = controller.revoke_share(
         RevokeShareInput {
-            content_id: created.content_id,
+            file_id: created.file_id,
             remote_content_id: Some("reissue-remote".to_string()),
             sender_public_key: sender.public_key.clone(),
             sender_private_key: sender.private_key.clone(),
@@ -1090,7 +1091,7 @@ async fn share_acl_survives_an_edit_so_a_later_revoke_reissues_to_earlier_recipi
     let share = |content_id: &str,
                  recipient: &monas_sdk::models::keypair::GenerateKeypairOutput| {
         controller.share_content(ShareContentInput {
-            content_id: content_id.to_string(),
+            file_id: content_id.to_string(),
             remote_content_id: Some("acl-remote".to_string()),
             sender_public_key: sender.public_key.clone(),
             sender_private_key: sender.private_key.clone(),
@@ -1098,13 +1099,13 @@ async fn share_acl_survives_an_edit_so_a_later_revoke_reissues_to_earlier_recipi
             permissions: vec![Permission::Read],
         })
     };
-    assert!(share(&created.content_id, &bob).success);
+    assert!(share(&created.file_id, &bob).success);
 
     // The owner edits: a new version id.
     let updated = controller
         .update_content(
             monas_sdk::models::content::UpdateContentInput {
-                local_content_id: created.content_id.clone(),
+                file_id: created.file_id.clone(),
                 remote_content_id: "acl-remote".to_string(),
                 content: URL_SAFE_NO_PAD.encode(b"acl v2 after edit"),
                 metadata: None,
@@ -1115,12 +1116,12 @@ async fn share_acl_survives_an_edit_so_a_later_revoke_reissues_to_earlier_recipi
         .expect("update");
     assert_ne!(updated.version_id, created.content_id);
 
-    // Share the new version to carol, then revoke her.
-    assert!(share(&updated.version_id, &carol).success);
+    // Share the file (now at the new version) to carol, then revoke her.
+    assert!(share(&updated.file_id, &carol).success);
     let revoke = controller
         .revoke_share(
             RevokeShareInput {
-                content_id: updated.version_id.clone(),
+                file_id: updated.file_id.clone(),
                 remote_content_id: Some("acl-remote".to_string()),
                 sender_public_key: sender.public_key.clone(),
                 sender_private_key: sender.private_key.clone(),
@@ -1150,5 +1151,647 @@ async fn share_acl_survives_an_edit_so_a_later_revoke_reissues_to_earlier_recipi
             .collect::<Vec<_>>()
     );
 
+    cleanup_content_artifacts();
+}
+
+// ============================================
+// update_share_permission
+// ============================================
+
+/// JWT の payload から capability 名(`read` / `write`)を取り出す。
+fn token_capabilities(jwt: &str) -> Vec<String> {
+    let payload = jwt.split('.').nth(1).expect("jwt payload");
+    let bytes = URL_SAFE_NO_PAD.decode(payload).expect("payload base64url");
+    let value: serde_json::Value = serde_json::from_slice(&bytes).expect("payload json");
+    let text = value.to_string();
+    ["read", "write"]
+        .iter()
+        .filter(|c| text.contains(&format!("\"{c}\"")))
+        .map(|c| c.to_string())
+        .collect()
+}
+
+struct PermissionFixture {
+    controller: MonasController,
+    file_id: String,
+    sender: monas_sdk::models::keypair::GenerateKeypairOutput,
+    target: monas_sdk::models::keypair::GenerateKeypairOutput,
+    other: monas_sdk::models::keypair::GenerateKeypairOutput,
+}
+
+/// `target` を `initial` 権限で、`other` を read で共有した状態を作る。
+async fn permission_fixture(
+    state_node: &mut mockito::ServerGuard,
+    initial: Permission,
+) -> PermissionFixture {
+    state_node
+        .mock("POST", "/content")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"content_id":"perm-remote"}"#)
+        .create_async()
+        .await;
+    let controller = controller_with_wide_skew(state_node.url());
+    let kp = || {
+        controller
+            .generate_keypair(GenerateKeypairInput {
+                key_type: KeyType::Secp256r1,
+            })
+            .data
+            .expect("keypair")
+    };
+    let (sender, target, other) = (kp(), kp(), kp());
+    let created = controller
+        .create_content(
+            CreateContentInput {
+                content: URL_SAFE_NO_PAD.encode(b"permission-target"),
+                metadata: Some(ContentMetadata {
+                    name: Some("perm.txt".to_string()),
+                    content_type: Some("text/plain".to_string()),
+                    created_at: None,
+                    updated_at: None,
+                }),
+            },
+            None,
+        )
+        .data
+        .expect("create");
+    for (who, perm) in [(&target, initial), (&other, Permission::Read)] {
+        let r = controller.share_content(ShareContentInput {
+            file_id: created.file_id.clone(),
+            remote_content_id: Some("perm-remote".into()),
+            sender_public_key: sender.public_key.clone(),
+            sender_private_key: sender.private_key.clone(),
+            recipient_public_key: who.public_key.clone(),
+            permissions: vec![perm],
+        });
+        assert!(r.success, "share: {:?}", r.error);
+    }
+    PermissionFixture {
+        controller,
+        file_id: created.file_id,
+        sender,
+        target,
+        other,
+    }
+}
+
+/// 同じ相手への再共有は「権限を変更して」と分かる 409 で返す(以前は 500 の
+/// `Share domain error: AlreadyShared` で、UI は "Share failed" としか出せなかった)。
+#[tokio::test(flavor = "multi_thread")]
+async fn resharing_to_an_existing_recipient_is_a_conflict() {
+    let _guard = acquire_test_lock();
+    let mut state_node = Server::new_async().await;
+    let f = permission_fixture(&mut state_node, Permission::Read).await;
+    let r = f.controller.share_content(ShareContentInput {
+        file_id: f.file_id.clone(),
+        remote_content_id: Some("perm-remote".into()),
+        sender_public_key: f.sender.public_key.clone(),
+        sender_private_key: f.sender.private_key.clone(),
+        recipient_public_key: f.target.public_key.clone(),
+        permissions: vec![Permission::Write],
+    });
+    assert!(!r.success);
+    assert!(
+        matches!(r.error, Some(monas_sdk::ApiError::Conflict(_))),
+        "{:?}",
+        r.error
+    );
+    cleanup_content_artifacts();
+}
+
+/// 昇格(read → write): revoke せずに通る。Token 失効も CEK ローテーションも
+/// しない(state node へは何も送らない)。新しい Token は write を持つ。
+#[tokio::test(flavor = "multi_thread")]
+async fn upgrading_read_to_write_reissues_a_write_token_without_rotation() {
+    let _guard = acquire_test_lock();
+    let mut state_node = Server::new_async().await;
+    let f = permission_fixture(&mut state_node, Permission::Read).await;
+    let invalidate_mock = state_node
+        .mock("POST", "/content/perm-remote/access/invalidate")
+        .expect(0)
+        .create_async()
+        .await;
+    let put_mock = state_node
+        .mock("PUT", mockito::Matcher::Any)
+        .expect(0)
+        .create_async()
+        .await;
+
+    let r = f.controller.update_share_permission(
+        UpdateSharePermissionInput {
+            file_id: f.file_id.clone(),
+            remote_content_id: Some("perm-remote".into()),
+            recipient_public_key: f.target.public_key.clone(),
+            permissions: vec![Permission::Read, Permission::Write],
+        },
+        Some(&auth_context("Bearer owner")),
+    );
+    assert!(r.success, "{:?}", r.error);
+    let out = r.data.expect("data");
+    assert_eq!(out.permissions, vec![Permission::Write]);
+    assert_eq!(
+        token_capabilities(&out.delegated_access.delegated_token),
+        vec!["write"]
+    );
+    assert!(out.token_invalidated_at.is_none());
+    assert!(out.reissued_tokens.is_empty());
+    invalidate_mock.assert();
+    put_mock.assert();
+
+    // 変更は ACL に残る: 続けて降格方向の判定に使われる(もう一度 write にしても
+    // 失効は起きない = 現在 write と認識されている)。
+    let again = f.controller.update_share_permission(
+        UpdateSharePermissionInput {
+            file_id: f.file_id.clone(),
+            remote_content_id: Some("perm-remote".into()),
+            recipient_public_key: f.target.public_key.clone(),
+            permissions: vec![Permission::Write],
+        },
+        Some(&auth_context("Bearer owner")),
+    );
+    assert!(again.success, "{:?}", again.error);
+    invalidate_mock.assert();
+    cleanup_content_artifacts();
+}
+
+/// 降格(write → read): 受信者の手元の write Token を止めるため境界を進める。
+/// 新しい Token は read のみで境界より後の iat。巻き添えで失効した他の
+/// 受信者にも各自の権限で Token を発行し直す。CEK は回さない(PUT なし)。
+#[tokio::test(flavor = "multi_thread")]
+async fn downgrading_write_to_read_invalidates_and_reissues_tokens() {
+    let _guard = acquire_test_lock();
+    let mut state_node = Server::new_async().await;
+    let f = permission_fixture(&mut state_node, Permission::Write).await;
+    let boundary = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let invalidate_mock = state_node
+        .mock("POST", "/content/perm-remote/access/invalidate")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(format!(
+            r#"{{"content_id":"perm-remote","new_min_valid_issued_at":{boundary},"notified_members":["n2"],"unreached_members":[],"relayed":false}}"#
+        ))
+        .expect(1)
+        .create_async()
+        .await;
+    let put_mock = state_node
+        .mock("PUT", mockito::Matcher::Any)
+        .expect(0)
+        .create_async()
+        .await;
+
+    let r = f.controller.update_share_permission(
+        UpdateSharePermissionInput {
+            file_id: f.file_id.clone(),
+            remote_content_id: Some("perm-remote".into()),
+            recipient_public_key: f.target.public_key.clone(),
+            permissions: vec![Permission::Read],
+        },
+        Some(&auth_context("Bearer owner")),
+    );
+    assert!(r.success, "{:?}", r.error);
+    invalidate_mock.assert();
+    put_mock.assert();
+    let out = r.data.expect("data");
+    assert_eq!(out.permissions, vec![Permission::Read]);
+    assert_eq!(
+        token_capabilities(&out.delegated_access.delegated_token),
+        vec!["read"]
+    );
+    assert!(out.delegated_access.issued_at > boundary);
+    assert_eq!(out.token_invalidated_at, Some(boundary));
+    assert_eq!(
+        out.token_invalidation_reach.map(|r| r.notified_members),
+        Some(vec!["n2".to_string()])
+    );
+    assert_eq!(out.reissued_tokens.len(), 1, "the other recipient");
+    let other_token = out.reissued_tokens[0]
+        .delegated_access
+        .as_ref()
+        .expect("other recipient gets a fresh token");
+    assert!(other_token.issued_at > boundary);
+    assert_eq!(
+        token_capabilities(&other_token.delegated_token),
+        vec!["read"]
+    );
+    let _ = &f.other;
+    cleanup_content_artifacts();
+}
+
+/// 共有していない相手の権限変更は 404(黙って新規共有にはしない)。
+#[tokio::test(flavor = "multi_thread")]
+async fn updating_permission_of_an_unshared_key_is_not_found() {
+    let _guard = acquire_test_lock();
+    let mut state_node = Server::new_async().await;
+    let f = permission_fixture(&mut state_node, Permission::Read).await;
+    let stranger = f
+        .controller
+        .generate_keypair(GenerateKeypairInput {
+            key_type: KeyType::Secp256r1,
+        })
+        .data
+        .expect("keypair");
+    let r = f.controller.update_share_permission(
+        UpdateSharePermissionInput {
+            file_id: f.file_id.clone(),
+            remote_content_id: Some("perm-remote".into()),
+            recipient_public_key: stranger.public_key,
+            permissions: vec![Permission::Write],
+        },
+        Some(&auth_context("Bearer owner")),
+    );
+    assert!(
+        matches!(r.error, Some(monas_sdk::ApiError::NotFound(_))),
+        "{:?}",
+        r.error
+    );
+    cleanup_content_artifacts();
+}
+
+/// 降格で失効させた後に対象者の Token 発行が失敗したら、ACL を write へ戻す。
+/// 戻さないと、再試行は「read → read」と判定されて失効も他受信者への再発行も
+/// せず、最初の失効で無効になった他受信者の Token が返らないまま残る。
+#[tokio::test(flavor = "multi_thread")]
+async fn downgrade_retry_after_token_issuance_failure_still_reissues_other_tokens() {
+    let _guard = acquire_test_lock();
+    let mut state_node = Server::new_async().await;
+    let f = permission_fixture(&mut state_node, Permission::Write).await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    // 境界が SDK の時計より 60 秒先: 待ち上限を超えるので Token 発行が失敗する。
+    let skewed = state_node
+        .mock("POST", "/content/perm-remote/access/invalidate")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(format!(
+            r#"{{"content_id":"perm-remote","new_min_valid_issued_at":{}}}"#,
+            now + 60
+        ))
+        .expect(1)
+        .create_async()
+        .await;
+    let input = UpdateSharePermissionInput {
+        file_id: f.file_id.clone(),
+        remote_content_id: Some("perm-remote".into()),
+        recipient_public_key: f.target.public_key.clone(),
+        permissions: vec![Permission::Read],
+    };
+    let failed = f
+        .controller
+        .update_share_permission(input.clone(), Some(&auth_context("Bearer owner")));
+    assert!(
+        !failed.success,
+        "issuance must fail with a far-future cutoff"
+    );
+    skewed.assert();
+    skewed.remove_async().await;
+
+    let fixed = state_node
+        .mock("POST", "/content/perm-remote/access/invalidate")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(format!(
+            r#"{{"content_id":"perm-remote","new_min_valid_issued_at":{now}}}"#
+        ))
+        .expect(1)
+        .create_async()
+        .await;
+    let retry = f
+        .controller
+        .update_share_permission(input, Some(&auth_context("Bearer owner")));
+    assert!(retry.success, "{:?}", retry.error);
+    fixed.assert();
+    let out = retry.data.expect("data");
+    assert_eq!(
+        out.token_invalidated_at,
+        Some(now),
+        "retry must redo the downgrade"
+    );
+    assert_eq!(
+        out.reissued_tokens.len(),
+        1,
+        "the other recipient's token is reissued"
+    );
+    assert!(out.reissued_tokens[0].delegated_access.is_some());
+    cleanup_content_artifacts();
+}
+
+// ============================================
+// 本文を以前と同じ内容に戻したとき(plainCid が過去と同じになる)
+// ============================================
+
+/// 受信者の KeyId(base64url)。SDK の出力と同じ計算(公開鍵の SHA-256 先頭 16 byte)。
+fn key_id_of(kp: &monas_sdk::models::keypair::GenerateKeypairOutput) -> String {
+    use sha2::{Digest, Sha256};
+    let pk = URL_SAFE_NO_PAD.decode(&kp.public_key).unwrap();
+    URL_SAFE_NO_PAD.encode(&Sha256::digest(&pk)[..16])
+}
+
+struct RevertFixture {
+    controller: MonasController,
+    /// ファイルのキー(owner 側の操作の対象)
+    file_id: String,
+    /// 作成時の版の plainCid
+    created_id: String,
+    sender: monas_sdk::models::keypair::GenerateKeypairOutput,
+    bob: monas_sdk::models::keypair::GenerateKeypairOutput,
+    carol: monas_sdk::models::keypair::GenerateKeypairOutput,
+}
+
+/// 本文 "body A" で作成し、Bob と Carol に `initial` で共有した状態を作る。
+/// state node は作成・更新・失効をすべて受け付ける。
+async fn revert_fixture(
+    state_node: &mut mockito::ServerGuard,
+    initial: Permission,
+) -> RevertFixture {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    state_node
+        .mock("POST", "/content")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"content_id":"revert-remote"}"#)
+        .create_async()
+        .await;
+    state_node
+        .mock("PUT", "/content/revert-remote")
+        .with_status(200)
+        .create_async()
+        .await;
+    state_node
+        .mock("POST", "/content/revert-remote/access/invalidate")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(format!(
+            r#"{{"content_id":"revert-remote","new_min_valid_issued_at":{now}}}"#
+        ))
+        .create_async()
+        .await;
+    let controller = controller_with_wide_skew(state_node.url());
+    let kp = || {
+        controller
+            .generate_keypair(GenerateKeypairInput {
+                key_type: KeyType::Secp256r1,
+            })
+            .data
+            .expect("keypair")
+    };
+    let (sender, bob, carol) = (kp(), kp(), kp());
+    let created = controller
+        .create_content(
+            CreateContentInput {
+                content: URL_SAFE_NO_PAD.encode(b"body A"),
+                metadata: Some(ContentMetadata {
+                    name: Some("revert.txt".to_string()),
+                    content_type: Some("text/plain".to_string()),
+                    created_at: None,
+                    updated_at: None,
+                }),
+            },
+            None,
+        )
+        .data
+        .expect("create");
+    for who in [&bob, &carol] {
+        let r = controller.share_content(ShareContentInput {
+            file_id: created.file_id.clone(),
+            remote_content_id: Some("revert-remote".into()),
+            sender_public_key: sender.public_key.clone(),
+            sender_private_key: sender.private_key.clone(),
+            recipient_public_key: who.public_key.clone(),
+            permissions: vec![initial],
+        });
+        assert!(r.success, "share: {:?}", r.error);
+    }
+    RevertFixture {
+        controller,
+        file_id: created.file_id,
+        created_id: created.content_id,
+        sender,
+        bob,
+        carol,
+    }
+}
+
+impl RevertFixture {
+    /// 本文を編集し、新しい版の plainCid を返す。
+    fn edit(&self, body: &[u8]) -> String {
+        self.controller
+            .update_content(
+                monas_sdk::models::content::UpdateContentInput {
+                    file_id: self.file_id.clone(),
+                    remote_content_id: "revert-remote".to_string(),
+                    content: URL_SAFE_NO_PAD.encode(body),
+                    metadata: None,
+                },
+                Some(&auth_context("Bearer owner")),
+            )
+            .data
+            .expect("update")
+            .version_id
+    }
+
+    fn downgrade(
+        &self,
+        who: &monas_sdk::models::keypair::GenerateKeypairOutput,
+    ) -> monas_sdk::models::share::UpdateSharePermissionOutput {
+        let r = self.controller.update_share_permission(
+            UpdateSharePermissionInput {
+                file_id: self.file_id.clone(),
+                remote_content_id: Some("revert-remote".into()),
+                recipient_public_key: who.public_key.clone(),
+                permissions: vec![Permission::Read],
+            },
+            Some(&auth_context("Bearer owner")),
+        );
+        assert!(r.success, "downgrade: {:?}", r.error);
+        r.data.expect("data")
+    }
+
+    fn revoke(
+        &self,
+        who: &monas_sdk::models::keypair::GenerateKeypairOutput,
+    ) -> monas_sdk::models::share::RevokeShareOutput {
+        let r = self.controller.revoke_share(
+            RevokeShareInput {
+                file_id: self.file_id.clone(),
+                remote_content_id: Some("revert-remote".into()),
+                sender_public_key: self.sender.public_key.clone(),
+                sender_private_key: self.sender.private_key.clone(),
+                recipient_public_key: who.public_key.clone(),
+            },
+            Some(&auth_context("Bearer owner")),
+        );
+        assert!(r.success, "revoke: {:?}", r.error);
+        r.data.expect("data")
+    }
+}
+
+/// 降格のあとに本文を元に戻しても、降格は戻らない。
+///
+/// 共有設定を plainCid ごとに持っていた頃は、本文を "body A" に戻すと plainCid が
+/// 作成時と同じになり、作成時の plainCid に残っていた「Bob = write」を拾っていた。
+/// 今は共有設定をファイルのキーで 1 件だけ持つ。
+/// その状態で Carol を降格すると、巻き添えで再発行される Bob の Token が write になる。
+#[tokio::test(flavor = "multi_thread")]
+async fn reverting_the_body_does_not_revive_a_downgraded_recipients_write() {
+    let _guard = acquire_test_lock();
+    let mut state_node = Server::new_async().await;
+    let f = revert_fixture(&mut state_node, Permission::Write).await;
+
+    f.edit(b"body B");
+    f.downgrade(&f.bob);
+    let reverted = f.edit(b"body A");
+    assert_eq!(reverted, f.created_id, "same body, same plainCid");
+
+    let out = f.downgrade(&f.carol);
+    let bob = out
+        .reissued_tokens
+        .iter()
+        .find(|t| t.recipient_key_id == key_id_of(&f.bob))
+        .expect("bob's token is reissued after the cutoff");
+    assert_eq!(
+        token_capabilities(
+            &bob.delegated_access
+                .as_ref()
+                .expect("bob token")
+                .delegated_token
+        ),
+        vec!["read"],
+        "bob was downgraded before the body was reverted"
+    );
+    cleanup_content_artifacts();
+}
+
+/// 取り消しのあとに本文を元に戻しても、取り消した相手は共有先に戻らない。
+///
+/// plainCid ごとの共有設定では、戻した plainCid に残っていた「Bob と Carol」を
+/// 拾うので、続けて Bob を取り消すと、取り消し済みの Carol に新しい CEK の
+/// envelope が再発行されていた(読めなくしたはずの相手が再び読める)。
+#[tokio::test(flavor = "multi_thread")]
+async fn reverting_the_body_does_not_reissue_to_a_revoked_recipient() {
+    let _guard = acquire_test_lock();
+    let mut state_node = Server::new_async().await;
+    let f = revert_fixture(&mut state_node, Permission::Read).await;
+
+    f.edit(b"body B");
+    f.revoke(&f.carol);
+    let reverted = f.edit(b"body A");
+    assert_eq!(reverted, f.created_id, "same body, same plainCid");
+
+    let out = f.revoke(&f.bob);
+    let reissued: Vec<_> = out
+        .reissued_envelopes
+        .iter()
+        .map(|e| e.recipient_key_id.clone())
+        .collect();
+    assert!(
+        !reissued.contains(&key_id_of(&f.carol)),
+        "carol was revoked before the body was reverted; reissued to {reissued:?}"
+    );
+    cleanup_content_artifacts();
+}
+
+/// 降格の成功応答を失った(タイムアウト・タブの再読み込み)あとに同じ降格を
+/// やり直しても、他の受信者の再発行 Token が返る。1 回目の降格で失効境界は
+/// 進んでいて、他の受信者の古い Token はもう使えないので、返らないと
+/// その人たちのアクセスを戻す手段がない。やり直しで失効は繰り返さない。
+#[tokio::test(flavor = "multi_thread")]
+async fn retrying_a_downgrade_whose_response_was_lost_still_reissues_other_tokens() {
+    let _guard = acquire_test_lock();
+    let mut state_node = Server::new_async().await;
+    let f = permission_fixture(&mut state_node, Permission::Write).await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let invalidate = state_node
+        .mock("POST", "/content/perm-remote/access/invalidate")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(format!(
+            r#"{{"content_id":"perm-remote","new_min_valid_issued_at":{now}}}"#
+        ))
+        .expect(1)
+        .create_async()
+        .await;
+    let downgrade = || {
+        f.controller.update_share_permission(
+            UpdateSharePermissionInput {
+                file_id: f.file_id.clone(),
+                remote_content_id: Some("perm-remote".into()),
+                recipient_public_key: f.target.public_key.clone(),
+                permissions: vec![Permission::Read],
+            },
+            Some(&auth_context("Bearer owner")),
+        )
+    };
+    let first = downgrade();
+    assert!(first.success, "{:?}", first.error);
+    // The first response is "lost"; the caller retries the same request.
+    let retry = downgrade();
+    assert!(retry.success, "{:?}", retry.error);
+    invalidate.assert();
+    let out = retry.data.expect("data");
+    assert_eq!(
+        out.token_invalidated_at, None,
+        "the retry does not cut off again"
+    );
+    let other = out
+        .reissued_tokens
+        .iter()
+        .find(|t| t.recipient_key_id == key_id_of(&f.other))
+        .expect("the other recipient's token is returned on the retry too");
+    let token = other.delegated_access.as_ref().expect("issued");
+    assert!(token.issued_at > now);
+    assert_eq!(token_capabilities(&token.delegated_token), vec!["read"]);
+    cleanup_content_artifacts();
+}
+
+/// 降格は古い write Token を止めるために State Node の失効境界を進める。
+/// State Node に届けられない(auth 無し)なら、止めずに成功を返さない。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_downgrade_without_state_node_auth_is_refused() {
+    let _guard = acquire_test_lock();
+    let mut state_node = Server::new_async().await;
+    let f = permission_fixture(&mut state_node, Permission::Write).await;
+    let r = f.controller.update_share_permission(
+        UpdateSharePermissionInput {
+            file_id: f.file_id.clone(),
+            remote_content_id: Some("perm-remote".into()),
+            recipient_public_key: f.target.public_key.clone(),
+            permissions: vec![Permission::Read],
+        },
+        None,
+    );
+    assert!(
+        matches!(r.error, Some(monas_sdk::ApiError::Validation(_))),
+        "{:?}",
+        r.error
+    );
+    // The ACL is unchanged: the target still has write.
+    let again = f.controller.update_share_permission(
+        UpdateSharePermissionInput {
+            file_id: f.file_id.clone(),
+            remote_content_id: Some("perm-remote".into()),
+            recipient_public_key: f.target.public_key.clone(),
+            permissions: vec![Permission::Write],
+        },
+        None,
+    );
+    assert!(again.success, "{:?}", again.error);
+    assert!(again
+        .data
+        .unwrap()
+        .reissued_tokens
+        .iter()
+        .all(|t| t.recipient_key_id != key_id_of(&f.target)));
     cleanup_content_artifacts();
 }

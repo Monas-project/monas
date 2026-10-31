@@ -45,7 +45,14 @@ type Modal =
   | { type: "delete"; entry: Entry }
   | { type: "share"; entryId: string }
   | { type: "importShare" }
-  | { type: "preview"; entry: Entry; contentB64Url: string }
+  | {
+      type: "preview";
+      entry: Entry;
+      contentB64Url: string;
+      /** Plain id of the body actually shown — what the open returned, not the
+       *  entry's id before the open (another tab may have saved since). */
+      displayedVersionId?: string;
+    }
   | { type: "identity" }
   | { type: "settings" }
   | { type: "loadingEdit" };
@@ -175,6 +182,7 @@ export default function App() {
         mimeType,
         createdAt: Date.now(),
         updatedAt: Date.now(),
+        fileId: created.file_id,
         localContentId: created.content_id,
         remoteContentId: created.remote_content_id || undefined,
         syncedToStateNode: !!created.remote_content_id,
@@ -252,7 +260,7 @@ export default function App() {
         // overwriting it.
         const pulled = await stateApi.pullFromStateNode({
           contentId: entry.remoteContentId,
-          localContentId: entry.localContentId!,
+          fileId: entry.fileId!,
         });
         if (pulled.adopted) {
           updateEntry(entry.id, {
@@ -267,7 +275,7 @@ export default function App() {
         }
         text = pulled.content;
       } else {
-        text = (await contentApi.getContent(entry.localContentId!)).content;
+        text = (await contentApi.getContent(entry.fileId!)).content;
       }
       setModal({ type: "edit", entry, text: base64UrlToUtf8(text) });
     } catch (e) {
@@ -331,7 +339,6 @@ export default function App() {
       const upd = ctx.update as contentApi.UpdateContentOutput;
       updateEntry(entry.id, {
         localContentId: upd.version_id,
-        seriesId: upd.series_id,
         sizeBytes,
         versionCount: entry.versionCount + 1,
         ...(renamed ? { name: renamed } : {}),
@@ -382,8 +389,13 @@ export default function App() {
     }
     const { ok, ctx } = await run("Open", entry.name, specs);
     if (ok && ctx.get) {
-      const g = ctx.get as { content: string };
-      setModal({ type: "preview", entry, contentB64Url: g.content });
+      const g = ctx.get as { content: string; content_id?: string };
+      setModal({
+        type: "preview",
+        entry,
+        contentB64Url: g.content,
+        displayedVersionId: g.content_id ?? entry.localContentId,
+      });
       void checkNetworkHead(entry);
     } else {
       pushToast("Could not open file", "error");
@@ -456,17 +468,19 @@ export default function App() {
     }
     setView({ kind: "drive" });
     pushToast(`“${pkg.name}” unwrapped and added to your Drive`, "success");
-    setModal({ type: "preview", entry, contentB64Url: res.content });
+    setModal({ type: "preview", entry, contentB64Url: res.content, displayedVersionId: pkg.content_id });
     // The envelope carries the version the owner shared; whether that is
     // still the head only the network knows.
     void checkNetworkHead(entry);
   };
 
-  const handleShare = async (entry: Entry, input: ShareInput) => {
+  // Share-dialog handlers resolve to whether the action succeeded, so the
+  // dialog can show the package that just became deliverable (and only then).
+  const handleShare = async (entry: Entry, input: ShareInput): Promise<boolean> => {
     if (!active) {
       pushToast("Create an identity first", "error");
       setModal({ type: "identity" });
-      return;
+      return false;
     }
     setBusy(true);
     const specs = flows.shareFlow({
@@ -491,6 +505,9 @@ export default function App() {
             recipientKeyId: g.recipient_key_id,
             senderPublicKeyB64Url: g.sender_public_key,
             envelope: g.key_envelope,
+            // The envelope is bound to the version it was wrapped for; a
+            // later edit moves entry.localContentId but not this.
+            envelopeContentId: g.content_id,
             delegatedAccess: g.delegated_access,
             grantedAt: Date.now(),
           },
@@ -501,10 +518,97 @@ export default function App() {
       pushToast("Share failed", "error");
     }
     setBusy(false);
+    return ok && !!ctx.share;
   };
 
-  const handleRevoke = async (entry: Entry, recipientPublicKeyB64Url: string) => {
-    if (!active) return;
+  // How far a token cutoff (revoke, or a write → read downgrade) got. A
+  // member authorizes against its own copy of the policy, so a member the
+  // cutoff did not reach keeps accepting the voided tokens until it syncs.
+  const reportCutoffReach = (
+    reach: shareApi.TokenInvalidationReach | undefined,
+    action: "revoke" | "downgrade",
+  ) => {
+    const what = action === "revoke" ? "the revoked token" : "the old write token";
+    if (!reach) {
+      pushToast(
+        "Token invalidation propagation is unknown — the node returned no reach report. Members that have not synced may still accept writes under old tokens.",
+        "warning",
+      );
+    } else if (reach.relayed) {
+      pushToast(
+        `The ${action} was relayed to a member node; which members enforce the cutoff yet is not known from here. Writes under ${what} may land on members that have not synced.`,
+        "warning",
+      );
+    } else if (reach.unreached_members.length > 0) {
+      pushToast(
+        `Cutoff did not reach ${reach.unreached_members.length} member node(s). Until they sync (~30 s), a write under ${what} can still land there.`,
+        "warning",
+      );
+    }
+  };
+
+  // read ⇄ write for an existing recipient. No key rotation: only the
+  // delegated token carries the permission, so only tokens are replaced.
+  const handleChangePermission = async (
+    entry: Entry,
+    recipientPublicKeyB64Url: string,
+    permissions: shareApi.Permission[],
+  ): Promise<boolean> => {
+    setBusy(true);
+    const specs = flows.changePermissionFlow({ entry, recipientPublicKeyB64Url, permissions });
+    const { ok, ctx } = await run("Change permission", entry.name, specs);
+    const r = ctx.permission as shareApi.UpdateSharePermissionOutput | undefined;
+    if (ok && r) {
+      const now = Date.now();
+      const others = new Map((r.reissued_tokens ?? []).map((t) => [t.recipient_key_id, t]));
+      const shares = entry.shares.map((s) => {
+        // Only a downgrade voids earlier tokens (it advances the cutoff); an
+        // upgrade leaves the recipient's old read token working.
+        const voided = r.token_invalidated_at != null;
+        if (s.recipientPublicKeyB64Url === recipientPublicKeyB64Url) {
+          return {
+            ...s,
+            permissions: r.permissions,
+            delegatedAccess: r.delegated_access,
+            tokenReissuedAt: now,
+            oldTokenVoided: voided,
+          };
+        }
+        const fresh = others.get(s.recipientKeyId);
+        return fresh
+          ? {
+              ...s,
+              delegatedAccess: fresh.delegated_access ?? undefined,
+              tokenReissuedAt: now,
+              // Without a cutoff in this call (a retried downgrade), whether
+              // their old token still works depends on the earlier call.
+              oldTokenVoided: voided ? true : undefined,
+            }
+          : s;
+      });
+      updateEntry(entry.id, { shares });
+      const target = shares.find((s) => s.recipientPublicKeyB64Url === recipientPublicKeyB64Url);
+      pushToast(
+        `${target?.recipientLabel || "Recipient"} now has ${r.permissions.join(" + ")} — send them the new package`,
+        "success",
+      );
+      // A downgrade stops the old write token only on members the cutoff
+      // reached; the rest accept it until their next sync. Same report as
+      // revoke, so "downgraded" does not overstate what just happened.
+      if (r.token_invalidated_at != null) reportCutoffReach(r.token_invalidation_reach, "downgrade");
+      const missing = (r.reissued_tokens ?? []).filter((t) => !t.delegated_access).length;
+      if (missing > 0) {
+        pushToast(`${missing} other recipient(s) got no fresh token and can no longer reach the state node`, "error");
+      }
+    } else {
+      pushToast("Permission change failed", "error");
+    }
+    setBusy(false);
+    return ok && !!r;
+  };
+
+  const handleRevoke = async (entry: Entry, recipientPublicKeyB64Url: string): Promise<boolean> => {
+    if (!active) return false;
     setBusy(true);
     const specs = flows.revokeFlow({ entry, identity: active, recipientPublicKeyB64Url });
     const { ok, ctx } = await run("Revoke", entry.name, specs);
@@ -525,6 +629,9 @@ export default function App() {
             ? {
                 ...s,
                 envelope: fresh.key_envelope,
+                // Re-wrapped for the version the revoke rotated (after the
+                // head pull, possibly a recipient's newer one).
+                ...(r ? { envelopeContentId: r.content_id } : {}),
                 delegatedAccess: fresh.delegated_access ?? undefined,
                 reissuedAt: Date.now(),
               }
@@ -563,22 +670,8 @@ export default function App() {
       // policy; a member it did not reach still accepts writes under the
       // voided tokens until its next sync. Say so — "revoked" alone would
       // overstate what just happened.
-      const reach = r?.token_invalidation_reach;
-      if (!reach && (r?.token_invalidated_at != null || entry.syncedToStateNode || entry.remoteContentId)) {
-        pushToast(
-          "Token invalidation propagation is unknown — the node returned no reach report. Members that have not synced may still accept writes under old tokens.",
-          "error",
-        );
-      } else if (reach?.relayed) {
-        pushToast(
-          "The revoke was relayed to a member node; which members enforce the cutoff yet is not known from here. Writes under the old token may land on members that have not synced.",
-          "error",
-        );
-      } else if (reach && reach.unreached_members.length > 0) {
-        pushToast(
-          `Cutoff did not reach ${reach.unreached_members.length} member node(s). Until they sync (~30 s), a write under the revoked token can still land there.`,
-          "error",
-        );
+      if (r?.token_invalidated_at != null || entry.syncedToStateNode || entry.remoteContentId) {
+        reportCutoffReach(r?.token_invalidation_reach, "revoke");
       }
       if (stale > 0) {
         pushToast(
@@ -590,6 +683,7 @@ export default function App() {
       pushToast("Revoke failed", "error");
     }
     setBusy(false);
+    return ok;
   };
 
   // ---- dispatch from row menu ----------------------------------------
@@ -694,6 +788,7 @@ export default function App() {
           busy={busy}
           onShare={handleShare}
           onRevoke={handleRevoke}
+          onChangePermission={handleChangePermission}
           onClose={() => setModal({ type: "none" })}
         />
       )}
@@ -709,7 +804,7 @@ export default function App() {
         <PreviewModal
           entry={liveEntry(modal.entry.id) ?? modal.entry}
           contentB64Url={modal.contentB64Url}
-          displayedVersionId={modal.entry.localContentId}
+          displayedVersionId={modal.displayedVersionId ?? modal.entry.localContentId}
           onCheckHead={checkNetworkHead}
           onEdit={(e) => handleEditOpen(e)}
           onClose={() => setModal({ type: "none" })}

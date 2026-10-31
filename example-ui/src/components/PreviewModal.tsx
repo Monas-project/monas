@@ -8,6 +8,7 @@ import {
   getHistory,
   getLatestVersion,
   readFromStateNode,
+  readerOf,
   verifyIntegrity,
   type GetHistoryOutput,
   type GetLatestVersionOutput,
@@ -130,7 +131,8 @@ export function PreviewModal({
       contentId: cid,
       contentBase64Url: contentB64Url,
       expectedVersion,
-      localContentId: entry.localContentId,
+      // Only the owner has the file's local ciphertext to compare against.
+      fileId: entry.receivedShare ? undefined : entry.fileId,
     })
       .then((d) => setVerify({ status: "ok", data: d }))
       .catch((e) => setVerify({ status: "error", message: errMsg(e) }));
@@ -156,7 +158,7 @@ export function PreviewModal({
           if (!d) throw new Error(entry.networkCheckError || "could not read the Content Network head");
           return d;
         })
-      : readFromStateNode({ contentId: cid, localContentId: entry.localContentId, acceptAnyVersion: true, auth });
+      : readFromStateNode({ contentId: cid, ...readerOf(entry), acceptAnyVersion: true, auth });
     p.then((d) => setRead({ status: "ok", data: d })).catch((e) =>
       setRead({ status: "error", message: errMsg(e) }),
     );
@@ -256,7 +258,7 @@ export function PreviewModal({
 
       <div style={{ marginTop: 14 }}>
         <div className="kv">
-          <span>local content_id</span>
+          <span>plain content_id</span>
           <b>{entry.localContentId}</b>
         </div>
         {entry.remoteContentId && (
@@ -265,10 +267,10 @@ export function PreviewModal({
             <b>{entry.remoteContentId}</b>
           </div>
         )}
-        {entry.seriesId && (
+        {entry.fileId && (
           <div className="kv">
-            <span>seriesId</span>
-            <b>{entry.seriesId}</b>
+            <span>file key (this device only)</span>
+            <b>{entry.fileId}</b>
           </div>
         )}
         <div className="kv">

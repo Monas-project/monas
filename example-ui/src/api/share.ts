@@ -32,7 +32,7 @@ export interface ShareContentOutput {
 }
 
 export function shareContent(input: {
-  contentId: string; // local content id
+  fileId: string; // the SDK's file key (owner side)
   /** State-node series id. The delegated token is issued for this — the
    *  state node matches capabilities by series id, so a token for the
    *  local id would never authorise the recipient. */
@@ -47,7 +47,7 @@ export function shareContent(input: {
   return gateway<ShareContentOutput>("/share", {
     method: "POST",
     body: {
-      content_id: input.contentId,
+      file_id: input.fileId,
       remote_content_id: input.remoteContentId,
       sender_public_key: input.senderPublicKeyB64Url,
       sender_private_key: input.senderPrivateKeyB64Url,
@@ -104,7 +104,7 @@ export interface TokenInvalidationReach {
 }
 
 export function revokeShare(input: {
-  contentId: string;
+  fileId: string;
   /** State-node series id — the state node only knows this, not the SDK-local
    *  version id, so the post-revoke re-encryption sync must address it. */
   remoteContentId?: string;
@@ -118,11 +118,52 @@ export function revokeShare(input: {
     method: "POST",
     timestamp: true,
     body: {
-      content_id: input.contentId,
+      file_id: input.fileId,
       remote_content_id: input.remoteContentId,
       sender_public_key: input.senderPublicKeyB64Url,
       sender_private_key: input.senderPrivateKeyB64Url,
       recipient_public_key: input.recipientPublicKeyB64Url,
+    },
+  });
+}
+
+export interface ReissuedDelegatedToken {
+  recipient_key_id: string;
+  /** Absent only if issuance failed. */
+  delegated_access?: DelegatedAccessToken;
+}
+
+export interface UpdateSharePermissionOutput {
+  content_id: string;
+  recipient_public_key: string;
+  recipient_key_id: string;
+  permissions: Permission[];
+  /** The recipient's new token, carrying the new permission. */
+  delegated_access: DelegatedAccessToken;
+  /** Only on a downgrade (write → read): the node voided every earlier
+   *  token so the old write token stops working, and these are the other
+   *  recipients' replacements. */
+  reissued_tokens?: ReissuedDelegatedToken[];
+  token_invalidated_at?: number;
+  token_invalidation_reach?: TokenInvalidationReach;
+}
+
+/** Change an existing recipient's permission (read ⇄ write) without a
+ *  revoke: no key rotation, only a new delegated token. */
+export function updateSharePermission(input: {
+  fileId: string;
+  remoteContentId?: string;
+  recipientPublicKeyB64Url: string;
+  permissions: Permission[];
+}) {
+  return gateway<UpdateSharePermissionOutput>("/share/permission", {
+    method: "POST",
+    timestamp: true,
+    body: {
+      file_id: input.fileId,
+      remote_content_id: input.remoteContentId,
+      recipient_public_key: input.recipientPublicKeyB64Url,
+      permissions: input.permissions,
     },
   });
 }

@@ -18,8 +18,19 @@ use monas_content::domain::content_id::ContentId;
 
 use super::MonasController;
 
+/// 検証付き read で、誰がどの鍵で読むか。
+pub(super) enum StateReader<'a> {
+    /// owner が自分のファイルを読む。CEK と照合する plainCid はそのファイルの
+    /// 記録(キー = file_id)から取る。
+    Owner { file_id: &'a str },
+    /// share 受信者が読む。CEK は送信者ピン(系列ID)か、共有された版の
+    /// plainCid の下にある。
+    Recipient { local_content_id: &'a str },
+}
+
 /// `MonasController::adopt_remote_head` の結果。
 pub(super) struct AdoptedHead {
+    /// 取り込み後の今の版の plainCid。
     pub local_content_id: ContentId,
     pub version: String,
     pub adopted: bool,
@@ -251,7 +262,7 @@ impl MonasController {
     fn verified_read_from_state_node<T>(
         &self,
         content_id: &str,
-        local_content_id: &str,
+        reader: StateReader<'_>,
         version: Option<&str>,
         accept_any_version: bool,
         auth: Option<&StateNodeAuthContext>,
@@ -301,9 +312,27 @@ impl MonasController {
         // 再開してキャッシュだけを N に戻す)。権威レコードから直接引けば、
         // その巻き戻りは read に影響しない。
         //
-        // 自分で作成した content には送信者ピンが存在しないので、その場合は
-        // 従来どおりストアを引く。
+        // owner の読み取りは、ファイルの記録の CEK と plainCid を使う
+        // (送信者ピンは受信者側のもの)。
+        let local_content_id = match reader {
+            StateReader::Owner { file_id } => {
+                let read = self
+                    .content_service
+                    .verify_and_decrypt_owner_read(
+                        &node_bytes,
+                        &version,
+                        &ContentId::new(file_id.to_string()),
+                        accept_any_version,
+                    )
+                    .map_err(|e| {
+                        ApiResponse::error(Self::map_verified_read_error(e, file_id), trace_id)
+                    })?;
+                return Ok((version, read));
+            }
+            StateReader::Recipient { local_content_id } => local_content_id,
+        };
         let local_id = ContentId::new(local_content_id.to_string());
+
         //
         // ピンは系列ID(= ここでの `content_id`)でも版ID(`local_content_id`)でも
         // 保存され得る: share 受信者は `remote_content_id` を渡して系列IDに、
@@ -384,17 +413,27 @@ impl MonasController {
         {
             return response;
         }
-        if input.local_content_id.is_empty() {
-            return ApiResponse::error(
-                ApiError::Validation("local_content_id must not be empty".into()),
-                trace_id,
-            );
-        }
+        let reader = match (input.file_id.as_deref(), input.local_content_id.as_str()) {
+            (Some(file_id), "") if !file_id.is_empty() => StateReader::Owner { file_id },
+            (None, local) if !local.is_empty() => StateReader::Recipient {
+                local_content_id: local,
+            },
+            _ => {
+                return ApiResponse::error(
+                    ApiError::Validation(
+                        "exactly one of file_id (owner) or local_content_id (share recipient) \
+                         must be given"
+                            .into(),
+                    ),
+                    trace_id,
+                );
+            }
+        };
 
         let (version, read) = match self
             .verified_read_from_state_node::<ReadContentFromStateNodeOutput>(
                 &input.content_id,
-                &input.local_content_id,
+                reader,
                 input.version.as_deref(),
                 input.accept_any_version,
                 auth,
@@ -437,15 +476,19 @@ impl MonasController {
         {
             return response;
         }
-        if input.local_content_id.is_empty() {
+        if input.file_id.is_empty() {
             return ApiResponse::error(
-                ApiError::Validation("local_content_id must not be empty".into()),
+                ApiError::Validation("file_id must not be empty".into()),
                 trace_id,
             );
         }
+        // 取り込みは記録を書き換えるので、同じファイルへの他の書き込み
+        // (update・delete・revoke)と同じロックで直列化する。revoke は
+        // `adopt_remote_head` をロックを持ったまま呼ぶので、ロックはここで取る。
+        let _file_guard = self.content_revoke_locks.lock(&input.file_id);
         match self.adopt_remote_head::<PullContentFromStateNodeOutput>(
             &input.content_id,
-            &input.local_content_id,
+            &input.file_id,
             auth,
             trace_id.clone(),
         ) {
@@ -465,25 +508,31 @@ impl MonasController {
 
     /// `pull_content_from_state_node` の本体。`revoke_share` からも呼ぶ。
     ///
-    /// head の平文 id がローカル版と違えば `ContentService::adopt_version` で
-    /// レコードを head へ進め、共有 ACL も新しい版IDへ引き継ぐ
-    /// (`update_content` と同じ理由: 引き継がないと既存受信者が SDK から消える)。
+    /// head がファイルの記録と違えば(plainCid か暗号文が違えば)
+    /// `ContentService::adopt_version` で記録を head へ進める。記録・CEK・
+    /// 共有設定はファイルのキーで持つので、plainCid が変わっても引き継ぐ
+    /// ものは無い。
     pub(super) fn adopt_remote_head<T>(
         &self,
         content_id: &str,
-        local_content_id: &str,
+        file_id: &str,
         auth: Option<&StateNodeAuthContext>,
         trace_id: String,
     ) -> Result<AdoptedHead, ApiResponse<T>> {
         let (version, read) = self.verified_read_from_state_node::<T>(
             content_id,
-            local_content_id,
+            StateReader::Owner { file_id },
             None,
             true,
             auth,
             trace_id.clone(),
         )?;
-        if read.plain_content_id.as_str() == local_content_id {
+        let file = ContentId::new(file_id.to_string());
+        let current = self.content_service.load_record(&file).ok().flatten();
+        let unchanged = current.as_ref().is_some_and(|(c, _)| {
+            c.raw_id() == &read.plain_content_id && c.encrypted_content() == Some(&read.ciphertext)
+        });
+        if unchanged {
             return Ok(AdoptedHead {
                 local_content_id: read.plain_content_id,
                 version,
@@ -492,21 +541,18 @@ impl MonasController {
             });
         }
 
-        let local = ContentId::new(local_content_id.to_string());
         let adopted = self
             .content_service
-            .adopt_version(&local, read.ciphertext)
+            .adopt_version(&file, read.ciphertext)
             .map_err(|e| {
                 ApiResponse::error(
                     ApiError::Internal(format!(
-                        "state node head {} could not be adopted into local content {}: {e}",
+                        "state node head {} could not be adopted into the local file: {e}",
                         read.plain_content_id.as_str(),
-                        local_content_id
                     )),
                     trace_id.clone(),
                 )
             })?;
-        self.carry_share_acl(&local, &adopted.content_id);
 
         Ok(AdoptedHead {
             local_content_id: adopted.content_id,
@@ -669,9 +715,9 @@ impl MonasController {
         };
 
         // State Node が保持するのは SDK が送信した「暗号文」なので、
-        // local_content_id があればローカルに保存された暗号文とバイト比較する。
+        // file_id があればそのファイルの記録の暗号文とバイト比較する。
         // （平文 `content` と State Node のバイト列は一致し得ない。）
-        let (valid, reason) = if let Some(local_id) = input.local_content_id.as_deref() {
+        let (valid, reason) = if let Some(local_id) = input.file_id.as_deref() {
             match self.content_service.fetch_encrypted(
                 monas_content::domain::content_id::ContentId::new(local_id.to_string()),
             ) {

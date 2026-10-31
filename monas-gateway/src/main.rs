@@ -9,7 +9,8 @@ use monas_sdk::models::content::{
 };
 use monas_sdk::models::keypair::GenerateKeypairInput;
 use monas_sdk::models::share::{
-    DecryptSharedContentInput, RevokeShareInput, ShareContentInput, UpdateSharedContentInput,
+    DecryptSharedContentInput, RevokeShareInput, ShareContentInput, UpdateSharePermissionInput,
+    UpdateSharedContentInput,
 };
 use monas_sdk::models::state::{
     GetHistoryInput, GetLatestVersionInput, PullContentFromStateNodeInput,
@@ -57,6 +58,7 @@ async fn main() {
         // share
         .route("/share", post(share_content))
         .route("/share/revoke", post(revoke_share))
+        .route("/share/permission", post(update_share_permission))
         .route("/share/decrypt", post(decrypt_shared_content))
         .route("/share/content/{id}", put(update_shared_content))
         // state
@@ -139,7 +141,7 @@ async fn get_content(
     StatusCode,
     Json<ApiResponse<monas_sdk::models::content::GetContentOutput>>,
 ) {
-    let input = GetContentInput { content_id: id };
+    let input = GetContentInput { file_id: id };
     api_json(Arc::clone(&state.controller).get_content_async(input).await)
 }
 
@@ -152,7 +154,7 @@ async fn update_content(
     StatusCode,
     Json<ApiResponse<monas_sdk::models::content::UpdateContentOutput>>,
 ) {
-    input.local_content_id = id;
+    input.file_id = id;
     let auth = match build_state_node_auth_context(&headers) {
         Ok(auth) => auth,
         Err(error) => return auth_error_json(error),
@@ -173,7 +175,7 @@ async fn delete_content(
     StatusCode,
     Json<ApiResponse<monas_sdk::models::content::DeleteContentOutput>>,
 ) {
-    input.local_content_id = id;
+    input.file_id = id;
     let auth = match build_state_node_auth_context(&headers) {
         Ok(auth) => auth,
         Err(error) => return auth_error_json(error),
@@ -214,6 +216,27 @@ async fn revoke_share(
     api_json(
         Arc::clone(&state.controller)
             .revoke_share_async(input, Some(auth))
+            .await,
+    )
+}
+
+/// 既存共有先の権限を read ⇄ write で変更する。降格(write → read)では
+/// State Node の Token 失効を伴うので、revoke と同じく署名ヘッダが要る。
+async fn update_share_permission(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<UpdateSharePermissionInput>,
+) -> (
+    StatusCode,
+    Json<ApiResponse<monas_sdk::models::share::UpdateSharePermissionOutput>>,
+) {
+    let auth = match build_state_node_auth_context(&headers) {
+        Ok(auth) => auth,
+        Err(error) => return auth_error_json(error),
+    };
+    api_json(
+        Arc::clone(&state.controller)
+            .update_share_permission_async(input, Some(auth))
             .await,
     )
 }

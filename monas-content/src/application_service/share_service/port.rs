@@ -6,10 +6,14 @@ use crate::domain::share::{KeyId, Share, ShareError};
 
 /// 共有状態（ACL）を永続化するためのポート。
 ///
-/// - key: `content_id`
-/// - value: そのコンテンツに対する `Share`
+/// - key: ファイルのキー(`Content::series_id`)。`Share::content_id` もこの値。
+/// - value: そのファイルに対する `Share`
+///
+/// 共有設定はファイル単位で 1 つ。plainCid(本文のハッシュ)をキーにすると、
+/// 本文を以前と同じ内容に戻したときに古い設定を拾い、同じ本文の別ファイルと
+/// 設定が混ざる。
 pub trait ShareRepository {
-    fn load(&self, content_id: &ContentId) -> Result<Option<Share>, ShareRepositoryError>;
+    fn load(&self, series_id: &ContentId) -> Result<Option<Share>, ShareRepositoryError>;
 
     fn save(&self, share: &Share) -> Result<(), ShareRepositoryError>;
 }
@@ -17,8 +21,8 @@ pub trait ShareRepository {
 /// `Arc<dyn ShareRepository + Send + Sync>` を `ShareService` の型パラメータに
 /// 直接渡せるようにする blanket impl。
 impl<T: ShareRepository + ?Sized> ShareRepository for std::sync::Arc<T> {
-    fn load(&self, content_id: &ContentId) -> Result<Option<Share>, ShareRepositoryError> {
-        (**self).load(content_id)
+    fn load(&self, series_id: &ContentId) -> Result<Option<Share>, ShareRepositoryError> {
+        (**self).load(series_id)
     }
 
     fn save(&self, share: &Share) -> Result<(), ShareRepositoryError> {

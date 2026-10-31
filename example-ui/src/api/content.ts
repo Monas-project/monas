@@ -11,7 +11,9 @@ export interface ContentMetadata {
 }
 
 export interface CreateContentOutput {
-  content_id: string; // local id (encCid)
+  /** The SDK's file key: what every later owner-side call addresses. */
+  file_id: string;
+  content_id: string; // plain content id of the created version
   remote_content_id?: string; // state-node Content Network id
   created_at?: string;
 }
@@ -33,32 +35,32 @@ export interface GetContentOutput {
   metadata?: ContentMetadata;
 }
 
-export function getContent(localContentId: string) {
-  return gateway<GetContentOutput>(`/content/${encodeURIComponent(localContentId)}`, {
+export function getContent(fileId: string) {
+  return gateway<GetContentOutput>(`/content/${encodeURIComponent(fileId)}`, {
     method: "GET",
   });
 }
 
 export interface UpdateContentOutput {
-  series_id: string;
+  file_id: string; // unchanged by the edit
   previous_version_id: string;
-  version_id: string; // new local id
+  version_id: string; // plain content id of the new version
   updated_at?: string;
 }
 
 export function updateContent(input: {
-  localContentId: string;
+  fileId: string;
   remoteContentId: string;
   contentBase64Url: string;
   name?: string;
 }) {
   return gateway<UpdateContentOutput>(
-    `/content/${encodeURIComponent(input.localContentId)}`,
+    `/content/${encodeURIComponent(input.fileId)}`,
     {
       method: "PUT",
       timestamp: true,
       body: {
-        local_content_id: input.localContentId,
+        file_id: input.fileId,
         remote_content_id: input.remoteContentId,
         content: input.contentBase64Url,
         metadata: input.name ? { name: input.name } : undefined,
@@ -73,14 +75,14 @@ export interface DeleteContentOutput {
   deleted_at?: string;
 }
 
-export function deleteContent(input: { localContentId: string; remoteContentId: string }) {
+export function deleteContent(input: { fileId: string; remoteContentId: string }) {
   return gateway<DeleteContentOutput>(
-    `/content/${encodeURIComponent(input.localContentId)}`,
+    `/content/${encodeURIComponent(input.fileId)}`,
     {
       method: "DELETE",
       timestamp: true,
       body: {
-        local_content_id: input.localContentId,
+        file_id: input.fileId,
         remote_content_id: input.remoteContentId,
       },
     },

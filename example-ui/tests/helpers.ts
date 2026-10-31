@@ -10,7 +10,7 @@ import { expect } from "@playwright/test";
  * silently change what a later assertion sees.
  */
 
-export const REGISTRY_KEY = "monas.registry.v3";
+export const REGISTRY_KEY = "monas.registry.v4";
 export const IDENTITY_KEY = "monas.identities.v2";
 export const ENDPOINT_KEY = "monas.endpoints.v2";
 
@@ -72,6 +72,7 @@ export async function seedFileEntry(
         mimeType: "text/plain",
         createdAt: Date.now(),
         updatedAt: Date.now(),
+        fileId: "seeded-file-key",
         localContentId: "seeded-local-cid",
         remoteContentId: "seeded-remote-cid",
         syncedToStateNode: true,

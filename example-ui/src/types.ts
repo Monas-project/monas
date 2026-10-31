@@ -45,12 +45,25 @@ export interface ShareGrant {
    *  the recipient needs this, not the (self-asserted) sender_key_id. */
   senderPublicKeyB64Url: string;
   envelope: KeyEnvelopeData;
+  /** The content version the envelope was wrapped for. HPKE binds the wrap
+   *  to it (info/AAD), so a package must name this version, not the entry's
+   *  current one — after an owner edit the two differ. */
+  envelopeContentId: string;
   delegatedAccess?: DelegatedAccessToken;
   grantedAt: number;
   /** Set when a revoke of *another* recipient rotated the CEK and reissued
    *  this grant's envelope. The recipient must process the new envelope
    *  before it can decrypt again. */
   reissuedAt?: number;
+  /** Set when this grant's delegated token was reissued without a key
+   *  rotation: its permission changed, or another recipient's downgrade
+   *  voided every earlier token. The envelope still opens; the old package
+   *  can no longer read from or write to the state node. */
+  tokenReissuedAt?: number;
+  /** With `tokenReissuedAt`: whether that reissue voided the old token
+   *  (true — a downgrade advanced the cutoff) or left it working (false — an
+   *  upgrade). Undefined when not known. */
+  oldTokenVoided?: boolean;
 }
 
 // Everything a recipient on another device needs to unwrap and read a share.
@@ -115,9 +128,17 @@ export interface Entry {
   updatedAt: number;
 
   // --- Monas content state ---
-  localContentId?: string; // SDK content_id (encCid) — used for fetch/share/CEK
+  /** Owner files: the SDK's file key. Every owner-side operation (open,
+   *  edit, delete, share, permission change, revoke, pull) addresses the file
+   *  by it. Fixed at creation — edits, revokes and pulls do not change it —
+   *  and device-local: it never goes into a package or to the state node.
+   *  Absent on received shares. */
+  fileId?: string;
+  /** Plain content id (SHA-256 of the body) of the version this device holds.
+   *  Compared with the network head for the sync badge; a package names the
+   *  version its envelope was wrapped for (`ShareGrant.envelopeContentId`). */
+  localContentId?: string;
   remoteContentId?: string; // state-node Content Network id
-  seriesId?: string; // logical series across versions
   syncedToStateNode: boolean;
   versionCount: number;
   /** What the Content Network's head looked like when this device last

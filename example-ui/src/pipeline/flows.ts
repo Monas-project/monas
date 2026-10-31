@@ -11,7 +11,7 @@ import * as shareApi from "../api/share";
 import * as stateApi from "../api/stateNode";
 import { byteLengthOfBase64Url, short } from "../api/crypto";
 import type { Entry, Identity, Permission, SharePackage } from "../types";
-import type { StepSpec } from "./types";
+import { StepWarning, type StepSpec } from "./types";
 
 function fmtBytes(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -104,7 +104,7 @@ export function updateFileFlow(input: {
       minMs: 160,
       exec: async (ctx) => {
         const resp = await contentApi.updateContent({
-          localContentId: entry.localContentId!,
+          fileId: entry.fileId!,
           remoteContentId: entry.remoteContentId || entry.localContentId!,
           contentBase64Url: input.contentBase64Url,
           name: input.name ?? entry.name,
@@ -120,7 +120,7 @@ export function updateFileFlow(input: {
       minMs: 200,
       exec: async (ctx) => {
         const r = ctx.update as contentApi.UpdateContentOutput;
-        return `new version ${short(r.version_id)} · series ${short(r.series_id)}`;
+        return `new version ${short(r.version_id)} (was ${short(r.previous_version_id)})`;
       },
     },
     {
@@ -193,7 +193,7 @@ export function openFileFlow(input: { entry: Entry }): StepSpec[] {
       kind: "verify",
       minMs: 200,
       exec: async (ctx) => {
-        const resp = await contentApi.getContent(entry.localContentId!);
+        const resp = await contentApi.getContent(entry.fileId!);
         ctx.get = resp;
         const n = byteLengthOfBase64Url(resp.content);
         return `${fmtBytes(n)} of plaintext recovered with the CEK`;
@@ -261,7 +261,7 @@ export function readFromStateNodeFlow(input: {
       exec: async (ctx) => {
         const resp = await stateApi.readFromStateNode({
           contentId: entry.remoteContentId || entry.localContentId!,
-          localContentId: entry.localContentId!,
+          ...stateApi.readerOf(entry),
           version: input.version,
         });
         ctx.read = resp;
@@ -297,7 +297,7 @@ export function deleteFileFlow(input: { entry: Entry }): StepSpec[] {
       minMs: 200,
       exec: async (ctx) => {
         const resp = await contentApi.deleteContent({
-          localContentId: entry.localContentId!,
+          fileId: entry.fileId!,
           remoteContentId: entry.remoteContentId || entry.localContentId!,
         });
         ctx.delete = resp;
@@ -331,7 +331,7 @@ export function shareFlow(input: {
       minMs: 180,
       exec: async (ctx) => {
         const grant = await shareApi.shareContent({
-          contentId: entry.localContentId!,
+          fileId: entry.fileId!,
           remoteContentId: entry.remoteContentId,
           senderPublicKeyB64Url: identity.publicKeyB64Url,
           senderPrivateKeyB64Url: identity.privateKeyB64Url,
@@ -353,7 +353,7 @@ export function shareFlow(input: {
       exec: async (ctx) => {
         const g = ctx.share as shareApi.ShareContentOutput;
         if (g.delegated_access) return `AuthToken issued · jti ${short(g.delegated_access.jti, 6, 4)}`;
-        return `Capability: ${input.permissions.join(", ")} on monas://content/${short(entry.localContentId!, 6, 4)}`;
+        return `Capability: ${input.permissions.join(", ")} on monas://content/${short(entry.remoteContentId ?? "(local only)", 6, 4)}`;
       },
     },
     {
@@ -426,6 +426,63 @@ export function importShareFlow(input: {
   ];
 }
 
+// ------------------------------------------------------ change permission
+// read ⇄ write for a recipient who already has a share. The permission lives
+// only in the delegated token, so the CEK is not rotated and the envelope
+// keeps opening; the recipient needs the new package for the new token.
+export function changePermissionFlow(input: {
+  entry: Entry;
+  recipientPublicKeyB64Url: string;
+  permissions: Permission[];
+}): StepSpec[] {
+  const { entry } = input;
+  const downgrade = !input.permissions.includes("write");
+  return [
+    {
+      title: "Update permission & reissue token · gateway call",
+      hint: downgrade ? "min_valid_issued_at · JWT" : "JWT · P-256",
+      kind: "state",
+      minMs: 180,
+      exec: async (ctx) => {
+        const r = await shareApi.updateSharePermission({
+          fileId: entry.fileId!,
+          remoteContentId: entry.remoteContentId,
+          recipientPublicKeyB64Url: input.recipientPublicKeyB64Url,
+          permissions: input.permissions,
+        });
+        ctx.permission = r;
+        return (
+          `Now ${r.permissions.join(", ")} · token jti ${short(r.delegated_access.jti, 6, 4)}` +
+          (r.token_invalidated_at ? ` · earlier tokens void (cutoff ${r.token_invalidated_at})` : "")
+        );
+      },
+    },
+    {
+      title: "Content key unchanged",
+      hint: "no rotation",
+      kind: "key",
+      minMs: 140,
+      exec: async (ctx) => {
+        const r = ctx.permission as shareApi.UpdateSharePermissionOutput;
+        const others = r.reissued_tokens?.length ?? 0;
+        if (!downgrade) {
+          return "The envelope still opens; send the recipient the new package so they hold the write token.";
+        }
+        // Only a member that took the cutoff refuses the old write token.
+        const reach = r.token_invalidation_reach;
+        const tail = `${others} other recipient(s) got a fresh token. Send each recipient their new package.`;
+        if (reach && !reach.relayed && reach.unreached_members.length === 0) {
+          return `The old write token is void on every member. ${tail}`;
+        }
+        // The downgrade succeeded; only how far the cutoff reached is open.
+        throw new StepWarning(
+          `Members that took the cutoff refuse the old write token; others accept it until they sync (~30 s). ${tail}`,
+        );
+      },
+    },
+  ];
+}
+
 // ---------------------------------------------------------------- revoke
 export function revokeFlow(input: {
   entry: Entry;
@@ -453,7 +510,7 @@ export function revokeFlow(input: {
       minMs: 180,
       exec: async (ctx) => {
         const r = await shareApi.revokeShare({
-          contentId: entry.localContentId!,
+          fileId: entry.fileId!,
           remoteContentId: entry.remoteContentId,
           senderPublicKeyB64Url: identity.publicKeyB64Url,
           senderPrivateKeyB64Url: identity.privateKeyB64Url,
@@ -479,22 +536,26 @@ export function revokeFlow(input: {
       hint: "members · best-effort push",
       kind: "state",
       minMs: 200,
-      // The revoke itself succeeded; this step going red must not fail the
-      // run or skip the envelope reissue that follows.
+      // The revoke itself succeeded: incomplete propagation is a warning
+      // (StepWarning, amber). `optional` keeps any real failure here from
+      // failing the run or skipping the envelope reissue that follows.
       optional: true,
       exec: async (ctx) => {
         const r = ctx.revoke as shareApi.RevokeShareOutput;
         const reach = r.token_invalidation_reach;
         if (!reach) {
-          return r.token_invalidated_at != null || entry.syncedToStateNode || entry.remoteContentId
-            ? "Token invalidation propagation is unknown — the node returned no reach report. Members that have not synced may still accept writes under old tokens."
-            : "No state node involved — nothing to propagate";
+          if (r.token_invalidated_at != null || entry.syncedToStateNode || entry.remoteContentId) {
+            throw new StepWarning(
+              "Token invalidation propagation is unknown — the node returned no reach report. Members that have not synced may still accept writes under old tokens.",
+            );
+          }
+          return "No state node involved — nothing to propagate";
         }
         if (reach.relayed) {
-          return (
+          throw new StepWarning(
             "The node we contacted relayed the revoke to a member; which members " +
-            "have the cutoff is not known from here. Until their next sync, members " +
-            "without it may still accept writes under the old tokens."
+              "have the cutoff is not known from here. Until their next sync, members " +
+              "without it may still accept writes under the old tokens.",
           );
         }
         const n = reach.notified_members.length;
@@ -506,7 +567,7 @@ export function revokeFlow(input: {
         const who = reach.unreached_members
           .map((m) => `${short(m.node_id, 8, 4)} (${m.error})`)
           .join(", ");
-        throw new Error(
+        throw new StepWarning(
           `${reach.unreached_members.length} member(s) did not get the cutoff: ${who}. ` +
             `Until they sync (~30 s), a write under the revoked token can still land there. ` +
             `${n} member(s) acknowledged.`,

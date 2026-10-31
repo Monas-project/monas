@@ -4,12 +4,12 @@
 import { createStore } from "./store";
 import type { Entry } from "../types";
 
-// v3: content encryption moved from AES-256-CTR to AES-256-GCM and KeyEnvelope
-// gained `key_epoch`, so every v2 entry points at ciphertext the backend can no
-// longer decrypt and every v2 share grant carries an envelope the recipient now
-// rejects. There is nothing to migrate — the ids are dead — so this starts
-// clean rather than surfacing entries that only fail on open.
-const store = createStore<Entry[]>("monas.registry.v3", []);
+// v4: owner files are addressed by the SDK's file key (`Entry.fileId`), not
+// by the plain content id, and the gateway keeps its records under that key.
+// A v3 entry has no file key the gateway knows, so there is nothing to
+// migrate; this starts clean rather than surfacing entries that only fail on
+// open.
+const store = createStore<Entry[]>("monas.registry.v4", []);
 
 // Registries written before folders were removed may hold folder rows. They
 // never carried Monas content, so drop them; the files that sat "inside" them

@@ -90,7 +90,7 @@ export async function checkNetworkHead(
   try {
     const r = await stateApi.readFromStateNode({
       contentId: entry.remoteContentId,
-      localContentId: entry.localContentId,
+      ...stateApi.readerOf(entry),
       acceptAnyVersion: true,
       auth: token ? { delegatedToken: token.delegated_token } : undefined,
     });
