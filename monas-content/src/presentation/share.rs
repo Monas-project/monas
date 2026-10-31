@@ -20,6 +20,8 @@ use super::{decode_base64, decode_key_id_base64, AppState};
 
 #[derive(Deserialize)]
 pub struct GrantShareRequest {
+    /// 対象ファイルのキー(`/contents` の作成応答の `series_id`)。
+    /// `/shares/...` のパスの `content_id` も同じ。
     pub content_id: String,
     pub sender_key_id_base64: String,
     /// 送信者の秘密鍵(base64)。HPKE Auth モードの wrap(送信者認証)に用いる。
@@ -30,6 +32,7 @@ pub struct GrantShareRequest {
 
 #[derive(Serialize)]
 pub struct GrantShareResponse {
+    /// envelope が指す版の plainCid。
     pub content_id: String,
     pub sender_key_id: String,
     pub recipient_key_id: String,

@@ -1698,3 +1698,100 @@ async fn reverting_the_body_does_not_reissue_to_a_revoked_recipient() {
     );
     cleanup_content_artifacts();
 }
+
+/// 降格の成功応答を失った(タイムアウト・タブの再読み込み)あとに同じ降格を
+/// やり直しても、他の受信者の再発行 Token が返る。1 回目の降格で失効境界は
+/// 進んでいて、他の受信者の古い Token はもう使えないので、返らないと
+/// その人たちのアクセスを戻す手段がない。やり直しで失効は繰り返さない。
+#[tokio::test(flavor = "multi_thread")]
+async fn retrying_a_downgrade_whose_response_was_lost_still_reissues_other_tokens() {
+    let _guard = acquire_test_lock();
+    let mut state_node = Server::new_async().await;
+    let f = permission_fixture(&mut state_node, Permission::Write).await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let invalidate = state_node
+        .mock("POST", "/content/perm-remote/access/invalidate")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(format!(
+            r#"{{"content_id":"perm-remote","new_min_valid_issued_at":{now}}}"#
+        ))
+        .expect(1)
+        .create_async()
+        .await;
+    let downgrade = || {
+        f.controller.update_share_permission(
+            UpdateSharePermissionInput {
+                file_id: f.file_id.clone(),
+                remote_content_id: Some("perm-remote".into()),
+                recipient_public_key: f.target.public_key.clone(),
+                permissions: vec![Permission::Read],
+            },
+            Some(&auth_context("Bearer owner")),
+        )
+    };
+    let first = downgrade();
+    assert!(first.success, "{:?}", first.error);
+    // The first response is "lost"; the caller retries the same request.
+    let retry = downgrade();
+    assert!(retry.success, "{:?}", retry.error);
+    invalidate.assert();
+    let out = retry.data.expect("data");
+    assert_eq!(
+        out.token_invalidated_at, None,
+        "the retry does not cut off again"
+    );
+    let other = out
+        .reissued_tokens
+        .iter()
+        .find(|t| t.recipient_key_id == key_id_of(&f.other))
+        .expect("the other recipient's token is returned on the retry too");
+    let token = other.delegated_access.as_ref().expect("issued");
+    assert!(token.issued_at > now);
+    assert_eq!(token_capabilities(&token.delegated_token), vec!["read"]);
+    cleanup_content_artifacts();
+}
+
+/// 降格は古い write Token を止めるために State Node の失効境界を進める。
+/// State Node に届けられない(auth 無し)なら、止めずに成功を返さない。
+#[tokio::test(flavor = "multi_thread")]
+async fn a_downgrade_without_state_node_auth_is_refused() {
+    let _guard = acquire_test_lock();
+    let mut state_node = Server::new_async().await;
+    let f = permission_fixture(&mut state_node, Permission::Write).await;
+    let r = f.controller.update_share_permission(
+        UpdateSharePermissionInput {
+            file_id: f.file_id.clone(),
+            remote_content_id: Some("perm-remote".into()),
+            recipient_public_key: f.target.public_key.clone(),
+            permissions: vec![Permission::Read],
+        },
+        None,
+    );
+    assert!(
+        matches!(r.error, Some(monas_sdk::ApiError::Validation(_))),
+        "{:?}",
+        r.error
+    );
+    // The ACL is unchanged: the target still has write.
+    let again = f.controller.update_share_permission(
+        UpdateSharePermissionInput {
+            file_id: f.file_id.clone(),
+            remote_content_id: Some("perm-remote".into()),
+            recipient_public_key: f.target.public_key.clone(),
+            permissions: vec![Permission::Write],
+        },
+        None,
+    );
+    assert!(again.success, "{:?}", again.error);
+    assert!(again
+        .data
+        .unwrap()
+        .reissued_tokens
+        .iter()
+        .all(|t| t.recipient_key_id != key_id_of(&f.target)));
+    cleanup_content_artifacts();
+}

@@ -218,7 +218,8 @@ pub struct UpdateSharePermissionOutput {
     pub delegated_access: DelegatedAccessToken,
     /// 降格(write → read)では古い write Token を止めるため State Node の
     /// `min_valid_issued_at` を進める。それで失効した他の受信者の Token を
-    /// 発行し直したもの。昇格・変更なしでは空。
+    /// 発行し直したもの。権限が変わらない要求(降格の応答を失ったあとの
+    /// やり直しなど)でも、失効はせずに同じく他の受信者分を返す。昇格では空。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reissued_tokens: Vec<ReissuedDelegatedToken>,
     /// 降格で進めた `min_valid_issued_at`。失効させていなければ `None`。

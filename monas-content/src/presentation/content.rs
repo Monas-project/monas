@@ -28,8 +28,15 @@ pub struct CreateContentRequest {
     pub provider: Option<String>,
 }
 
+/// 作成・更新の応答。
+///
+/// `series_id` はファイルのキーで、以後の `/contents/{id}`(更新・削除・
+/// 取得・再暗号化)と `/shares` の `content_id` にはこれを渡す。作成時に
+/// 決まり、本文を編集しても変わらない。`content_id` は今の版の plainCid
+/// (本文の SHA-256)で、`/contents/{id}/decrypt` の照合に使う。
 #[derive(Serialize)]
 pub struct CreateContentResponse {
+    pub series_id: String,
     pub content_id: String,
     pub name: String,
     pub path: String,
@@ -106,6 +113,7 @@ async fn create_content(
 fn to_response(result: CreateContentResult) -> CreateContentResponse {
     let metadata = &result.metadata;
     CreateContentResponse {
+        series_id: result.series_id.as_str().to_string(),
         content_id: result.content_id.as_str().to_string(),
         name: metadata.name().to_string(),
         path: metadata.path().to_string(),
@@ -159,6 +167,7 @@ async fn update_content(
 
     let metadata = &result.metadata;
     Ok(Json(CreateContentResponse {
+        series_id: result.series_id.as_str().to_string(),
         content_id: result.content_id.as_str().to_string(),
         name: metadata.name().to_string(),
         path: metadata.path().to_string(),
@@ -416,4 +425,89 @@ async fn disconnect_provider(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Minimal HTTP/1.1 client: one request per connection.
+    async fn call(
+        addr: std::net::SocketAddr,
+        method: &str,
+        path: &str,
+        body: &str,
+    ) -> (u16, String) {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let req = format!(
+            "{method} {path} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let mut out = String::new();
+        stream.read_to_string(&mut out).await.unwrap();
+        let status = out[9..12].parse().unwrap();
+        let body = out.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+        (status, body)
+    }
+
+    /// The id the create response hands out addresses the file in every later
+    /// call: fetch, update (which changes the plainCid but not the file key),
+    /// fetch again, delete.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_created_files_key_addresses_it_in_later_calls() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, crate::presentation::create_router())
+                .await
+                .unwrap()
+        });
+
+        let (status, body) = call(
+            addr,
+            "POST",
+            "/contents",
+            r#"{"name":"a.txt","path":"/a.txt","content_base64":"djE="}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let created: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let file = created["series_id"].as_str().unwrap().to_string();
+        assert_ne!(created["content_id"], created["series_id"]);
+
+        let (status, body) = call(addr, "GET", &format!("/contents/{file}/fetch"), "").await;
+        assert_eq!(status, 200, "{body}");
+
+        let (status, body) = call(
+            addr,
+            "PATCH",
+            &format!("/contents/{file}"),
+            r#"{"content_base64":"djI="}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let updated: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(updated["series_id"].as_str().unwrap(), file);
+        assert_ne!(updated["content_id"], created["content_id"]);
+
+        let (status, body) = call(addr, "GET", &format!("/contents/{file}/fetch"), "").await;
+        assert_eq!(status, 200, "{body}");
+        let fetched: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(fetched["content_base64"], "djI=");
+
+        let (status, body) = call(addr, "DELETE", &format!("/contents/{file}"), "").await;
+        assert_eq!(status, 204, "{body}");
+
+        // The router's local provider writes under ./content (the crate dir
+        // under `cargo test`); remove what this test left there.
+        if let Ok(entries) = std::fs::read_dir("content") {
+            for path in entries.flatten().map(|e| e.path()) {
+                if path.extension().is_some_and(|ext| ext == "json") {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+        let _ = std::fs::remove_dir("content");
+    }
 }

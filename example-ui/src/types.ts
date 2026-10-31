@@ -60,6 +60,10 @@ export interface ShareGrant {
    *  voided every earlier token. The envelope still opens; the old package
    *  can no longer read from or write to the state node. */
   tokenReissuedAt?: number;
+  /** With `tokenReissuedAt`: whether that reissue voided the old token
+   *  (true — a downgrade advanced the cutoff) or left it working (false — an
+   *  upgrade). Undefined when not known. */
+  oldTokenVoided?: boolean;
 }
 
 // Everything a recipient on another device needs to unwrap and read a share.

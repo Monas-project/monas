@@ -949,8 +949,15 @@ impl MonasController {
             );
         }
 
-        // 2. ファイルのキーで記録を取る(失敗時はこの記録と CEK をそのまま戻す)
+        // 2. ファイルのキーで記録を取る(失敗時はこの記録と CEK をそのまま戻す)。
+        //
+        // 記録・CEK はファイルごとに 1 件なので、巻き戻しは「保存前の記録を
+        // 丸ごと戻す」になる。同じファイルへの他の書き込み(別タブの保存・
+        // revoke・削除・取り込み)と並行させると、こちらの失敗の巻き戻しが
+        // その間に成功した書き込みを消す。revoke と同じファイル単位のロックで、
+        // 記録の取得から State Node への送信・巻き戻しまでを直列化する。
         let content_id = ContentId::new(input.file_id.clone());
+        let _file_guard = self.content_revoke_locks.lock(content_id.as_str());
         let before_update = match self.capture_stored_content_snapshot(&content_id) {
             Ok(snapshot) => snapshot,
             Err(error) => return ApiResponse::error(error, trace_id),
@@ -1064,6 +1071,8 @@ impl MonasController {
         //    これをそのまま戻す(作り直さないので、ファイルのキー・CEK・暗号文・
         //    共有設定は削除前と同じ)。
         let content_id = ContentId::new(input.file_id.clone());
+        // update と同じ理由で、同じファイルへの書き込みと直列化する。
+        let _file_guard = self.content_revoke_locks.lock(content_id.as_str());
 
         let snapshot = match self.capture_stored_content_snapshot(&content_id) {
             Ok(snapshot) => snapshot,

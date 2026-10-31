@@ -72,15 +72,19 @@ export function ShareModal({
 
   const share = async () => {
     if (!trimmedKey || existing) return;
+    const sentKey = trimmedKey;
+    const sentLabel = label;
     const ok = await onShare(entry, {
-      recipientPublicKeyB64Url: trimmedKey,
-      recipientLabel: label.trim() || undefined,
+      recipientPublicKeyB64Url: sentKey,
+      recipientLabel: sentLabel.trim() || undefined,
       permissions,
     });
     if (ok) {
-      setPackageFor(trimmedKey);
-      setPubKey("");
-      setLabel("");
+      setPackageFor(sentKey);
+      // Clear only what was sent: the user may already have typed the next
+      // recipient while this share was running.
+      setPubKey((cur) => (cur.trim() === sentKey ? "" : cur));
+      setLabel((cur) => (cur === sentLabel ? "" : cur));
     }
   };
 
@@ -218,7 +222,11 @@ export function ShareModal({
                 {shownGrant.reissuedAt
                   ? " (re-wrapped: the old one no longer opens)"
                   : shownGrant.tokenReissuedAt
-                    ? " (new token: the old package can no longer reach the state node)"
+                    ? shownGrant.oldTokenVoided === true
+                      ? " (new token: the old package can no longer reach the state node)"
+                      : shownGrant.oldTokenVoided === false
+                        ? " (new token: the old package still works with its earlier permission)"
+                        : " (new token)"
                     : ""}
               </label>
               <textarea

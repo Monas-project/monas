@@ -217,3 +217,38 @@ test("downgrade reached every member: no warning", async ({ page }) => {
   await expect(page.locator(".toast.warning")).toHaveCount(0);
   await expect(page.locator(".step").filter({ hasText: "Content key unchanged" })).toHaveClass(/\bdone\b/);
 });
+
+// An upgrade issues a write token but voids nothing: the recipient's old read
+// package still works. Only a downgrade (which advances the cutoff) makes the
+// old package unusable.
+test("the package label says the old package still works after an upgrade, and not after a downgrade", async ({ page }) => {
+  await boot(page, [fileEntry([grant("bob", ["read"]), grant("carol", ["read", "write"])])]);
+  await openShare(page);
+  const bob = page.locator(".recipient-row").filter({ hasText: "bob" });
+  await bob.locator(".seg").getByRole("button", { name: "read + write" }).click();
+  await expect(page.locator(".run-status").first()).toHaveText("complete");
+  await expect(page.locator(".share-package label")).toContainText("old package still works");
+  await expect(page.locator(".share-package label")).not.toContainText("can no longer reach");
+
+  const carol = page.locator(".recipient-row").filter({ hasText: "carol" });
+  await carol.locator(".seg").getByRole("button", { name: "read", exact: true }).click();
+  await expect(page.locator(".share-package label")).toContainText("Share package for carol");
+  await expect(page.locator(".share-package label")).toContainText("can no longer reach the state node");
+});
+
+// While a share is running the key field stays editable; a key typed for the
+// next recipient must survive the first share's success.
+test("a key typed while a share is running is not cleared when that share completes", async ({ page }) => {
+  await boot(page, [fileEntry([])]);
+  let release!: () => void;
+  const held = new Promise<void>((r) => { release = r; });
+  await page.route("**/api/share", async (route) => { await held; await route.fallback(); });
+  await openShare(page);
+  const key = page.getByPlaceholder("P-256 public key, base64url (from the gateway /keypair)");
+  await key.fill("public-bob");
+  await page.getByRole("button", { name: "Wrap CEK & share" }).click();
+  await key.fill("public-dave");
+  release();
+  await expect(page.locator(".share-package textarea")).toBeVisible();
+  await expect(key).toHaveValue("public-dave");
+});

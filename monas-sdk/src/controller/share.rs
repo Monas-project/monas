@@ -850,6 +850,27 @@ impl MonasController {
         };
         let downgrade = matches!(previous, DomainPermission::Write)
             && matches!(permission, DomainPermission::Read);
+        // 降格は古い write Token を止めるために State Node の失効境界を進める。
+        // 届けられない(auth 無し)なら、止めないまま成功を返さない。
+        if downgrade && auth.is_none() {
+            return ApiResponse::error(
+                ApiError::Validation(
+                    "a downgrade must void the recipient's write token on the state node; \
+                     state node auth is required"
+                        .into(),
+                ),
+                trace_id,
+            );
+        }
+        // 権限が変わらない要求は、降格の成功応答を失った呼び出し側のやり直しで
+        // あり得る。1 回目の降格で失効境界は進んでいて他の受信者の古い Token は
+        // もう使えないので、失効は繰り返さずに他の受信者の Token も発行し直して
+        // 返す(新しい Token は各自の今の権限なので、権限は広がらない)。
+        let unchanged = matches!(
+            (&previous, &permission),
+            (DomainPermission::Read, DomainPermission::Read)
+                | (DomainPermission::Write, DomainPermission::Write)
+        );
 
         // 降格のときだけ、ACL を変える前に既発行 Token を一括失効させる
         // (revoke と同じ順序: 失効が先なら、後段が失敗しても余分な失効が残るだけ)。
@@ -894,7 +915,8 @@ impl MonasController {
             };
 
         // 失効させた場合は、他の受信者の Token も巻き添えで無効になっている。
-        let reissued_tokens = if token_invalidated_at.is_some() {
+        // 変わらない要求(上の `unchanged`)でも同じものを返す。
+        let reissued_tokens = if token_invalidated_at.is_some() || unchanged {
             self.share_service
                 .get_share(content_id.clone())
                 .ok()

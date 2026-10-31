@@ -48,7 +48,7 @@ async function boot(page: Page, entries: Entry[] = [], identities = [identity("B
       expect(req.headers().authorization).toBe("Bearer fixture-token");
       head = "v2";
       data = { remote_content_id: "network", version_id: "plain-v2" };
-    } else if (path === "/api/content/file-1") data = { content_id: "plain-v1", content: b64("V1") };
+    } else if (path === "/api/content/file-1") data = { content_id: `plain-${head}`, content: b64(head.toUpperCase()) };
     else if (path === "/api/account" && req.method() === "POST") data = { key_type: "secp256r1", public_key: "public-created", private_key: "private-created" };
     else {
       unexpected.push(`${req.method()} ${path}`);
@@ -93,6 +93,18 @@ test("recipient import → edit → reopen compares the displayed envelope, not 
     expect(r.body.local_content_id).toBe("plain-v1");
     expect(r.body.file_id).toBeUndefined();
   }
+  expect(gateway.unexpected).toEqual([]);
+});
+
+// Another tab saved V2 after this tab loaded its registry (which still says
+// plain-v1). Open fetches and shows V2, the head is V2: the preview must say
+// up to date, not "newer on the network".
+test("owner preview judges sync by the body it shows, not the entry's id from before the open", async ({ page }) => {
+  const gateway = await boot(page, [ownerEntry()]);
+  gateway.setHead("v2");
+  await action(page, "Open / preview");
+  await expect(page.locator(".preview-box").first()).toHaveText("V2");
+  await expect(page.locator(".sync-status")).toHaveAttribute("data-sync", "current");
   expect(gateway.unexpected).toEqual([]);
 });
 

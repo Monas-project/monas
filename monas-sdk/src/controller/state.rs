@@ -482,6 +482,10 @@ impl MonasController {
                 trace_id,
             );
         }
+        // 取り込みは記録を書き換えるので、同じファイルへの他の書き込み
+        // (update・delete・revoke)と同じロックで直列化する。revoke は
+        // `adopt_remote_head` をロックを持ったまま呼ぶので、ロックはここで取る。
+        let _file_guard = self.content_revoke_locks.lock(&input.file_id);
         match self.adopt_remote_head::<PullContentFromStateNodeOutput>(
             &input.content_id,
             &input.file_id,

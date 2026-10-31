@@ -422,3 +422,161 @@ async fn the_file_key_never_leaves_the_device() {
     anything.assert_async().await;
     cleanup_content_artifacts();
 }
+
+/// A tiny state-node stand-in whose FIRST `PUT /content/race-remote` is held
+/// until the test releases it, then answered 500. Every other request
+/// succeeds. mockito answers immediately, so it cannot hold one request
+/// while another one runs.
+mod held_put {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc::{channel, Receiver, Sender};
+    use std::sync::{Arc, Mutex};
+
+    pub struct HeldPut {
+        pub url: String,
+        pub arrived: Receiver<()>,
+        pub release: Sender<()>,
+    }
+
+    fn respond(stream: &mut TcpStream, status: &str, body: &str) {
+        let _ = write!(
+            stream,
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+    }
+
+    fn serve(
+        stream: TcpStream,
+        first: Arc<AtomicBool>,
+        arrived: Sender<()>,
+        release: Arc<Mutex<Receiver<()>>>,
+    ) {
+        let mut writer = stream.try_clone().unwrap();
+        let mut reader = BufReader::new(stream);
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                return;
+            }
+            let mut length = 0usize;
+            loop {
+                let mut h = String::new();
+                reader.read_line(&mut h).unwrap();
+                if h == "\r\n" {
+                    break;
+                }
+                let lower = h.to_ascii_lowercase();
+                if let Some(v) = lower.strip_prefix("content-length:") {
+                    length = v.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            if line.starts_with("POST /content ") {
+                respond(&mut writer, "200 OK", r#"{"content_id":"race-remote"}"#);
+            } else if line.starts_with("PUT /content/race-remote ")
+                && first.swap(false, Ordering::SeqCst)
+            {
+                arrived.send(()).unwrap();
+                release.lock().unwrap().recv().unwrap();
+                respond(
+                    &mut writer,
+                    "500 Internal Server Error",
+                    r#"{"error":"held"}"#,
+                );
+            } else {
+                respond(&mut writer, "200 OK", "");
+            }
+        }
+    }
+
+    pub fn start() -> HeldPut {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (arrived_tx, arrived) = channel();
+        let (release, release_rx) = channel();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let first = Arc::new(AtomicBool::new(true));
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let (first, arrived_tx, release_rx) =
+                    (first.clone(), arrived_tx.clone(), release_rx.clone());
+                std::thread::spawn(move || serve(stream, first, arrived_tx, release_rx));
+            }
+        });
+        HeldPut {
+            url,
+            arrived,
+            release,
+        }
+    }
+}
+
+/// Two tabs edit one file. Tab A's save is still waiting for the state node
+/// when tab B's save goes through; then A's save fails. Rolling A back must
+/// not undo B: the local record and its CEK are one per file, so restoring
+/// the snapshot A took before saving would put the pre-A body back over B's.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_save_does_not_undo_a_save_that_succeeded_meanwhile() {
+    let _guard = acquire_test_lock();
+    let stub = held_put::start();
+    let c = std::sync::Arc::new(controller(stub.url.clone()));
+    let f = c
+        .create_content(
+            CreateContentInput {
+                content: URL_SAFE_NO_PAD.encode(b"v1"),
+                metadata: Some(ContentMetadata {
+                    name: Some("race.txt".to_string()),
+                    content_type: Some("text/plain".to_string()),
+                    created_at: None,
+                    updated_at: None,
+                }),
+            },
+            None,
+        )
+        .data
+        .expect("create");
+    let save = |body: &'static [u8]| {
+        let (c, file_id) = (c.clone(), f.file_id.clone());
+        let rt = tokio::runtime::Handle::current();
+        std::thread::spawn(move || {
+            let _rt = rt.enter();
+            c.update_content(
+                UpdateContentInput {
+                    file_id,
+                    remote_content_id: "race-remote".into(),
+                    content: URL_SAFE_NO_PAD.encode(body),
+                    metadata: None,
+                },
+                Some(&owner_auth()),
+            )
+            .success
+        })
+    };
+
+    let a = save(b"tab A");
+    stub.arrived
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("A reached the state node");
+    let b = save(b"tab B");
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    stub.release.send(()).unwrap();
+    assert!(!a.join().unwrap(), "A's save fails");
+    assert!(b.join().unwrap(), "B's save succeeds");
+
+    let now = c
+        .get_content(monas_sdk::models::content::GetContentInput {
+            file_id: f.file_id.clone(),
+        })
+        .data
+        .expect("get");
+    assert_eq!(
+        URL_SAFE_NO_PAD.decode(now.content).unwrap(),
+        b"tab B",
+        "B's successful save must survive A's rollback"
+    );
+    cleanup_content_artifacts();
+}

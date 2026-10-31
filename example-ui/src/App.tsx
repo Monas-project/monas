@@ -45,7 +45,14 @@ type Modal =
   | { type: "delete"; entry: Entry }
   | { type: "share"; entryId: string }
   | { type: "importShare" }
-  | { type: "preview"; entry: Entry; contentB64Url: string }
+  | {
+      type: "preview";
+      entry: Entry;
+      contentB64Url: string;
+      /** Plain id of the body actually shown — what the open returned, not the
+       *  entry's id before the open (another tab may have saved since). */
+      displayedVersionId?: string;
+    }
   | { type: "identity" }
   | { type: "settings" }
   | { type: "loadingEdit" };
@@ -382,8 +389,13 @@ export default function App() {
     }
     const { ok, ctx } = await run("Open", entry.name, specs);
     if (ok && ctx.get) {
-      const g = ctx.get as { content: string };
-      setModal({ type: "preview", entry, contentB64Url: g.content });
+      const g = ctx.get as { content: string; content_id?: string };
+      setModal({
+        type: "preview",
+        entry,
+        contentB64Url: g.content,
+        displayedVersionId: g.content_id ?? entry.localContentId,
+      });
       void checkNetworkHead(entry);
     } else {
       pushToast("Could not open file", "error");
@@ -456,7 +468,7 @@ export default function App() {
     }
     setView({ kind: "drive" });
     pushToast(`“${pkg.name}” unwrapped and added to your Drive`, "success");
-    setModal({ type: "preview", entry, contentB64Url: res.content });
+    setModal({ type: "preview", entry, contentB64Url: res.content, displayedVersionId: pkg.content_id });
     // The envelope carries the version the owner shared; whether that is
     // still the head only the network knows.
     void checkNetworkHead(entry);
@@ -550,12 +562,28 @@ export default function App() {
       const now = Date.now();
       const others = new Map((r.reissued_tokens ?? []).map((t) => [t.recipient_key_id, t]));
       const shares = entry.shares.map((s) => {
+        // Only a downgrade voids earlier tokens (it advances the cutoff); an
+        // upgrade leaves the recipient's old read token working.
+        const voided = r.token_invalidated_at != null;
         if (s.recipientPublicKeyB64Url === recipientPublicKeyB64Url) {
-          return { ...s, permissions: r.permissions, delegatedAccess: r.delegated_access, tokenReissuedAt: now };
+          return {
+            ...s,
+            permissions: r.permissions,
+            delegatedAccess: r.delegated_access,
+            tokenReissuedAt: now,
+            oldTokenVoided: voided,
+          };
         }
         const fresh = others.get(s.recipientKeyId);
         return fresh
-          ? { ...s, delegatedAccess: fresh.delegated_access ?? undefined, tokenReissuedAt: now }
+          ? {
+              ...s,
+              delegatedAccess: fresh.delegated_access ?? undefined,
+              tokenReissuedAt: now,
+              // Without a cutoff in this call (a retried downgrade), whether
+              // their old token still works depends on the earlier call.
+              oldTokenVoided: voided ? true : undefined,
+            }
           : s;
       });
       updateEntry(entry.id, { shares });
@@ -776,7 +804,7 @@ export default function App() {
         <PreviewModal
           entry={liveEntry(modal.entry.id) ?? modal.entry}
           contentB64Url={modal.contentB64Url}
-          displayedVersionId={modal.entry.localContentId}
+          displayedVersionId={modal.displayedVersionId ?? modal.entry.localContentId}
           onCheckHead={checkNetworkHead}
           onEdit={(e) => handleEditOpen(e)}
           onClose={() => setModal({ type: "none" })}
