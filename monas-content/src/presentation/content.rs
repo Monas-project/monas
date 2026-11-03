@@ -153,6 +153,7 @@ async fn update_content(
         None => None,
     };
 
+    let _file_guard = state.file_locks.lock(content_id.as_str()).await;
     let cmd = UpdateContentCommand {
         content_id,
         new_name: req.name,
@@ -195,6 +196,7 @@ async fn delete_content(
         None => None,
     };
 
+    let _file_guard = state.file_locks.lock(content_id.as_str()).await;
     let cmd = DeleteContentCommand {
         content_id,
         provider,
@@ -323,6 +325,7 @@ async fn reencrypt_content(
 ) -> Result<Json<ReencryptContentResponse>, (StatusCode, String)> {
     let content_id = ContentId::new(content_id_str);
 
+    let _file_guard = state.file_locks.lock(content_id.as_str()).await;
     // ReencryptContentCommandを構築
     let cmd = ReencryptContentCommand { content_id };
 
@@ -431,6 +434,28 @@ async fn disconnect_provider(
 mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    /// The router's local provider writes records under ./content (the crate
+    /// dir under `cargo test`). Tests remove only the records they added, and
+    /// run one at a time so one test's cleanup cannot remove the directory
+    /// under another.
+    static CONTENT_DIR: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn existing_records() -> std::collections::HashSet<std::path::PathBuf> {
+        std::fs::read_dir("content")
+            .map(|entries| entries.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default()
+    }
+
+    fn remove_new_records(before: &std::collections::HashSet<std::path::PathBuf>) {
+        for path in existing_records() {
+            if !before.contains(&path) {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        // Only removes the directory when it is empty, i.e. the tests made it.
+        let _ = std::fs::remove_dir("content");
+    }
+
     /// Minimal HTTP/1.1 client: one request per connection.
     async fn call(
         addr: std::net::SocketAddr,
@@ -463,6 +488,8 @@ mod tests {
                 .await
                 .unwrap()
         });
+        let _dir = CONTENT_DIR.lock().await;
+        let before = existing_records();
 
         let (status, body) = call(
             addr,
@@ -499,15 +526,55 @@ mod tests {
         let (status, body) = call(addr, "DELETE", &format!("/contents/{file}"), "").await;
         assert_eq!(status, 204, "{body}");
 
-        // The router's local provider writes under ./content (the crate dir
-        // under `cargo test`); remove what this test left there.
-        if let Ok(entries) = std::fs::read_dir("content") {
-            for path in entries.flatten().map(|e| e.path()) {
-                if path.extension().is_some_and(|ext| ext == "json") {
-                    let _ = std::fs::remove_file(path);
-                }
-            }
+        remove_new_records(&before);
+    }
+
+    /// An update and a re-encryption of one file arriving together must both
+    /// leave a readable file: each reads the record, writes it back with its
+    /// own ciphertext and (for re-encryption) a new CEK, so unserialized the
+    /// last record write and the last CEK write can come from different
+    /// requests.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_update_and_reencrypt_leave_the_file_readable() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, crate::presentation::create_router())
+                .await
+                .unwrap()
+        });
+        let _dir = CONTENT_DIR.lock().await;
+        let before = existing_records();
+
+        let (status, body) = call(
+            addr,
+            "POST",
+            "/contents",
+            r#"{"name":"r.txt","path":"/r.txt","content_base64":"cjA="}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let created: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let file = created["series_id"].as_str().unwrap().to_string();
+
+        for round in 0..30 {
+            let update_body = format!(r#"{{"content_base64":"{}"}}"#, base64_of(round));
+            let update_path = format!("/contents/{file}");
+            let reencrypt_path = format!("/contents/{file}/reencrypt");
+            let (u, r) = tokio::join!(
+                call(addr, "PATCH", &update_path, &update_body),
+                call(addr, "POST", &reencrypt_path, ""),
+            );
+            assert_eq!(u.0, 200, "{}", u.1);
+            assert_eq!(r.0, 200, "{}", r.1);
+            let (status, body) = call(addr, "GET", &format!("/contents/{file}/fetch"), "").await;
+            assert_eq!(status, 200, "round {round}: {body}");
         }
-        let _ = std::fs::remove_dir("content");
+        remove_new_records(&before);
+    }
+
+    fn base64_of(round: u32) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(format!("round {round}"))
     }
 }

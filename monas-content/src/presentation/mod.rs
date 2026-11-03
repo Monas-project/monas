@@ -29,8 +29,57 @@ use base64_helpers::{
     decode_base64, decode_base64_optional, decode_cek_base64, decode_key_id_base64,
 };
 
+/// ファイル単位の書き込みロック。
+///
+/// 記録・CEK・共有設定はファイルのキーごとに 1 件で、更新・削除・再暗号化・
+/// 共有・revoke はそれぞれ「読んで書き戻す」。同じファイルへの書き込みが
+/// 並行すると、記録と CEK の最後の書き込みが別々の要求のものになり得る
+/// (例: 更新の本文 + 再暗号化の新 CEK で復号できなくなる)。SDK のファイル
+/// 単位ロックと同じく、同じファイルへの書き込みを 1 つずつにする。
+#[derive(Default)]
+struct FileLocks {
+    held: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl FileLocks {
+    async fn lock(&self, file_id: &str) -> FileLockGuard<'_> {
+        let mutex = {
+            let mut held = self.held.lock().unwrap_or_else(|p| p.into_inner());
+            held.entry(file_id.to_string()).or_default().clone()
+        };
+        let guard = mutex.clone().lock_owned().await;
+        FileLockGuard {
+            locks: self,
+            file_id: file_id.to_string(),
+            mutex,
+            _guard: Some(guard),
+        }
+    }
+}
+
+/// drop で表から自分のエントリを消す(誰も待っていなければ)。表は書き込み中の
+/// ファイル数までしか伸びない。
+struct FileLockGuard<'a> {
+    locks: &'a FileLocks,
+    file_id: String,
+    mutex: Arc<tokio::sync::Mutex<()>>,
+    _guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl Drop for FileLockGuard<'_> {
+    fn drop(&mut self) {
+        self._guard.take();
+        let mut held = self.locks.held.lock().unwrap_or_else(|p| p.into_inner());
+        // 表と自分の分だけなら、他に保持者も待機者もいない。
+        if Arc::strong_count(&self.mutex) == 2 {
+            held.remove(&self.file_id);
+        }
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
+    file_locks: Arc<FileLocks>,
     pub content_service: Arc<
         ContentService<
             Sha256ContentIdGenerator,
@@ -81,6 +130,7 @@ pub fn create_router() -> Router {
     };
 
     let state = Arc::new(AppState {
+        file_locks: Arc::new(FileLocks::default()),
         content_service: Arc::new(content_service),
         share_service: Arc::new(share_service),
     });

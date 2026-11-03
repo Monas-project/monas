@@ -580,3 +580,46 @@ async fn a_failed_save_does_not_undo_a_save_that_succeeded_meanwhile() {
     );
     cleanup_content_artifacts();
 }
+
+/// The file key names exactly one record. Another spelling of it (`./<key>`,
+/// upper case on a case-insensitive file system) must not reach the same
+/// record: the per-file write lock is keyed by the string, so an alias would
+/// let two writes to one file run in parallel.
+#[tokio::test(flavor = "multi_thread")]
+async fn another_spelling_of_a_file_key_does_not_reach_the_file() {
+    let _guard = acquire_test_lock();
+    let stub = held_put::start();
+    let c = controller(stub.url.clone());
+    let f = c
+        .create_content(
+            CreateContentInput {
+                content: URL_SAFE_NO_PAD.encode(b"alias"),
+                metadata: Some(ContentMetadata {
+                    name: Some("alias.txt".to_string()),
+                    content_type: Some("text/plain".to_string()),
+                    created_at: None,
+                    updated_at: None,
+                }),
+            },
+            None,
+        )
+        .data
+        .expect("create");
+    for alias in [
+        format!("./{}", f.file_id),
+        f.file_id.to_ascii_uppercase(),
+        format!("x/../{}", f.file_id),
+    ] {
+        let got = c.get_content(monas_sdk::models::content::GetContentInput {
+            file_id: alias.clone(),
+        });
+        assert!(!got.success, "{alias} must not reach the file");
+    }
+    assert!(
+        c.get_content(monas_sdk::models::content::GetContentInput {
+            file_id: f.file_id.clone(),
+        })
+        .success
+    );
+    cleanup_content_artifacts();
+}

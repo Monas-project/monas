@@ -833,13 +833,26 @@ impl MonasController {
 
         let _guard = self.content_revoke_locks.lock(content_id.as_str());
 
-        // 現在の権限(降格かどうかの判定)。共有されていない相手はここで弾く。
-        let previous = match self.share_service.get_share(content_id.clone()) {
-            Ok(share) => share
-                .and_then(|s| s.permissions_of(&recipient_key_id).map(|p| p.to_vec()))
-                .and_then(|p| Self::resolve_domain_permission(&p)),
+        // 現在の ACL。対象者の権限(降格かどうかの判定)と、失効で巻き添えに
+        // なる他の受信者の一覧をここで取る。共有されていない相手はここで弾く。
+        let current_share = match self.share_service.get_share(content_id.clone()) {
+            Ok(share) => share,
             Err(e) => return ApiResponse::error(Self::map_share_error(e), trace_id),
         };
+        let previous = current_share
+            .as_ref()
+            .and_then(|s| s.permissions_of(&recipient_key_id).map(|p| p.to_vec()))
+            .and_then(|p| Self::resolve_domain_permission(&p));
+        // 対象者の権限変更は他の受信者の権限を変えないので、ACL 更新前の一覧で足りる。
+        let mut others: Vec<_> = current_share
+            .iter()
+            .flat_map(|s| s.recipients().iter())
+            .filter(|(kid, _)| **kid != recipient_key_id)
+            .filter_map(|(kid, r)| {
+                Self::resolve_domain_permission(r.permissions()).map(|p| (kid.clone(), p))
+            })
+            .collect();
+        others.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
         let Some(previous) = previous else {
             return ApiResponse::error(
                 ApiError::NotFound(
@@ -902,6 +915,57 @@ impl MonasController {
             Err(e) => return ApiResponse::error(e, trace_id),
         };
 
+        // 失効させた場合は、他の受信者の Token も巻き添えで無効になっている。
+        // 変わらない要求(上の `unchanged`)でも同じものを返す。対象者と同じ
+        // 理由で ACL 更新より先に発行し、1 人分でも発行できなければ失敗を返す
+        // (成功扱いで空や欠けた一覧を返すと、呼び出し側はその人たちの
+        // アクセスが失われたことに気づけない。ACL は元のままなので、再試行は
+        // 降格の判定からやり直す)。
+        let reissued_tokens = if token_invalidated_at.is_some() || unchanged {
+            let mut reissued = Vec::with_capacity(others.len());
+            for (kid, p) in others {
+                let public_key = match self
+                    .share_service
+                    .public_key_directory
+                    .find_public_key(&kid)
+                {
+                    Ok(Some(pk)) => pk,
+                    Ok(None) => {
+                        return ApiResponse::error(
+                            ApiError::Internal(format!(
+                                "no public key is stored for recipient {}; \
+                                 their token could not be reissued",
+                                Self::encode_key_id_base64url(&kid)
+                            )),
+                            trace_id,
+                        )
+                    }
+                    Err(e) => {
+                        return ApiResponse::error(
+                            ApiError::Internal(format!("public key lookup failed: {e}")),
+                            trace_id,
+                        )
+                    }
+                };
+                let delegated_access = match self.issue_delegated_token(
+                    &state_node_content_id,
+                    &public_key,
+                    p,
+                    token_invalidated_at,
+                ) {
+                    Ok(t) => t,
+                    Err(e) => return ApiResponse::error(e, trace_id),
+                };
+                reissued.push(ReissuedDelegatedToken {
+                    recipient_key_id: Self::encode_key_id_base64url(&kid),
+                    delegated_access: Some(delegated_access),
+                });
+            }
+            reissued
+        } else {
+            Vec::new()
+        };
+
         let result =
             match self
                 .share_service
@@ -913,54 +977,6 @@ impl MonasController {
                 Ok(r) => r,
                 Err(e) => return ApiResponse::error(Self::map_share_error(e), trace_id),
             };
-
-        // 失効させた場合は、他の受信者の Token も巻き添えで無効になっている。
-        // 変わらない要求(上の `unchanged`)でも同じものを返す。
-        let reissued_tokens = if token_invalidated_at.is_some() || unchanged {
-            self.share_service
-                .get_share(content_id.clone())
-                .ok()
-                .flatten()
-                .map(|share| {
-                    let mut others: Vec<_> = share
-                        .recipients()
-                        .iter()
-                        .filter(|(kid, _)| **kid != recipient_key_id)
-                        .filter_map(|(kid, r)| {
-                            Self::resolve_domain_permission(r.permissions())
-                                .map(|p| (kid.clone(), p))
-                        })
-                        .collect();
-                    others.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
-                    others
-                        .into_iter()
-                        .map(|(kid, p)| {
-                            let delegated_access = self
-                                .share_service
-                                .public_key_directory
-                                .find_public_key(&kid)
-                                .ok()
-                                .flatten()
-                                .and_then(|pk| {
-                                    self.issue_delegated_token(
-                                        &state_node_content_id,
-                                        &pk,
-                                        p,
-                                        token_invalidated_at,
-                                    )
-                                    .ok()
-                                });
-                            ReissuedDelegatedToken {
-                                recipient_key_id: Self::encode_key_id_base64url(&kid),
-                                delegated_access,
-                            }
-                        })
-                        .collect()
-                })
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
 
         let permissions = match result.current.first() {
             Some(DomainPermission::Write) => vec![Permission::Write],

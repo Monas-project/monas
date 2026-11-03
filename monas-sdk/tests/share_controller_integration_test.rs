@@ -1299,8 +1299,9 @@ async fn upgrading_read_to_write_reissues_a_write_token_without_rotation() {
     invalidate_mock.assert();
     put_mock.assert();
 
-    // 変更は ACL に残る: 続けて降格方向の判定に使われる(もう一度 write にしても
-    // 失効は起きない = 現在 write と認識されている)。
+    // 変更は ACL に残る: もう一度 write を求めると「変わらない要求」として
+    // 扱われ、他の受信者の Token が返る。ACL が read のままなら昇格と判定され、
+    // 他の受信者分は空になる。
     let again = f.controller.update_share_permission(
         UpdateSharePermissionInput {
             file_id: f.file_id.clone(),
@@ -1311,6 +1312,16 @@ async fn upgrading_read_to_write_reissues_a_write_token_without_rotation() {
         Some(&auth_context("Bearer owner")),
     );
     assert!(again.success, "{:?}", again.error);
+    let again = again.data.expect("data");
+    assert_eq!(
+        again
+            .reissued_tokens
+            .iter()
+            .map(|t| t.recipient_key_id.clone())
+            .collect::<Vec<_>>(),
+        vec![key_id_of(&f.other)],
+        "the ACL holds write: a second write request is unchanged, not an upgrade"
+    );
     invalidate_mock.assert();
     cleanup_content_artifacts();
 }
@@ -1377,7 +1388,23 @@ async fn downgrading_write_to_read_invalidates_and_reissues_tokens() {
         token_capabilities(&other_token.delegated_token),
         vec!["read"]
     );
-    let _ = &f.other;
+    assert_eq!(out.reissued_tokens[0].recipient_key_id, key_id_of(&f.other));
+
+    // 変更は ACL に残る: もう一度 read を求めても降格ではないので、境界は
+    // 進めない(invalidate は 1 回のまま)。ACL が write のままなら 2 回目の
+    // 降格として invalidate が呼ばれる。
+    let again = f.controller.update_share_permission(
+        UpdateSharePermissionInput {
+            file_id: f.file_id.clone(),
+            remote_content_id: Some("perm-remote".into()),
+            recipient_public_key: f.target.public_key.clone(),
+            permissions: vec![Permission::Read],
+        },
+        Some(&auth_context("Bearer owner")),
+    );
+    assert!(again.success, "{:?}", again.error);
+    assert_eq!(again.data.expect("data").token_invalidated_at, None);
+    invalidate_mock.assert();
     cleanup_content_artifacts();
 }
 

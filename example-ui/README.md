@@ -374,8 +374,10 @@ that narrate the protocol and read ids out of the response:
   rather than invent one that would exist only in this browser. (Registries
   saved by older builds with folders load flat; the folder rows are dropped.)
 - The gateway has no listing API, so the UI keeps its own file registry in
-  `localStorage` (`monas.registry.v3`). Identities and the endpoint live there
-  too. Clearing site data resets the demo.
+  `localStorage` (`monas.registry.v4`; owner files are addressed by their
+  file key, `fileId`). Registries saved by older builds (`v3`) are not
+  migrated. Identities and the endpoint live there too. Clearing site data
+  resets the demo.
 - **Rename** a file through the name field in `Edit contents`; the new name
   reaches the SDK with that update.
 - Private keys for demo identities are stored in `localStorage` so the HPKE

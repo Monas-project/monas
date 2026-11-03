@@ -86,7 +86,9 @@ impl LocalMobileProvider {
             })?;
         }
 
-        fs::write(path, data).map_err(|err| FetchError {
+        // Records are overwritten in place (one per file); a write failing
+        // part-way must not destroy the previous contents.
+        super::atomic_write::write_atomically(path, data).map_err(|err| FetchError {
             message: format!("failed to write {}: {err}", path.display()),
         })
     }

@@ -140,6 +140,9 @@ async fn grant_share(
         }
     };
 
+    // 記録と CEK を読んで envelope を作り、共有設定を書き戻す。並行する
+    // 更新・再暗号化と混ざらないよう、他の書き込みと同じロックを取る。
+    let _file_guard = state.file_locks.lock(content_id.as_str()).await;
     let cmd = GrantShareCommand {
         content_id,
         sender_key_id,
@@ -228,6 +231,7 @@ async fn revoke_share(
     let recipient_key_id =
         decode_key_id_base64(&recipient_key_id_b64, "recipient_key_id (base64)")?;
 
+    let _file_guard = state.file_locks.lock(content_id.as_str()).await;
     let cmd = RevokeShareCommand {
         content_id,
         sender_key_id,

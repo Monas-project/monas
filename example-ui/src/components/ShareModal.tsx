@@ -15,6 +15,31 @@ const READ: Permission[] = ["read"];
 const READ_WRITE: Permission[] = ["read", "write"];
 const hasWrite = (p: Permission[]) => p.includes("write");
 
+/** The grant's most recent change: a revoke re-wrap or a token-only reissue
+ *  (a permission change). A later permission change supersedes an earlier
+ *  re-wrap and vice versa. */
+const latestChange = (g: ShareGrant): "rewrap" | "token" | undefined => {
+  if (g.tokenReissuedAt && (!g.reissuedAt || g.tokenReissuedAt > g.reissuedAt)) return "token";
+  return g.reissuedAt ? "rewrap" : undefined;
+};
+
+/** What can be said about the package this one replaces — only what the call
+ *  that produced it established. */
+const packageNote = (g: ShareGrant): string => {
+  switch (latestChange(g)) {
+    case "rewrap":
+      return " (re-wrapped: the old one no longer opens)";
+    case "token":
+      return g.oldTokenCutoff === "everywhere"
+        ? " (new token: the old package can no longer reach the state node)"
+        : g.oldTokenCutoff === "partly"
+          ? " (new token: member nodes the cutoff reached refuse the old package; others accept it until they sync)"
+          : " (new token)";
+    default:
+      return "";
+  }
+};
+
 // Sharing is always to a pasted public key. A device has exactly one account
 // (see IdentityModal), so there is no second local identity to pick, and the
 // recipient's private key is never on this device — the HPKE round trip is
@@ -106,7 +131,7 @@ export function ShareModal({
     : undefined;
   // Revoking rotates the key; every surviving recipient's old package stops
   // opening, so say how many need a new one instead of opening one of them.
-  const rewrapped = entry.shares.filter((s) => s.reissuedAt).length;
+  const rewrapped = entry.shares.filter((s) => latestChange(s) === "rewrap").length;
 
   return (
     <Modal
@@ -170,9 +195,9 @@ export function ShareModal({
                 </div>
                 <div className="mono" style={{ fontSize: 10.5 }}>
                   KeyId {s.recipientKeyId} · epoch {s.envelope.key_epoch}
-                  {s.reissuedAt
+                  {latestChange(s) === "rewrap"
                     ? " · re-wrapped after a revoke"
-                    : s.tokenReissuedAt
+                    : latestChange(s) === "token"
                       ? " · new token issued"
                       : ""}
                 </div>
@@ -219,15 +244,7 @@ export function ShareModal({
             <div className="field share-package" style={{ marginTop: 10 }}>
               <label>
                 Share package for {shownGrant.recipientLabel || "recipient"} — send this to them
-                {shownGrant.reissuedAt
-                  ? " (re-wrapped: the old one no longer opens)"
-                  : shownGrant.tokenReissuedAt
-                    ? shownGrant.oldTokenVoided === true
-                      ? " (new token: the old package can no longer reach the state node)"
-                      : shownGrant.oldTokenVoided === false
-                        ? " (new token: the old package still works with its earlier permission)"
-                        : " (new token)"
-                    : ""}
+                {packageNote(shownGrant)}
               </label>
               <textarea
                 className="input mono"

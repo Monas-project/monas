@@ -204,6 +204,9 @@ for (const c of reachCases) {
     const step = page.locator(".step").filter({ hasText: "Content key unchanged" });
     await expect(step).not.toContainText("old write token is void");
     await expect(step).toHaveClass(/\bwarning\b/);
+    // Nor does the package label claim the old package is refused everywhere.
+    await expect(label(page)).toContainText("others accept it until they sync");
+    await expect(label(page)).not.toContainText("can no longer reach");
     expect(gateway.unexpected).toEqual([]);
   });
 }
@@ -218,22 +221,49 @@ test("downgrade reached every member: no warning", async ({ page }) => {
   await expect(page.locator(".step").filter({ hasText: "Content key unchanged" })).toHaveClass(/\bdone\b/);
 });
 
-// An upgrade issues a write token but voids nothing: the recipient's old read
-// package still works. Only a downgrade (which advances the cutoff) makes the
-// old package unusable.
-test("the package label says the old package still works after an upgrade, and not after a downgrade", async ({ page }) => {
+// The package label claims only what the call that produced the package
+// established about the package it replaces.
+const label = (page: Page) => page.locator(".share-package label");
+
+test("package label: an upgrade claims nothing about the old package; a fully reached downgrade says it is refused", async ({ page }) => {
   await boot(page, [fileEntry([grant("bob", ["read"]), grant("carol", ["read", "write"])])]);
   await openShare(page);
   const bob = page.locator(".recipient-row").filter({ hasText: "bob" });
   await bob.locator(".seg").getByRole("button", { name: "read + write" }).click();
   await expect(page.locator(".run-status").first()).toHaveText("complete");
-  await expect(page.locator(".share-package label")).toContainText("old package still works");
-  await expect(page.locator(".share-package label")).not.toContainText("can no longer reach");
+  await expect(label(page)).toContainText("Share package for bob — send this to them (new token)");
+  await expect(label(page)).not.toContainText("old package");
 
   const carol = page.locator(".recipient-row").filter({ hasText: "carol" });
   await carol.locator(".seg").getByRole("button", { name: "read", exact: true }).click();
-  await expect(page.locator(".share-package label")).toContainText("Share package for carol");
-  await expect(page.locator(".share-package label")).toContainText("can no longer reach the state node");
+  await expect(label(page)).toContainText("Share package for carol");
+  await expect(label(page)).toContainText("(new token: the old package can no longer reach the state node)");
+});
+
+// A retried downgrade (its first response was lost) sets no cutoff of its
+// own; the label must not say the old package still works.
+test("package label: a retried downgrade claims nothing about the old package", async ({ page }) => {
+  await boot(page, [fileEntry([grant("bob", ["read", "write"])])], {
+    token_invalidated_at: undefined, token_invalidation_reach: undefined,
+  });
+  await openShare(page);
+  await page.locator(".recipient-row").filter({ hasText: "bob" }).locator(".seg").getByRole("button", { name: "read", exact: true }).click();
+  await expect(page.locator(".run-status").first()).toHaveText("complete");
+  await expect(label(page)).toContainText("Share package for bob — send this to them (new token)");
+  await expect(label(page)).not.toContainText("old package");
+});
+
+// After a revoke re-wrapped a recipient, a later upgrade's package replaces
+// the re-wrapped one, which still opens: the label follows the latest change.
+test("package label: an upgrade after a revoke re-wrap does not say the old package no longer opens", async ({ page }) => {
+  await boot(page, [fileEntry([{ ...grant("bob", ["read"]), reissuedAt: 5 }])]);
+  await openShare(page);
+  await expect(page.locator(".recipient-row").filter({ hasText: "bob" })).toContainText("re-wrapped after a revoke");
+  await page.locator(".recipient-row").filter({ hasText: "bob" }).locator(".seg").getByRole("button", { name: "read + write" }).click();
+  await expect(page.locator(".run-status").first()).toHaveText("complete");
+  await expect(label(page)).toContainText("(new token)");
+  await expect(label(page)).not.toContainText("no longer opens");
+  await expect(page.locator(".recipient-row").filter({ hasText: "bob" })).toContainText("new token issued");
 });
 
 // While a share is running the key field stays editable; a key typed for the

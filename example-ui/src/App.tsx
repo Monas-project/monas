@@ -36,7 +36,7 @@ import * as flows from "./pipeline/flows";
 import * as contentApi from "./api/content";
 import * as shareApi from "./api/share";
 import * as stateApi from "./api/stateNode";
-import type { Entry, Identity, SharePackage, View } from "./types";
+import type { Entry, Identity, ShareGrant, SharePackage, View } from "./types";
 
 type Modal =
   | { type: "none" }
@@ -271,7 +271,13 @@ export default function App() {
           entry = { ...entry, localContentId: pulled.local_content_id };
           pushToast("Pulled a newer version written by a recipient into your copy", "info");
         } else {
-          updateEntry(entry.id, ownHead(pulled.local_content_id));
+          // Nothing new to adopt, but this tab's row may still name an older
+          // body (another tab already pulled): record what the copy holds now.
+          updateEntry(entry.id, {
+            localContentId: pulled.local_content_id,
+            ...ownHead(pulled.local_content_id),
+          });
+          entry = { ...entry, localContentId: pulled.local_content_id };
         }
         text = pulled.content;
       } else {
@@ -561,17 +567,24 @@ export default function App() {
     if (ok && r) {
       const now = Date.now();
       const others = new Map((r.reissued_tokens ?? []).map((t) => [t.recipient_key_id, t]));
+      // Only a call that set the cutoff (a downgrade) voids earlier tokens,
+      // and only on the members it reached. Without a cutoff in this call
+      // (an upgrade, a retried downgrade) say nothing about the old package.
+      const reach = r.token_invalidation_reach;
+      const oldTokenCutoff: ShareGrant["oldTokenCutoff"] =
+        r.token_invalidated_at == null
+          ? undefined
+          : reach && !reach.relayed && reach.unreached_members.length === 0
+            ? "everywhere"
+            : "partly";
       const shares = entry.shares.map((s) => {
-        // Only a downgrade voids earlier tokens (it advances the cutoff); an
-        // upgrade leaves the recipient's old read token working.
-        const voided = r.token_invalidated_at != null;
         if (s.recipientPublicKeyB64Url === recipientPublicKeyB64Url) {
           return {
             ...s,
             permissions: r.permissions,
             delegatedAccess: r.delegated_access,
             tokenReissuedAt: now,
-            oldTokenVoided: voided,
+            oldTokenCutoff,
           };
         }
         const fresh = others.get(s.recipientKeyId);
@@ -580,9 +593,7 @@ export default function App() {
               ...s,
               delegatedAccess: fresh.delegated_access ?? undefined,
               tokenReissuedAt: now,
-              // Without a cutoff in this call (a retried downgrade), whether
-              // their old token still works depends on the earlier call.
-              oldTokenVoided: voided ? true : undefined,
+              oldTokenCutoff,
             }
           : s;
       });
@@ -676,6 +687,19 @@ export default function App() {
       if (stale > 0) {
         pushToast(
           `${stale} other recipient(s) got no reissued envelope and can no longer decrypt`,
+          "error",
+        );
+      }
+      // The cutoff voided every survivor's token too; one the SDK could not
+      // reissue leaves that recipient unable to reach the state node, even
+      // though their new envelope opens.
+      const tokenless =
+        r?.token_invalidated_at != null
+          ? (r.reissued_envelopes ?? []).filter((e) => !e.delegated_access).length
+          : 0;
+      if (tokenless > 0) {
+        pushToast(
+          `${tokenless} other recipient(s) got no fresh token and can no longer reach the state node`,
           "error",
         );
       }
