@@ -28,12 +28,12 @@ pub struct CreateContentRequest {
     pub provider: Option<String>,
 }
 
-/// 作成・更新の応答。
+/// Response for create/update.
 ///
-/// `series_id` はファイルのキーで、以後の `/contents/{id}`(更新・削除・
-/// 取得・再暗号化)と `/shares` の `content_id` にはこれを渡す。作成時に
-/// 決まり、本文を編集しても変わらない。`content_id` は今の版の plainCid
-/// (本文の SHA-256)で、`/contents/{id}/decrypt` の照合に使う。
+/// `series_id` is the file's key; pass it to subsequent `/contents/{id}` calls (update, delete,
+/// fetch, re-encrypt) and as `content_id` for `/shares`. It is decided at creation and does not
+/// change when the body is edited. `content_id` is the plainCid of the current version
+/// (SHA-256 of the body), used for matching in `/contents/{id}/decrypt`.
 #[derive(Serialize)]
 pub struct CreateContentResponse {
     pub series_id: String,
@@ -47,14 +47,14 @@ pub struct CreateContentResponse {
 pub struct UpdateContentRequest {
     pub name: Option<String>,
     pub content_base64: Option<String>,
-    /// 取得元のストレージプロバイダー（省略時はデフォルト）。
+    /// Storage provider to fetch from (default if omitted).
     pub provider: Option<String>,
 }
 
-/// fetch / delete 用のクエリパラメータ。
+/// Query parameters for fetch / delete.
 #[derive(Deserialize)]
 pub struct ProviderQuery {
-    /// ストレージプロバイダー（省略時はデフォルト）。
+    /// Storage provider (default if omitted).
     pub provider: Option<String>,
 }
 
@@ -128,7 +128,7 @@ async fn update_content(
 ) -> Result<Json<CreateContentResponse>, (StatusCode, String)> {
     let content_id = ContentId::new(id);
 
-    // content_base64 が指定されている場合のみデコード
+    // Decode only if content_base64 is specified
     let raw_opt = decode_base64_optional(req.content_base64.as_deref(), "content_base64")?;
 
     if let Some(ref bytes) = raw_opt {
@@ -217,7 +217,7 @@ pub struct FetchContentResponse {
     pub name: String,
     pub path: String,
     pub status: String,
-    /// Base64でエンコードされた復号済みコンテンツバイナリ。
+    /// Base64-encoded decrypted content binary.
     pub content_base64: String,
 }
 
@@ -245,7 +245,7 @@ async fn fetch_content(
         .content_service
         .fetch(content_id, provider_str)
         .map_err(|e| {
-            // とりあえず NotFound 系は 404、それ以外は 400 として扱う。
+            // For now, treat NotFound-type errors as 404 and everything else as 400.
             let status = match e {
                 crate::application_service::content_service::FetchError::NotFound
                 | crate::application_service::content_service::FetchError::Deleted => {
@@ -326,10 +326,10 @@ async fn reencrypt_content(
     let content_id = ContentId::new(content_id_str);
 
     let _file_guard = state.file_locks.lock(content_id.as_str()).await;
-    // ReencryptContentCommandを構築
+    // Build the ReencryptContentCommand
     let cmd = ReencryptContentCommand { content_id };
 
-    // ContentService::reencrypt()を呼び出し
+    // Call ContentService::reencrypt()
     let result = state.content_service.reencrypt(cmd).map_err(|e| {
         let status = match e {
             ReencryptError::ContentNotFound => StatusCode::NOT_FOUND,
@@ -339,7 +339,7 @@ async fn reencrypt_content(
         (status, e.to_string())
     })?;
 
-    // ReencryptContentResponseに変換
+    // Convert to ReencryptContentResponse
     let metadata = &result.metadata;
     let encrypted_content_base64 = BASE64_STANDARD.encode(&result.encrypted_content);
 
@@ -370,7 +370,7 @@ pub struct ProviderListResponse {
     pub default_provider: String,
 }
 
-/// 接続済みのプロバイダー一覧を取得する
+/// Gets the list of connected providers
 async fn list_providers(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<ProviderListResponse>, (StatusCode, String)> {
@@ -390,7 +390,7 @@ async fn list_providers(
     }))
 }
 
-/// ストレージプロバイダーを接続する（認証トークンを登録）
+/// Connects a storage provider (registers an auth token)
 async fn connect_provider(
     State(state): State<Arc<AppState>>,
     Path(provider): Path<String>,
@@ -417,7 +417,7 @@ async fn connect_provider(
     }))
 }
 
-/// ストレージプロバイダーを切断する（認証トークンを削除）
+/// Disconnects a storage provider (deletes the auth token)
 async fn disconnect_provider(
     State(state): State<Arc<AppState>>,
     Path(provider): Path<String>,

@@ -1,30 +1,32 @@
-//! 受信者側の送信者公開鍵ピン(TOFU)ストア。
+//! Recipient-side store of pinned sender public keys (TOFU).
 //!
-//! share の KeyEnvelope は HPKE Auth モードでラップされており、受信者は
-//! 「期待する送信者の公開鍵」で unwrap する(成功 = その鍵の持ち主が作った証明)。
-//! このストアは content ごとに、最初に unwrap に成功した送信者公開鍵を
-//! ピン留めし(TOFU)、以後の envelope はピン済みの鍵でのみ検証する。
+//! A share's KeyEnvelope is wrapped in HPKE Auth mode, and the recipient unwraps it with
+//! "the expected sender public key" (success = proof that the holder of that key created it).
+//! For each content, this store pins the sender public key of the first successful unwrap
+//! (TOFU), and afterwards verifies envelopes only with the pinned key.
 //!
-//! 併せて CEK の鍵世代(key_epoch)と、**その世代の CEK 自体**を記録する。
-//! 記録済み世代より古い envelope は拒否する(rotation 後に旧 envelope を
-//! 再送して CEK を巻き戻す replay 攻撃の防止)。
+//! It also records the CEK key generation (key_epoch) and **the CEK of that generation itself**.
+//! Envelopes older than the recorded generation are rejected (prevents replay attacks that
+//! resend an old envelope after a rotation to roll back the CEK).
 //!
-//! ## なぜ CEK をここに置くのか
+//! ## Why the CEK lives here
 //!
-//! 守るべき不変条件は「送信者鍵・世代・CEK の3つ組が常に整合していること」で
-//! あって、世代番号だけではない。3つ組を別ストアに分けて別々に commit すると、
-//! 世代を CAS で守っても次の interleaving で壊れる:
+//! The invariant to protect is "the triple of sender key, generation, and CEK is always
+//! consistent", not just the generation number. If the triple is split across separate stores
+//! and committed separately, it breaks under the following interleaving even if the
+//! generation is protected by CAS:
 //!
-//! 1. epoch N の処理が pin(epoch N-1)を読む
-//! 2. epoch N+1 の処理が pin を N+1 へ進め、新しい CEK を保存する
-//! 3. epoch N の処理が「同一世代の再処理」等の経路で CEK だけを書き戻す
-//! 4. 結果は `pin = N+1, CEK = N` となり、以後の復号が失敗する
+//! 1. The epoch N handler reads the pin (epoch N-1)
+//! 2. The epoch N+1 handler advances the pin to N+1 and saves the new CEK
+//! 3. The epoch N handler writes back only the CEK via a path such as "reprocessing the same
+//!    generation"
+//! 4. The result is `pin = N+1, CEK = N`, and subsequent decryption fails
 //!
-//! 3つ組を1レコードに入れて単一の compare-and-swap で入れ替えれば、この
-//! interleaving は構造的に起こり得ない。CEK ストア側は、この権威レコードから
-//! 導出されるキャッシュとして扱う(書き損じても再処理で回復できる)。
+//! Putting the triple in one record and swapping it with a single compare-and-swap makes this
+//! interleaving structurally impossible. The CEK store is treated as a cache derived from this
+//! authoritative record (a failed write can be recovered by reprocessing).
 //!
-//! キーは受信者から見た(ローカルの) content id。
+//! The key is the content id as seen by the recipient (local).
 
 #[derive(Debug, thiserror::Error)]
 pub enum SenderKeyPinStoreError {
@@ -32,26 +34,27 @@ pub enum SenderKeyPinStoreError {
     Storage(String),
 }
 
-/// ピン留めされた送信者公開鍵と、その送信者から受理した最新の鍵世代・CEK。
+/// The pinned sender public key, and the latest key generation and CEK accepted from that sender.
 ///
-/// この3つは常に同じ commit で入れ替わる。個別に更新してはならない
-/// (モジュール doc の interleaving を参照)。
+/// These three are always swapped in the same commit. They must not be updated individually
+/// (see the interleaving in the module doc).
 #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SenderKeyPin {
-    /// 送信者の公開鍵バイト列(P-256 uncompressed form)。
+    /// Sender public key bytes (P-256 uncompressed form).
     pub sender_public_key: Vec<u8>,
-    /// 最後に unwrap に成功した envelope の key_epoch。
+    /// key_epoch of the last successfully unwrapped envelope.
     pub key_epoch: u64,
-    /// `key_epoch` 世代の CEK。この端末のローカルにのみ存在し、ネットワークには出ない。
+    /// CEK of generation `key_epoch`. Exists only locally on this device and never goes out to
+    /// the network.
     ///
-    /// 旧レコード(CEK を持たない形式)から読んだ場合は `None` になる。
-    /// その場合は次に受理した envelope で埋まる。
+    /// `None` when read from an old record (a format without the CEK).
+    /// In that case it is filled in by the next accepted envelope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cek: Option<Vec<u8>>,
 }
 
-/// CEK を含むため、`Debug` は鍵素材を出さない。ログや panic メッセージに
-/// レコードが載っても CEK が漏れないようにする。
+/// Contains the CEK, so `Debug` does not print key material. This keeps the CEK from leaking
+/// even if the record ends up in logs or panic messages.
 impl std::fmt::Debug for SenderKeyPin {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SenderKeyPin")
@@ -65,18 +68,18 @@ impl std::fmt::Debug for SenderKeyPin {
     }
 }
 
-/// `content_id -> (送信者公開鍵, 最終受理 key_epoch, その世代の CEK)` の永続化ポート。
+/// Persistence port for `content_id -> (sender public key, last accepted key_epoch, that epoch's CEK)`.
 pub trait SenderKeyPinStore: Send + Sync {
     fn load(&self, content_id: &str) -> Result<Option<SenderKeyPin>, SenderKeyPinStoreError>;
     fn save(&self, content_id: &str, pin: &SenderKeyPin) -> Result<(), SenderKeyPinStoreError>;
 
-    /// compare-and-advance: 現在値が `expected` と一致する場合のみ `pin` へ進める。
-    /// 戻り値は「進めたかどうか」。
+    /// compare-and-advance: advances to `pin` only if the current value equals `expected`.
+    /// Returns "whether it advanced".
     ///
-    /// envelope の並行処理(rotation 前後の epoch N / N+1 が同時に走る等)で、
-    /// 「load した時点の pin」を前提に無条件 save すると、後から完了した古い
-    /// epoch が新しいレコードを巻き戻せる。3つ組は1レコードなので、この CAS が
-    /// 成功した時点で送信者鍵・世代・CEK は一括で入れ替わっている。
+    /// With concurrent envelope processing (e.g. epochs N / N+1 around a rotation running at the
+    /// same time), an unconditional save based on "the pin as of load" would let an older epoch
+    /// that completes later roll back the newer record. The triple is a single record, so once
+    /// this CAS succeeds the sender key, generation, and CEK have all been swapped at once.
     fn compare_and_save(
         &self,
         content_id: &str,

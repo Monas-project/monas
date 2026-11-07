@@ -29,12 +29,12 @@ struct AppState {
 
 #[tokio::main]
 async fn main() {
-    // monas-sdk側でもenvを見るが、ここで明示的に読むことで挙動が分かりやすくなる
+    // monas-sdk also reads the env, but reading it explicitly here makes the behavior clearer
     let state_node_url =
         std::env::var("MONAS_STATE_NODE_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".into());
 
-    // 本番運用は MONAS_PERSISTENCE_DIR を必ず設定する。未設定時は in-memory にフォールバックし、
-    // SDK 側で stderr に警告が出る (署名鍵・CEK・share が再起動で揮発する)。
+    // Production must always set MONAS_PERSISTENCE_DIR. If unset, it falls back to in-memory and
+    // the SDK prints a warning to stderr (the signing key, CEK, and shares are lost on restart).
     let mut config = MonasConfig::new(state_node_url);
     if let Ok(dir) = std::env::var("MONAS_PERSISTENCE_DIR") {
         config = config.with_persistence_dir(dir);
@@ -87,7 +87,7 @@ async fn health() -> StatusCode {
     StatusCode::OK
 }
 
-/// 署名アカウントを作る(既存の署名鍵は置き換わる)。利用者の操作でだけ呼ばれる。
+/// Creates the signing account (replaces any existing signing key). Called only by user action.
 async fn create_signing_account(
     State(state): State<AppState>,
 ) -> (
@@ -220,8 +220,8 @@ async fn revoke_share(
     )
 }
 
-/// 既存共有先の権限を read ⇄ write で変更する。降格(write → read)では
-/// State Node の Token 失効を伴うので、revoke と同じく署名ヘッダが要る。
+/// Changes an existing recipient's permission between read ⇄ write. Demotion (write → read)
+/// involves revoking the token on the State Node, so it requires signature headers like revoke.
 async fn update_share_permission(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -255,8 +255,8 @@ async fn decrypt_shared_content(
     )
 }
 
-/// 共有を受けた側の書き込み。`Authorization: Bearer <委譲 Token>` が必須で、
-/// gateway は自分の account 鍵で署名して State Node に転送する。
+/// Write by the share recipient. `Authorization: Bearer <delegated token>` is required, and
+/// the gateway signs with its own account key and forwards to the State Node.
 async fn update_shared_content(
     State(state): State<AppState>,
     Path(id): Path<String>,

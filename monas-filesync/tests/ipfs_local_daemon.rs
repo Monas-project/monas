@@ -9,7 +9,7 @@ use multihash::Multihash;
 use sha2::{Digest, Sha256};
 
 fn raw_block_cid_v1_sha2_256(data: &[u8]) -> String {
-    // IPFS `block put --format=raw --mhtype=sha2-256` と同じCIDを生成する。
+    // Produce the same CID as IPFS `block put --format=raw --mhtype=sha2-256`.
     // multicodec: raw (0x55)
     // multihash code: sha2-256 (0x12)
     let digest = Sha256::digest(data);

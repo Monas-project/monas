@@ -15,7 +15,8 @@ use std::time::Duration;
 mod support;
 use support::{acquire_test_lock, cleanup_content_artifacts};
 
-/// テストの固定 timestamp をそのまま使えるよう、skew 許容を十分広げた controller。
+/// A controller with the skew tolerance widened enough that the tests' fixed timestamps can be
+/// used as-is.
 fn controller_with_wide_skew(state_node_url: String) -> MonasController {
     let config = MonasConfig::new(state_node_url)
         .with_request_timestamp_skew(Duration::from_secs(60 * 60 * 24 * 365 * 100));
@@ -28,7 +29,8 @@ fn controller_with_wide_skew(state_node_url: String) -> MonasController {
     controller
 }
 
-/// 署名アカウントを作った controller(既定の skew)。SDK は自分では署名鍵を作らない。
+/// A controller with a signing account created (default skew). The SDK does not create signing
+/// keys on its own.
 fn controller_with_account(state_node_url: String) -> MonasController {
     let controller = MonasController::with_state_node_url(state_node_url);
     controller
@@ -433,13 +435,15 @@ async fn revoke_share_rolls_back_local_state_when_state_node_sync_fails() {
     cleanup_content_artifacts();
 }
 
-/// §3: `share_service.revoke_share` の内部エラーでも snapshot が復元されることを検証。
+/// §3: Verifies that the snapshot is restored even on an internal error in
+/// `share_service.revoke_share`.
 ///
-/// 同じ recipient に対して revoke_share を 2 回呼び出す。1 回目は ACL から recipient を除去して
-/// 成功する。2 回目は recipient が既に ACL に無いため `share.revoke` が失敗
-/// (`ShareApplicationError::Share`) するが、以前はこの経路で snapshot 復元が呼ばれなかった。
-/// 本 PR 以降は失敗時も snapshot が復元され、後続の decrypt_shared_content や
-/// 正常系の処理に悪影響がない（残った状態が pre-revoke と一致する）ことを確認する。
+/// Calls revoke_share twice for the same recipient. The first call removes the recipient from the
+/// ACL and succeeds. The second call fails in `share.revoke` (`ShareApplicationError::Share`)
+/// because the recipient is no longer in the ACL; previously snapshot restoration was not invoked
+/// on this path. From this PR on, the snapshot is restored on failure as well; this checks that
+/// subsequent decrypt_shared_content and normal-path processing are not adversely affected (the
+/// remaining state matches pre-revoke).
 #[tokio::test(flavor = "multi_thread")]
 async fn revoke_share_rollback_fires_on_inner_share_service_error() {
     let _guard = acquire_test_lock();
@@ -451,7 +455,7 @@ async fn revoke_share_rollback_fires_on_inner_share_service_error() {
         .with_body(r#"{"content_id":"share-test-remote"}"#)
         .create_async()
         .await;
-    // 1 回目の revoke で PUT が 1 回走る想定
+    // Expect the PUT to run once for the first revoke
     let first_update_mock = server
         .mock("PUT", mockito::Matcher::Regex(r"^/content/.+$".to_string()))
         .with_status(200)
@@ -502,7 +506,7 @@ async fn revoke_share_rollback_fires_on_inner_share_service_error() {
         })
         .data
         .expect("share");
-    // 1 回目: 成功
+    // First: succeeds
     let first = controller.revoke_share(
         RevokeShareInput {
             file_id: created.file_id.clone(),
@@ -520,9 +524,9 @@ async fn revoke_share_rollback_fires_on_inner_share_service_error() {
     );
     first_update_mock.assert();
 
-    // 2 回目: ACL に recipient が既に無いので share_service.revoke_share で失敗する。
-    // 追加したロールバック経路が発火することを、このテストはコードパスとしてカバーする
-    // (panic/deadlock せず、失敗として返ることを検証)。
+    // Second: the recipient is no longer in the ACL, so share_service.revoke_share fails.
+    // This test covers, as a code path, that the added rollback path fires
+    // (verifying it returns as a failure without panicking/deadlocking).
     let second = controller.revoke_share(
         RevokeShareInput {
             file_id: created.file_id,
@@ -545,10 +549,10 @@ async fn revoke_share_rollback_fires_on_inner_share_service_error() {
     cleanup_content_artifacts();
 }
 
-/// State Node 連携ありの revoke は、CEK ローテーションの前に
-/// `POST /content/:id/access/invalidate` を呼んで既発行 Token を失効させる
-/// (docs/design.md「アクセス取り消し」)。これが無いと、取り消した相手の委譲
-/// write Token が TTL 満了まで有効なまま残り、新しい状態へ書き込み続けられる。
+/// A revoke with State Node integration calls `POST /content/:id/access/invalidate` before the
+/// CEK rotation to revoke already-issued tokens (the access revocation section of
+/// docs/design.md). Without this, the revoked party's delegated write token stays valid until its TTL
+/// expires, and they can keep writing to the new state.
 #[tokio::test(flavor = "multi_thread")]
 async fn revoke_share_invalidates_previously_issued_tokens() {
     let _guard = acquire_test_lock();
@@ -563,7 +567,8 @@ async fn revoke_share_invalidates_previously_issued_tokens() {
         .await;
     let invalidate_mock = state_node
         .mock("POST", "/content/invalidate-remote/access/invalidate")
-        // 認証ヘッダは SDK 内の署名鍵から作る。呼び出し元の Bearer は置き換わる。
+        // The auth header is built from the signing key inside the SDK. The caller's Bearer is
+        // replaced.
         .match_header(
             "x-request-signature",
             mockito::Matcher::Regex(r"^[A-Za-z0-9+/]+=*$".into()),
@@ -667,10 +672,11 @@ async fn revoke_share_invalidates_previously_issued_tokens() {
     cleanup_content_artifacts();
 }
 
-/// 失効に失敗したら revoke 全体を失敗させる。ここで握りつぶすと
-/// 「CEK はローテーションされたが Token は生きている」中途半端な状態になり、
-/// 呼び出し側はそれを知らないまま revoke 成功と受け取ってしまう。
-/// 失効はローカル状態を触る前なので、巻き戻しは不要（共有は元のまま有効）。
+/// If the revocation fails, the whole revoke fails. Swallowing it here would leave a half-done
+/// state of "the CEK was rotated but the token is still alive", and the caller would take it as
+/// a successful revoke without knowing that.
+/// The revocation happens before local state is touched, so no rollback is needed (the share
+/// remains valid as before).
 #[tokio::test(flavor = "multi_thread")]
 async fn revoke_share_fails_when_token_invalidation_fails() {
     let _guard = acquire_test_lock();
@@ -691,7 +697,7 @@ async fn revoke_share_fails_when_token_invalidation_fails() {
         .expect(1)
         .create_async()
         .await;
-    // 失効が失敗した以上、再暗号化した ciphertext を送ってはいけない。
+    // Since the revocation failed, the re-encrypted ciphertext must not be sent.
     let update_mock = state_node
         .mock("PUT", "/content/invalidate-fail-remote")
         .with_status(200)
@@ -759,7 +765,7 @@ async fn revoke_share_fails_when_token_invalidation_fails() {
     );
     invalidate_mock.assert();
     update_mock.assert();
-    // ローカル状態は一切触っていないので、元の共有はそのまま復号できる。
+    // Local state was not touched at all, so the original share can still be decrypted.
     let get_shared = controller.decrypt_shared_content(DecryptSharedContentInput {
         content_id: created.content_id.clone(),
         remote_content_id: None,
@@ -778,13 +784,12 @@ async fn revoke_share_fails_when_token_invalidation_fails() {
     cleanup_content_artifacts();
 }
 
-/// 同じ content への revoke が並行しても、両方の受信者削除が残る。
+/// Even when revokes on the same content run concurrently, both recipient removals persist.
 ///
-/// revoke は ACL・CEK・ローカル ciphertext・state node 状態にまたがる
-/// load-modify-save で、どこにも version CAS が無い。直列化しないと 2 つの
-/// revoke が同じ Share を読んで後勝ちで save し、片方の削除が消える
-/// (lost update)。`MonasController` は gateway から `Arc` 共有されるので、
-/// これは理論上の話ではない。
+/// revoke is a load-modify-save spanning the ACL, CEK, local ciphertext, and state node state,
+/// with no version CAS anywhere. Without serialization, two revokes read the same Share and save
+/// last-writer-wins, and one of the removals is lost (lost update). `MonasController` is shared
+/// via `Arc` from the gateway, so this is not merely theoretical.
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_revokes_do_not_lose_either_removal() {
     let _guard = acquire_test_lock();
@@ -856,7 +861,7 @@ async fn concurrent_revokes_do_not_lose_either_removal() {
         );
     }
 
-    // 2 つの受信者を同時に revoke する
+    // Revoke two recipients at the same time
     let handles: Vec<_> = [&recipient_a, &recipient_b]
         .into_iter()
         .map(|recipient| {
@@ -865,8 +870,8 @@ async fn concurrent_revokes_do_not_lose_either_removal() {
             let sender_public_key = sender.public_key.clone();
             let sender_private_key = sender.private_key.clone();
             let recipient_public_key = recipient.public_key.clone();
-            // filesync repository が Tokio reactor を要求するので、素の
-            // std::thread ではなく blocking task として走らせる。
+            // The filesync repository requires a Tokio reactor, so run it as a
+            // blocking task rather than a bare std::thread.
             tokio::task::spawn_blocking(move || {
                 controller.revoke_share(
                     RevokeShareInput {
@@ -891,8 +896,8 @@ async fn concurrent_revokes_do_not_lose_either_removal() {
         );
     }
 
-    // どちらの受信者も復号できない = 両方の削除が残っている。
-    // 片方の削除が lost update で消えていれば、その受信者は復号できてしまう。
+    // Neither recipient can decrypt = both removals persisted.
+    // If one removal had been lost to a lost update, that recipient would be able to decrypt.
     for (label, recipient) in [("a", &recipient_a), ("b", &recipient_b)] {
         let shared_again = controller.share_content(ShareContentInput {
             file_id: created.file_id.clone(),
@@ -912,11 +917,12 @@ async fn concurrent_revokes_do_not_lose_either_removal() {
     cleanup_content_artifacts();
 }
 
-/// revoke は残存受信者の Token も失効させる(`min_valid_issued_at` が進む)ので、
-/// 再発行 envelope には境界より後の iat を持つ Token を同梱する。境界と同じ秒に
-/// 発行してしまったら次の秒まで待って発行し直す — 同じ秒の Token は State Node の
-/// `iat > min_valid_issued_at` で生まれた瞬間から無効なので。境界を「今」にして、
-/// 最初の発行が必ず境界以下になるようにする。
+/// revoke also revokes the remaining recipients' tokens (`min_valid_issued_at` advances), so the
+/// reissued envelope bundles a token whose iat is after the boundary. If it was issued in the same
+/// second as the boundary, wait until the next second and reissue — because under the State
+/// Node's `iat > min_valid_issued_at`, a token from the same second is invalid from the moment
+/// it is created. The boundary is set to "now" so that the first issuance is always at or below
+/// the boundary.
 #[tokio::test(flavor = "multi_thread")]
 async fn revoke_reissues_a_valid_token_for_each_surviving_recipient() {
     let _guard = acquire_test_lock();
@@ -1029,9 +1035,9 @@ async fn revoke_reissues_a_valid_token_for_each_surviving_recipient() {
     cleanup_content_artifacts();
 }
 
-/// 共有 ACL は版IDに紐づく。編集で版IDが変わっても引き継がれなければ、編集後に
-/// 別の受信者を revoke したとき、編集前からの受信者は CEK ローテーションから
-/// 締め出される(envelope も Token も再発行されない)。
+/// The share ACL is tied to the version ID. If it were not carried over when an edit changes the
+/// version ID, then when another recipient is revoked after the edit, recipients from before the
+/// edit would be locked out of the CEK rotation (neither an envelope nor a token is reissued).
 #[tokio::test(flavor = "multi_thread")]
 async fn share_acl_survives_an_edit_so_a_later_revoke_reissues_to_earlier_recipients() {
     let _guard = acquire_test_lock();
@@ -1158,7 +1164,7 @@ async fn share_acl_survives_an_edit_so_a_later_revoke_reissues_to_earlier_recipi
 // update_share_permission
 // ============================================
 
-/// JWT の payload から capability 名(`read` / `write`)を取り出す。
+/// Extracts the capability name (`read` / `write`) from a JWT payload.
 fn token_capabilities(jwt: &str) -> Vec<String> {
     let payload = jwt.split('.').nth(1).expect("jwt payload");
     let bytes = URL_SAFE_NO_PAD.decode(payload).expect("payload base64url");
@@ -1179,7 +1185,7 @@ struct PermissionFixture {
     other: monas_sdk::models::keypair::GenerateKeypairOutput,
 }
 
-/// `target` を `initial` 権限で、`other` を read で共有した状態を作る。
+/// Sets up a state where `target` is shared with the `initial` permission and `other` with read.
 async fn permission_fixture(
     state_node: &mut mockito::ServerGuard,
     initial: Permission,
@@ -1236,8 +1242,9 @@ async fn permission_fixture(
     }
 }
 
-/// 同じ相手への再共有は「権限を変更して」と分かる 409 で返す(以前は 500 の
-/// `Share domain error: AlreadyShared` で、UI は "Share failed" としか出せなかった)。
+/// Re-sharing to the same party returns a 409 that makes clear "change the permission instead"
+/// (previously it was a 500 `Share domain error: AlreadyShared`, and the UI could only show
+/// "Share failed").
 #[tokio::test(flavor = "multi_thread")]
 async fn resharing_to_an_existing_recipient_is_a_conflict() {
     let _guard = acquire_test_lock();
@@ -1260,8 +1267,8 @@ async fn resharing_to_an_existing_recipient_is_a_conflict() {
     cleanup_content_artifacts();
 }
 
-/// 昇格(read → write): revoke せずに通る。Token 失効も CEK ローテーションも
-/// しない(state node へは何も送らない)。新しい Token は write を持つ。
+/// Promotion (read → write): goes through without a revoke. Neither token revocation nor CEK
+/// rotation happens (nothing is sent to the state node). The new token has write.
 #[tokio::test(flavor = "multi_thread")]
 async fn upgrading_read_to_write_reissues_a_write_token_without_rotation() {
     let _guard = acquire_test_lock();
@@ -1299,9 +1306,9 @@ async fn upgrading_read_to_write_reissues_a_write_token_without_rotation() {
     invalidate_mock.assert();
     put_mock.assert();
 
-    // 変更は ACL に残る: もう一度 write を求めると「変わらない要求」として
-    // 扱われ、他の受信者の Token が返る。ACL が read のままなら昇格と判定され、
-    // 他の受信者分は空になる。
+    // The change persists in the ACL: asking for write again is treated as an "unchanged request",
+    // and the other recipients' tokens are returned. If the ACL were still read, it would be
+    // judged a promotion and the other recipients' part would be empty.
     let again = f.controller.update_share_permission(
         UpdateSharePermissionInput {
             file_id: f.file_id.clone(),
@@ -1326,9 +1333,9 @@ async fn upgrading_read_to_write_reissues_a_write_token_without_rotation() {
     cleanup_content_artifacts();
 }
 
-/// 降格(write → read): 受信者の手元の write Token を止めるため境界を進める。
-/// 新しい Token は read のみで境界より後の iat。巻き添えで失効した他の
-/// 受信者にも各自の権限で Token を発行し直す。CEK は回さない(PUT なし)。
+/// Demotion (write → read): advances the boundary to stop the write token the recipient holds.
+/// The new token is read-only with an iat after the boundary. Other recipients revoked as
+/// collateral are also reissued tokens with their own permissions. The CEK is not rotated (no PUT).
 #[tokio::test(flavor = "multi_thread")]
 async fn downgrading_write_to_read_invalidates_and_reissues_tokens() {
     let _guard = acquire_test_lock();
@@ -1390,9 +1397,9 @@ async fn downgrading_write_to_read_invalidates_and_reissues_tokens() {
     );
     assert_eq!(out.reissued_tokens[0].recipient_key_id, key_id_of(&f.other));
 
-    // 変更は ACL に残る: もう一度 read を求めても降格ではないので、境界は
-    // 進めない(invalidate は 1 回のまま)。ACL が write のままなら 2 回目の
-    // 降格として invalidate が呼ばれる。
+    // The change persists in the ACL: asking for read again is not a demotion, so the boundary is
+    // not advanced (invalidate stays at 1 call). If the ACL were still write, invalidate would be
+    // called as a second demotion.
     let again = f.controller.update_share_permission(
         UpdateSharePermissionInput {
             file_id: f.file_id.clone(),
@@ -1408,7 +1415,8 @@ async fn downgrading_write_to_read_invalidates_and_reissues_tokens() {
     cleanup_content_artifacts();
 }
 
-/// 共有していない相手の権限変更は 404(黙って新規共有にはしない)。
+/// Changing the permission of a party not shared with returns 404 (it does not silently create
+/// a new share).
 #[tokio::test(flavor = "multi_thread")]
 async fn updating_permission_of_an_unshared_key_is_not_found() {
     let _guard = acquire_test_lock();
@@ -1438,9 +1446,10 @@ async fn updating_permission_of_an_unshared_key_is_not_found() {
     cleanup_content_artifacts();
 }
 
-/// 降格で失効させた後に対象者の Token 発行が失敗したら、ACL を write へ戻す。
-/// 戻さないと、再試行は「read → read」と判定されて失効も他受信者への再発行も
-/// せず、最初の失効で無効になった他受信者の Token が返らないまま残る。
+/// If issuing the target's token fails after the demotion's revocation, the ACL is reverted to
+/// write. Otherwise a retry is judged "read → read" and performs neither the revocation nor the
+/// reissue to other recipients, so the other recipients' tokens invalidated by the first
+/// revocation are never returned.
 #[tokio::test(flavor = "multi_thread")]
 async fn downgrade_retry_after_token_issuance_failure_still_reissues_other_tokens() {
     let _guard = acquire_test_lock();
@@ -1450,7 +1459,8 @@ async fn downgrade_retry_after_token_issuance_failure_still_reissues_other_token
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    // 境界が SDK の時計より 60 秒先: 待ち上限を超えるので Token 発行が失敗する。
+    // The boundary is 60 seconds ahead of the SDK's clock: this exceeds the wait limit, so token
+    // issuance fails.
     let skewed = state_node
         .mock("POST", "/content/perm-remote/access/invalidate")
         .with_status(200)
@@ -1509,10 +1519,11 @@ async fn downgrade_retry_after_token_issuance_failure_still_reissues_other_token
 }
 
 // ============================================
-// 本文を以前と同じ内容に戻したとき(plainCid が過去と同じになる)
+// When the body is reverted to the same content as before (plainCid matches a past one)
 // ============================================
 
-/// 受信者の KeyId(base64url)。SDK の出力と同じ計算(公開鍵の SHA-256 先頭 16 byte)。
+/// The recipient's KeyId (base64url). Same computation as the SDK output (first 16 bytes of the
+/// public key's SHA-256).
 fn key_id_of(kp: &monas_sdk::models::keypair::GenerateKeypairOutput) -> String {
     use sha2::{Digest, Sha256};
     let pk = URL_SAFE_NO_PAD.decode(&kp.public_key).unwrap();
@@ -1521,17 +1532,17 @@ fn key_id_of(kp: &monas_sdk::models::keypair::GenerateKeypairOutput) -> String {
 
 struct RevertFixture {
     controller: MonasController,
-    /// ファイルのキー(owner 側の操作の対象)
+    /// The file's key (target of owner-side operations)
     file_id: String,
-    /// 作成時の版の plainCid
+    /// plainCid of the version at creation
     created_id: String,
     sender: monas_sdk::models::keypair::GenerateKeypairOutput,
     bob: monas_sdk::models::keypair::GenerateKeypairOutput,
     carol: monas_sdk::models::keypair::GenerateKeypairOutput,
 }
 
-/// 本文 "body A" で作成し、Bob と Carol に `initial` で共有した状態を作る。
-/// state node は作成・更新・失効をすべて受け付ける。
+/// Sets up a state created with body "body A" and shared to Bob and Carol with `initial`.
+/// The state node accepts all creates, updates, and revocations.
 async fn revert_fixture(
     state_node: &mut mockito::ServerGuard,
     initial: Permission,
@@ -1608,7 +1619,7 @@ async fn revert_fixture(
 }
 
 impl RevertFixture {
-    /// 本文を編集し、新しい版の plainCid を返す。
+    /// Edits the body and returns the new version's plainCid.
     fn edit(&self, body: &[u8]) -> String {
         self.controller
             .update_content(
@@ -1661,12 +1672,13 @@ impl RevertFixture {
     }
 }
 
-/// 降格のあとに本文を元に戻しても、降格は戻らない。
+/// Reverting the body after a demotion does not undo the demotion.
 ///
-/// 共有設定を plainCid ごとに持っていた頃は、本文を "body A" に戻すと plainCid が
-/// 作成時と同じになり、作成時の plainCid に残っていた「Bob = write」を拾っていた。
-/// 今は共有設定をファイルのキーで 1 件だけ持つ。
-/// その状態で Carol を降格すると、巻き添えで再発行される Bob の Token が write になる。
+/// Back when share settings were held per plainCid, reverting the body to "body A" made the
+/// plainCid the same as at creation, and the "Bob = write" left on the creation-time plainCid was
+/// picked up.
+/// Now share settings are held as a single entry under the file's key.
+/// In that state, demoting Carol would make Bob's collaterally reissued token write.
 #[tokio::test(flavor = "multi_thread")]
 async fn reverting_the_body_does_not_revive_a_downgraded_recipients_write() {
     let _guard = acquire_test_lock();
@@ -1697,11 +1709,12 @@ async fn reverting_the_body_does_not_revive_a_downgraded_recipients_write() {
     cleanup_content_artifacts();
 }
 
-/// 取り消しのあとに本文を元に戻しても、取り消した相手は共有先に戻らない。
+/// Reverting the body after a revocation does not bring the revoked party back as a share
+/// recipient.
 ///
-/// plainCid ごとの共有設定では、戻した plainCid に残っていた「Bob と Carol」を
-/// 拾うので、続けて Bob を取り消すと、取り消し済みの Carol に新しい CEK の
-/// envelope が再発行されていた(読めなくしたはずの相手が再び読める)。
+/// With per-plainCid share settings, the "Bob and Carol" left on the reverted plainCid was picked
+/// up, so revoking Bob next reissued an envelope for the new CEK to the already-revoked Carol
+/// (a party that should have been cut off could read again).
 #[tokio::test(flavor = "multi_thread")]
 async fn reverting_the_body_does_not_reissue_to_a_revoked_recipient() {
     let _guard = acquire_test_lock();
@@ -1726,10 +1739,11 @@ async fn reverting_the_body_does_not_reissue_to_a_revoked_recipient() {
     cleanup_content_artifacts();
 }
 
-/// 降格の成功応答を失った(タイムアウト・タブの再読み込み)あとに同じ降格を
-/// やり直しても、他の受信者の再発行 Token が返る。1 回目の降格で失効境界は
-/// 進んでいて、他の受信者の古い Token はもう使えないので、返らないと
-/// その人たちのアクセスを戻す手段がない。やり直しで失効は繰り返さない。
+/// Even when the same demotion is retried after its success response was lost (timeout, tab
+/// reload), the other recipients' reissued tokens are returned. The first demotion already
+/// advanced the revocation boundary, and the other recipients' old tokens can no longer be used,
+/// so without them there is no way to restore those people's access. The retry does not repeat
+/// the revocation.
 #[tokio::test(flavor = "multi_thread")]
 async fn retrying_a_downgrade_whose_response_was_lost_still_reissues_other_tokens() {
     let _guard = acquire_test_lock();
@@ -1782,8 +1796,8 @@ async fn retrying_a_downgrade_whose_response_was_lost_still_reissues_other_token
     cleanup_content_artifacts();
 }
 
-/// 降格は古い write Token を止めるために State Node の失効境界を進める。
-/// State Node に届けられない(auth 無し)なら、止めずに成功を返さない。
+/// Demotion advances the State Node's revocation boundary to stop old write tokens.
+/// If it cannot reach the State Node (no auth), it does not return success without stopping them.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_downgrade_without_state_node_auth_is_refused() {
     let _guard = acquire_test_lock();

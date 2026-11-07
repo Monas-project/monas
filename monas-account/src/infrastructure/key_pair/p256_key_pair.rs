@@ -27,7 +27,7 @@ impl P256KeyPair {
         }
     }
 
-    /// 永続化された鍵バイト列から P256KeyPair を復元する。
+    /// Restores a P256KeyPair from persisted key bytes.
     pub fn from_key_bytes(
         public_key: &[u8],
         secret_key_bytes: &[u8],

@@ -547,10 +547,10 @@ where
             )
         })?;
 
-        // 署名対象は body の有無・トークン種別によらず同一構造で、
-        // operation と resource に必ず束縛される。body がある場合はその digest も
-        // 含める。これがないと、ある content 向けに取得した update の
-        // body+署名を別 content や create へ転用できてしまう。
+        // The signed message has the same structure regardless of body presence or token type,
+        // and is always bound to operation and resource. If there is a body, its digest is
+        // included too. Without this, the body+signature of an update obtained for one
+        // content could be reused for another content or for create.
         let message = Self::build_signing_message(operation, resource, ts, request_body);
 
         auth_service
@@ -1056,7 +1056,7 @@ where
         let content_id_vo = ContentId::new(content_id.to_string())?;
         // Return the whole crsl-lib Node (CBOR), not just the payload, so the
         // client can recompute the CID and verify the response was not
-        // tampered with (docs/design.md §10「read応答の完全性検証」).
+        // tampered with (docs/design.md §10 "read response integrity verification").
         match version {
             Some(v) => {
                 let node_bytes = self
@@ -1664,9 +1664,9 @@ where
                 return Err(StateNodeError::ContentNotFound(content_id_vo.clone()));
             }
 
-            // 転送前にこのノードでも署名を消費する。member 側だけで消費すると、
-            // 同じ署名を relay へ送り直すたびに「まだ見ていない member」へ
-            // 振り分けられて再適用できてしまう。
+            // Consume the signature on this node too before forwarding. If only the member
+            // consumes it, every resend of the same signature to the relay gets routed to a
+            // "member that hasn't seen it yet" and can be re-applied.
             self.consume_relayed_mutation_signature(
                 token,
                 request_signature,
@@ -1853,9 +1853,9 @@ where
                 return Err(StateNodeError::ContentNotFound(content_id_vo.clone()));
             }
 
-            // 転送前にこのノードでも署名を消費する。member 側だけで消費すると、
-            // 同じ署名を relay へ送り直すたびに「まだ見ていない member」へ
-            // 振り分けられて再適用できてしまう。
+            // Consume the signature on this node too before forwarding. If only the member
+            // consumes it, every resend of the same signature to the relay gets routed to a
+            // "member that hasn't seen it yet" and can be re-applied.
             self.consume_relayed_mutation_signature(
                 token,
                 request_signature,
@@ -2112,10 +2112,10 @@ where
                 return Err(StateNodeError::ContentNotFound(content_id_vo.clone()));
             }
 
-            // NOTE: invalidate は local / relay の分岐より前に
-            // `verify_and_consume_mutation_signature` を通しているので、
-            // ここで改めて消費する必要はない(するとこのノード自身の
-            // 1 回目の転送が 409 になる)。
+            // NOTE: invalidate already goes through
+            // `verify_and_consume_mutation_signature` before the local / relay branch,
+            // so it must not be consumed again here (doing so would make this node's own
+            // first forward return 409).
             //
             // Resolve members from our local record, or via DHT discovery when
             // we hold no record (bug #93), then relay with failover.
@@ -3132,8 +3132,8 @@ where
             Some(&update.signing_message()),
         )
         .await
-        // 再送の拒否は偽造の拒否と区別する。潰してしまうと、運用者は
-        // 「攻撃された」のか「正規リクエストが二重に届いた」のか判断できない。
+        // Distinguish replay rejection from forgery rejection. If collapsed, operators cannot
+        // tell whether they were "attacked" or a "legitimate request arrived twice".
         .map_err(|e| match e {
             StateNodeError::RequestAlreadyApplied(_) => AccessControlError::AlreadyApplied,
             _ => AccessControlError::InvalidSignature,
@@ -3273,8 +3273,8 @@ mod tests {
         vec![0x01]
     }
 
-    /// timestamp は署名検証で構造的に必須(issue #61)。mock 認証でも
-    /// 存在チェックは実コードを通るため、現在時刻を渡す。
+    /// timestamp is structurally required for signature verification (issue #61). Even with
+    /// mock auth the presence check runs through real code, so pass the current time.
     fn test_timestamp() -> Option<u64> {
         Some(
             std::time::SystemTime::now()
@@ -3385,9 +3385,9 @@ mod tests {
         }
     }
 
-    /// timestamp が無いリクエストは署名検証に到達する前に拒否される
-    /// (issue #61: freshness は署名内 timestamp が担うため、欠如は
-    /// サーバ時刻へのフォールバックではなく認証エラー)。
+    /// Requests without a timestamp are rejected before reaching signature verification
+    /// (issue #61: freshness is carried by the in-signature timestamp, so its absence is an
+    /// authentication error rather than a fallback to server time).
     #[tokio::test]
     async fn test_create_content_requires_timestamp() {
         let mut capacities = HashMap::new();
@@ -4023,11 +4023,11 @@ mod tests {
         ));
     }
 
-    /// 未証明の DHT 候補が返した 401/403 で member loop を打ち切ってはいけない。
-    /// 打ち切ると、DHT キーの近くに Peer ID を置いた 1 台が 403 を返すだけで
-    /// あらゆる read を止められる(可用性への攻撃)。正規 member でも policy の
-    /// 複製が終わっていなければ 403 を返し得るので、健全なレプリカへの failover
-    /// を潰さないためにも継続する必要がある。
+    /// A 401/403 from an unproven DHT candidate must not abort the member loop.
+    /// Aborting would let a single node that placed its Peer ID near the DHT key stop
+    /// every read just by returning 403 (an availability attack). Even a legitimate member
+    /// may return 403 if policy replication hasn't finished, so we must also continue in
+    /// order not to break failover to healthy replicas.
     #[test]
     fn unproven_peer_auth_verdict_does_not_stop_failover() {
         use crate::port::peer_network::{RelayReadError, RelayReadErrorKind};
@@ -4045,20 +4045,20 @@ mod tests {
                 kind: RelayReadErrorKind::AuthorizationFailed,
                 message: "fabricated 403".to_string(),
             },
-            false, // 未証明の候補
+            false, // unproven candidate
         );
         assert!(
             matches!(flow, ControlFlow::Continue(())),
             "an unproven peer's verdict must not end the loop"
         );
-        // ただし答えとしては保持する(次の候補が何も返さなければこれを返す)
+        // However, keep it as the answer (return it if no later candidate returns anything)
         assert!(matches!(
             best.as_ref().map(|b| b.kind),
             Some(RelayReadErrorKind::AuthorizationFailed)
         ));
 
-        // 後続候補の NotFound で auth verdict を上書きしない。
-        // 上書きすると「拒否された」が「存在しない」に化ける。
+        // Do not overwrite the auth verdict with a later candidate's NotFound.
+        // Overwriting would turn "rejected" into "does not exist".
         let flow = StateNodeService::<
             MockNodeRegistry,
             MockContentNetworkRepository,
@@ -4080,13 +4080,13 @@ mod tests {
         ));
     }
 
-    /// `record_relay_read_error` は「権威あり」と言われれば打ち切る。
+    /// `record_relay_read_error` aborts when told the verdict is "authoritative".
     ///
-    /// ただし現在この `true` を渡す呼び出し側は無い
-    /// ([`ResolvedMembers::auth_verdict_is_authoritative`] は常に false)。
-    /// レコード自体が最初の 1 通で植え付けられる間は、そこに載った peer の
-    /// 403 も最終判断にはできないためである。owner 署名付き membership
-    /// (#63)が入れば早期打ち切りを戻せるので、その配線だけは残してある。
+    /// However, no caller currently passes `true`
+    /// ([`ResolvedMembers::auth_verdict_is_authoritative`] is always false).
+    /// While the record itself is planted by the first message, a 403 from a peer listed in it
+    /// cannot be treated as final either. Once owner-signed membership (#63) lands, early abort
+    /// can be restored, so only that wiring is kept.
     #[test]
     fn record_relay_read_error_breaks_when_told_the_verdict_is_authoritative() {
         use crate::port::peer_network::{RelayReadError, RelayReadErrorKind};
@@ -4112,18 +4112,18 @@ mod tests {
         );
     }
 
-    /// 出自は verdict の扱いだけを変え、候補リストそのものは削らない。
+    /// Provenance only changes how the verdict is treated; it does not trim the candidate list.
     ///
-    /// credential は未証明の相手へ渡っても構わない。token は自己完結型 key id
-    /// (公開鍵)か委譲 JWT で、その JWT の `aud` もまた公開鍵であり、認可は
-    /// proof-of-possession だからである — リクエスト署名は `aud` の鍵に対して
-    /// 検証されるので、両方を傍受した相手も秘密鍵を持たない以上、新しい
-    /// リクエストを作れない。傍受した署名自体も操作・リソース・body・timestamp
-    /// に束縛され、mutation はさらに使い切りである。
+    /// It is fine for credentials to reach unproven peers. The token is either a self-contained key
+    /// id (public key) or a delegated JWT whose `aud` is also a public key, and authorization is
+    /// proof-of-possession — the request signature is verified against the `aud` key, so a party
+    /// that intercepts both still cannot build a new request without the private key. An
+    /// intercepted signature is itself bound to operation, resource, body, and timestamp, and
+    /// mutations are additionally single-use.
     ///
-    /// 逆に候補を削ると、正当な member への failover が減って可用性だけが
-    /// 落ちる。DHT 距離順で先頭に来る相手は上限があろうと credential を
-    /// 受け取るので、機密性は何も改善しない。
+    /// Conversely, trimming candidates only reduces failover to legitimate members and hurts
+    /// availability. Whoever comes first in DHT distance order receives the credential regardless
+    /// of any cap, so confidentiality is not improved at all.
     #[test]
     fn candidate_list_is_not_truncated_by_provenance() {
         let many: Vec<String> = (0..10).map(|i| format!("peer-{i}")).collect();
@@ -4141,8 +4141,8 @@ mod tests {
         }
     }
 
-    /// 署名を検証しない認証サービス以外は全部通す mock。
-    /// `bad` と完全一致する署名だけを拒否する。
+    /// Mock auth service that does not verify signatures and lets everything else through.
+    /// Rejects only a signature that exactly matches `bad`.
     struct RejectsOneSignature {
         bad: Vec<u8>,
     }
@@ -4186,14 +4186,14 @@ mod tests {
         }
     }
 
-    /// relay は**署名を検証してから**消費記録を書く。
+    /// The relay writes the consumption record **after verifying the signature**.
     ///
-    /// request id は署名対象メッセージと principal から導かれ、その構成要素
-    /// (操作・リソース・timestamp・body digest・`aud`)は**すべて公開情報**である。
-    /// 検証前に記録すると、鍵も有効な署名も持たない第三者が、対象ユーザーの
-    /// 正規リクエストの id をゴミ署名で先に焼き潰せてしまう —
-    /// body の無い `delete` は現在秒を入れるだけでメッセージが完全に予測でき、
-    /// 毎秒繰り返せばそのユーザーはこの relay 経由で何も更新できなくなる。
+    /// The request id is derived from the signed message and principal, and its components
+    /// (operation, resource, timestamp, body digest, `aud`) are **all public information**.
+    /// Recording before verification would let a third party with neither the key nor a valid
+    /// signature burn the id of the target user's legitimate request in advance with a garbage
+    /// signature — a body-less `delete` is fully predictable from just the current second, and
+    /// repeating it every second would leave that user unable to update anything via this relay.
     #[tokio::test]
     async fn an_invalid_signature_cannot_burn_a_legitimate_request_id() {
         let token = AuthToken::new("user:04aaaa".to_string());
@@ -4213,8 +4213,8 @@ mod tests {
         })
         .with_authorization_service(AllowAllAuthorizationService);
 
-        // 攻撃者が、被害者の principal・対象 content・現在秒で `delete` を
-        // 先回りして送る。署名は持っていないので出鱈目。
+        // The attacker preemptively sends a `delete` with the victim's principal, the target
+        // content, and the current second. They have no signature, so it is garbage.
         let attack = service
             .consume_relayed_mutation_signature(
                 &token,
@@ -4225,10 +4225,10 @@ mod tests {
                 None,
             )
             .await;
-        assert!(attack.is_err(), "無効な署名は拒否されなければならない");
+        assert!(attack.is_err(), "an invalid signature must be rejected");
 
-        // 同じ principal・同じメッセージの正規リクエストが、まだ通ること。
-        // ここが Err になるなら記録が先に書かれている＝ DoS が成立している。
+        // A legitimate request with the same principal and same message must still go through.
+        // If this is Err, the record was written first, i.e. the DoS succeeds.
         service
             .consume_relayed_mutation_signature(
                 &token,
@@ -4239,9 +4239,9 @@ mod tests {
                 None,
             )
             .await
-            .expect("正規リクエストが先取りで潰されてはならない");
+            .expect("a legitimate request must not be burned by preemption");
 
-        // 使い切りそのものは維持されている(2 度目は拒否)。
+        // Single-use itself is still enforced (the second one is rejected).
         let replay = service
             .consume_relayed_mutation_signature(
                 &token,
@@ -4254,22 +4254,22 @@ mod tests {
             .await;
         assert!(
             matches!(replay, Err(StateNodeError::RequestAlreadyApplied(_))),
-            "同じ署名済みリクエストの 2 度目は拒否されなければならない"
+            "a second submission of the same signed request must be rejected"
         );
     }
 
-    /// 委譲 JWT **自身の署名**も malleable である。生のトークン文字列を ID の
-    /// 入力にすると、claims も `aud` も request signature も変えずに `s` を
-    /// 反転するだけで別 ID を作れてしまい、同一ノードでも再適用できる。
+    /// The delegated JWT's **own signature** is also malleable. If the raw token string were an
+    /// input to the ID, flipping `s` without changing the claims, `aud`, or request signature
+    /// would produce a different ID, allowing re-application even on the same node.
     ///
-    /// ID は検証後の canonical principal(`aud` の鍵 ID)から導くので、
-    /// JWT のバイト列が変わっても ID は動かない。
+    /// The ID is derived from the verified canonical principal (the key ID of `aud`), so it
+    /// does not change when the JWT bytes change.
     #[test]
     fn mutation_request_id_ignores_the_jwt_signature_encoding() {
         use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
         use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 
-        // 実物と同じ形の JWT を組み立てる(header.payload を P-256 で署名)。
+        // Build a JWT with the same shape as the real one (sign header.payload with P-256).
         let key = SigningKey::random(&mut p256::elliptic_curve::rand_core::OsRng);
         let header = URL_SAFE_NO_PAD.encode(br#"{"alg":"ES256","typ":"JWT","ver":"1.0"}"#);
         let payload = URL_SAFE_NO_PAD.encode(
@@ -4278,21 +4278,21 @@ mod tests {
         let signing_input = format!("{}.{}", header, payload);
         let sig: Signature = key.sign(signing_input.as_bytes());
 
-        // 同じ鍵・同じメッセージに対して有効な、もう一方の表現。
+        // The other representation, valid for the same key and same message.
         let alt = Signature::from_scalars(*sig.r(), -*sig.s()).unwrap();
 
         let jwt_a = format!("{}.{}", signing_input, URL_SAFE_NO_PAD.encode(sig.to_vec()));
         let jwt_b = format!("{}.{}", signing_input, URL_SAFE_NO_PAD.encode(alt.to_vec()));
         assert_ne!(
             jwt_a, jwt_b,
-            "2 つの表現が同じでは、このテストは何も証明しない"
+            "if the two representations are equal, this test proves nothing"
         );
-        // 実際に JWT として解釈できることを確かめる。ここが失敗すると
-        // `canonical_principal` が raw フォールバックに落ち、両者が別 ID に
-        // なるのを「malleability を防げていない」と誤読してしまう。
+        // Make sure it actually parses as a JWT. If this fails, `canonical_principal` falls
+        // back to raw, and the two getting different IDs would be misread as "malleability is
+        // not prevented".
         assert!(
             crate::infrastructure::auth::auth_token::AuthToken::from_jwt(&jwt_a).is_ok(),
-            "テスト用 JWT が本物のスキーマを満たしていない"
+            "test JWT does not satisfy the real schema"
         );
 
         let msg = StateNodeService::<
@@ -4318,10 +4318,10 @@ mod tests {
         assert_eq!(
             id_of(&jwt_a),
             id_of(&jwt_b),
-            "JWT の署名表現を変えても同じリクエストとして識別されなければならない"
+            "changing the JWT signature encoding must still identify the same request"
         );
 
-        // 別の aud(＝別の principal)なら当然 ID は変わる。
+        // A different aud (i.e. a different principal) naturally changes the ID.
         let other_payload = URL_SAFE_NO_PAD.encode(
             br#"{"iss":"monas:user:alice","aud":"monas:user:carol","jti":"j1","iat":1700000000,"exp":1700003600,"att":[]}"#,
         );
@@ -4335,14 +4335,14 @@ mod tests {
         assert_ne!(
             id_of(&jwt_a),
             id_of(&jwt_c),
-            "aud が違えば別 principal なので ID も別でなければならない"
+            "a different aud is a different principal, so the ID must differ too"
         );
     }
 
-    /// mutation の同一性は「署名バイト列」ではなく「署名対象メッセージ + signer」
-    /// から導く。ECDSA は malleable なので、署名の digest を ID にすると、
-    /// 1 つの承認済みリクエストが 2 つの ID を持ってしまい、`s` を反転した
-    /// 署名を送り直すだけで消費記録をすり抜けて再適用できてしまう。
+    /// Mutation identity is derived from "signed message + signer", not "signature bytes".
+    /// ECDSA is malleable, so using the signature digest as the ID would give one approved
+    /// request two IDs, and resending a signature with `s` flipped would slip past the
+    /// consumption record and be re-applied.
     #[test]
     fn mutation_request_id_ignores_the_signature_encoding() {
         let token = AuthToken::new("user:04aaaa".to_string());
@@ -4366,11 +4366,11 @@ mod tests {
             >::mutation_request_id(t, m)
         };
 
-        // 同じ (token, message) は常に同じ ID。署名は一切入力に含まれないので、
-        // その表現がどうであれ ID は動かない。
+        // The same (token, message) always yields the same ID. The signature is not an input at
+        // all, so the ID does not change regardless of its encoding.
         assert_eq!(id_of(&token, &msg), id_of(&token, &msg));
 
-        // 署名対象が 1 ビットでも違えば別 ID
+        // Differing by even one bit in the signed message gives a different ID
         for other in [
             StateNodeService::<
                 MockNodeRegistry,
@@ -4412,14 +4412,14 @@ mod tests {
             assert_ne!(id_of(&token, &msg), id_of(&token, &other));
         }
 
-        // 別の caller は別 ID。同じにすると、一方が他方のリクエストを
-        // 先に消費してしまう。
+        // A different caller gets a different ID. If they were the same, one could consume
+        // the other's request first.
         let other_token = AuthToken::new("user:04bbbb".to_string());
         assert_ne!(id_of(&token, &msg), id_of(&other_token, &msg));
     }
 
-    /// token と message の境界が曖昧だと、片方の末尾ともう片方の先頭を
-    /// 付け替えた別の組み合わせが同じ ID になり得る。長さ前置でそれを防ぐ。
+    /// If the token/message boundary is ambiguous, a different pair formed by moving the tail of
+    /// one to the head of the other could yield the same ID. Length prefixing prevents this.
     #[test]
     fn mutation_request_id_separates_token_from_message() {
         let id_of = |t: &str, m: &str| {
@@ -4463,12 +4463,12 @@ mod tests {
         assert!(result.is_ok(), "owner must be allowed: {result:?}");
     }
 
-    /// policy が無いレプリカでの read は拒否する(fail-closed)。
+    /// Reads on a replica without a policy are rejected (fail-closed).
     ///
-    /// create genesis は `access_policy: None` で作られ owner policy は別
-    /// operation として届くため、「genesis はあるが policy が無い」状態は
-    /// 部分同期で実際に起こり得る。これを public 扱いにすると、認可契約の
-    /// 無いまま暗号文と履歴を任意の認証済み caller に渡してしまう。
+    /// A create genesis is made with `access_policy: None` and the owner policy arrives as a
+    /// separate operation, so a "genesis present but no policy" state can actually occur during
+    /// partial sync. Treating it as public would hand ciphertext and history to any authenticated
+    /// caller without an authorization contract.
     #[tokio::test]
     async fn test_authorize_read_denies_when_policy_is_missing() {
         let service = create_test_service("node-1");
@@ -4488,15 +4488,15 @@ mod tests {
         }
     }
 
-    /// 「genesis はレプリカにあるが owner policy がまだ届いていない」状態を
-    /// 直接再現し、非 owner の read が拒否されることを確認する。
-    /// これが塞ぐ実シナリオ(create の Create payload は `access_policy: None`
-    /// で、owner policy は別 operation として届く)。
+    /// Directly reproduce the "genesis is on the replica but the owner policy has not arrived
+    /// yet" state and verify that a non-owner read is rejected.
+    /// This is the real scenario it closes (the Create payload of create has `access_policy: None`,
+    /// and the owner policy arrives as a separate operation).
     #[tokio::test]
     async fn test_authorize_read_denies_on_genesis_only_replica() {
         let service = create_test_service("node-1");
 
-        // genesis(コンテンツ本体)だけが存在し、access_policies は空のまま
+        // Only the genesis (content body) exists; access_policies stays empty
         service
             .crdt_repo
             .contents
@@ -4610,9 +4610,9 @@ mod tests {
         assert_eq!(captured.len(), 1, "exactly one signature check expected");
         let message = &captured[0];
 
-        // 署名対象は domain-separated かつ operation / resource / timestamp に
-        // 束縛される。content id が入っていないと、ある content 向けの署名を
-        // 別 content の read に再利用できてしまう。
+        // The signed message is domain-separated and bound to operation / resource / timestamp.
+        // Without the content id, a signature for one content could be reused for a read of
+        // another content.
         assert_eq!(
             message,
             &RequestMetadata {

@@ -252,7 +252,7 @@ mod tests {
         let request_sig = bob.sign_request("read", "content-1", ts);
         assert!(!request_sig.is_empty());
 
-        // 統一形式 `{operation}:{resource}:{timestamp}` に対する署名として検証できる
+        // Verifiable as a signature over the unified format `{operation}:{resource}:{timestamp}`
         let message = format!("read:content-1:{ts}");
         use p256::ecdsa::signature::Verifier;
         let vk = bob.secret_key.verifying_key();

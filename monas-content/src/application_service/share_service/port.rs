@@ -4,22 +4,22 @@ use crate::application_service::content_service::{
 use crate::domain::content_id::ContentId;
 use crate::domain::share::{KeyId, Share, ShareError};
 
-/// 共有状態（ACL）を永続化するためのポート。
+/// Port for persisting the share state (ACL).
 ///
-/// - key: ファイルのキー(`Content::series_id`)。`Share::content_id` もこの値。
-/// - value: そのファイルに対する `Share`
+/// - key: the file's key (`Content::series_id`). `Share::content_id` is also this value.
+/// - value: the `Share` for that file
 ///
-/// 共有設定はファイル単位で 1 つ。plainCid(本文のハッシュ)をキーにすると、
-/// 本文を以前と同じ内容に戻したときに古い設定を拾い、同じ本文の別ファイルと
-/// 設定が混ざる。
+/// There is one share setting per file. Keying by plainCid (the hash of the body) would pick up
+/// stale settings when the body is reverted to earlier contents, and would mix settings with
+/// other files that have the same body.
 pub trait ShareRepository {
     fn load(&self, series_id: &ContentId) -> Result<Option<Share>, ShareRepositoryError>;
 
     fn save(&self, share: &Share) -> Result<(), ShareRepositoryError>;
 }
 
-/// `Arc<dyn ShareRepository + Send + Sync>` を `ShareService` の型パラメータに
-/// 直接渡せるようにする blanket impl。
+/// Blanket impl so that `Arc<dyn ShareRepository + Send + Sync>` can be passed directly as a
+/// type parameter of `ShareService`.
 impl<T: ShareRepository + ?Sized> ShareRepository for std::sync::Arc<T> {
     fn load(&self, series_id: &ContentId) -> Result<Option<Share>, ShareRepositoryError> {
         (**self).load(series_id)
@@ -36,31 +36,31 @@ pub enum ShareRepositoryError {
     Storage(String),
 }
 
-/// KeyId と HPKE 用公開鍵バイト列を管理するためのポート。
+/// Port for managing KeyIds and HPKE public key bytes.
 ///
-/// - 実装は、ローカルのキーストア / State Node / 外部 KMS などを想定。
+/// - Implementations are expected to be a local key store / State Node / external KMS, etc.
 pub trait PublicKeyDirectory {
-    /// 公開鍵から KeyId を計算する（副作用なし）。
+    /// Computes a KeyId from a public key (no side effects).
     ///
-    /// - この操作は永続化を行わず、KeyId の計算のみを行う。
-    /// - 検証や事前計算に使用する。
+    /// - This operation does not persist anything; it only computes the KeyId.
+    /// - Used for validation and precomputation.
     fn compute_key_id(&self, public_key: &[u8]) -> KeyId;
 
-    /// 新しい公開鍵を登録し、対応する KeyId を返す。
+    /// Registers a new public key and returns the corresponding KeyId.
     fn register_public_key(&self, public_key: &[u8]) -> Result<KeyId, PublicKeyDirectoryError>;
 
-    /// 既存の KeyId から公開鍵バイト列を取得する。
+    /// Gets the public key bytes for an existing KeyId.
     fn find_public_key(&self, key_id: &KeyId) -> Result<Option<Vec<u8>>, PublicKeyDirectoryError>;
 
-    /// 指定された KeyId の公開鍵を削除する。
+    /// Deletes the public key for the given KeyId.
     ///
-    /// - 補償トランザクション（ロールバック）に使用する。
-    /// - 存在しない KeyId を削除しようとしてもエラーにならない（冪等）。
+    /// - Used for compensating transactions (rollback).
+    /// - Deleting a non-existent KeyId is not an error (idempotent).
     fn delete_public_key(&self, key_id: &KeyId) -> Result<(), PublicKeyDirectoryError>;
 }
 
-/// `Arc<dyn PublicKeyDirectory + Send + Sync>` を `ShareService` の型パラメータに
-/// 直接渡せるようにする blanket impl。
+/// Blanket impl so that `Arc<dyn PublicKeyDirectory + Send + Sync>` can be passed directly as a
+/// type parameter of `ShareService`.
 impl<T: PublicKeyDirectory + ?Sized> PublicKeyDirectory for std::sync::Arc<T> {
     fn compute_key_id(&self, public_key: &[u8]) -> KeyId {
         (**self).compute_key_id(public_key)
@@ -85,7 +85,7 @@ pub enum PublicKeyDirectoryError {
     Lookup(String),
 }
 
-/// Share 用アプリケーションサービスで発生しうるエラー。
+/// Errors that can occur in the Share application service.
 #[derive(Debug, thiserror::Error)]
 pub enum ShareApplicationError {
     #[error("content not found")]

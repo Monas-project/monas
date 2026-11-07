@@ -1,13 +1,14 @@
-/// Content を一意に識別するための ID。
+/// ID that uniquely identifies a Content.
 ///
-/// 実際の生成ロジックやフォーマット（ハッシュ・CID 等）は別ライブラリ/infra 側で実装し、
-/// ドメイン側では「ContentId という概念」と最小限の操作だけを提供する。
+/// The actual generation logic and format (hash, CID, etc.) are implemented in a separate
+/// library / the infra side; the domain side provides only "the concept of a ContentId" and
+/// minimal operations.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ContentId(String);
 
 impl ContentId {
     pub fn new(value: String) -> Self {
-        // 将来的にフォーマット検証などをここに追加してもよい。
+        // Format validation etc. may be added here in the future.
         Self(value)
     }
 
@@ -20,28 +21,33 @@ impl ContentId {
     }
 }
 
-/// ContentId を生成するためのポート。
+/// Port for generating ContentIds.
 ///
-/// 実装は別ライブラリを呼び出す infra 層に置く想定。
+/// Implementations are expected to live in the infra layer, calling a separate library.
 pub trait ContentIdGenerator {
     fn generate(&self, raw_content: &[u8]) -> ContentId;
 
-    /// 平文由来の ContentId と暗号文（IV等を含む暗号化結果）から、暗号文側の識別子（encCid）を生成する。
+    /// Generates the ciphertext-side identifier (encCid) from the plaintext-derived ContentId
+    /// and the ciphertext (encryption output including the IV, etc.).
     ///
-    /// 例: `encCid = H(plain_cid || ciphertext)`
+    /// Example: `encCid = H(plain_cid || ciphertext)`
     ///
-    /// - state-node 側で `plain_cid` と `ciphertext` だけから整合性検証ができることを意図する。
-    /// - 平文そのものを state-node に渡さない前提。
+    /// - Intended so that the state node can verify integrity from only `plain_cid` and
+    ///   `ciphertext`.
+    /// - Assumes the plaintext itself is never passed to the state node.
     fn generate_encrypted(&self, plain_cid: &ContentId, ciphertext: &[u8]) -> ContentId;
 
-    /// ファイルのキー(`series_id`)を生成する。
+    /// Generates the file's key (`series_id`).
     ///
-    /// 例: `series_id = H(初回の plainCid || 0x00 || 作成時刻)`
+    /// Example: `series_id = H(initial plainCid || 0x00 || creation time)`
     ///
-    /// - 作成時に 1 回だけ決め、編集・再暗号化・最新版の取り込みでは変えない。
-    ///   端末側の記録・CEK・共有設定はこのキーでファイルごとに 1 件だけ持つ。
-    /// - 本文だけから決めると、同じ本文で作った別のファイルが同じキーになる
-    ///   (記録・CEK・共有設定が混ざる)。作成時刻を含めて区別する。
-    /// - 平文のハッシュを含むので、端末の外(state node・package)には出さない。
+    /// - Decided only once at creation; not changed by edits, re-encryption, or importing the
+    ///   latest version. Device-side records, CEKs, and share settings are kept as exactly one
+    ///   entry per file under this key.
+    /// - Deriving it from the body alone would give separate files created with the same body
+    ///   the same key (mixing records, CEKs, and share settings). The creation time is included
+    ///   to distinguish them.
+    /// - Since it contains a hash of the plaintext, it never leaves the device (state node,
+    ///   package).
     fn generate_series(&self, initial_plain_cid: &ContentId, created_at: u64) -> ContentId;
 }

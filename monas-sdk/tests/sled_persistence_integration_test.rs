@@ -1,24 +1,23 @@
-//! Sled persistence backend のスモークテスト。
+//! Smoke tests for the sled persistence backend.
 //!
-//! PR #29 review (architecture / implementation 軸) で指摘された:
-//! - 「同じ sled DB ファイルを CEK と Share で共有させる」設計が
-//!   実装と一致していなかった (`sled::open(dir)` を 2 度呼んで起動時に
-//!   `Resource temporarily unavailable` で `MonasController::with_config`
-//!   が `Err`、`monas-gateway/src/main.rs::main` が `.expect()` で panic)
-//! - sled persistence の round-trip テストが無い
-//! - flock 衝突を直接 pin する negative test が無い
+//! Regression tests for the following, pointed out in the PR #29 review
+//! (architecture / implementation axes):
+//! - The design "CEK and Share share the same sled DB file" did not match
+//!   the implementation (`sled::open(dir)` was called twice, so at startup
+//!   `MonasController::with_config` returned `Err` with `Resource temporarily
+//!   unavailable` and `monas-gateway/src/main.rs::main` panicked on `.expect()`)
+//! - There was no round-trip test for sled persistence
+//! - There was no negative test directly pinning the flock conflict
 //!
-//! の regression test。
-//!
-//! 注意: content 本体 (暗号文) は SDK 側で `MultiStorageRepository::in_memory`
-//! に保存されており、現状の PR スコープでは sled 化されていないので、
-//! `create_content` → controller drop → 別 controller で `get_content`
-//! の完全 round-trip は確認できない。代わりに以下を検証する:
-//! 1. `MonasConfig::with_persistence_dir(dir)` で `MonasController::with_config`
-//!    が成功する (sled の double-open 問題が起きない)。
-//! 2. controller 構築後に sled DB ファイルが指定 dir に作成される。
-//! 3. controller drop 後に同じ dir で 2 度目の `MonasController::with_config`
-//!    が成功する (== 排他 flock が解放されている)。
+//! Note: the content body (ciphertext) is stored on the SDK side in
+//! `MultiStorageRepository::in_memory` and is not moved to sled within the current PR scope,
+//! so a full `create_content` → controller drop → `get_content` on another controller
+//! round-trip cannot be checked. Instead, this verifies:
+//! 1. `MonasController::with_config` succeeds with `MonasConfig::with_persistence_dir(dir)`
+//!    (the sled double-open problem does not occur).
+//! 2. After the controller is built, the sled DB file is created in the given dir.
+//! 3. After the controller is dropped, a second `MonasController::with_config` on the
+//!    same dir succeeds (== the exclusive flock has been released).
 
 use monas_sdk::{MonasConfig, MonasController};
 use std::path::PathBuf;
@@ -46,12 +45,12 @@ fn cleanup_dir(dir: &PathBuf) {
 fn sled_persistence_opens_without_double_lock() {
     let dir = tmp_dir("opens");
 
-    // 1 回目: CEK と Share で同一 DB を共有して open できる
+    // First: can open with CEK and Share sharing the same DB
     let config = MonasConfig::new("http://127.0.0.1:1").with_persistence_dir(dir.clone());
     let controller =
         MonasController::with_config(config).expect("first with_config should succeed");
 
-    // sled DB ファイルが実際に作成されていること
+    // The sled DB file must actually have been created
     assert!(
         dir.exists(),
         "persistence dir should exist after with_config: {:?}",
@@ -60,7 +59,7 @@ fn sled_persistence_opens_without_double_lock() {
 
     drop(controller);
 
-    // 2 回目: 同一 dir で再度 open できる (排他 flock が drop で解放されている)
+    // Second: can open the same dir again (the exclusive flock was released on drop)
     let config2 = MonasConfig::new("http://127.0.0.1:1").with_persistence_dir(dir.clone());
     let controller2 =
         MonasController::with_config(config2).expect("second with_config should succeed");
@@ -72,7 +71,7 @@ fn sled_persistence_opens_without_double_lock() {
 #[test]
 fn sled_persistence_creates_dir_if_missing() {
     let dir = tmp_dir("missing");
-    // tmp_dir は create_dir_all 済なので削除して "存在しない" 状態に戻す
+    // tmp_dir has already run create_dir_all, so delete it to get back to "does not exist"
     cleanup_dir(&dir);
     assert!(!dir.exists(), "precondition: dir should not exist");
 
@@ -88,14 +87,14 @@ fn sled_persistence_creates_dir_if_missing() {
     cleanup_dir(&dir);
 }
 
-/// `SledContentEncryptionKeyStore`、`SledShareRepository::with_db` 経由ではなく、
-/// CEK と PublicKeyDirectory の sled-backed round-trip を pin する。
-/// 同じ dir に書き込んでから controller を drop し、新しい sled DB ハンドルで
-/// 再 open して、書き込んだ data を find できることを確認する。
+/// Pins the sled-backed round-trip of CEK and PublicKeyDirectory, rather than going through
+/// `SledContentEncryptionKeyStore` / `SledShareRepository::with_db`.
+/// Writes into the same dir, drops the controller, reopens with a new sled DB handle,
+/// and checks that the written data can be found.
 ///
-/// PR #29 review (cycle 5 diagnosis 軸) で「fix が実際に動くことの execution-level
-/// 検証が無い」と指摘されたのを受けて、cycle 4 で plug した persistence の
-/// round-trip を実際の data flow で固定する。
+/// In response to the PR #29 review (cycle 5 diagnosis axis) pointing out "there is no
+/// execution-level verification that the fix actually works", this fixes the round-trip
+/// of the persistence plugged in cycle 4 with a real data flow.
 #[test]
 fn sled_cek_store_persists_across_reopen() {
     use monas_content::application_service::content_service::ContentEncryptionKeyStore;
@@ -185,23 +184,23 @@ fn sled_share_repository_persists_across_reopen() {
     cleanup_dir(&dir);
 }
 
-/// 「`sled::open(dir)` を同一プロセスから同じ path に対して 2 度呼ぶと、
-/// 2 度目は排他 flock 取得に失敗する」という、cycle 2 で diagnose した
-/// 根本原因を直接 pin する negative test。
+/// Negative test that directly pins the root cause diagnosed in cycle 2: "calling
+/// `sled::open(dir)` twice on the same path from the same process makes the second
+/// call fail to acquire the exclusive flock".
 ///
-/// この test が pass することは「`SledContentEncryptionKeyStore::open(dir)` と
-/// `SledShareRepository::open(dir)` を別々に呼ぶ実装に戻すと壊れる」ことの
-/// 根拠になる。`MonasController::create_persistence` は単一 `sled::open` +
-/// `Db::clone()` でこの flock 衝突を回避している。
+/// This test passing is the basis for "reverting to an implementation that calls
+/// `SledContentEncryptionKeyStore::open(dir)` and `SledShareRepository::open(dir)`
+/// separately would break". `MonasController::create_persistence` avoids this flock
+/// conflict with a single `sled::open` + `Db::clone()`.
 #[test]
 fn sled_open_twice_on_same_dir_fails_due_to_flock() {
     let dir = tmp_dir("double-open");
 
     let first = sled::open(&dir).expect("first sled::open should succeed");
 
-    // 2 度目は flock 競合で失敗するはず。エラー variant 自体は OS / sled バージョン
-    // に依存するので「Err である」だけを assert する (Resource temporarily unavailable
-    // / WouldBlock / IO 等のいずれかが返る)。
+    // The second should fail due to the flock conflict. The error variant itself depends
+    // on the OS / sled version, so only assert "it is Err" (one of Resource temporarily
+    // unavailable / WouldBlock / IO etc. is returned).
     let second = sled::open(&dir);
     assert!(
         second.is_err(),
@@ -209,7 +208,7 @@ fn sled_open_twice_on_same_dir_fails_due_to_flock() {
     );
 
     drop(first);
-    // first を drop すれば flock が解放され再 open できる
+    // Dropping first releases the flock, so it can be reopened
     let third = sled::open(&dir).expect("after dropping first, third sled::open should succeed");
     drop(third);
 

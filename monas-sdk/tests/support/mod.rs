@@ -48,10 +48,10 @@ pub fn cleanup_content_artifacts() {
     }
 }
 
-/// crsl-lib の `Node<ContentPayload, ContentMetadata>` と同じ CBOR 形状になる
-/// ミラー(フィールド名・順序を一致させる)。ミラーの正しさは monas-content の
-/// node_verification にある crsl-lib パリティテストで担保されている。
-/// State Node の read 応答(Node CBOR)をテストで模擬生成するために使う。
+/// Mirror with the same CBOR shape as crsl-lib's `Node<ContentPayload, ContentMetadata>`
+/// (field names and order match). The mirror's correctness is guaranteed by the crsl-lib parity
+/// test in monas-content's node_verification.
+/// Used to mock the State Node's read response (Node CBOR) in tests.
 #[allow(dead_code)]
 pub mod node_mirror {
     use cid::Cid;

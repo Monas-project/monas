@@ -11,9 +11,10 @@ use super::{
     UpdateSharePermissionResult,
 };
 
-/// コンテンツ共有ユースケースのアプリケーションサービス。
+/// Application service for the content sharing use case.
 ///
-/// - ContentService とは独立に、「共有（ACL と KeyEnvelope 生成 / CEK 復号）」に責務を限定する。
+/// - Independent of ContentService; its responsibility is limited to "sharing" (ACL and
+///   KeyEnvelope generation / CEK decryption).
 pub struct ShareService<SR, CR, KS, KD, KW> {
     pub share_repository: SR,
     pub content_repository: CR,
@@ -73,14 +74,14 @@ where
         ))
     }
 
-    /// `content` のファイルに対する共有設定を読む(ファイルのキー = `series_id`)。
+    /// Reads the share settings for `content`'s file (file key = `series_id`).
     fn load_share_of(&self, content: &Content) -> Result<Option<Share>, ShareApplicationError> {
         self.share_repository
             .load(content.series_id())
             .map_err(ShareApplicationError::ShareRepository)
     }
 
-    /// ファイル `series_id` の今の記録を引く(削除済みは拒否)。
+    /// Looks up the current record of file `series_id` (rejects deleted ones).
     fn current_record(
         &self,
         series_id: &crate::domain::content_id::ContentId,
@@ -96,7 +97,7 @@ where
         Ok(content)
     }
 
-    /// ファイルの今の CEK。
+    /// The file's current CEK.
     fn current_cek(
         &self,
         content: &Content,
@@ -107,10 +108,10 @@ where
             .ok_or(ShareApplicationError::MissingContentEncryptionKey)
     }
 
-    /// 指定されたファイルに対する現在の共有状態（ACL）を取得する。
+    /// Returns the current share state (ACL) for the specified file.
     ///
-    /// - `series_id` はファイルのキー。
-    /// - Share がまだ一度も保存されていない場合は Ok(None) を返す。
+    /// - `series_id` is the file key.
+    /// - Returns Ok(None) if the Share has never been saved.
     pub fn get_share(
         &self,
         series_id: crate::domain::content_id::ContentId,
@@ -120,13 +121,14 @@ where
             .map_err(ShareApplicationError::ShareRepository)
     }
 
-    /// 1 人の受信者に対して共有を付与し、その受信者向けの KeyEnvelope を生成する。
+    /// Grants a share to a single recipient and generates a KeyEnvelope for that recipient.
     pub fn grant_share(
         &self,
         cmd: GrantShareCommand,
     ) -> Result<GrantShareResult, ShareApplicationError> {
-        // 1. コンテンツ本体と暗号化状態の確認(`content_id` はファイルのキー)。
-        //    包む CEK・暗号文・AAD の plainCid はすべてこのファイルの今の版のもの。
+        // 1. Check the content body and encryption state (`content_id` is the file key).
+        //    The wrapped CEK, the ciphertext, and the AAD's plainCid all belong to this file's
+        //    current version.
         let content = self.current_record(&cmd.content_id)?;
         let plain_content_id = content.raw_id().clone();
 
@@ -135,20 +137,20 @@ where
             .cloned()
             .ok_or(ShareApplicationError::MissingEncryptedContent)?;
 
-        // 2. CEK の取得
+        // 2. Fetch the CEK
         let cek = self.current_cek(&content)?;
 
-        // 3. KeyId を計算
+        // 3. Compute the KeyId
         let recipient_key_id = self
             .public_key_directory
             .compute_key_id(&cmd.recipient_public_key);
 
-        // 4. Share をロード(共有設定はファイル単位 = 系列ID のキー)
+        // 4. Load the Share (share settings are per file = keyed by series ID)
         let mut share = self
             .load_share_of(&content)?
             .unwrap_or_else(|| Share::new(content.series_id().clone()));
 
-        // 5. Share のドメインルール検証
+        // 5. Validate the Share's domain rules
         let event = match cmd.permission {
             crate::domain::share::Permission::Read => share.grant_read(recipient_key_id.clone()),
             crate::domain::share::Permission::Write => share.grant_write(recipient_key_id.clone()),
@@ -158,7 +160,8 @@ where
 
         let _ = event;
 
-        // 6. CEK をラップ(HPKE Auth: 送信者秘密鍵で送信者認証、AAD で宛先と鍵世代を束縛)
+        // 6. Wrap the CEK (HPKE Auth: sender authenticated with the sender's private key; the AAD
+        //    binds the recipient and the key generation)
         let key_epoch = share.key_epoch();
         let aad = crate::domain::share::encryption::EnvelopeAad {
             content_id: &plain_content_id,
@@ -171,20 +174,20 @@ where
             .wrap_cek(&cek, recipient_public_key, &cmd.sender_private_key, &aad)
             .map_err(|e| ShareApplicationError::KeyWrapping(format!("{e:?}")))?;
 
-        // 7. 公開鍵を登録
+        // 7. Register the public key
         self.public_key_directory
             .register_public_key(&cmd.recipient_public_key)
             .map_err(ShareApplicationError::PublicKeyDirectory)?;
 
-        // 8. Share を保存（失敗時は公開鍵を削除してロールバック）
+        // 8. Save the Share (on failure, remove the public key to roll back)
         if let Err(e) = self.share_repository.save(&share) {
-            // 補償トランザクション: 公開鍵を削除してロールバック
+            // Compensating transaction: remove the public key to roll back
             let _ = self
                 .public_key_directory
                 .delete_public_key(&recipient_key_id);
             return Err(ShareApplicationError::ShareRepository(e));
         }
-        // 9. KeyEnvelope を構築
+        // 9. Build the KeyEnvelope
         let wrapped_recipient = crate::domain::share::WrappedRecipientKey::new(
             recipient_key_id.clone(),
             enc,
@@ -206,14 +209,14 @@ where
         })
     }
 
-    /// 指定された受信者との共有関係を取り消す。
+    /// Revokes the share relationship with the specified recipient.
     ///
-    /// - ACL のみを更新し、KeyEnvelope の失効やコンテンツ削除はここでは扱わない。
+    /// - Only updates the ACL; KeyEnvelope revocation and content deletion are not handled here.
     pub fn revoke_share(
         &self,
         cmd: RevokeShareCommand,
     ) -> Result<RevokeShareResult, ShareApplicationError> {
-        // 1. コンテンツ本体と暗号化状態の確認（KeyEnvelope 再発行に必要）
+        // 1. Check the content body and encryption state (needed to reissue KeyEnvelopes)
         let content = self.current_record(&cmd.content_id)?;
         let plain_content_id = content.raw_id().clone();
 
@@ -222,11 +225,11 @@ where
             .cloned()
             .ok_or(ShareApplicationError::MissingEncryptedContent)?;
 
-        // 2. CEK の取得（再暗号化後はここが新しい CEK になっている想定）
+        // 2. Fetch the CEK (after re-encryption, this is expected to be the new CEK)
         let cek = self.current_cek(&content)?;
 
-        // 3. Share をロードして ACL を更新。CEK は rotation 済み(呼び出し側が
-        //    reencrypt を先に実行している)なので鍵世代も進める。
+        // 3. Load the Share and update the ACL. The CEK has been rotated (the caller
+        //    ran reencrypt first), so also advance the key generation.
         let mut share = self
             .load_share_of(&content)?
             .ok_or(ShareApplicationError::ContentNotFound)?;
@@ -240,7 +243,8 @@ where
             .save(&share)
             .map_err(ShareApplicationError::ShareRepository)?;
 
-        // 4. 取り消し後に残っている受信者向けに、新しい鍵世代で KeyEnvelope を再発行
+        // 4. Reissue KeyEnvelopes under the new key generation for the recipients remaining
+        //    after revocation
         let mut recipient_key_ids: Vec<_> = share.recipients().keys().cloned().collect();
         recipient_key_ids.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
 
@@ -265,11 +269,12 @@ where
         })
     }
 
-    /// 既存の受信者の権限を変更する(ACL のみ)。
+    /// Changes the permission of an existing recipient (ACL only).
     ///
-    /// - 受信者が共有されていない場合は `Share(RecipientNotFound)`。
-    /// - CEK・鍵世代・KeyEnvelope は変えない。権限は委譲 Token に載るので、
-    ///   Token の再発行(と降格時の旧 Token 失効)は呼び出し側(SDK)が行う。
+    /// - Returns `Share(RecipientNotFound)` if the content is not shared with the recipient.
+    /// - Does not change the CEK, key generation, or KeyEnvelope. The permission is carried by
+    ///   the delegated Token, so reissuing the Token (and revoking the old Token on downgrade)
+    ///   is done by the caller (SDK).
     pub fn update_share_permission(
         &self,
         cmd: UpdateSharePermissionCommand,
@@ -302,12 +307,14 @@ where
         })
     }
 
-    /// KeyEnvelope と受信者の秘密鍵バイト列から CEK を復号（アンラップ）する。
+    /// Decrypts (unwraps) the CEK from a KeyEnvelope and the recipient's private key bytes.
     ///
-    /// - monas-account など別サービスが秘密鍵を管理し、このサービスにはバイト列として渡ってくる前提。
-    /// - `sender_public_key` は受信者が期待する送信者の公開鍵(TOFU でピン留めした鍵)。
-    ///   HPKE Auth モードのため、unwrap 成功はこの鍵の持ち主が envelope を作った証明になる。
-    /// - 現時点では HpkeV1 のみをサポートする。
+    /// - Assumes a separate service such as monas-account manages the private key and passes it
+    ///   to this service as bytes.
+    /// - `sender_public_key` is the sender public key the recipient expects (the key pinned via
+    ///   TOFU). Since HPKE Auth mode is used, a successful unwrap proves that the holder of this
+    ///   key created the envelope.
+    /// - Currently only HpkeV1 is supported.
     pub fn unwrap_cek_from_envelope(
         &self,
         envelope: &KeyEnvelope,
@@ -1175,7 +1182,7 @@ mod tests {
         let remaining_kid = KeyId::new(vec![4, 5, 6]);
         let sender = sender_key_id();
 
-        // revoke_share は KeyEnvelope 再発行のために content(ciphertext) と CEK を必要とする
+        // revoke_share needs the content (ciphertext) and the CEK to reissue KeyEnvelopes
         let content = build_content(&content_id, Some(encrypted()), false);
         {
             let mut guard = content_storage.lock().unwrap();
@@ -1198,7 +1205,8 @@ mod tests {
             guard.insert(content_id.as_str().to_string(), share);
         }
 
-        // build_envelope_for_recipient 内で公開鍵ディレクトリ参照が必要（実装上は first を返すだけ）
+        // build_envelope_for_recipient needs a public key directory lookup (the implementation
+        // just returns the first one)
         public_key_dir
             .register_public_key(&[1, 2, 3, 4])
             .expect("public key registration should succeed");
@@ -1224,7 +1232,7 @@ mod tests {
         assert_eq!(result.content_id, content_id);
         assert_eq!(result.recipient_key_id, revoked_kid);
 
-        // 取り消し後に残っている受信者向けの KeyEnvelope が再発行される
+        // KeyEnvelopes are reissued for the recipients remaining after revocation
         assert_eq!(result.envelopes.len(), 1);
         let env = &result.envelopes[0];
         assert_eq!(env.content_id(), &content_id);
@@ -1248,7 +1256,7 @@ mod tests {
         let public_key_dir = TestPublicKeyDirectory::default();
         let key_wrapper = TestKeyWrapper;
 
-        // revoke_share は share をロードする前に content/ciphertext と CEK を参照する
+        // revoke_share references content/ciphertext and the CEK before loading the share
         let cid = cid();
         let content = build_content(&cid, Some(encrypted()), false);
         {
@@ -1409,9 +1417,9 @@ mod tests {
         assert_eq!(result.recipients().len(), 1);
     }
 
-    /// 共有設定・CEK はファイルのキー(series_id)で引き、包むのは今の版
-    /// (記録の暗号文、AAD は今の plainCid)。編集で plainCid が変わっても
-    /// 共有設定は 1 件のまま。
+    /// Share settings and the CEK are looked up by file key (series_id), and what is wrapped is
+    /// the current version (the record's ciphertext, with the current plainCid as AAD). Even if
+    /// an edit changes plainCid, there is still only one share setting.
     #[test]
     fn share_is_keyed_by_the_file_and_wraps_the_current_version() {
         use crate::infrastructure::content_id::Sha256ContentIdGenerator;
@@ -1432,11 +1440,11 @@ mod tests {
             .unwrap();
         assert_ne!(v2.raw_id(), v1.raw_id());
         assert_eq!(v2.series_id(), v1.series_id());
-        // 記録はファイルのキーに 1 件(今の版)。
+        // One record per file key (the current version).
         content_repo.save(v2.series_id(), &v2).unwrap();
         service.cek_store.save(v2.series_id(), &cek()).unwrap();
 
-        // テスト用の公開鍵ディレクトリは常にこの KeyId を返す。
+        // The test public key directory always returns this KeyId.
         let bob = KeyId::new(vec![1, 2, 3]);
         let granted = service
             .grant_share(GrantShareCommand {

@@ -3,16 +3,16 @@ use base64::Engine;
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-/// 受信者や鍵を識別するための KeyId（kid）。
+/// KeyId (kid) identifying a recipient or a key.
 ///
-/// - 実体は公開鍵バイト列のハッシュ先頭 N バイトなどから生成される想定。
-/// - 生成ロジック自体は infra 側に委譲し、ドメインでは「不透明な ID」としてのみ扱う。
+/// - Expected to be derived from e.g. the first N bytes of a hash of the public key bytes.
+/// - The derivation logic is delegated to infra; the domain treats it only as an opaque ID.
 ///
-/// serde 表現は **base64url 文字列**である。`Vec<u8>` の派生実装だと JSON では
-/// 配列になり、`Share.recipients` のように `HashMap<KeyId, _>` のキーとして使った
-/// 瞬間に `key must be a string` でシリアライズが落ちる（JSON のオブジェクトキーは
-/// 文字列に限られる）。KeyId は API 境界でも base64url で表現されるため、
-/// 永続化表現もそれに揃えている。
+/// The serde representation is a **base64url string**. With the derived `Vec<u8>` impl it becomes
+/// an array in JSON, and serialization fails with `key must be a string` as soon as it is used as
+/// a `HashMap<KeyId, _>` key, as in `Share.recipients` (JSON object keys must be strings). Since
+/// KeyId is also represented as base64url at the API boundary, the persisted representation
+/// matches it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct KeyId(Vec<u8>);
 
@@ -66,8 +66,8 @@ mod tests {
         assert_eq!(decoded, key_id);
     }
 
-    /// これがこの実装の存在理由。派生 `Serialize` だと KeyId は JSON 配列になり、
-    /// map のキーに使った時点で `key must be a string` で落ちる。
+    /// This is why this impl exists. With a derived `Serialize`, KeyId becomes a JSON array and
+    /// fails with `key must be a string` once used as a map key.
     #[test]
     fn works_as_a_json_map_key() {
         let mut map = HashMap::new();

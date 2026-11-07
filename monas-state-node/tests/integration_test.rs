@@ -106,8 +106,8 @@ fn test_request_signature() -> Vec<u8> {
     vec![0x01]
 }
 
-/// timestamp は署名検証で構造的に必須(issue #61)。mock 認証でも
-/// 存在チェックは実コードを通るため、現在時刻を渡す。
+/// timestamp is structurally required for signature verification (issue #61). Even with
+/// mock auth the presence check runs through real code, so pass the current time.
 fn test_timestamp() -> Option<u64> {
     Some(
         std::time::SystemTime::now()
@@ -643,17 +643,17 @@ async fn test_access_control_update_and_verify() {
     assert!(result, "Future tokens should be allowed");
 }
 
-/// 署名済み mutation の再送は拒否され、しかも「偽造」ではなく「再送」として
-/// 報告される。
+/// Replays of signed mutations are rejected, and are reported as a "replay" rather than a
+/// "forgery".
 ///
-/// 署名内 timestamp の鮮度チェックは「古い署名を無限に使い回せない」ことしか
-/// 保証せず、5分の窓の中では同じ署名を何度でも通せてしまう。
+/// The in-signature timestamp freshness check only guarantees that "old signatures cannot be
+/// reused forever"; within the 5-minute window the same signature passes any number of times.
 ///
-/// なお `update_access_control` に限っては、より古い `min_valid_issued_at` への
-/// 巻き戻しはドメイン側の単調性チェックが既に弾いていた。ここで塞ぐのは
-/// **同じ値の再送**で、そちらは素通りしていた。エラーの種類まで検証するのは、
-/// 潰してしまうと運用者が「攻撃された」のか「正規リクエストが二重に届いた」
-/// のか区別できなくなるため。
+/// Note that for `update_access_control` specifically, rollback to an older
+/// `min_valid_issued_at` was already rejected by the domain's monotonicity check. What this
+/// closes is **resending the same value**, which used to pass straight through. The error kind
+/// is checked too because collapsing it would leave operators unable to tell whether they were
+/// "attacked" or a "legitimate request arrived twice".
 #[tokio::test]
 async fn test_signed_mutation_cannot_be_replayed_after_a_newer_one() {
     let request_timestamp = test_timestamp();
@@ -667,16 +667,16 @@ async fn test_signed_mutation_cannot_be_replayed_after_a_newer_one() {
         update.with_signature(signature, public_key)
     };
 
-    // 消費記録の ID は署名対象メッセージから導かれる。revoke は
-    // `new_min_valid_issued_at` を body として署名対象に含めるので、
-    // A(1000)と B(2000)は同じ timestamp でも別リクエストになる。
+    // The consumption record ID is derived from the signed message. revoke includes
+    // `new_min_valid_issued_at` in the signed message as the body, so
+    // A (1000) and B (2000) are different requests even with the same timestamp.
     let sig_a: Vec<u8> = vec![0xAA];
     let sig_b: Vec<u8> = vec![0xBB];
 
     let update_a = sign(1000);
     let update_b = sign(2000);
 
-    // A → B の順に正規適用
+    // Apply A → B legitimately, in order
     service
         .update_access_control(
             &update_a,
@@ -705,9 +705,9 @@ async fn test_signed_mutation_cannot_be_replayed_after_a_newer_one() {
         2000
     );
 
-    // 攻撃者が捕まえておいた B の署名を再送する。
-    // (A の再送はドメイン側の単調性チェックが別途弾くので、消費記録が
-    //  効いていることを見るにはこちらを使う)
+    // The attacker resends B's signature captured earlier.
+    // (A's replay is rejected separately by the domain monotonicity check, so use this one
+    //  to see that the consumption record is working)
     // Cross a whole-second boundary: replay must preserve the original timestamp.
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
     let replay = service
@@ -725,7 +725,7 @@ async fn test_signed_mutation_cannot_be_replayed_after_a_newer_one() {
         "a replay must be reported as such, not as a forged signature: {err}"
     );
 
-    // 失効時刻は巻き戻っていない
+    // The revocation time has not been rolled back
     assert_eq!(
         service
             .get_access_control("content-1")
@@ -738,12 +738,12 @@ async fn test_signed_mutation_cannot_be_replayed_after_a_newer_one() {
     );
 }
 
-/// 署名のバイト表現を変えても再送は通らない。
+/// Changing the signature's byte representation does not let a replay through.
 ///
-/// ECDSA は malleable で、有効な `(r, s)` に対し `(r, n - s)` も同じメッセージ・
-/// 同じ鍵で検証を通る。消費記録の ID を署名バイト列の digest にしていると、
-/// 攻撃者は捕捉した署名を 1 回変換するだけで「別のリクエスト」として通せてしまい、
-/// 状態巻き戻しが成立する。ID は署名対象メッセージから導くのでこれは効かない。
+/// ECDSA is malleable: for a valid `(r, s)`, `(r, n - s)` also verifies with the same message
+/// and key. If the consumption record ID were a digest of the signature bytes, an attacker
+/// could pass a captured signature as "a different request" by transforming it once, and a
+/// state rollback would succeed. The ID is derived from the signed message, so this does not work.
 #[tokio::test]
 async fn test_signed_mutation_replay_survives_signature_malleability() {
     let request_timestamp = test_timestamp();
@@ -756,9 +756,9 @@ async fn test_signed_mutation_replay_survives_signature_malleability() {
     let (signature, public_key) = sign_access_control_update(&update);
     let update = update.with_signature(signature, public_key);
 
-    // 実際の P-256 署名を作り、その malleable な相方を用意する。
-    // (mock 認証はリクエスト署名の中身を見ないので、ここで検証したいのは
-    //  「バイト列が違っても同じリクエストとして消費されるか」だけ)
+    // Create a real P-256 signature and prepare its malleable counterpart.
+    // (Mock auth does not inspect request signature contents, so all we want to check here is
+    //  "whether it is consumed as the same request even with different bytes")
     use p256::ecdsa::{signature::Signer, SigningKey};
     use p256::elliptic_curve::rand_core::OsRng;
     let key = SigningKey::random(&mut OsRng);
@@ -782,7 +782,7 @@ async fn test_signed_mutation_replay_survives_signature_malleability() {
         .await
         .expect("first presentation should apply");
 
-    // 同じリクエストを、別バイト列の署名で再送する
+    // Resend the same request with a signature of different bytes
     // Cross a whole-second boundary: replay must preserve the original timestamp.
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
     let replay = service
@@ -799,9 +799,9 @@ async fn test_signed_mutation_replay_survives_signature_malleability() {
     );
 }
 
-/// 同一署名の単純な再送(A → replay(A))も拒否される。
-/// `invalidate` は再送のたびに `min_valid_issued_at` を現在時刻へ進めるため、
-/// 通してしまうと正規リクエスト後に発行された Token まで巻き添えで失効する。
+/// A plain replay of the same signature (A → replay(A)) is also rejected.
+/// `invalidate` advances `min_valid_issued_at` to the current time on every resend, so
+/// letting it through would also revoke Tokens issued after the legitimate request.
 #[tokio::test]
 async fn test_signed_mutation_is_single_use() {
     let request_timestamp = test_timestamp();

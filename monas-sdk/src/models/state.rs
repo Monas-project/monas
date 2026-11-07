@@ -4,13 +4,13 @@ use serde::{Deserialize, Serialize};
 // get_latest_version
 // ============================================
 
-/// 最新バージョン取得リクエスト
+/// Get-latest-version request
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetLatestVersionInput {
     pub content_id: String,
 }
 
-/// 最新バージョン取得レスポンス
+/// Get-latest-version response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetLatestVersionOutput {
     pub content_id: String,
@@ -23,7 +23,7 @@ pub struct GetLatestVersionOutput {
 // get_history
 // ============================================
 
-/// 履歴取得リクエスト
+/// Get-history request
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetHistoryInput {
     pub content_id: String,
@@ -35,7 +35,7 @@ fn default_limit() -> u32 {
     100
 }
 
-/// 履歴取得レスポンス
+/// Get-history response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetHistoryOutput {
     pub content_id: String,
@@ -46,91 +46,94 @@ pub struct GetHistoryOutput {
 // read_content_from_state_node
 // ============================================
 
-/// State Node からの検証付き read リクエスト。
+/// Verified read request from the State Node.
 ///
-/// - `content_id`: State Node 側の content id（remote id）。履歴・版データの取得と
-///   読み取り署名（`read:{content_id}:{timestamp}`）のバインドに使う。
-/// - `local_content_id`: SDK ローカルの content id（plain CID）。CEK の引き当てと
-///   復号後の整合性チェック（平文から再計算した plain CID との一致）に使う。
-///   local↔remote の対応表は存在しないため、呼び出し側が両方を渡す
-///   （`VerifyIntegrityInput` と同じ設計）。
-/// - `version`: 読む版 CID。省略時は State Node の履歴から最新版を読む。
+/// - `content_id`: content id on the State Node side (remote id). Used to fetch history and
+///   version data and to bind the read signature (`read:{content_id}:{timestamp}`).
+/// - `local_content_id`: SDK-local content id (plain CID). Used to look up the CEK and for the
+///   post-decryption integrity check (match against the plain CID recomputed from plaintext).
+///   There is no local↔remote mapping table, so the caller passes both
+///   (same design as `VerifyIntegrityInput`).
+/// - `version`: version CID to read. If omitted, the latest version from the State Node
+///   history is read.
 ///
-/// 保証されるのは**payloadの真正性まで**である。返ってきたバイト列が要求した版
-/// CIDに一致すること（CID再計算 + AES-GCM復号）は確認するが、その版が正規の
-/// writerによるものか、そのcontent seriesのcanonical headか、本当に最新かは
-/// 確認しない。読み取り専用の受信者もCEKを持つため、CEKで復号できることは
-/// write権限の証明にならない。
+/// What is guaranteed is **only payload authenticity**. It checks that the returned bytes match
+/// the requested version CID (CID recomputation + AES-GCM decryption), but does not check
+/// whether that version comes from a legitimate writer, is the canonical head of the content
+/// series, or is truly the latest. Read-only recipients also hold the CEK, so being able to
+/// decrypt with the CEK does not prove write permission.
 ///
-/// 単調性チェック（ロールバック検出）は**実装されていない**。一度入れたが、
-/// 偽のparentsを詰めた版でbypassできて防御にならない一方、正当なsync遅延と
-/// 攻撃を応答単体で区別できず正規readを壊す誤検知が残るため撤去した。
-/// 版の真正性にはowner/writer署名のtrust anchorが必要で、issue #59 で追跡している。
+/// A monotonicity check (rollback detection) is **not implemented**. One was added once, but it
+/// was removed because it could be bypassed by a version stuffed with fake parents and so gave
+/// no protection, while it could not distinguish a legitimate sync delay from an attack from a
+/// single response, leaving false positives that broke legitimate reads.
+/// Version authenticity requires a trust anchor of owner/writer signatures, tracked in issue #59.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadContentFromStateNodeInput {
     pub content_id: String,
-    /// owner が自分のファイルを読むときの、そのファイルのキー
-    /// (`CreateContentOutput::file_id`)。CEK と、照合する plainCid(今の版)は
-    /// そのファイルの記録から取る。`local_content_id` とどちらか一方を指定する。
+    /// Key of the file (`CreateContentOutput::file_id`) when the owner reads their own file.
+    /// The CEK and the plainCid to match (current version) are taken from that file's record.
+    /// Specify either this or `local_content_id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_id: Option<String>,
-    /// share 受信者が読むときの、共有された版の plainCid(CEK の選択と照合に使う)。
+    /// plainCid of the shared version when a share recipient reads (used to select the CEK
+    /// and to match).
     #[serde(default)]
     pub local_content_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
-    /// 平文 CID の `local_content_id` との一致検証を省く。
+    /// Skip verifying that the plaintext CID matches `local_content_id`.
     ///
-    /// share の受信者は CEK を「共有された版の content_id」の下に持つが、
-    /// owner がその後に書いた版の平文 CID は知り得ない。`true` なら
-    /// `local_content_id` は CEK の選択にだけ使い、復号した平文が実際に
-    /// 指す id を `ReadContentFromStateNodeOutput::local_content_id` で返す。
-    /// Node CID の再計算と AES-GCM の認証はそのまま効く。
+    /// A share recipient holds the CEK under "the content_id of the shared version", but cannot
+    /// know the plaintext CID of versions the owner wrote afterwards. If `true`,
+    /// `local_content_id` is used only to select the CEK, and the id the decrypted plaintext
+    /// actually points to is returned in `ReadContentFromStateNodeOutput::local_content_id`.
+    /// Node CID recomputation and AES-GCM authentication still apply.
     #[serde(default)]
     pub accept_any_version: bool,
 }
 
-/// State Node からの検証付き read レスポンス。
+/// Verified read response from the State Node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadContentFromStateNodeOutput {
     pub content_id: String,
-    /// 復号した平文が指す content_id。`accept_any_version` でなければ入力の
-    /// `local_content_id` と同じ。
+    /// content_id the decrypted plaintext points to. Same as the input `local_content_id` unless
+    /// `accept_any_version`.
     pub local_content_id: String,
-    /// 実際に読まれた版 CID（CID 再計算で検証済み）
+    /// Version CID actually read (verified by CID recomputation)
     pub version: String,
-    /// 復号済みの平文（base64url）
+    /// Decrypted plaintext (base64url)
     pub content: String,
 }
 
 // ============================================
 // pull_content_from_state_node
 
-/// State Node の最新版を owner のローカルレコードへ取り込む。
+/// Pull the latest State Node version into the owner's local record.
 ///
-/// write 権限を委譲した受信者が新しい版を書くと、owner のローカルレコードは
-/// ネットワークの head より古くなる。その状態で owner が更新や revoke
-/// (再暗号化)をすると、古いローカル平文で受信者の版を黙って上書きする。
-/// これはその前に呼ぶ「pull」で、検証付き read(Node CID 再計算 + 自分の CEK
-/// での AES-GCM 復号)を通った版だけを取り込む。
+/// When a recipient delegated write permission writes a new version, the owner's local record
+/// falls behind the network head. If the owner then updates or revokes (re-encrypts) in that
+/// state, the recipient's version is silently overwritten with the stale local plaintext.
+/// This is the "pull" called before that; it adopts only a version that passed a verified read
+/// (Node CID recomputation + AES-GCM decryption with own CEK).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PullContentFromStateNodeInput {
-    /// State Node の系列ID。
+    /// State Node series ID.
     pub content_id: String,
-    /// 取り込み先のファイルのキー(`CreateContentOutput::file_id`)。
+    /// Key of the file to pull into (`CreateContentOutput::file_id`).
     pub file_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PullContentFromStateNodeOutput {
     pub content_id: String,
-    /// 取り込み後の今の版の plainCid。
+    /// plainCid of the current version after the pull.
     pub local_content_id: String,
-    /// 読んだ版 CID(検証済み)。
+    /// Version CID read (verified).
     pub version: String,
-    /// ローカルレコードが動いたか(head がローカル版と違ったか)。
+    /// Whether the local record moved (whether the head differed from the local version).
     pub adopted: bool,
-    /// head の平文(base64url)。
+    /// Plaintext of the head (base64url).
     pub content: String,
 }
 
@@ -138,23 +141,24 @@ pub struct PullContentFromStateNodeOutput {
 // verify_integrity
 // ============================================
 
-/// 整合性検証リクエスト
+/// Integrity verification request
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerifyIntegrityInput {
     pub content_id: String,
-    /// 検証するコンテンツ（base64url）
+    /// Content to verify (base64url)
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected_version: Option<String>,
-    /// 対象ファイルのキー(`CreateContentOutput::file_id`)。指定すると、State
-    /// Node が返す暗号文をそのファイルの記録の暗号文とバイト比較して検証する
-    /// （State Node は暗号文を保持するため、平文である `content` とは直接比較
-    /// できない）。未指定の場合は従来どおり `content` のバイト列と直接比較する。
+    /// Key of the target file (`CreateContentOutput::file_id`). If specified, the ciphertext
+    /// returned by the State Node is verified by byte comparison with the ciphertext in that
+    /// file's record (the State Node holds ciphertext, so it cannot be compared directly with
+    /// the plaintext `content`). If unset, it is compared directly with the bytes of `content`
+    /// as before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_id: Option<String>,
 }
 
-/// 整合性検証レスポンス
+/// Integrity verification response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerifyIntegrityOutput {
     pub valid: bool,

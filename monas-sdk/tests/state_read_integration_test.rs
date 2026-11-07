@@ -1,15 +1,18 @@
 // Integration tests intentionally use the test/dev-only `with_state_node_url` constructor.
 #![allow(deprecated)]
-//! `read_content_from_state_node`(検証付き read)の統合テスト。
+//! Integration tests for `read_content_from_state_node` (verified read).
 //!
-//! mockito で State Node を模擬し、以下を検証する:
-//! - 作成者が自分の content を state node 経由で読み、平文まで復号できる(A + 復号)
-//! - share 受信者が KeyEnvelope 処理後に同じ content を読める(CEK 永続化)
-//! - KeyEnvelope 未処理の受信者は MissingKey 由来の NotFound で誘導される
-//! - 改ざんされた Node(CID 不一致)は拒否される
+//! Mocks the State Node with mockito and verifies that:
+//! - The creator can read their own content via the state node and decrypt it down to the
+//!   plaintext (A + decryption)
+//! - A share recipient can read the same content after processing the KeyEnvelope (CEK persistence)
+//! - A recipient that has not processed the KeyEnvelope is guided by a NotFound derived from
+//!   MissingKey
+//! - A tampered Node (CID mismatch) is rejected
 //!
-//! State Node が返す Node CBOR は crsl-lib `Node` と同じ CBOR 形状のミラー構造体で
-//! 生成する(ミラーの正しさは monas-content 側の crsl-lib パリティテストで担保)。
+//! The Node CBOR returned by the State Node is generated with a mirror struct that has the same
+//! CBOR shape as crsl-lib `Node` (the mirror's correctness is ensured by the crsl-lib parity tests
+//! in monas-content).
 
 use base64::{
     engine::general_purpose::STANDARD as BASE64_STANDARD, engine::general_purpose::URL_SAFE_NO_PAD,
@@ -62,7 +65,7 @@ async fn mock_version_data(server: &mut ServerGuard, version: &str, node_bytes: 
         .await
 }
 
-/// 署名アカウントを作った controller。SDK は自分では署名鍵を作らない。
+/// A controller with a signing account created. The SDK does not create signing keys on its own.
 #[allow(deprecated)]
 fn controller_with_account(state_node_url: String) -> MonasController {
     let controller = MonasController::with_state_node_url(state_node_url);
@@ -73,13 +76,13 @@ fn controller_with_account(state_node_url: String) -> MonasController {
     controller
 }
 
-/// content を作成し、share 経由で実際の AES-GCM 暗号文を入手する
-/// (ciphertext を SDK の外に取り出す公開経路が share envelope しかないため)。
-/// 戻り値: (local_content_id, ciphertext, share 出力, sender/recipient keypair)
+/// Creates content and obtains the actual AES-GCM ciphertext via share
+/// (the share envelope is the only public path that takes the ciphertext out of the SDK).
+/// Returns: (local_content_id, ciphertext, share output, sender/recipient keypair)
 struct CreatedContent {
-    /// owner 側の操作の対象(ファイルのキー)
+    /// Target of owner-side operations (the file's key)
     file_id: String,
-    /// 共有された版の plainCid(受信者側の read の照合に使う)
+    /// plainCid of the shared version (used to match the recipient-side read)
     local_content_id: String,
     ciphertext: Vec<u8>,
     shared: monas_sdk::models::share::ShareContentOutput,
@@ -214,11 +217,12 @@ async fn share_recipient_reads_content_after_processing_envelope() {
     let genesis_bytes = make_node_bytes(&created.ciphertext, vec![], None);
     let genesis_cid = recompute_node_cid(&genesis_bytes).unwrap();
 
-    // 受信者は別インスタンス(= 別デバイス相当。ローカル content も CEK も無い)
+    // The recipient is a separate instance (= equivalent to a separate device; it has neither
+    // local content nor a CEK)
     let recipient_controller = controller_with_account(server.url());
 
-    // KeyEnvelope 未処理の状態では CEK が無く、NotFound で share 処理へ誘導される
-    // (read は前後 2 回行うので、mock は 2 ヒットを期待する)
+    // Before the KeyEnvelope is processed there is no CEK, and NotFound guides toward share
+    // processing (the read is done twice, before and after, so the mock expects 2 hits)
     let history_mock = mock_history(&mut server, &[&genesis_cid])
         .await
         .expect_at_least(1);
@@ -243,7 +247,7 @@ async fn share_recipient_reads_content_after_processing_envelope() {
         other => panic!("expected NotFound, got: {other:?}"),
     }
 
-    // KeyEnvelope を処理すると CEK が受信者ローカルに永続化される
+    // Processing the KeyEnvelope persists the CEK locally on the recipient
     let decrypt_response = recipient_controller.decrypt_shared_content(DecryptSharedContentInput {
         content_id: created.local_content_id.clone(),
         remote_content_id: None,
@@ -259,7 +263,7 @@ async fn share_recipient_reads_content_after_processing_envelope() {
         decrypt_response.error
     );
 
-    // 以後は state node 経由の検証付き read で読める
+    // From then on it can be read via the verified read through the state node
     let after = recipient_controller.read_content_from_state_node(
         ReadContentFromStateNodeInput {
             content_id: REMOTE_ID.into(),
@@ -285,10 +289,10 @@ async fn share_recipient_reads_content_after_processing_envelope() {
     cleanup_content_artifacts();
 }
 
-/// CEK ローテーションの追従: revoke で CEK が回転した後、
-/// - 旧 CEK しか持たない受信者の read は Forbidden(鍵が古い)で落ち、
-/// - revoke 出力の再発行 KeyEnvelope を処理すると保存 CEK が更新され、
-/// - 以後の state node read が新 ciphertext を復号できる。
+/// Following CEK rotation: after revoke rotates the CEK,
+/// - a read by a recipient holding only the old CEK fails with Forbidden (stale key),
+/// - processing the reissued KeyEnvelope from the revoke output updates the stored CEK,
+/// - and subsequent state node reads can decrypt the new ciphertext.
 #[tokio::test(flavor = "multi_thread")]
 async fn cek_rotation_after_revoke_updates_recipient_and_read() {
     let _guard = acquire_test_lock();
@@ -338,7 +342,7 @@ async fn cek_rotation_after_revoke_updates_recipient_and_read() {
     assert!(create_response.success, "{:?}", create_response.error);
     let created = create_response.data.unwrap();
 
-    // 2 名に share(片方を後で revoke する)
+    // Share with 2 recipients (one of them is revoked later)
     let share_to = |recipient_pub: &str| {
         creator.share_content(ShareContentInput {
             file_id: created.file_id.clone(),
@@ -355,7 +359,7 @@ async fn cek_rotation_after_revoke_updates_recipient_and_read() {
     assert!(share_surviving.success, "{:?}", share_surviving.error);
     let shared_surviving = share_surviving.data.unwrap();
 
-    // 残存受信者(別デバイス)が旧 CEK の envelope を処理
+    // The remaining recipient (separate device) processes the envelope for the old CEK
     let recipient_controller = controller_with_account(server.url());
     let decrypt_v1 = recipient_controller.decrypt_shared_content(DecryptSharedContentInput {
         content_id: created.content_id.clone(),
@@ -368,7 +372,7 @@ async fn cek_rotation_after_revoke_updates_recipient_and_read() {
     });
     assert!(decrypt_v1.success, "{:?}", decrypt_v1.error);
 
-    // revoke → CEK ローテーション + 残存受信者向け envelope 再発行
+    // revoke → CEK rotation + envelope reissue for the remaining recipients
     let _update_mock = server
         .mock("PUT", format!("/content/{REMOTE_ID}").as_str())
         .with_status(200)
@@ -403,7 +407,7 @@ async fn cek_rotation_after_revoke_updates_recipient_and_read() {
         "ciphertext must change after CEK rotation"
     );
 
-    // ローテーション後の ciphertext で state node の新版 v2 を用意
+    // Prepare the state node's new version v2 with the post-rotation ciphertext
     let old_ciphertext = URL_SAFE_NO_PAD
         .decode(&shared_surviving.key_envelope.ciphertext)
         .unwrap();
@@ -431,7 +435,8 @@ async fn cek_rotation_after_revoke_updates_recipient_and_read() {
         )
     };
 
-    // 旧 CEK のままでは新 ciphertext を復号できない(鍵が古い旨のエラーで誘導)
+    // The new ciphertext cannot be decrypted with the old CEK (guided by an error saying the key
+    // is stale)
     let stale_read = read_latest();
     assert!(!stale_read.success, "stale-CEK read must fail");
     match stale_read.error {
@@ -444,7 +449,7 @@ async fn cek_rotation_after_revoke_updates_recipient_and_read() {
         other => panic!("expected Forbidden(stale CEK), got: {other:?}"),
     }
 
-    // 再発行 envelope を処理 → 保存 CEK がローテーション後のものへ更新される
+    // Process the reissued envelope → the stored CEK is updated to the post-rotation one
     let decrypt_v2 = recipient_controller.decrypt_shared_content(DecryptSharedContentInput {
         content_id: created.content_id.clone(),
         remote_content_id: None,
@@ -456,7 +461,7 @@ async fn cek_rotation_after_revoke_updates_recipient_and_read() {
     });
     assert!(decrypt_v2.success, "{:?}", decrypt_v2.error);
 
-    // 以後の read は新 ciphertext を復号できる
+    // Subsequent reads can decrypt the new ciphertext
     let fresh_read = read_latest();
     assert!(fresh_read.success, "{:?}", fresh_read.error);
     assert_eq!(
@@ -466,9 +471,9 @@ async fn cek_rotation_after_revoke_updates_recipient_and_read() {
         plaintext
     );
 
-    // rotation 前の旧 envelope(key_epoch が古い)を再送しても、保存済み CEK は
-    // 巻き戻らない(replay 防止)。攻撃者が保存しておいた正規の旧 envelope で
-    // 受信者の CEK を旧世代へ戻し、read を壊すことはできない。
+    // Resending a pre-rotation old envelope (with an older key_epoch) does not roll back the
+    // stored CEK (replay prevention). An attacker cannot use a legitimate old envelope they saved
+    // to revert the recipient's CEK to an older generation and break reads.
     assert!(
         reissued.key_envelope.key_epoch > shared_surviving.key_envelope.key_epoch,
         "rotation must advance the envelope key_epoch"
@@ -489,7 +494,7 @@ async fn cek_rotation_after_revoke_updates_recipient_and_read() {
         }
         other => panic!("expected Conflict(stale envelope), got: {other:?}"),
     }
-    // read は引き続き新 CEK で成功する(巻き戻っていない証明)
+    // The read still succeeds with the new CEK (proof that it was not rolled back)
     let read_after_replay = read_latest();
     assert!(
         read_after_replay.success,
@@ -497,11 +502,11 @@ async fn cek_rotation_after_revoke_updates_recipient_and_read() {
         read_after_replay.error
     );
 
-    // 同一世代の envelope を再処理しても、送信者鍵・世代・CEK の3つ組は
-    // そのままで read も壊れない。以前はこの経路が「pin は据え置き、CEK だけ
-    // 無条件 save」だったため、並行処理と組み合わせると世代と CEK が食い違う
-    // 状態を作れた(pin=N+1 / CEK=N)。3つ組を1レコードの CAS で入れ替える
-    // ようにしたので、この経路からは不整合が作れない。
+    // Reprocessing an envelope of the same generation leaves the (sender key, generation, CEK)
+    // triple unchanged and does not break reads. Previously this path was "keep the pin, save
+    // only the CEK unconditionally", so combined with concurrent processing it could produce a
+    // state where the generation and CEK disagree (pin=N+1 / CEK=N). The triple is now swapped
+    // via a CAS on a single record, so this path cannot create an inconsistency.
     let reprocess_same_epoch =
         recipient_controller.decrypt_shared_content(DecryptSharedContentInput {
             content_id: created.content_id.clone(),
@@ -538,7 +543,7 @@ async fn read_rejects_tampered_node() {
     let genesis_bytes = make_node_bytes(&created.ciphertext, vec![], None);
     let genesis_cid = recompute_node_cid(&genesis_bytes).unwrap();
 
-    // 攻撃者が偽 ciphertext の Node を正規版 CID を騙って返す
+    // An attacker returns a Node with a fake ciphertext, claiming the legitimate version's CID
     let forged_bytes = make_node_bytes(b"forged-by-attacker", vec![], None);
 
     let _history_mock = mock_history(&mut server, &[&genesis_cid]).await;
@@ -565,10 +570,11 @@ async fn read_rejects_tampered_node() {
     cleanup_content_artifacts();
 }
 
-/// KeyEnvelope は HPKE Auth モードでラップされており、受信者は送信者公開鍵で
-/// unwrap する(成功 = その鍵の持ち主が作った証明)。
-/// - 間違った送信者鍵での処理は復号自体が失敗する
-/// - 一度正しい鍵で処理すると TOFU でピン留めされ、以後別の鍵を渡しても拒否される
+/// The KeyEnvelope is wrapped in HPKE Auth mode, and the recipient unwraps it with the sender's
+/// public key (success = proof that the holder of that key created it).
+/// - Processing with the wrong sender key fails at decryption itself
+/// - Once processed with the correct key, it is pinned via TOFU, and any other key passed later
+///   is rejected
 #[tokio::test(flavor = "multi_thread")]
 async fn envelope_sender_auth_rejects_wrong_sender_key() {
     let _guard = acquire_test_lock();
@@ -597,7 +603,7 @@ async fn envelope_sender_auth_rejects_wrong_sender_key() {
         })
     };
 
-    // 1. 間違った送信者鍵(攻撃者の鍵)を渡して処理 → unwrap が失敗する
+    // 1. Process with the wrong sender key (the attacker's key) → unwrap fails
     let wrong_key = decrypt_with_sender(attacker.public_key.clone());
     assert!(!wrong_key.success, "wrong sender key must fail to unwrap");
     match wrong_key.error {
@@ -607,11 +613,11 @@ async fn envelope_sender_auth_rejects_wrong_sender_key() {
         other => panic!("expected Forbidden(unwrap failure), got: {other:?}"),
     }
 
-    // 2. 正しい送信者鍵で処理 → 成功し、TOFU でピン留めされる
+    // 2. Process with the correct sender key → succeeds and is pinned via TOFU
     let correct = decrypt_with_sender(created.shared.sender_public_key.clone());
     assert!(correct.success, "{:?}", correct.error);
 
-    // 3. ピン留め後に別の鍵を渡す → unwrap 以前にピン不一致で拒否される
+    // 3. Pass a different key after pinning → rejected for pin mismatch before unwrap
     let after_pin = decrypt_with_sender(attacker.public_key.clone());
     assert!(!after_pin.success, "non-pinned sender key must be rejected");
     match after_pin.error {
@@ -624,11 +630,12 @@ async fn envelope_sender_auth_rejects_wrong_sender_key() {
     cleanup_content_artifacts();
 }
 
-/// 別デバイスの受信者が、共有後に owner が書いた版を読む。
+/// A recipient on a separate device reads a version the owner wrote after sharing.
 ///
-/// 受信者の CEK は「共有された版の id」の下にある。owner が更新した版の平文
-/// CID はそれと異なるので、厳密 read は ContentIdMismatch で拒否する(改ざんと
-/// 区別できない)。`accept_any_version` なら復号し、平文が指す id を返す。
+/// The recipient's CEK is under "the id of the shared version". The plaintext CID of the version
+/// the owner updated differs from it, so a strict read rejects it with ContentIdMismatch (it cannot
+/// be distinguished from tampering). With `accept_any_version`, it decrypts and returns the id the
+/// plaintext points to.
 #[tokio::test(flavor = "multi_thread")]
 async fn share_recipient_reads_a_version_written_after_the_share() {
     let _guard = acquire_test_lock();
@@ -637,7 +644,7 @@ async fn share_recipient_reads_a_version_written_after_the_share() {
 
     let created = create_and_share(&mut server, &creator, b"first version").await;
 
-    // 受信者は別インスタンス。envelope を処理して CEK を得る。
+    // The recipient is a separate instance. It processes the envelope to obtain the CEK.
     let recipient_controller = controller_with_account(server.url());
     let decrypt_response = recipient_controller.decrypt_shared_content(DecryptSharedContentInput {
         content_id: created.local_content_id.clone(),
@@ -650,8 +657,8 @@ async fn share_recipient_reads_a_version_written_after_the_share() {
     });
     assert!(decrypt_response.success, "{:?}", decrypt_response.error);
 
-    // owner が新しい版を書く(同じ CEK で再暗号化される)。新しい暗号文は、
-    // もう一度 share したときの envelope から取り出す。
+    // The owner writes a new version (re-encrypted with the same CEK). The new ciphertext is
+    // extracted from the envelope produced by sharing once more.
     let update_mock = server
         .mock("PUT", format!("/content/{REMOTE_ID}").as_str())
         .with_status(200)
@@ -672,10 +679,10 @@ async fn share_recipient_reads_a_version_written_after_the_share() {
     update_mock.assert();
     assert_ne!(updated.version_id, created.local_content_id);
 
-    // 共有し直すのは暗号文を取り出すためだけなので、送信者鍵も宛先も何でも
-    // よい(この envelope を処理する受信者はいない)。ACL は編集後の版へ引き
-    // 継がれているので、元の受信者への再 share は「共有済み」で拒否される —
-    // 別の宛先を使う。
+    // Re-sharing is only to extract the ciphertext, so any sender key and destination will do
+    // (no recipient processes this envelope). The ACL has been carried over to the edited
+    // version, so re-sharing to the original recipient is rejected as "already shared" —
+    // use a different destination.
     let sender = creator
         .generate_keypair(GenerateKeypairInput {
             key_type: KeyType::Secp256r1,
@@ -712,7 +719,7 @@ async fn share_recipient_reads_a_version_written_after_the_share() {
         .await
         .expect_at_least(1);
 
-    // 厳密 read: 共有された版の id を期待して読むと不一致で拒否される
+    // Strict read: reading while expecting the shared version's id is rejected as a mismatch
     let strict = recipient_controller.read_content_from_state_node(
         ReadContentFromStateNodeInput {
             content_id: REMOTE_ID.into(),
@@ -733,7 +740,8 @@ async fn share_recipient_reads_a_version_written_after_the_share() {
         strict.error
     );
 
-    // any-version read: 同じ CEK で復号でき、平文が指す id = owner 側の新しい版 id
+    // any-version read: decrypts with the same CEK, and the id the plaintext points to = the
+    // owner's new version id
     let lenient = recipient_controller.read_content_from_state_node(
         ReadContentFromStateNodeInput {
             content_id: REMOTE_ID.into(),
@@ -759,8 +767,8 @@ async fn share_recipient_reads_a_version_written_after_the_share() {
     cleanup_content_artifacts();
 }
 
-/// 委譲 Token は State Node が知っている系列IDで発行される。ローカル版IDで
-/// 発行した Token は `monas://content/<系列ID>` の照合で必ず落ちる。
+/// A delegated token is issued with the series ID the State Node knows. A token issued with the
+/// local version ID always fails the `monas://content/<series ID>` check.
 #[tokio::test(flavor = "multi_thread")]
 async fn delegated_token_is_issued_for_the_remote_content_id() {
     let _guard = acquire_test_lock();
@@ -835,10 +843,10 @@ async fn delegated_token_is_issued_for_the_remote_content_id() {
     cleanup_content_artifacts();
 }
 
-/// share 受信者としての read: 呼び出し側が委譲 Token を `Authorization: Bearer`
-/// で渡し署名は渡さない場合、SDK は account 鍵で `read:<id>:<ts>` に署名しつつ
-/// Token をそのまま残す。State Node は Token の `aud` 鍵で署名を検証する
-/// ので、`user:` トークンに差し替えては通らない。
+/// Read as a share recipient: when the caller passes the delegated token via
+/// `Authorization: Bearer` and passes no signature, the SDK signs `read:<id>:<ts>` with the
+/// account key while keeping the token as-is. The State Node verifies the signature with the
+/// token's `aud` key, so swapping it for a `user:` token does not pass.
 #[tokio::test(flavor = "multi_thread")]
 async fn delegated_read_keeps_the_bearer_token_and_signs_with_the_account_key() {
     let _guard = acquire_test_lock();
@@ -882,10 +890,10 @@ async fn delegated_read_keeps_the_bearer_token_and_signs_with_the_account_key() 
     history_mock.assert();
 }
 
-/// 送信者ピン(鍵世代の記録)は系列IDに属する。版IDでピンすると、owner が
-/// 編集して版IDが変わった後に revoke で世代が進んでも、編集前の版IDで作られた
-/// 古い envelope は「その版IDには記録が無い」として受理され、rotation の
-/// replay 防止が編集1回で素通りになる。
+/// The sender pin (record of the key generation) belongs to the series ID. If pinned by version
+/// ID, then even when revoke advances the generation after the owner edits and the version ID
+/// changes, an old envelope made with the pre-edit version ID is accepted as "no record for that
+/// version ID", and rotation's replay prevention is bypassed by a single edit.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pre_rotation_envelope_for_an_older_version_id_is_still_refused() {
     let _guard = acquire_test_lock();
@@ -1019,10 +1027,11 @@ async fn a_pre_rotation_envelope_for_an_older_version_id_is_still_refused() {
     cleanup_content_artifacts();
 }
 
-/// 共有を受けた側の write。受信者は content レコードを持たないので、送信者
-/// ピンの CEK で新しい平文を暗号化し、owner の系列IDへ `Authorization: Bearer`
-/// (委譲 Token)+ account 鍵の署名で PUT する。State Node に届いた暗号文は
-/// owner が自分の CEK で復号でき、平文が指す id は返された `version_id`。
+/// Write by the side that received the share. The recipient has no content record, so it
+/// encrypts the new plaintext with the sender pin's CEK and PUTs to the owner's series ID with
+/// `Authorization: Bearer` (delegated token) + an account-key signature. The owner can decrypt
+/// the ciphertext that reached the State Node with their own CEK, and the id the plaintext points
+/// to is the returned `version_id`.
 #[tokio::test(flavor = "multi_thread")]
 async fn share_recipient_writes_a_new_version_with_the_delegated_token() {
     let _guard = acquire_test_lock();
@@ -1131,8 +1140,8 @@ async fn share_recipient_writes_a_new_version_with_the_delegated_token() {
     cleanup_content_artifacts();
 }
 
-/// 委譲 Token 無しでは State Node に届く前に拒否する。owner の write は
-/// `update_content` の経路であり、`user:` でここに来るのは呼び出し側の誤り。
+/// Without a delegated token, the write is rejected before reaching the State Node. The owner's
+/// write goes through `update_content`; arriving here with `user:` is a caller error.
 #[tokio::test(flavor = "multi_thread")]
 async fn share_recipient_write_requires_a_bearer_token() {
     let _guard = acquire_test_lock();
@@ -1186,7 +1195,7 @@ async fn share_recipient_write_requires_a_bearer_token() {
     cleanup_content_artifacts();
 }
 
-/// share package を取り込んでいない系列には CEK が無いので書けない。
+/// A series whose share package has not been imported has no CEK, so it cannot be written.
 #[tokio::test(flavor = "multi_thread")]
 async fn share_recipient_write_needs_an_imported_share() {
     let _guard = acquire_test_lock();
@@ -1223,9 +1232,9 @@ async fn share_recipient_write_needs_an_imported_share() {
     cleanup_content_artifacts();
 }
 
-/// State Node の 4xx はそのステータスのまま呼び出し側へ届く。以前は ureq が
-/// 非 2xx を transport error にしていたため、`try_state_node_http_error` に
-/// 届く前に body ごと捨てられ、失効 Token の 403 が gateway から 500 に見えた。
+/// A State Node 4xx reaches the caller with its status intact. Previously ureq turned non-2xx
+/// into a transport error, so it was discarded along with the body before reaching
+/// `try_state_node_http_error`, and a revoked token's 403 looked like a 500 from the gateway.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_state_node_refusal_keeps_its_status_and_reason() {
     let _guard = acquire_test_lock();
@@ -1298,13 +1307,13 @@ async fn a_state_node_refusal_keeps_its_status_and_reason() {
     cleanup_content_artifacts();
 }
 
-/// owner 側の pull と、revoke が受信者の版を巻き戻さないこと。
+/// Owner-side pull, and revoke not rolling back the recipient's version.
 ///
-/// write を委譲した Bob が新しい版を書いた後、owner のローカルレコードは
-/// head より古い。`pull_content_from_state_node` はその版を検証付き read で
-/// 取り込み(ローカル版IDが Bob の版IDへ進む)、`revoke_share` は再暗号化の
-/// 前に同じ取り込みを自分で行うので、ローテーション後の暗号文も、残存受信者へ
-/// 再発行される envelope も Bob の版を運ぶ。
+/// After Bob, who was delegated write, writes a new version, the owner's local record is older
+/// than head. `pull_content_from_state_node` imports that version via a verified read (the local
+/// version ID advances to Bob's version ID), and `revoke_share` performs the same import itself
+/// before re-encrypting, so both the post-rotation ciphertext and the envelopes reissued to the
+/// remaining recipients carry Bob's version.
 #[tokio::test(flavor = "multi_thread")]
 async fn owner_pulls_a_recipients_version_and_revoke_rotates_that_version() {
     let _guard = acquire_test_lock();
