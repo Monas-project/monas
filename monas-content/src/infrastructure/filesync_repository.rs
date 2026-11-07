@@ -313,7 +313,7 @@ impl MultiStorageRepository {
         content: &Content,
     ) -> Result<(), ContentRepositoryError> {
         let (storage_provider, auth) = self.get_provider_and_auth(provider)?;
-        let path = Self::content_path(provider, content_id);
+        let path = Self::content_path(provider, content_id)?;
 
         let data = serde_json::to_vec(content)
             .map_err(|e| ContentRepositoryError::Storage(format!("serialization error: {e}")))?;
@@ -332,7 +332,7 @@ impl MultiStorageRepository {
         content_id: &ContentId,
     ) -> Result<Option<Content>, ContentRepositoryError> {
         let (storage_provider, auth) = self.get_provider_and_auth(provider)?;
-        let path = Self::content_path(provider, content_id);
+        let path = Self::content_path(provider, content_id)?;
 
         let result = tokio::task::block_in_place(|| {
             Handle::current().block_on(async { storage_provider.fetch(&auth, &path).await })
@@ -381,8 +381,27 @@ impl MultiStorageRepository {
     }
 
     /// コンテンツIDからストレージパスを生成する。
-    fn content_path(provider: &str, content_id: &ContentId) -> String {
-        format!("{}://content/{}.json", provider, content_id.as_str())
+    ///
+    /// ID は 1 つのファイル名にそのまま使える文字(ASCII 小文字・数字・`-`・`_`)
+    /// に限る。`./<id>`・`x/../<id>`・大文字(大文字小文字を区別しないファイル
+    /// システム)のような別表記が同じ記録に届くと、文字列で取っている呼び出し
+    /// 側のファイル単位ロックが別扱いになり、同じファイルへの書き込みが並行
+    /// してしまう。ディレクトリの外を指すパスも作らせない。
+    fn content_path(
+        provider: &str,
+        content_id: &ContentId,
+    ) -> Result<String, ContentRepositoryError> {
+        let id = content_id.as_str();
+        let plain = !id.is_empty()
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_');
+        if !plain {
+            return Err(ContentRepositoryError::Storage(format!(
+                "invalid content id {id:?}: only lowercase letters, digits, '-' and '_' are allowed"
+            )));
+        }
+        Ok(format!("{provider}://content/{id}.json"))
     }
 }
 

@@ -20,6 +20,8 @@ use super::{decode_base64, decode_key_id_base64, AppState};
 
 #[derive(Deserialize)]
 pub struct GrantShareRequest {
+    /// 対象ファイルのキー(`/contents` の作成応答の `series_id`)。
+    /// `/shares/...` のパスの `content_id` も同じ。
     pub content_id: String,
     pub sender_key_id_base64: String,
     /// 送信者の秘密鍵(base64)。HPKE Auth モードの wrap(送信者認証)に用いる。
@@ -30,6 +32,7 @@ pub struct GrantShareRequest {
 
 #[derive(Serialize)]
 pub struct GrantShareResponse {
+    /// envelope が指す版の plainCid。
     pub content_id: String,
     pub sender_key_id: String,
     pub recipient_key_id: String,
@@ -137,6 +140,9 @@ async fn grant_share(
         }
     };
 
+    // 記録と CEK を読んで envelope を作り、共有設定を書き戻す。並行する
+    // 更新・再暗号化と混ざらないよう、他の書き込みと同じロックを取る。
+    let _file_guard = state.file_locks.lock(content_id.as_str()).await;
     let cmd = GrantShareCommand {
         content_id,
         sender_key_id,
@@ -225,6 +231,7 @@ async fn revoke_share(
     let recipient_key_id =
         decode_key_id_base64(&recipient_key_id_b64, "recipient_key_id (base64)")?;
 
+    let _file_guard = state.file_locks.lock(content_id.as_str()).await;
     let cmd = RevokeShareCommand {
         content_id,
         sender_key_id,

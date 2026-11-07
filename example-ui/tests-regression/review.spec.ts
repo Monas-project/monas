@@ -10,7 +10,7 @@ const pkg: SharePackage = {
   key_envelope: envelope, shared_at: 1,
   delegated_access: { delegated_token: "fixture-token", issued_at: 1, expires_at: 4102444800, jti: "fixture" },
 };
-const ownerEntry = (): Entry => ({ id: "owner-file", kind: "file", name: "owner.txt", parentPath: "/", sizeBytes: 2, mimeType: "text/plain", createdAt: 1, updatedAt: 1, localContentId: "plain-v1", remoteContentId: "network", syncedToStateNode: true, versionCount: 1, shares: [] });
+const ownerEntry = (): Entry => ({ id: "owner-file", kind: "file", name: "owner.txt", parentPath: "/", sizeBytes: 2, mimeType: "text/plain", createdAt: 1, updatedAt: 1, fileId: "file-1", localContentId: "plain-v1", remoteContentId: "network", syncedToStateNode: true, versionCount: 1, shares: [] });
 const b64 = (text: string) => Buffer.from(text).toString("base64url");
 
 // Exercise App, stores, flow runner and API adapters unchanged. Only HTTP is
@@ -23,7 +23,7 @@ async function boot(page: Page, entries: Entry[] = [], identities = [identity("B
     if (sessionStorage.getItem("regression-seeded")) return;
     sessionStorage.setItem("regression-seeded", "yes");
     localStorage.setItem("monas.identities.v2", JSON.stringify({ identities, activeLabel }));
-    localStorage.setItem("monas.registry.v3", JSON.stringify(entries));
+    localStorage.setItem("monas.registry.v4", JSON.stringify(entries));
     localStorage.setItem("monas.endpoints.v2", JSON.stringify({ gateway: "/api" }));
   }, { entries, identities, activeLabel });
   await page.route("**/*", async route => {
@@ -41,6 +41,7 @@ async function boot(page: Page, entries: Entry[] = [], identities = [identity("B
     if (path === "/api/health") return route.fulfill({ status: 200, body: "" });
     if (path === "/api/share/decrypt") data = { content_id: "plain-v1", content: b64("V1"), version: "v1" };
     else if (path === "/api/state/read") data = { content_id: "network", local_content_id: `plain-${head}`, version: head, content: b64(head.toUpperCase()) };
+    else if (path === "/api/state/pull") data = { content_id: "network", local_content_id: `plain-${head}`, version: head, adopted: false, content: b64(head.toUpperCase()) };
     else if (path === "/api/state/latest-version") data = { content_id: "network", latest_version: head };
     else if (path === "/api/state/history") data = { content_id: "network", versions: [head] };
     else if (path === "/api/share/content/network" && req.method() === "PUT") {
@@ -48,7 +49,7 @@ async function boot(page: Page, entries: Entry[] = [], identities = [identity("B
       expect(req.headers().authorization).toBe("Bearer fixture-token");
       head = "v2";
       data = { remote_content_id: "network", version_id: "plain-v2" };
-    } else if (path === "/api/content/plain-v1") data = { content_id: "plain-v1", content: b64("V1") };
+    } else if (path === "/api/content/file-1") data = { content_id: `plain-${head}`, content: b64(head.toUpperCase()) };
     else if (path === "/api/account" && req.method() === "POST") data = { key_type: "secp256r1", public_key: "public-created", private_key: "private-created" };
     else {
       unexpected.push(`${req.method()} ${path}`);
@@ -76,7 +77,7 @@ test("recipient import → edit → reopen compares the displayed envelope, not 
   await expect(page.locator(".modal textarea")).toHaveValue("V1");
   await page.locator(".modal textarea").fill("V2");
   await page.getByRole("button", { name: "Re-encrypt & save" }).click();
-  await expect.poll(() => page.evaluate(() => JSON.parse(localStorage.getItem("monas.registry.v3")!)[0].receivedShare.writtenVersionId)).toBe("plain-v2");
+  await expect.poll(() => page.evaluate(() => JSON.parse(localStorage.getItem("monas.registry.v4")!)[0].receivedShare.writtenVersionId)).toBe("plain-v2");
   await expect(page.locator(".row .sync")).toHaveAttribute("data-sync", "current");
   await action(page, "Open / preview");
   await expect(page.locator(".preview-box").first()).toHaveText("V1");
@@ -88,6 +89,36 @@ test("recipient import → edit → reopen compares the displayed envelope, not 
   await expect(page.locator(".sync-status")).toHaveAttribute("data-sync", "behind");
   await expect(page.locator(".row .sync")).toHaveAttribute("data-sync", "current");
   expect(gateway.requests.filter(r => r.path === "/api/share/decrypt")).toHaveLength(2);
+  // A recipient has no file key; it reads by the plain id it was shared.
+  for (const r of gateway.requests.filter(r => r.path === "/api/state/read")) {
+    expect(r.body.local_content_id).toBe("plain-v1");
+    expect(r.body.file_id).toBeUndefined();
+  }
+  expect(gateway.unexpected).toEqual([]);
+});
+
+// Another tab already pulled V2 into the gateway's copy; this tab's row still
+// names plain-v1. Edit contents pulls, gets adopted:false (nothing new to the
+// copy) — the row must follow the copy and read up to date, not stay behind.
+test("an edit's pull with nothing new to adopt still moves a stale row to what the copy holds", async ({ page }) => {
+  const gateway = await boot(page, [ownerEntry()]);
+  gateway.setHead("v2");
+  await action(page, "Edit contents");
+  await expect(page.locator(".modal textarea")).toHaveValue("V2");
+  await expect(page.locator(".row .sync")).toHaveAttribute("data-sync", "current");
+  await expect.poll(() => page.evaluate(() => JSON.parse(localStorage.getItem("monas.registry.v4")!)[0].localContentId)).toBe("plain-v2");
+  expect(gateway.unexpected).toEqual([]);
+});
+
+// Another tab saved V2 after this tab loaded its registry (which still says
+// plain-v1). Open fetches and shows V2, the head is V2: the preview must say
+// up to date, not "newer on the network".
+test("owner preview judges sync by the body it shows, not the entry's id from before the open", async ({ page }) => {
+  const gateway = await boot(page, [ownerEntry()]);
+  gateway.setHead("v2");
+  await action(page, "Open / preview");
+  await expect(page.locator(".preview-box").first()).toHaveText("V2");
+  await expect(page.locator(".sync-status")).toHaveAttribute("data-sync", "current");
   expect(gateway.unexpected).toEqual([]);
 });
 
@@ -102,6 +133,14 @@ test("owner preview compares its local body with the network head", async ({ pag
   await expect(page.locator(".row .sync")).toHaveAttribute("data-sync", "behind");
   await expect(page.locator(".preview-box").first()).toHaveText("V1");
   await expect(page.locator(".preview-box").last()).toHaveText("V2");
+  // The owner reads by its file key (CEK and expected plain id come from the
+  // file's record), not by a plain id.
+  const reads = gateway.requests.filter(r => r.path === "/api/state/read");
+  expect(reads.length).toBeGreaterThan(0);
+  for (const r of reads) {
+    expect(r.body.file_id).toBe("file-1");
+    expect(r.body.local_content_id).toBeUndefined();
+  }
   expect(gateway.unexpected).toEqual([]);
 });
 
@@ -126,13 +165,37 @@ for (const scenario of reachCases) {
     await page.getByRole("button", { name: "Revoke", exact: true }).click();
     await expect(page.locator(".run-status")).toHaveText("complete");
     // Soft assertions catch flow and App toast independently in a RED run.
-    await expect.soft(page.locator(".step").filter({ hasText: "Cutoff propagation" })).toContainText(scenario.detail);
-    if (scenario.toast) await expect.soft(page.locator(".toast.error")).toContainText(scenario.toast);
-    else await expect(page.locator(".toast.error")).toHaveCount(0);
+    const step = page.locator(".step").filter({ hasText: "Cutoff propagation" });
+    await expect.soft(step).toContainText(scenario.detail);
+    // The revoke succeeded: incomplete propagation is a warning (amber), never an error (red).
+    await expect.soft(step).toHaveClass(scenario.toast ? /\bwarning\b/ : /\bdone\b/);
+    if (scenario.toast) await expect.soft(page.locator(".toast.warning")).toContainText(scenario.toast);
+    else await expect(page.locator(".toast.warning")).toHaveCount(0);
+    await expect(page.locator(".toast.error")).toHaveCount(0);
     await expect(page.locator(".modal").getByRole("button", { name: "Revoke", exact: true })).toHaveCount(0);
     expect(gateway.unexpected).toEqual([]);
   });
 }
+
+// The revoke's cutoff voided the survivor's token too. A survivor the SDK
+// re-wrapped but could not issue a token for opens the new envelope yet
+// cannot reach the state node — that must not read as a clean success.
+test("revoke: a survivor re-wrapped without a fresh token is reported", async ({ page }) => {
+  const entry = ownerEntry();
+  const share = (who: string) => ({ recipientPublicKeyB64Url: `public-${who}`, recipientLabel: who, permissions: ["read"] as ("read" | "write")[], senderKeyId: "B", recipientKeyId: who, senderPublicKeyB64Url: "public-B", envelope, grantedAt: 1 });
+  entry.shares = [share("gone"), share("carol")];
+  const gateway = await boot(page, [entry]);
+  await page.route("**/api/share/revoke", route => route.fulfill({ json: { success: true, data: {
+    content_id: "plain-v1", recipient_public_key: "public-gone", revoked: true, token_invalidated_at: 42,
+    token_invalidation_reach: { notified_members: ["node-2"], unreached_members: [], relayed: false },
+    reissued_envelopes: [{ recipient_key_id: "carol", key_envelope: { ...envelope, key_epoch: 2 } }],
+  } } }));
+  await action(page, "Share");
+  await page.locator(".recipient-row").filter({ hasText: "gone" }).getByRole("button", { name: "Revoke", exact: true }).click();
+  await expect(page.locator(".run-status")).toHaveText("complete");
+  await expect(page.locator(".toast.error")).toContainText("1 other recipient(s) got no fresh token");
+  expect(gateway.unexpected).toEqual([]);
+});
 
 for (const activeLabel of ["B", "A", "legacy"]) {
   test(`identity migration retains latest signing key B when old activeLabel is ${activeLabel}`, async ({ page }) => {

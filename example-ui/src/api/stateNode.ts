@@ -1,5 +1,6 @@
 // State / version operations via the gateway (monas-sdk state controller).
 import { gateway } from "./http";
+import type { Entry } from "../types";
 
 /**
  * How a state-node call is authorised. By default the gateway signs as this
@@ -69,13 +70,24 @@ export interface ReadFromStateNodeOutput {
  * legitimate writer produced it. Version metadata has no trust anchor yet
  * (issue #59).
  *
- * Both ids are required and are not interchangeable: `contentId` is the
- * state-node series id (also what the read signature binds to), while
- * `localContentId` selects the CEK and is re-derived from the plaintext.
+ * `contentId` is the state-node series id (also what the read signature
+ * binds to). The reader is named by exactly one of: `fileId` — the owner's
+ * file key; the SDK takes the CEK and the expected plain id from that file's
+ * record — or `localContentId` — a share recipient's plain id of the shared
+ * version, which selects the CEK and is re-derived from the plaintext.
  */
+/** Who reads `entry` from the state node: the owner by its file key, a share
+ *  recipient by the plain id of the version it received. */
+export function readerOf(entry: Entry): { fileId?: string; localContentId?: string } {
+  return entry.receivedShare
+    ? { localContentId: entry.localContentId }
+    : { fileId: entry.fileId };
+}
+
 export function readFromStateNode(input: {
   contentId: string;
-  localContentId: string;
+  fileId?: string;
+  localContentId?: string;
   /** Omit to read whatever the state node reports as the newest version. */
   version?: string;
   /** For a share recipient: `localContentId` only selects the CEK (the id the
@@ -90,6 +102,7 @@ export function readFromStateNode(input: {
     headers: authHeaders(input.auth),
     body: {
       content_id: input.contentId,
+      file_id: input.fileId,
       local_content_id: input.localContentId,
       version: input.version,
       accept_any_version: input.acceptAnyVersion ?? false,
@@ -99,7 +112,7 @@ export function readFromStateNode(input: {
 
 export interface PullFromStateNodeOutput {
   content_id: string;
-  /** The local id after the pull — the head's plain id if it was adopted. */
+  /** The plain id after the pull — the head's plain id if it was adopted. */
   local_content_id: string;
   version: string;
   /** True when the head was someone else's version and the local record
@@ -116,11 +129,11 @@ export interface PullFromStateNodeOutput {
  * recipient's version with stale plaintext. The SDK's revoke pulls by
  * itself; the editor calls this before opening.
  */
-export function pullFromStateNode(input: { contentId: string; localContentId: string }) {
+export function pullFromStateNode(input: { contentId: string; fileId: string }) {
   return gateway<PullFromStateNodeOutput>("/state/pull", {
     method: "POST",
     timestamp: true,
-    body: { content_id: input.contentId, local_content_id: input.localContentId },
+    body: { content_id: input.contentId, file_id: input.fileId },
   });
 }
 
@@ -134,10 +147,10 @@ export function verifyIntegrity(input: {
   contentId: string;
   contentBase64Url: string;
   expectedVersion?: string;
-  /** SDK-local version id — lets the SDK compare the state-node ciphertext
-   *  against its locally stored ciphertext (the state node never sees
-   *  plaintext, so a plaintext comparison can never match). */
-  localContentId?: string;
+  /** The owner's file key — lets the SDK compare the state-node ciphertext
+   *  against that file's locally stored ciphertext (the state node never
+   *  sees plaintext, so a plaintext comparison can never match). */
+  fileId?: string;
 }) {
   return gateway<VerifyIntegrityOutput>("/state/verify-integrity", {
     method: "POST",
@@ -146,7 +159,7 @@ export function verifyIntegrity(input: {
       content_id: input.contentId,
       content: input.contentBase64Url,
       expected_version: input.expectedVersion,
-      local_content_id: input.localContentId,
+      file_id: input.fileId,
     },
   });
 }

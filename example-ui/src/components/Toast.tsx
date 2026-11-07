@@ -4,7 +4,9 @@ import { Check, X } from "./icons";
 
 export interface ToastItem {
   id: string;
-  kind: "info" | "success" | "error";
+  /** warning: the action succeeded but something needs the user's attention
+   *  (e.g. a cutoff that may not have reached every member yet). */
+  kind: "info" | "success" | "warning" | "error";
   text: string;
 }
 
@@ -19,7 +21,7 @@ export function pushToast(text: string, kind: ToastItem["kind"] = "info") {
   setTimeout(() => {
     items = items.filter((t) => t.id !== id);
     emit();
-  }, kind === "error" ? 5200 : 3200);
+  }, kind === "error" || kind === "warning" ? 5200 : 3200);
 }
 
 function subscribe(l: () => void) {

@@ -244,10 +244,12 @@ test("J-4: a file shared from one device opens, reads and is edited on another v
     const bobRow = modal.locator(".recipient-row", { hasText: "bob" });
     await expect(bobRow).toContainText("re-wrapped after a revoke");
 
-    // The re-wrapped package is what the dialog now shows for bob.
-    const pkgBox = modal.locator(".share-package textarea");
-    await expect(modal.locator(".share-package label")).toContainText("re-wrapped");
-    rewrapped = await pkgBox.inputValue();
+    // The dialog points at the re-wrapped recipients; packages open only on
+    // request (they no longer pop up by themselves), so copy bob's.
+    await expect(modal).toContainText("1 recipient(s) were re-wrapped");
+    await bobRow.getByRole("button", { name: "Copy package" }).click();
+    await expectToast(alice.page, "Share package for bob copied");
+    rewrapped = await readClipboard(alice.page);
     const before = JSON.parse(sharePackage);
     const after = JSON.parse(rewrapped);
     expect(after.key_envelope.key_epoch).toBeGreaterThan(before.key_envelope.key_epoch);

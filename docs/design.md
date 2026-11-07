@@ -276,7 +276,7 @@ CIDはMonasにおいて複数の役割を担う。
 |-----------|----------|------|
 | `plainCid` | sha256(raw_content) | コンテンツの論理的同一性 |
 | `encCid` | sha256(plainCid ∥ 0x00 ∥ ciphertext) | 暗号文の整合性検証 |
-| `seriesCid` | 初回のplainCid | コンテンツ系列の追跡 |
+| `seriesCid` | sha256(初回のplainCid ∥ 0x00 ∥ 作成時刻) | 端末側でのファイルの識別 |
 | `versionCid` | CRDT操作のCID | バージョン履歴 |
 
 state-nodeはencCidとversionCidのみを保持する。これにより：

@@ -1,12 +1,14 @@
 use crate::application_service::content_service::{ContentEncryptionKeyStore, ContentRepository};
 use crate::domain::content::encryption::ContentEncryptionKey;
+use crate::domain::content::Content;
 use crate::domain::share::{
     encryption::KeyWrapping, key_envelope::KeyWrapAlgorithm, KeyEnvelope, Share,
 };
 
 use super::{
     GrantShareCommand, GrantShareResult, PublicKeyDirectory, RevokeShareCommand, RevokeShareResult,
-    ShareApplicationError, ShareRepository,
+    ShareApplicationError, ShareRepository, UpdateSharePermissionCommand,
+    UpdateSharePermissionResult,
 };
 
 /// コンテンツ共有ユースケースのアプリケーションサービス。
@@ -71,15 +73,50 @@ where
         ))
     }
 
-    /// 指定されたコンテンツに対する現在の共有状態（ACL）を取得する。
+    /// `content` のファイルに対する共有設定を読む(ファイルのキー = `series_id`)。
+    fn load_share_of(&self, content: &Content) -> Result<Option<Share>, ShareApplicationError> {
+        self.share_repository
+            .load(content.series_id())
+            .map_err(ShareApplicationError::ShareRepository)
+    }
+
+    /// ファイル `series_id` の今の記録を引く(削除済みは拒否)。
+    fn current_record(
+        &self,
+        series_id: &crate::domain::content_id::ContentId,
+    ) -> Result<Content, ShareApplicationError> {
+        let content = self
+            .content_repository
+            .find_by_id(series_id)
+            .map_err(ShareApplicationError::ContentRepository)?
+            .ok_or(ShareApplicationError::ContentNotFound)?;
+        if content.is_deleted() {
+            return Err(ShareApplicationError::ContentDeleted);
+        }
+        Ok(content)
+    }
+
+    /// ファイルの今の CEK。
+    fn current_cek(
+        &self,
+        content: &Content,
+    ) -> Result<ContentEncryptionKey, ShareApplicationError> {
+        self.cek_store
+            .load(content.series_id())
+            .map_err(ShareApplicationError::ContentEncryptionKeyStore)?
+            .ok_or(ShareApplicationError::MissingContentEncryptionKey)
+    }
+
+    /// 指定されたファイルに対する現在の共有状態（ACL）を取得する。
     ///
+    /// - `series_id` はファイルのキー。
     /// - Share がまだ一度も保存されていない場合は Ok(None) を返す。
     pub fn get_share(
         &self,
-        content_id: crate::domain::content_id::ContentId,
+        series_id: crate::domain::content_id::ContentId,
     ) -> Result<Option<Share>, ShareApplicationError> {
         self.share_repository
-            .load(&content_id)
+            .load(&series_id)
             .map_err(ShareApplicationError::ShareRepository)
     }
 
@@ -88,16 +125,10 @@ where
         &self,
         cmd: GrantShareCommand,
     ) -> Result<GrantShareResult, ShareApplicationError> {
-        // 1. コンテンツ本体と暗号化状態の確認
-        let content = self
-            .content_repository
-            .find_by_id(&cmd.content_id)
-            .map_err(ShareApplicationError::ContentRepository)?
-            .ok_or(ShareApplicationError::ContentNotFound)?;
-
-        if content.is_deleted() {
-            return Err(ShareApplicationError::ContentDeleted);
-        }
+        // 1. コンテンツ本体と暗号化状態の確認(`content_id` はファイルのキー)。
+        //    包む CEK・暗号文・AAD の plainCid はすべてこのファイルの今の版のもの。
+        let content = self.current_record(&cmd.content_id)?;
+        let plain_content_id = content.raw_id().clone();
 
         let ciphertext = content
             .encrypted_content()
@@ -105,23 +136,17 @@ where
             .ok_or(ShareApplicationError::MissingEncryptedContent)?;
 
         // 2. CEK の取得
-        let cek = self
-            .cek_store
-            .load(&cmd.content_id)
-            .map_err(ShareApplicationError::ContentEncryptionKeyStore)?
-            .ok_or(ShareApplicationError::MissingContentEncryptionKey)?;
+        let cek = self.current_cek(&content)?;
 
         // 3. KeyId を計算
         let recipient_key_id = self
             .public_key_directory
             .compute_key_id(&cmd.recipient_public_key);
 
-        // 4. Share をロード
+        // 4. Share をロード(共有設定はファイル単位 = 系列ID のキー)
         let mut share = self
-            .share_repository
-            .load(&cmd.content_id)
-            .map_err(ShareApplicationError::ShareRepository)?
-            .unwrap_or_else(|| Share::new(cmd.content_id.clone()));
+            .load_share_of(&content)?
+            .unwrap_or_else(|| Share::new(content.series_id().clone()));
 
         // 5. Share のドメインルール検証
         let event = match cmd.permission {
@@ -136,7 +161,7 @@ where
         // 6. CEK をラップ(HPKE Auth: 送信者秘密鍵で送信者認証、AAD で宛先と鍵世代を束縛)
         let key_epoch = share.key_epoch();
         let aad = crate::domain::share::encryption::EnvelopeAad {
-            content_id: &cmd.content_id,
+            content_id: &plain_content_id,
             recipient_key_id: &recipient_key_id,
             key_epoch,
         };
@@ -167,7 +192,7 @@ where
         );
 
         let envelope = KeyEnvelope::new(
-            cmd.content_id.clone(),
+            plain_content_id,
             crate::domain::share::key_envelope::KeyWrapAlgorithm::HpkeV1,
             cmd.sender_key_id.clone(),
             wrapped_recipient,
@@ -189,15 +214,8 @@ where
         cmd: RevokeShareCommand,
     ) -> Result<RevokeShareResult, ShareApplicationError> {
         // 1. コンテンツ本体と暗号化状態の確認（KeyEnvelope 再発行に必要）
-        let content = self
-            .content_repository
-            .find_by_id(&cmd.content_id)
-            .map_err(ShareApplicationError::ContentRepository)?
-            .ok_or(ShareApplicationError::ContentNotFound)?;
-
-        if content.is_deleted() {
-            return Err(ShareApplicationError::ContentDeleted);
-        }
+        let content = self.current_record(&cmd.content_id)?;
+        let plain_content_id = content.raw_id().clone();
 
         let ciphertext = content
             .encrypted_content()
@@ -205,18 +223,12 @@ where
             .ok_or(ShareApplicationError::MissingEncryptedContent)?;
 
         // 2. CEK の取得（再暗号化後はここが新しい CEK になっている想定）
-        let cek = self
-            .cek_store
-            .load(&cmd.content_id)
-            .map_err(ShareApplicationError::ContentEncryptionKeyStore)?
-            .ok_or(ShareApplicationError::MissingContentEncryptionKey)?;
+        let cek = self.current_cek(&content)?;
 
         // 3. Share をロードして ACL を更新。CEK は rotation 済み(呼び出し側が
         //    reencrypt を先に実行している)なので鍵世代も進める。
         let mut share = self
-            .share_repository
-            .load(&cmd.content_id)
-            .map_err(ShareApplicationError::ShareRepository)?
+            .load_share_of(&content)?
             .ok_or(ShareApplicationError::ContentNotFound)?;
 
         share
@@ -235,7 +247,7 @@ where
         let mut envelopes = Vec::with_capacity(recipient_key_ids.len());
         for recipient_key_id in recipient_key_ids {
             let env = self.build_envelope_for_recipient(
-                &cmd.content_id,
+                &plain_content_id,
                 &cmd.sender_key_id,
                 &cmd.sender_private_key,
                 &recipient_key_id,
@@ -247,9 +259,46 @@ where
         }
 
         Ok(RevokeShareResult {
-            content_id: cmd.content_id,
+            content_id: plain_content_id,
             recipient_key_id: cmd.recipient_key_id,
             envelopes,
+        })
+    }
+
+    /// 既存の受信者の権限を変更する(ACL のみ)。
+    ///
+    /// - 受信者が共有されていない場合は `Share(RecipientNotFound)`。
+    /// - CEK・鍵世代・KeyEnvelope は変えない。権限は委譲 Token に載るので、
+    ///   Token の再発行(と降格時の旧 Token 失効)は呼び出し側(SDK)が行う。
+    pub fn update_share_permission(
+        &self,
+        cmd: UpdateSharePermissionCommand,
+    ) -> Result<UpdateSharePermissionResult, ShareApplicationError> {
+        let content = self.current_record(&cmd.content_id)?;
+
+        let mut share = self
+            .load_share_of(&content)?
+            .ok_or(ShareApplicationError::Share(
+                crate::domain::share::share::ShareError::RecipientNotFound,
+            ))?;
+
+        let previous = share
+            .permissions_of(&cmd.recipient_key_id)
+            .map(|p| p.to_vec())
+            .unwrap_or_default();
+        share
+            .update_recipient_permissions(&cmd.recipient_key_id, vec![cmd.permission.clone()])
+            .map_err(ShareApplicationError::Share)?;
+
+        self.share_repository
+            .save(&share)
+            .map_err(ShareApplicationError::ShareRepository)?;
+
+        Ok(UpdateSharePermissionResult {
+            content_id: content.raw_id().clone(),
+            recipient_key_id: cmd.recipient_key_id,
+            previous,
+            current: vec![cmd.permission],
         })
     }
 
@@ -1233,6 +1282,80 @@ mod tests {
     }
 
     #[test]
+    fn update_share_permission_changes_acl_without_touching_epoch() {
+        let (content_repo, content_storage) = TestContentRepository::new();
+        let (key_store, _key_storage) = TestKeyStore::new();
+        let (share_repo, share_storage) = TestShareRepository::new();
+        let public_key_dir = TestPublicKeyDirectory::default();
+        let key_wrapper = TestKeyWrapper;
+
+        let content_id = cid();
+        let kid = KeyId::new(vec![9, 9, 9]);
+        content_storage.lock().unwrap().insert(
+            content_id.as_str().to_string(),
+            build_content(&content_id, Some(encrypted()), false),
+        );
+        let mut share = Share::new(content_id.clone());
+        share.grant_read(kid.clone()).expect("grant_read");
+        share_storage
+            .lock()
+            .unwrap()
+            .insert(content_id.as_str().to_string(), share);
+
+        let service = build_service(
+            share_repo,
+            content_repo,
+            key_store,
+            public_key_dir,
+            key_wrapper,
+        );
+        let result = service
+            .update_share_permission(super::UpdateSharePermissionCommand {
+                content_id: content_id.clone(),
+                recipient_key_id: kid.clone(),
+                permission: Permission::Write,
+            })
+            .expect("update should succeed");
+        assert_eq!(result.previous, vec![Permission::Read]);
+        assert_eq!(result.current, vec![Permission::Write]);
+
+        let guard = share_storage.lock().unwrap();
+        let stored = guard.get(content_id.as_str()).expect("share kept");
+        assert_eq!(stored.permissions_of(&kid), Some(&[Permission::Write][..]));
+        assert_eq!(stored.key_epoch(), 0, "a permission change must not rotate");
+    }
+
+    #[test]
+    fn update_share_permission_fails_for_unknown_recipient() {
+        let (content_repo, content_storage) = TestContentRepository::new();
+        let (key_store, _key_storage) = TestKeyStore::new();
+        let (share_repo, _share_storage) = TestShareRepository::new();
+        let content_id = cid();
+        content_storage.lock().unwrap().insert(
+            content_id.as_str().to_string(),
+            build_content(&content_id, Some(encrypted()), false),
+        );
+        let service = build_service(
+            share_repo,
+            content_repo,
+            key_store,
+            TestPublicKeyDirectory::default(),
+            TestKeyWrapper,
+        );
+        let err = service
+            .update_share_permission(super::UpdateSharePermissionCommand {
+                content_id,
+                recipient_key_id: KeyId::new(vec![1]),
+                permission: Permission::Read,
+            })
+            .expect_err("unknown recipient");
+        assert!(matches!(
+            err,
+            ShareApplicationError::Share(ShareError::RecipientNotFound)
+        ));
+    }
+
+    #[test]
     fn get_share_returns_none_when_not_saved() {
         let (content_repo, _content_storage) = TestContentRepository::new();
         let (key_store, _key_storage) = TestKeyStore::new();
@@ -1284,5 +1407,61 @@ mod tests {
             .expect("get_share should succeed")
             .expect("share should exist");
         assert_eq!(result.recipients().len(), 1);
+    }
+
+    /// 共有設定・CEK はファイルのキー(series_id)で引き、包むのは今の版
+    /// (記録の暗号文、AAD は今の plainCid)。編集で plainCid が変わっても
+    /// 共有設定は 1 件のまま。
+    #[test]
+    fn share_is_keyed_by_the_file_and_wraps_the_current_version() {
+        use crate::infrastructure::content_id::Sha256ContentIdGenerator;
+        let (content_repo, _content_storage) = TestContentRepository::new();
+        let (key_store, _key_storage) = TestKeyStore::new();
+        let (share_repo, share_storage) = TestShareRepository::new();
+        let service = build_service(
+            share_repo,
+            content_repo.clone(),
+            key_store,
+            TestPublicKeyDirectory::default(),
+            TestKeyWrapper,
+        );
+
+        let v1 = build_content(&cid(), Some(encrypted()), false);
+        let (v2, _) = v1
+            .adopt_version(b"body B".to_vec(), vec![0xB2], &Sha256ContentIdGenerator)
+            .unwrap();
+        assert_ne!(v2.raw_id(), v1.raw_id());
+        assert_eq!(v2.series_id(), v1.series_id());
+        // 記録はファイルのキーに 1 件(今の版)。
+        content_repo.save(v2.series_id(), &v2).unwrap();
+        service.cek_store.save(v2.series_id(), &cek()).unwrap();
+
+        // テスト用の公開鍵ディレクトリは常にこの KeyId を返す。
+        let bob = KeyId::new(vec![1, 2, 3]);
+        let granted = service
+            .grant_share(GrantShareCommand {
+                content_id: v2.series_id().clone(),
+                sender_key_id: sender_key_id(),
+                sender_private_key: vec![1],
+                recipient_public_key: vec![7],
+                permission: Permission::Write,
+            })
+            .unwrap();
+        assert_eq!(granted.envelope.content_id(), v2.raw_id());
+        assert_eq!(granted.envelope.ciphertext(), &[0xB2][..]);
+
+        service
+            .update_share_permission(super::UpdateSharePermissionCommand {
+                content_id: v2.series_id().clone(),
+                recipient_key_id: bob.clone(),
+                permission: Permission::Read,
+            })
+            .unwrap();
+        let share = service
+            .get_share(v2.series_id().clone())
+            .unwrap()
+            .expect("share");
+        assert_eq!(share.permissions_of(&bob), Some(&[Permission::Read][..]));
+        assert_eq!(share_storage.lock().unwrap().len(), 1, "one share per file");
     }
 }

@@ -22,10 +22,9 @@ use monas_account::infrastructure::key_pair::KeyAlgorithm;
 
 use monas_content::application_service::content_service::{
     ContentEncryptionKeyStore, ContentRepository, ContentService, CreateContentCommand,
-    DeleteContentCommand, DeleteError, FetchError, RestoreDeletedContentCommand,
-    RestoreDeletedError, UpdateContentCommand, UpdateError,
+    DeleteContentCommand, DeleteError, FetchError, UpdateContentCommand, UpdateError,
 };
-use monas_content::domain::content::{Content, ContentEncryptionKey, StorageProvider};
+use monas_content::domain::content::{Content, ContentEncryptionKey};
 use monas_content::domain::content_id::ContentId;
 use monas_content::infrastructure::{
     content_id::Sha256ContentIdGenerator,
@@ -53,15 +52,6 @@ pub(super) type DynCekStore = std::sync::Arc<
         + Send
         + Sync,
 >;
-
-#[derive(Clone)]
-struct LocalContentSnapshot {
-    content_id: ContentId,
-    raw_content: Vec<u8>,
-    name: String,
-    path: String,
-    provider: Option<StorageProvider>,
-}
 
 #[derive(Clone)]
 struct StoredContentSnapshot {
@@ -308,26 +298,6 @@ impl MonasController {
         }
     }
 
-    fn map_restore_deleted_error(e: RestoreDeletedError) -> ApiError {
-        match e {
-            RestoreDeletedError::Validation(msg) => ApiError::Validation(msg),
-            RestoreDeletedError::NotFound => ApiError::NotFound("Content not found".into()),
-            RestoreDeletedError::NotDeleted => ApiError::Conflict("Content is not deleted".into()),
-            RestoreDeletedError::Domain(err) => {
-                ApiError::Internal(format!("Domain error: {err:?}"))
-            }
-            RestoreDeletedError::Repository(err) => {
-                ApiError::Internal(format!("Repository error: {err}"))
-            }
-            RestoreDeletedError::KeyStore(err) => {
-                ApiError::Internal(format!("Key store error: {err}"))
-            }
-            RestoreDeletedError::MissingEncryptedContent => {
-                ApiError::Internal("Missing encrypted content".into())
-            }
-        }
-    }
-
     /// content_idのバリデーション
     /// エラーがある場合はSome(ApiResponse)を返し、成功時はNoneを返す
     fn validate_content_id<T>(content_id: &str, trace_id: String) -> Option<ApiResponse<T>> {
@@ -371,35 +341,6 @@ impl MonasController {
         }
 
         Ok(content_bytes)
-    }
-
-    fn capture_local_content_snapshot(
-        &self,
-        content_id: ContentId,
-    ) -> Result<LocalContentSnapshot, FetchError> {
-        let fetched = self.content_service.fetch(content_id, None)?;
-        Ok(LocalContentSnapshot {
-            content_id: fetched.content_id,
-            raw_content: fetched.raw_content,
-            name: fetched.metadata.name().to_string(),
-            path: fetched.metadata.path().to_string(),
-            provider: fetched.metadata.provider().cloned(),
-        })
-    }
-
-    fn restore_deleted_from_snapshot(
-        &self,
-        snapshot: &LocalContentSnapshot,
-    ) -> Result<(), RestoreDeletedError> {
-        self.content_service
-            .restore_deleted(RestoreDeletedContentCommand {
-                content_id: snapshot.content_id.clone(),
-                name: snapshot.name.clone(),
-                path: snapshot.path.clone(),
-                raw_content: snapshot.raw_content.clone(),
-                provider: snapshot.provider.clone(),
-            })
-            .map(|_| ())
     }
 
     fn capture_stored_content_snapshot(
@@ -448,24 +389,6 @@ impl MonasController {
         self.content_service
             .delete(DeleteContentCommand {
                 content_id,
-                provider: None,
-            })
-            .map(|_| ())
-            .map_err(Self::map_delete_error)
-    }
-
-    fn rollback_updated_content(
-        &self,
-        before_update: &StoredContentSnapshot,
-        updated_content_id: &ContentId,
-    ) -> Result<(), ApiError> {
-        if updated_content_id == &before_update.content_id {
-            return self.restore_stored_content_snapshot(before_update);
-        }
-
-        self.content_service
-            .delete(DeleteContentCommand {
-                content_id: updated_content_id.clone(),
                 provider: None,
             })
             .map(|_| ())
@@ -838,7 +761,7 @@ impl MonasController {
     /// 1. 入力のバリデーション（content, metadata.name）
     /// 2. コンテンツをbase64urlデコード
     /// 3. ContentService::createを呼び出して以下を実行:
-    ///    - content_id生成（コンテンツのハッシュベース）
+    ///    - ファイルのキー(file_id)と版の plainCid の生成
     ///    - コンテンツの暗号化
     ///    - 暗号化コンテンツをリポジトリに保存
     ///    - CEKをキーストアに保存
@@ -912,7 +835,7 @@ impl MonasController {
                 Ok(remote_content_id) => remote_content_id,
                 Err(response) => {
                     if let Err(rollback_err) =
-                        self.rollback_created_content(result.content_id.clone())
+                        self.rollback_created_content(result.series_id.clone())
                     {
                         let primary = response.error.clone().unwrap_or_else(|| {
                             ApiError::Internal("unknown state node create failure".into())
@@ -933,6 +856,7 @@ impl MonasController {
             };
 
         let output = CreateContentOutput {
+            file_id: result.series_id.as_str().to_string(),
             content_id: result.content_id.as_str().to_string(),
             remote_content_id,
             created_at: Some(Utc::now().to_rfc3339()),
@@ -956,11 +880,11 @@ impl MonasController {
     pub fn get_content(&self, input: GetContentInput) -> ApiResponse<GetContentOutput> {
         let trace_id = generate_trace_id();
 
-        if let Some(response) = Self::validate_content_id(&input.content_id, trace_id.clone()) {
+        if let Some(response) = Self::validate_content_id(&input.file_id, trace_id.clone()) {
             return response;
         }
 
-        let content_id = ContentId::new(input.content_id.clone());
+        let content_id = ContentId::new(input.file_id.clone());
 
         let content_service = &self.content_service;
 
@@ -1012,9 +936,9 @@ impl MonasController {
         let trace_id = generate_trace_id();
 
         // 1. 入力のバリデーション
-        if input.local_content_id.is_empty() {
+        if input.file_id.is_empty() {
             return ApiResponse::error(
-                ApiError::Validation("local_content_id must not be empty".into()),
+                ApiError::Validation("file_id must not be empty".into()),
                 trace_id,
             );
         }
@@ -1025,13 +949,20 @@ impl MonasController {
             );
         }
 
-        // 2. ContentIdに変換
-        let base_version_id = input.local_content_id.clone();
-        let content_id = ContentId::new(base_version_id.clone());
+        // 2. ファイルのキーで記録を取る(失敗時はこの記録と CEK をそのまま戻す)。
+        //
+        // 記録・CEK はファイルごとに 1 件なので、巻き戻しは「保存前の記録を
+        // 丸ごと戻す」になる。同じファイルへの他の書き込み(別タブの保存・
+        // revoke・削除・取り込み)と並行させると、こちらの失敗の巻き戻しが
+        // その間に成功した書き込みを消す。revoke と同じファイル単位のロックで、
+        // 記録の取得から State Node への送信・巻き戻しまでを直列化する。
+        let content_id = ContentId::new(input.file_id.clone());
+        let _file_guard = self.content_revoke_locks.lock(content_id.as_str());
         let before_update = match self.capture_stored_content_snapshot(&content_id) {
             Ok(snapshot) => snapshot,
             Err(error) => return ApiResponse::error(error, trace_id),
         };
+        let base_version_id = before_update.content.raw_id().as_str().to_string();
 
         // 3. new_nameとnew_raw_contentを準備
         let new_name = input.metadata.as_ref().and_then(|m| m.name.clone());
@@ -1078,9 +1009,7 @@ impl MonasController {
             auth,
             trace_id.clone(),
         ) {
-            if let Err(rollback_err) =
-                self.rollback_updated_content(&before_update, &result.content_id)
-            {
+            if let Err(rollback_err) = self.restore_stored_content_snapshot(&before_update) {
                 let primary = response.error.clone().unwrap_or_else(|| {
                     ApiError::Internal("unknown state node update failure".into())
                 });
@@ -1098,44 +1027,14 @@ impl MonasController {
             return response;
         }
 
-        // 共有 ACL は版IDに紐づいて保存されている。新しい版へ引き継がないと、
-        // 編集した瞬間に既存の受信者が(SDK から見て)いなくなる: その後の share
-        // で作られる Share は新しい受信者だけを含み、誰かを revoke すると
-        // CEK はローテーションされるのに既存受信者には envelope も Token も
-        // 再発行されず、静かに締め出される。CEK 自体は content 層が新しい版へ
-        // コピーしているので、ACL も同じ扱いにする。
-        //
-        // 失敗しても更新自体は成立している(ローカル・State Node とも新しい版)
-        // ので巻き戻さない。次の share / revoke で「受信者がいない」として現れる。
-        if result.content_id.as_str() != base_version_id {
-            self.carry_share_acl(&ContentId::new(base_version_id.clone()), &result.content_id);
-        }
-
         let output = UpdateContentOutput {
-            series_id: result.series_id.as_str().to_string(),
+            file_id: result.series_id.as_str().to_string(),
             previous_version_id: base_version_id,
             version_id: result.content_id.as_str().to_string(),
             updated_at: Some(Utc::now().to_rfc3339()),
         };
 
         ApiResponse::success(output, trace_id)
-    }
-
-    /// 版IDに紐づく共有 ACL を新しい版IDへ引き継ぐ(best effort)。
-    /// `update_content` と `adopt_remote_head` で版IDが変わるときに呼ぶ。
-    ///
-    /// `to` に既に ACL があれば触らない: その ACL は `from` のものを引き継いだ
-    /// 後に変更された(受信者の追加・取り消し)より新しい状態であり、古い方で
-    /// 上書きすると後から加えた受信者が消える(head を取り込んだ後に古い版IDで
-    /// もう一度取り込む、といった再入で起きる)。
-    pub(super) fn carry_share_acl(&self, from: &ContentId, to: &ContentId) {
-        let share_repository = &self.share_service.share_repository;
-        if let Ok(Some(_)) = share_repository.load(to) {
-            return;
-        }
-        if let Ok(Some(share)) = share_repository.load(from) {
-            let _ = share_repository.save(&share.with_new_content_id(to.clone()));
-        }
     }
 
     /// コンテンツを削除する。
@@ -1158,8 +1057,7 @@ impl MonasController {
         let trace_id = generate_trace_id();
 
         // 1. 入力のバリデーション
-        if let Some(response) = Self::validate_content_id(&input.local_content_id, trace_id.clone())
-        {
+        if let Some(response) = Self::validate_content_id(&input.file_id, trace_id.clone()) {
             return response;
         }
         if input.remote_content_id.is_empty() {
@@ -1169,14 +1067,16 @@ impl MonasController {
             );
         }
 
-        // 2. ContentIdに変換
-        let content_id = ContentId::new(input.local_content_id.clone());
+        // 2. ファイルのキーで記録と CEK を取る。State Node が削除を拒否したら
+        //    これをそのまま戻す(作り直さないので、ファイルのキー・CEK・暗号文・
+        //    共有設定は削除前と同じ)。
+        let content_id = ContentId::new(input.file_id.clone());
+        // update と同じ理由で、同じファイルへの書き込みと直列化する。
+        let _file_guard = self.content_revoke_locks.lock(content_id.as_str());
 
-        let snapshot = match self.capture_local_content_snapshot(content_id.clone()) {
+        let snapshot = match self.capture_stored_content_snapshot(&content_id) {
             Ok(snapshot) => snapshot,
-            Err(e) => {
-                return ApiResponse::error(Self::map_fetch_error(e), trace_id);
-            }
+            Err(e) => return ApiResponse::error(e, trace_id),
         };
 
         // 3. ContentServiceを使用
@@ -1199,15 +1099,14 @@ impl MonasController {
         if let Some(response) =
             self.send_delete_to_state_node(&input.remote_content_id, auth, trace_id.clone())
         {
-            if let Err(restore_err) = self.restore_deleted_from_snapshot(&snapshot) {
+            if let Err(restore_err) = self.restore_stored_content_snapshot(&snapshot) {
                 let primary = response.error.clone().unwrap_or_else(|| {
                     ApiError::Internal("unknown state node delete failure".into())
                 });
-                let restore_message = Self::map_restore_deleted_error(restore_err);
                 return ApiResponse::error(
                     super::combine_rollback_failure(
                         primary,
-                        restore_message,
+                        restore_err,
                         "State Node delete",
                         "remote",
                         "restore",

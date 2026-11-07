@@ -26,7 +26,8 @@ use crate::models::keypair::{
 };
 use crate::models::share::{
     DecryptSharedContentInput, DecryptSharedContentOutput, RevokeShareInput, RevokeShareOutput,
-    ShareContentInput, ShareContentOutput, UpdateSharedContentInput, UpdateSharedContentOutput,
+    ShareContentInput, ShareContentOutput, UpdateSharePermissionInput, UpdateSharePermissionOutput,
+    UpdateSharedContentInput, UpdateSharedContentOutput,
 };
 use crate::models::state::{
     GetHistoryInput, GetHistoryOutput, GetLatestVersionInput, GetLatestVersionOutput,
@@ -120,6 +121,22 @@ impl MonasController {
         auth: Option<StateNodeAuthContext>,
     ) -> ApiResponse<RevokeShareOutput> {
         match tokio::task::spawn_blocking(move || self.revoke_share(input, auth.as_ref())).await {
+            Ok(resp) => resp,
+            Err(e) => map_join_error(e, fallback_trace_id()),
+        }
+    }
+
+    /// `update_share_permission` の async 版。
+    pub async fn update_share_permission_async(
+        self: Arc<Self>,
+        input: UpdateSharePermissionInput,
+        auth: Option<StateNodeAuthContext>,
+    ) -> ApiResponse<UpdateSharePermissionOutput> {
+        match tokio::task::spawn_blocking(move || {
+            self.update_share_permission(input, auth.as_ref())
+        })
+        .await
+        {
             Ok(resp) => resp,
             Err(e) => map_join_error(e, fallback_trace_id()),
         }

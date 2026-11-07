@@ -86,7 +86,7 @@ test("C-19: a registry saved with folders shows its files flat and drops the fol
         {
           id: "old-file", kind: "file", name: "inside.txt", parentPath: "/docs",
           sizeBytes: 5, mimeType: "text/plain", createdAt: now, updatedAt: now,
-          localContentId: "cid-local", syncedToStateNode: false, versionCount: 1, shares: [],
+          fileId: "file-local", localContentId: "cid-local", syncedToStateNode: false, versionCount: 1, shares: [],
         },
       ]),
     );

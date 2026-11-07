@@ -77,6 +77,9 @@ fn controller_with_account(state_node_url: String) -> MonasController {
 /// (ciphertext を SDK の外に取り出す公開経路が share envelope しかないため)。
 /// 戻り値: (local_content_id, ciphertext, share 出力, sender/recipient keypair)
 struct CreatedContent {
+    /// owner 側の操作の対象(ファイルのキー)
+    file_id: String,
+    /// 共有された版の plainCid(受信者側の read の照合に使う)
     local_content_id: String,
     ciphertext: Vec<u8>,
     shared: monas_sdk::models::share::ShareContentOutput,
@@ -130,7 +133,7 @@ async fn create_and_share(
     create_mock.assert();
 
     let share_response = controller.share_content(ShareContentInput {
-        content_id: created.content_id.clone(),
+        file_id: created.file_id.clone(),
         remote_content_id: None,
         sender_public_key: sender.public_key.clone(),
         sender_private_key: sender.private_key.clone(),
@@ -148,6 +151,7 @@ async fn create_and_share(
         .expect("envelope ciphertext should be base64url");
 
     CreatedContent {
+        file_id: created.file_id,
         local_content_id: created.content_id,
         ciphertext,
         shared,
@@ -173,7 +177,8 @@ async fn creator_reads_own_content_from_state_node() {
     let response = controller.read_content_from_state_node(
         ReadContentFromStateNodeInput {
             content_id: REMOTE_ID.into(),
-            local_content_id: created.local_content_id.clone(),
+            file_id: Some(created.file_id.clone()),
+            local_content_id: String::new(),
             version: None,
             accept_any_version: false,
         },
@@ -223,6 +228,7 @@ async fn share_recipient_reads_content_after_processing_envelope() {
     let before = recipient_controller.read_content_from_state_node(
         ReadContentFromStateNodeInput {
             content_id: REMOTE_ID.into(),
+            file_id: None,
             local_content_id: created.local_content_id.clone(),
             version: None,
             accept_any_version: false,
@@ -257,6 +263,7 @@ async fn share_recipient_reads_content_after_processing_envelope() {
     let after = recipient_controller.read_content_from_state_node(
         ReadContentFromStateNodeInput {
             content_id: REMOTE_ID.into(),
+            file_id: None,
             local_content_id: created.local_content_id.clone(),
             version: None,
             accept_any_version: false,
@@ -334,7 +341,7 @@ async fn cek_rotation_after_revoke_updates_recipient_and_read() {
     // 2 名に share(片方を後で revoke する)
     let share_to = |recipient_pub: &str| {
         creator.share_content(ShareContentInput {
-            content_id: created.content_id.clone(),
+            file_id: created.file_id.clone(),
             remote_content_id: None,
             sender_public_key: sender.public_key.clone(),
             sender_private_key: sender.private_key.clone(),
@@ -371,7 +378,7 @@ async fn cek_rotation_after_revoke_updates_recipient_and_read() {
         .await;
     let revoke_response = creator.revoke_share(
         monas_sdk::models::share::RevokeShareInput {
-            content_id: created.content_id.clone(),
+            file_id: created.file_id.clone(),
             remote_content_id: Some(REMOTE_ID.into()),
             sender_public_key: sender.public_key.clone(),
             sender_private_key: sender.private_key.clone(),
@@ -415,6 +422,7 @@ async fn cek_rotation_after_revoke_updates_recipient_and_read() {
         recipient_controller.read_content_from_state_node(
             ReadContentFromStateNodeInput {
                 content_id: REMOTE_ID.into(),
+                file_id: None,
                 local_content_id: created.content_id.clone(),
                 version: None,
                 accept_any_version: false,
@@ -539,7 +547,8 @@ async fn read_rejects_tampered_node() {
     let response = controller.read_content_from_state_node(
         ReadContentFromStateNodeInput {
             content_id: REMOTE_ID.into(),
-            local_content_id: created.local_content_id.clone(),
+            file_id: Some(created.file_id.clone()),
+            local_content_id: String::new(),
             version: None,
             accept_any_version: false,
         },
@@ -651,7 +660,7 @@ async fn share_recipient_reads_a_version_written_after_the_share() {
     let updated = creator
         .update_content(
             monas_sdk::models::content::UpdateContentInput {
-                local_content_id: created.local_content_id.clone(),
+                file_id: created.file_id.clone(),
                 remote_content_id: REMOTE_ID.into(),
                 content: URL_SAFE_NO_PAD.encode(b"second version, written after sharing"),
                 metadata: None,
@@ -681,7 +690,7 @@ async fn share_recipient_reads_a_version_written_after_the_share() {
         .unwrap();
     let reshared = creator
         .share_content(ShareContentInput {
-            content_id: updated.version_id.clone(),
+            file_id: updated.file_id.clone(),
             remote_content_id: Some(REMOTE_ID.into()),
             sender_public_key: sender.public_key.clone(),
             sender_private_key: sender.private_key.clone(),
@@ -707,6 +716,7 @@ async fn share_recipient_reads_a_version_written_after_the_share() {
     let strict = recipient_controller.read_content_from_state_node(
         ReadContentFromStateNodeInput {
             content_id: REMOTE_ID.into(),
+            file_id: None,
             local_content_id: created.local_content_id.clone(),
             version: None,
             accept_any_version: false,
@@ -727,6 +737,7 @@ async fn share_recipient_reads_a_version_written_after_the_share() {
     let lenient = recipient_controller.read_content_from_state_node(
         ReadContentFromStateNodeInput {
             content_id: REMOTE_ID.into(),
+            file_id: None,
             local_content_id: created.local_content_id.clone(),
             version: None,
             accept_any_version: true,
@@ -794,7 +805,7 @@ async fn delegated_token_is_issued_for_the_remote_content_id() {
         .data
         .unwrap();
     let shared = controller.share_content(ShareContentInput {
-        content_id: created.content_id.clone(),
+        file_id: created.file_id.clone(),
         remote_content_id: Some(REMOTE_ID.into()),
         sender_public_key: sender.public_key,
         sender_private_key: sender.private_key,
@@ -927,7 +938,7 @@ async fn a_pre_rotation_envelope_for_an_older_version_id_is_still_refused() {
                  recipient: &monas_sdk::models::keypair::GenerateKeypairOutput| {
         creator
             .share_content(ShareContentInput {
-                content_id: content_id.to_string(),
+                file_id: content_id.to_string(),
                 remote_content_id: Some(REMOTE_ID.into()),
                 sender_public_key: sender.public_key.clone(),
                 sender_private_key: sender.private_key.clone(),
@@ -937,7 +948,7 @@ async fn a_pre_rotation_envelope_for_an_older_version_id_is_still_refused() {
             .data
             .expect("share")
     };
-    let bob_v1 = share(&created.content_id, &bob);
+    let bob_v1 = share(&created.file_id, &bob);
 
     // Bob (another device) processes the epoch-0 envelope for version 1.
     let bob_device = controller_with_account(server.url());
@@ -960,7 +971,7 @@ async fn a_pre_rotation_envelope_for_an_older_version_id_is_still_refused() {
     let updated = creator
         .update_content(
             monas_sdk::models::content::UpdateContentInput {
-                local_content_id: created.content_id.clone(),
+                file_id: created.file_id.clone(),
                 remote_content_id: REMOTE_ID.into(),
                 content: URL_SAFE_NO_PAD.encode(b"pin v2 after edit"),
                 metadata: None,
@@ -970,11 +981,11 @@ async fn a_pre_rotation_envelope_for_an_older_version_id_is_still_refused() {
         .data
         .expect("update");
     assert_ne!(updated.version_id, created.content_id);
-    share(&updated.version_id, &carol);
+    share(&updated.file_id, &carol);
     let revoked = creator
         .revoke_share(
             monas_sdk::models::share::RevokeShareInput {
-                content_id: updated.version_id.clone(),
+                file_id: updated.file_id.clone(),
                 remote_content_id: Some(REMOTE_ID.into()),
                 sender_public_key: sender.public_key.clone(),
                 sender_private_key: sender.private_key.clone(),
@@ -1087,7 +1098,8 @@ async fn share_recipient_writes_a_new_version_with_the_delegated_token() {
     let owner_read = creator.read_content_from_state_node(
         ReadContentFromStateNodeInput {
             content_id: REMOTE_ID.into(),
-            local_content_id: created.local_content_id.clone(),
+            file_id: Some(created.file_id.clone()),
+            local_content_id: String::new(),
             version: None,
             accept_any_version: true,
         },
@@ -1107,6 +1119,7 @@ async fn share_recipient_writes_a_new_version_with_the_delegated_token() {
     let own_read = recipient.read_content_from_state_node(
         ReadContentFromStateNodeInput {
             content_id: REMOTE_ID.into(),
+            file_id: None,
             local_content_id: written.version_id.clone(),
             version: None,
             accept_any_version: false,
@@ -1270,7 +1283,7 @@ async fn a_state_node_refusal_keeps_its_status_and_reason() {
     };
     let updated = creator.update_content(
         monas_sdk::models::content::UpdateContentInput {
-            local_content_id: created.local_content_id.clone(),
+            file_id: created.file_id.clone(),
             remote_content_id: REMOTE_ID.into(),
             content: URL_SAFE_NO_PAD.encode(b"owner after refusal"),
             metadata: None,
@@ -1366,7 +1379,7 @@ async fn owner_pulls_a_recipients_version_and_revoke_rotates_that_version() {
                  recipient: &monas_sdk::models::keypair::GenerateKeypairOutput| {
         owner
             .share_content(ShareContentInput {
-                content_id: content_id.to_string(),
+                file_id: content_id.to_string(),
                 remote_content_id: Some(REMOTE_ID.into()),
                 sender_public_key: sender.public_key.clone(),
                 sender_private_key: sender.private_key.clone(),
@@ -1376,7 +1389,7 @@ async fn owner_pulls_a_recipients_version_and_revoke_rotates_that_version() {
             .data
             .expect("share")
     };
-    let bob_share = share(&created.content_id, &bob_key);
+    let bob_share = share(&created.file_id, &bob_key);
 
     // Bob (another device) imports and writes.
     let bob = controller_with_account(server.url());
@@ -1426,7 +1439,7 @@ async fn owner_pulls_a_recipients_version_and_revoke_rotates_that_version() {
         .pull_content_from_state_node(
             monas_sdk::models::state::PullContentFromStateNodeInput {
                 content_id: REMOTE_ID.into(),
-                local_content_id: created.content_id.clone(),
+                file_id: created.file_id.clone(),
             },
             None,
         )
@@ -1441,7 +1454,7 @@ async fn owner_pulls_a_recipients_version_and_revoke_rotates_that_version() {
     );
     let local = owner
         .get_content(monas_sdk::models::content::GetContentInput {
-            content_id: pulled.local_content_id.clone(),
+            file_id: created.file_id.clone(),
         })
         .data
         .expect("adopted version is a local record");
@@ -1454,7 +1467,7 @@ async fn owner_pulls_a_recipients_version_and_revoke_rotates_that_version() {
         .pull_content_from_state_node(
             monas_sdk::models::state::PullContentFromStateNodeInput {
                 content_id: REMOTE_ID.into(),
-                local_content_id: pulled.local_content_id.clone(),
+                file_id: created.file_id.clone(),
             },
             None,
         )
@@ -1463,11 +1476,10 @@ async fn owner_pulls_a_recipients_version_and_revoke_rotates_that_version() {
     assert!(!again.adopted);
     assert_eq!(again.local_content_id, pulled.local_content_id);
 
-    // The share ACL followed the adoption: sharing to carol from the pulled
-    // id works, and revoking her re-wraps Bob (the surviving recipient).
-    // Revoke pulls by itself, so a caller still holding the pre-pull id is
-    // not a problem either — pass the ORIGINAL id here on purpose.
-    share(&pulled.local_content_id, &carol_key);
+    // The share ACL is the file's, so it is unaffected by the adoption:
+    // sharing to carol works, and revoking her re-wraps Bob (the surviving
+    // recipient) for the adopted version.
+    share(&created.file_id, &carol_key);
     let owner_auth = monas_sdk::StateNodeAuthContext {
         authorization: None,
         request_signature: None,
@@ -1475,7 +1487,7 @@ async fn owner_pulls_a_recipients_version_and_revoke_rotates_that_version() {
     };
     let revoked = owner.revoke_share(
         monas_sdk::models::share::RevokeShareInput {
-            content_id: created.content_id.clone(),
+            file_id: created.file_id.clone(),
             remote_content_id: Some(REMOTE_ID.into()),
             sender_public_key: sender.public_key.clone(),
             sender_private_key: sender.private_key.clone(),

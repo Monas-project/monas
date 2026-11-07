@@ -27,9 +27,36 @@ pub enum ContentEvent {
     Deleted,
 }
 
+/// ファイルの作成時刻(Unix エポックからのナノ秒)。プロセス内で単調に増える。
+///
+/// 同じ時刻の読みが続いたときは前回値 + 1 を返すので、同じ本文のファイルを
+/// 続けて作っても `series_id` が重ならない(state node の
+/// `next_monotonic_timestamp` と同じ考え方)。
+fn next_creation_timestamp() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let mut last = LAST.load(Ordering::Relaxed);
+    loop {
+        let next = now.max(last.saturating_add(1));
+        match LAST.compare_exchange_weak(last, next, Ordering::AcqRel, Ordering::Relaxed) {
+            Ok(_) => return next,
+            Err(seen) => last = seen,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Content {
+    /// 今の版の plainCid(本文の SHA-256)。AAD と改ざん検出に使う値で、
+    /// 端末側の保存のキーには使わない。
     raw_id: ContentId,
+    /// ファイルのキー。作成時に `ContentIdGenerator::generate_series` で
+    /// 1 回だけ決め、以後変えない。記録・CEK・共有設定はこのキーで持つ。
     series_id: ContentId,
     encrypted_id: ContentId,
     metadata: Metadata,
@@ -78,6 +105,7 @@ impl Content {
         E: ContentEncryption,
     {
         let cid = id_generator.generate(&raw_content);
+        let series_id = id_generator.generate_series(&cid, next_creation_timestamp());
         let metadata = Metadata::new(name, path, cid.clone(), provider);
 
         if key.0.is_empty() {
@@ -91,8 +119,8 @@ impl Content {
         let enc_cid = id_generator.generate_encrypted(&cid, &encrypted_content);
 
         let content = Self {
-            raw_id: cid.clone(),
-            series_id: cid,
+            raw_id: cid,
+            series_id,
             encrypted_id: enc_cid,
             metadata,
             raw_content: Some(raw_content),
@@ -360,6 +388,13 @@ mod tests {
                 ciphertext.len()
             ))
         }
+
+        fn generate_series(&self, initial_plain_cid: &ContentId, created_at: u64) -> ContentId {
+            ContentId::new(format!(
+                "test-series-{}-{created_at}",
+                initial_plain_cid.as_str()
+            ))
+        }
     }
 
     #[test]
@@ -390,7 +425,29 @@ mod tests {
         assert_eq!(event, ContentEvent::Created);
         assert!(content.encrypted_content().is_some());
         assert!(content.raw_id().as_str().starts_with("test-content-id-"));
-        assert_eq!(content.raw_id(), content.series_id());
+        assert_ne!(content.raw_id(), content.series_id());
+    }
+
+    /// 同じ本文で作った 2 つのファイルは、別のファイルのキーを持つ。
+    #[test]
+    fn two_files_created_from_the_same_body_get_different_series_ids() {
+        let (key, encryption) = test_key_and_cipher();
+        let make = || {
+            Content::create(
+                "same".into(),
+                b"same body".to_vec(),
+                "/same".into(),
+                None,
+                &MockIdGenerator,
+                &key,
+                &encryption,
+            )
+            .unwrap()
+            .0
+        };
+        let (a, b) = (make(), make());
+        assert_eq!(a.raw_id(), b.raw_id());
+        assert_ne!(a.series_id(), b.series_id());
     }
 
     #[test]

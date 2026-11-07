@@ -662,6 +662,31 @@ textarea.input:focus {
   background: var(--pink-50);
   color: var(--pink-700);
 }
+.seg.sm {
+  gap: 4px;
+  flex: none;
+}
+.seg.sm button {
+  padding: 4px 8px;
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+.seg button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+.hint.existing-recipient {
+  color: var(--pink-700);
+}
+.link-btn {
+  border: 0;
+  background: none;
+  padding: 0;
+  color: var(--pink-700);
+  font-size: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
 
 .callout {
   background: var(--bg-subtle);
@@ -831,6 +856,14 @@ textarea.input:focus {
   background: var(--err);
   color: #fff;
 }
+.step.warning .node {
+  border-color: var(--warn);
+  background: var(--warn);
+  color: #fff;
+}
+.step .detail.warn {
+  color: var(--warn);
+}
 .step.skipped .node {
   opacity: 0.5;
 }
@@ -926,6 +959,12 @@ textarea.input:focus {
 }
 .toast.error {
   background: #7c1f29;
+}
+.toast.warning {
+  background: #8a5a00;
+}
+.toast.warning .dot {
+  background: #ffd166;
 }
 .toast.success .dot {
   background: #58e0a0;

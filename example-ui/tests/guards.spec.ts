@@ -41,7 +41,7 @@ test("I-45: content ops without a signing account are refused", async ({ page })
 
   // The registry is still empty on disk, not just visually.
   expect(
-    await page.evaluate(() => localStorage.getItem("monas.registry.v3")),
+    await page.evaluate(() => localStorage.getItem("monas.registry.v4")),
   ).toBeNull();
 
   // Wait out the error toast (5.2s) so the next assertion starts clean.

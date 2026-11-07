@@ -81,7 +81,7 @@ async fn create_content_and_get_content_round_trip_succeeds_with_mock_state_node
     create_mock.assert();
 
     let get_response = controller.get_content(GetContentInput {
-        content_id: created.content_id,
+        file_id: created.file_id,
     });
 
     assert!(get_response.success, "get_content should succeed");
@@ -135,7 +135,7 @@ async fn delete_content_round_trip_succeeds() {
 
     let delete_response = controller.delete_content(
         DeleteContentInput {
-            local_content_id: created.content_id.clone(),
+            file_id: created.file_id.clone(),
             remote_content_id: created
                 .remote_content_id
                 .clone()
@@ -151,7 +151,7 @@ async fn delete_content_round_trip_succeeds() {
     assert_eq!(deleted.content_id, created.content_id);
 
     let get_response = controller.get_content(GetContentInput {
-        content_id: created.content_id,
+        file_id: created.file_id,
     });
     assert!(
         !get_response.success,
@@ -213,7 +213,7 @@ async fn delete_content_rolls_back_locally_when_state_node_delete_fails() {
 
     let delete_response = controller.delete_content(
         DeleteContentInput {
-            local_content_id: created.content_id.clone(),
+            file_id: created.file_id.clone(),
             remote_content_id: created
                 .remote_content_id
                 .clone()
@@ -228,7 +228,7 @@ async fn delete_content_rolls_back_locally_when_state_node_delete_fails() {
     delete_mock.assert();
 
     let get_response = controller.get_content(GetContentInput {
-        content_id: created.content_id.clone(),
+        file_id: created.file_id.clone(),
     });
     assert!(
         get_response.success,
@@ -242,7 +242,7 @@ async fn delete_content_rolls_back_locally_when_state_node_delete_fails() {
 
     let second_delete_response = controller.delete_content(
         DeleteContentInput {
-            local_content_id: created.content_id,
+            file_id: created.file_id,
             remote_content_id: created
                 .remote_content_id
                 .expect("create should return remote_content_id"),
@@ -304,7 +304,7 @@ async fn update_content_round_trip_succeeds_with_mock_state_node() {
 
     let first_update_response = controller.update_content(
         UpdateContentInput {
-            local_content_id: created.content_id.clone(),
+            file_id: created.file_id.clone(),
             remote_content_id: created
                 .remote_content_id
                 .clone()
@@ -330,12 +330,12 @@ async fn update_content_round_trip_succeeds_with_mock_state_node() {
     let first_updated = first_update_response
         .data
         .expect("first update should return data");
-    assert_eq!(first_updated.series_id, created.content_id);
-    assert_eq!(first_updated.previous_version_id, first_updated.series_id);
+    assert_eq!(first_updated.file_id, created.file_id);
+    assert_eq!(first_updated.previous_version_id, created.content_id);
 
     let second_update_response = controller.update_content(
         UpdateContentInput {
-            local_content_id: first_updated.version_id.clone(),
+            file_id: first_updated.file_id.clone(),
             remote_content_id: created
                 .remote_content_id
                 .clone()
@@ -362,11 +362,11 @@ async fn update_content_round_trip_succeeds_with_mock_state_node() {
         .data
         .expect("second update should return data");
     update_mock.assert();
-    assert_eq!(second_updated.series_id, created.content_id);
+    assert_eq!(second_updated.file_id, created.file_id);
     assert_eq!(second_updated.previous_version_id, first_updated.version_id);
 
     let get_response = controller.get_content(GetContentInput {
-        content_id: second_updated.version_id,
+        file_id: second_updated.file_id,
     });
     assert!(
         get_response.success,
@@ -434,7 +434,7 @@ async fn create_content_rolls_back_locally_when_state_node_create_fails_and_can_
     succeeding_create_mock.assert();
 
     let get_response = controller.get_content(GetContentInput {
-        content_id: created.content_id,
+        file_id: created.file_id,
     });
     assert!(get_response.success, "created content should be readable");
     let fetched = get_response.data.expect("get should return data");
@@ -545,7 +545,7 @@ async fn update_content_rolls_back_new_version_when_state_node_update_fails() {
 
     let failed_update = controller.update_content(
         UpdateContentInput {
-            local_content_id: created.content_id.clone(),
+            file_id: created.file_id.clone(),
             remote_content_id: created
                 .remote_content_id
                 .clone()
@@ -567,7 +567,7 @@ async fn update_content_rolls_back_new_version_when_state_node_update_fails() {
     failed_update_mock.assert();
 
     let old_version_response = controller.get_content(GetContentInput {
-        content_id: created.content_id.clone(),
+        file_id: created.file_id.clone(),
     });
     assert!(
         old_version_response.success,
@@ -581,7 +581,7 @@ async fn update_content_rolls_back_new_version_when_state_node_update_fails() {
 
     let expected_new_version_id = compute_content_id(updated_raw);
     let rolled_back_version_response = controller.get_content(GetContentInput {
-        content_id: expected_new_version_id.clone(),
+        file_id: expected_new_version_id.clone(),
     });
     assert!(
         !rolled_back_version_response.success,
@@ -615,7 +615,7 @@ async fn update_content_rolls_back_new_version_when_state_node_update_fails() {
 
     let second_update = controller.update_content(
         UpdateContentInput {
-            local_content_id: created.content_id.clone(),
+            file_id: created.file_id.clone(),
             remote_content_id: created
                 .remote_content_id
                 .clone()
@@ -703,7 +703,7 @@ async fn delete_content_uses_account_signature_for_metadata_request() {
 
     let response = controller.delete_content(
         DeleteContentInput {
-            local_content_id: created.content_id,
+            file_id: created.file_id,
             remote_content_id: created
                 .remote_content_id
                 .expect("create should return remote_content_id"),

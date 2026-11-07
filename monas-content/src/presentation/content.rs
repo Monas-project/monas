@@ -28,8 +28,15 @@ pub struct CreateContentRequest {
     pub provider: Option<String>,
 }
 
+/// 作成・更新の応答。
+///
+/// `series_id` はファイルのキーで、以後の `/contents/{id}`(更新・削除・
+/// 取得・再暗号化)と `/shares` の `content_id` にはこれを渡す。作成時に
+/// 決まり、本文を編集しても変わらない。`content_id` は今の版の plainCid
+/// (本文の SHA-256)で、`/contents/{id}/decrypt` の照合に使う。
 #[derive(Serialize)]
 pub struct CreateContentResponse {
+    pub series_id: String,
     pub content_id: String,
     pub name: String,
     pub path: String,
@@ -106,6 +113,7 @@ async fn create_content(
 fn to_response(result: CreateContentResult) -> CreateContentResponse {
     let metadata = &result.metadata;
     CreateContentResponse {
+        series_id: result.series_id.as_str().to_string(),
         content_id: result.content_id.as_str().to_string(),
         name: metadata.name().to_string(),
         path: metadata.path().to_string(),
@@ -145,6 +153,7 @@ async fn update_content(
         None => None,
     };
 
+    let _file_guard = state.file_locks.lock(content_id.as_str()).await;
     let cmd = UpdateContentCommand {
         content_id,
         new_name: req.name,
@@ -159,6 +168,7 @@ async fn update_content(
 
     let metadata = &result.metadata;
     Ok(Json(CreateContentResponse {
+        series_id: result.series_id.as_str().to_string(),
         content_id: result.content_id.as_str().to_string(),
         name: metadata.name().to_string(),
         path: metadata.path().to_string(),
@@ -186,6 +196,7 @@ async fn delete_content(
         None => None,
     };
 
+    let _file_guard = state.file_locks.lock(content_id.as_str()).await;
     let cmd = DeleteContentCommand {
         content_id,
         provider,
@@ -314,6 +325,7 @@ async fn reencrypt_content(
 ) -> Result<Json<ReencryptContentResponse>, (StatusCode, String)> {
     let content_id = ContentId::new(content_id_str);
 
+    let _file_guard = state.file_locks.lock(content_id.as_str()).await;
     // ReencryptContentCommandを構築
     let cmd = ReencryptContentCommand { content_id };
 
@@ -416,4 +428,153 @@ async fn disconnect_provider(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// The router's local provider writes records under ./content (the crate
+    /// dir under `cargo test`). Tests remove only the records they added, and
+    /// run one at a time so one test's cleanup cannot remove the directory
+    /// under another.
+    static CONTENT_DIR: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn existing_records() -> std::collections::HashSet<std::path::PathBuf> {
+        std::fs::read_dir("content")
+            .map(|entries| entries.flatten().map(|e| e.path()).collect())
+            .unwrap_or_default()
+    }
+
+    fn remove_new_records(before: &std::collections::HashSet<std::path::PathBuf>) {
+        for path in existing_records() {
+            if !before.contains(&path) {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        // Only removes the directory when it is empty, i.e. the tests made it.
+        let _ = std::fs::remove_dir("content");
+    }
+
+    /// Minimal HTTP/1.1 client: one request per connection.
+    async fn call(
+        addr: std::net::SocketAddr,
+        method: &str,
+        path: &str,
+        body: &str,
+    ) -> (u16, String) {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let req = format!(
+            "{method} {path} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let mut out = String::new();
+        stream.read_to_string(&mut out).await.unwrap();
+        let status = out[9..12].parse().unwrap();
+        let body = out.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+        (status, body)
+    }
+
+    /// The id the create response hands out addresses the file in every later
+    /// call: fetch, update (which changes the plainCid but not the file key),
+    /// fetch again, delete.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_created_files_key_addresses_it_in_later_calls() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, crate::presentation::create_router())
+                .await
+                .unwrap()
+        });
+        let _dir = CONTENT_DIR.lock().await;
+        let before = existing_records();
+
+        let (status, body) = call(
+            addr,
+            "POST",
+            "/contents",
+            r#"{"name":"a.txt","path":"/a.txt","content_base64":"djE="}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let created: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let file = created["series_id"].as_str().unwrap().to_string();
+        assert_ne!(created["content_id"], created["series_id"]);
+
+        let (status, body) = call(addr, "GET", &format!("/contents/{file}/fetch"), "").await;
+        assert_eq!(status, 200, "{body}");
+
+        let (status, body) = call(
+            addr,
+            "PATCH",
+            &format!("/contents/{file}"),
+            r#"{"content_base64":"djI="}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let updated: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(updated["series_id"].as_str().unwrap(), file);
+        assert_ne!(updated["content_id"], created["content_id"]);
+
+        let (status, body) = call(addr, "GET", &format!("/contents/{file}/fetch"), "").await;
+        assert_eq!(status, 200, "{body}");
+        let fetched: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(fetched["content_base64"], "djI=");
+
+        let (status, body) = call(addr, "DELETE", &format!("/contents/{file}"), "").await;
+        assert_eq!(status, 204, "{body}");
+
+        remove_new_records(&before);
+    }
+
+    /// An update and a re-encryption of one file arriving together must both
+    /// leave a readable file: each reads the record, writes it back with its
+    /// own ciphertext and (for re-encryption) a new CEK, so unserialized the
+    /// last record write and the last CEK write can come from different
+    /// requests.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_update_and_reencrypt_leave_the_file_readable() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, crate::presentation::create_router())
+                .await
+                .unwrap()
+        });
+        let _dir = CONTENT_DIR.lock().await;
+        let before = existing_records();
+
+        let (status, body) = call(
+            addr,
+            "POST",
+            "/contents",
+            r#"{"name":"r.txt","path":"/r.txt","content_base64":"cjA="}"#,
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let created: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let file = created["series_id"].as_str().unwrap().to_string();
+
+        for round in 0..30 {
+            let update_body = format!(r#"{{"content_base64":"{}"}}"#, base64_of(round));
+            let update_path = format!("/contents/{file}");
+            let reencrypt_path = format!("/contents/{file}/reencrypt");
+            let (u, r) = tokio::join!(
+                call(addr, "PATCH", &update_path, &update_body),
+                call(addr, "POST", &reencrypt_path, ""),
+            );
+            assert_eq!(u.0, 200, "{}", u.1);
+            assert_eq!(r.0, 200, "{}", r.1);
+            let (status, body) = call(addr, "GET", &format!("/contents/{file}/fetch"), "").await;
+            assert_eq!(status, 200, "round {round}: {body}");
+        }
+        remove_new_records(&before);
+    }
+
+    fn base64_of(round: u32) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(format!("round {round}"))
+    }
 }

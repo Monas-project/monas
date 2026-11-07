@@ -29,6 +29,11 @@ pub struct CreateContentInput {
 /// コンテンツ作成レスポンス
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateContentOutput {
+    /// このファイルのキー。端末だけで使う値で、以後の owner 側の操作
+    /// (取得・更新・削除・共有・取り消し・権限変更・state の取り込み)は
+    /// これで対象を指定する。state node や受信者には渡さない。
+    pub file_id: String,
+    /// 作成した版の plainCid(本文の SHA-256)。
     pub content_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_content_id: Option<String>,
@@ -43,12 +48,14 @@ pub struct CreateContentOutput {
 /// コンテンツ取得リクエスト
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetContentInput {
-    pub content_id: String,
+    /// 対象ファイルのキー(`CreateContentOutput::file_id`)。
+    pub file_id: String,
 }
 
 /// コンテンツ取得レスポンス
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetContentOutput {
+    /// 今の版の plainCid。
     pub content_id: String,
     /// 復号されたコンテンツ（base64url）
     pub content: String,
@@ -63,8 +70,8 @@ pub struct GetContentOutput {
 /// コンテンツ更新リクエスト
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateContentInput {
-    /// SDK ローカルで管理する更新元の版ID
-    pub local_content_id: String,
+    /// 対象ファイルのキー(`CreateContentOutput::file_id`)
+    pub file_id: String,
     /// State Node へ送る系列ID
     pub remote_content_id: String,
     /// 新しいコンテンツデータ（base64url）
@@ -76,11 +83,11 @@ pub struct UpdateContentInput {
 /// コンテンツ更新レスポンス
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateContentOutput {
-    /// 論理的に同一なコンテンツ系列を識別するID
-    pub series_id: String,
-    /// 更新元として使用した版ID
+    /// 対象ファイルのキー(入力と同じ。編集では変わらない)
+    pub file_id: String,
+    /// 更新前の版の plainCid
     pub previous_version_id: String,
-    /// 更新後に作成された新しい版ID
+    /// 更新後の版の plainCid
     pub version_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
@@ -93,8 +100,8 @@ pub struct UpdateContentOutput {
 /// コンテンツ削除リクエスト
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeleteContentInput {
-    /// SDK ローカルで管理する削除対象ID
-    pub local_content_id: String,
+    /// 対象ファイルのキー(`CreateContentOutput::file_id`)
+    pub file_id: String,
     /// State Node へ送る系列ID
     pub remote_content_id: String,
 }
@@ -146,6 +153,7 @@ mod tests {
     #[test]
     fn test_create_content_output() {
         let output = CreateContentOutput {
+            file_id: "file".into(),
             content_id: "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi".into(),
             remote_content_id: Some("bafkreiabc".into()),
             created_at: Some("2025-12-05T12:34:56Z".into()),
@@ -158,9 +166,9 @@ mod tests {
 
     #[test]
     fn test_get_content_input_minimal() {
-        let json = r#"{"content_id": "test_id"}"#;
+        let json = r#"{"file_id": "test_id"}"#;
         let input: GetContentInput = serde_json::from_str(json).unwrap();
-        assert_eq!(input.content_id, "test_id");
+        assert_eq!(input.file_id, "test_id");
     }
 
     #[test]
@@ -179,13 +187,13 @@ mod tests {
     #[test]
     fn test_update_content_input() {
         let input = UpdateContentInput {
-            local_content_id: "local_id".into(),
+            file_id: "file".into(),
             remote_content_id: "bafkremote".into(),
             content: "bmV3IGNvbnRlbnQ=".into(),
             metadata: None,
         };
         let json = serde_json::to_string(&input).unwrap();
-        assert!(json.contains("\"local_content_id\":\"local_id\""));
+        assert!(json.contains("\"file_id\":\"file\""));
         assert!(json.contains("\"remote_content_id\":\"bafkremote\""));
         assert!(json.contains("\"content\":\"bmV3IGNvbnRlbnQ=\""));
     }
@@ -193,13 +201,13 @@ mod tests {
     #[test]
     fn test_update_content_output() {
         let output = UpdateContentOutput {
-            series_id: "series_id".into(),
+            file_id: "file".into(),
             previous_version_id: "prev_version".into(),
             version_id: "new_version".into(),
             updated_at: Some("2025-12-05T12:34:56Z".into()),
         };
         let json = serde_json::to_string(&output).unwrap();
-        assert!(json.contains("\"series_id\":\"series_id\""));
+        assert!(json.contains("\"file_id\":\"file\""));
         assert!(json.contains("\"previous_version_id\":\"prev_version\""));
         assert!(json.contains("\"version_id\":\"new_version\""));
         assert!(json.contains("\"updated_at\":\"2025-12-05T12:34:56Z\""));

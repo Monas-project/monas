@@ -117,7 +117,9 @@ pub struct MonasController {
     /// share 受信者側の送信者公開鍵ピン(TOFU)と受理済み CEK 鍵世代の記録
     /// (KeyEnvelope の送信者認証と rotation 巻き戻し replay 防止)
     sender_pin_store: DynSenderPinStore,
-    /// content 単位の revoke 直列化ロック。
+    /// ファイル(file_id)単位の書き込み直列化ロック。update・delete・pull と
+    /// share・revoke・権限変更が取る。記録・CEK・共有設定はファイルごとに
+    /// 1 件なので、失敗時の巻き戻しが並行する成功を消さないようにする。
     content_revoke_locks: ContentLocks,
 }
 

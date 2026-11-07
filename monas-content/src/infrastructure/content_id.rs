@@ -26,4 +26,13 @@ impl ContentIdGenerator for Sha256ContentIdGenerator {
         let hex = hex::encode(hash);
         ContentId::new(hex)
     }
+
+    fn generate_series(&self, initial_plain_cid: &ContentId, created_at: u64) -> ContentId {
+        // seriesId = sha256(plainCid || 0x00 || created_at(u64 big-endian))
+        let mut hasher = Sha256::new();
+        hasher.update(initial_plain_cid.as_str().as_bytes());
+        hasher.update([0u8]);
+        hasher.update(created_at.to_be_bytes());
+        ContentId::new(hex::encode(hasher.finalize()))
+    }
 }

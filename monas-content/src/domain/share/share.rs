@@ -178,6 +178,33 @@ impl Share {
         })
     }
 
+    /// 既存の受信者の権限を置き換える。
+    ///
+    /// - 受信者が存在しない場合は `RecipientNotFound` を返す(付与は `grant_*` で行う)。
+    /// - Owner への変更・Owner からの変更はここでは扱わない(`InvalidOperation`)。
+    pub fn update_recipient_permissions(
+        &mut self,
+        key_id: &KeyId,
+        permissions: Vec<Permission>,
+    ) -> Result<(), ShareError> {
+        if permissions.is_empty() || permissions.contains(&Permission::Owner) {
+            return Err(ShareError::InvalidOperation(
+                "recipient permissions must be read or write".to_string(),
+            ));
+        }
+        let recipient = self
+            .recipients
+            .get_mut(key_id)
+            .ok_or(ShareError::RecipientNotFound)?;
+        if recipient.permissions.contains(&Permission::Owner) {
+            return Err(ShareError::InvalidOperation(
+                "owner permissions cannot be changed".to_string(),
+            ));
+        }
+        recipient.update_permissions(permissions);
+        Ok(())
+    }
+
     /// 指定された受信者の情報を取得する。
     pub fn recipient(&self, key_id: &KeyId) -> Option<&ShareRecipient> {
         self.recipients.get(key_id)
@@ -332,6 +359,51 @@ mod tests {
 
         let err = share.revoke(&kid).expect_err("revoke should fail");
         assert!(matches!(err, ShareError::RecipientNotFound));
+    }
+
+    #[test]
+    fn update_recipient_permissions_switches_read_and_write() {
+        let mut share = Share::new(cid());
+        let kid = key_id(&[2, 2, 2]);
+        share.grant_read(kid.clone()).expect("grant_read");
+
+        share
+            .update_recipient_permissions(&kid, vec![Permission::Write])
+            .expect("upgrade");
+        assert_eq!(share.permissions_of(&kid), Some(&[Permission::Write][..]));
+
+        share
+            .update_recipient_permissions(&kid, vec![Permission::Read])
+            .expect("downgrade");
+        assert_eq!(share.permissions_of(&kid), Some(&[Permission::Read][..]));
+    }
+
+    #[test]
+    fn update_recipient_permissions_rejects_unknown_owner_and_empty() {
+        let mut share = Share::new(cid());
+        let unknown = key_id(&[3, 3, 3]);
+        assert!(matches!(
+            share.update_recipient_permissions(&unknown, vec![Permission::Read]),
+            Err(ShareError::RecipientNotFound)
+        ));
+
+        let kid = key_id(&[4, 4, 4]);
+        share.grant_read(kid.clone()).expect("grant_read");
+        assert!(matches!(
+            share.update_recipient_permissions(&kid, vec![Permission::Owner]),
+            Err(ShareError::InvalidOperation(_))
+        ));
+        assert!(matches!(
+            share.update_recipient_permissions(&kid, vec![]),
+            Err(ShareError::InvalidOperation(_))
+        ));
+
+        let owner = key_id(&[5, 5, 5]);
+        share.grant_owner(owner.clone()).expect("grant_owner");
+        assert!(matches!(
+            share.update_recipient_permissions(&owner, vec![Permission::Read]),
+            Err(ShareError::InvalidOperation(_))
+        ));
     }
 
     #[test]
