@@ -604,9 +604,9 @@ impl MonasController {
     /// (same contract as `http_api::invalidate_tokens_handler`).
     ///
     /// Advances `min_valid_issued_at` to the server time, revoking in bulk all delegated Tokens
-    /// issued before it. Even if revoke rotates the CEK, a revoked recipient's delegated write
-    /// Token stays valid until its TTL expires, so without calling this "the party that should
-    /// have been revoked can keep writing to the new state".
+    /// issued at or before it. Even if revoke rotates the CEK, a revoked recipient's delegated
+    /// write Token stays valid until its TTL expires, so without calling this "the party that
+    /// should have been revoked can keep writing to the new state".
     ///
     /// Returns `new_min_valid_issued_at` on success. On failure, returns the `ApiResponse`
     /// in `Err` (unlike the `send_*_to_state_node` family, to force the caller to always handle

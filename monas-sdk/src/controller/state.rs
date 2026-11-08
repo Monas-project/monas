@@ -20,8 +20,9 @@ use super::MonasController;
 
 /// Who reads with which key in a verified read.
 pub(super) enum StateReader<'a> {
-    /// The owner reads their own file. The plainCid checked against the CEK is taken from
-    /// that file's record (key = file_id).
+    /// The owner reads their own file. The CEK is looked up by file_id, and the expected
+    /// plainCid (compared with the one recomputed from the decrypted body) is taken from that
+    /// file's record (key = file_id).
     Owner { file_id: &'a str },
     /// A share recipient reads. The CEK is under the sender pin (series ID) or under the
     /// plainCid of the shared version.
