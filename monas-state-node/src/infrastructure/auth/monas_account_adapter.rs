@@ -8,6 +8,7 @@ use crate::infrastructure::auth::auth_token::AuthToken as InfraAuthToken;
 use crate::infrastructure::auth::signature_verifier::SignatureVerifier;
 use crate::port::auth_token::{AuthContext, AuthToken};
 use crate::port::authentication_service::AuthenticationService;
+use crate::port::consumed_request_store::{MAX_CLOCK_SKEW_SECS, MAX_REQUEST_AGE_SECS};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 
@@ -154,8 +155,7 @@ impl MonasAccountAdapter {
             // doing because it directly bounds how long a captured read
             // signature stays replayable — but it must not be cut below the
             // relay failover budget or legitimate reads start failing.
-            const MAX_AGE_SECS: u64 = 300;
-            if now > timestamp + MAX_AGE_SECS {
+            if now > timestamp + MAX_REQUEST_AGE_SECS {
                 return Err(anyhow::anyhow!(
                     "Authentication request expired (timestamp too old)"
                 ));
@@ -163,7 +163,6 @@ impl MonasAccountAdapter {
 
             // Future-dated timestamps are a clock-sync problem, not a latency
             // one, so they get their own much smaller allowance.
-            const MAX_CLOCK_SKEW_SECS: u64 = 30;
             if timestamp > now + MAX_CLOCK_SKEW_SECS {
                 return Err(anyhow::anyhow!("Invalid timestamp (too far in the future)"));
             }
