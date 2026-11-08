@@ -21,18 +21,33 @@
 //! 署名を hash すると 1 つの承認済みリクエストが 2 つの識別子を持ち、攻撃者は
 //! 捕捉した署名を 1 回変換するだけでこの記録をすり抜けられてしまう。
 //!
-//! ## 保持期間
+//! ## Retention
 //!
-//! 記録は署名の鮮度窓(`MAX_REQUEST_AGE_SECS`)を超えたら捨ててよい。窓の外へ
-//! 出た署名は、この記録が無くても鮮度チェックで拒否されるからである。よって
-//! ストアは無制限には育たず、GC も「期限切れを消す」だけで済む。
+//! Records may be discarded once no signature they could match is still fresh: that is
+//! `CONSUMED_REQUEST_RETENTION_SECS` after acceptance, which accounts for the freshness window
+//! (`MAX_REQUEST_AGE_SECS`) and the allowed future clock skew (`MAX_CLOCK_SKEW_SECS`). A
+//! signature past that point is rejected by the freshness check even without this record, so
+//! the store does not grow without bound and GC only needs to delete expired entries.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-/// 署名の鮮度窓。`MonasAccountAdapter` の `MAX_AGE_SECS` と揃えること。
-/// これを超えた記録は保持しても意味がない(署名側が先に期限切れになる)。
-pub const CONSUMED_REQUEST_RETENTION_SECS: u64 = 300;
+/// How old a signed request's timestamp may be (signature freshness window).
+/// Enforced by `MonasAccountAdapter`.
+pub const MAX_REQUEST_AGE_SECS: u64 = 300;
+
+/// How far in the future a signed request's timestamp may be (clock skew allowance).
+/// Enforced by `MonasAccountAdapter`.
+pub const MAX_CLOCK_SKEW_SECS: u64 = 30;
+
+/// How long a consumed request is remembered, counted from when the server accepted it.
+///
+/// A request accepted at `T` may carry a timestamp up to `T + MAX_CLOCK_SKEW_SECS`, and that
+/// signature stays fresh until `timestamp + MAX_REQUEST_AGE_SECS` inclusive. The record must
+/// outlive that whole span; the `+ 1` covers the inclusive boundary second. Dropping it at
+/// `MAX_REQUEST_AGE_SECS` alone reopened a replay window of up to `MAX_CLOCK_SKEW_SECS + 1`
+/// seconds.
+pub const CONSUMED_REQUEST_RETENTION_SECS: u64 = MAX_REQUEST_AGE_SECS + MAX_CLOCK_SKEW_SECS + 1;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConsumedRequestStoreError {
@@ -164,5 +179,33 @@ mod tests {
             1,
             "expired records must be pruned rather than accumulate"
         );
+    }
+
+    /// A request whose timestamp is as far in the future as allowed is still fresh
+    /// `MAX_REQUEST_AGE_SECS` after that timestamp, i.e. `MAX_CLOCK_SKEW_SECS` later than
+    /// acceptance + `MAX_REQUEST_AGE_SECS`. Its record must survive until then, including the
+    /// inclusive boundary second, or the same signed request is accepted a second time.
+    #[test]
+    fn record_outlives_a_future_dated_signature_freshness() {
+        let store = InMemoryConsumedRequestStore::default();
+        let accepted_at = 1_000_000;
+        let signed_timestamp = accepted_at + MAX_CLOCK_SKEW_SECS;
+
+        assert!(store.record_if_absent(b"sig", accepted_at).unwrap());
+
+        // The last second at which the freshness check still accepts this signature
+        // (`MonasAccountAdapter` rejects only `now > timestamp + MAX_REQUEST_AGE_SECS`).
+        let last_fresh_second = signed_timestamp + MAX_REQUEST_AGE_SECS;
+        for replay_at in [
+            accepted_at + MAX_REQUEST_AGE_SECS,
+            accepted_at + MAX_REQUEST_AGE_SECS + 1,
+            last_fresh_second,
+        ] {
+            assert!(
+                !store.record_if_absent(b"sig", replay_at).unwrap(),
+                "replay at +{}s is still fresh and must be rejected",
+                replay_at - accepted_at
+            );
+        }
     }
 }
