@@ -215,8 +215,9 @@ impl ContentLocks {
 ///
 /// The presence of the entry itself means "there is a holder", so drop always removes it.
 /// A waiter can become the holder only after seeing this removal (the while in `lock` loops
-/// until `contains_key` is false). Both the check and the removal happen under the same
-/// mutex, so no other request can cut in before the woken side becomes the holder.
+/// until `contains` is false). Both the check and the removal happen under the same mutex, so
+/// at most one request holds a given id at a time. This is not fair: a new request can take the
+/// id before a woken waiter re-acquires the mutex, in which case the waiter just waits again.
 /// As a result, **the table size is capped at the number of content concurrently being
 /// revoked**.
 pub(super) struct ContentLockGuard {
@@ -357,10 +358,12 @@ impl MonasController {
 
     /// Helper method that creates a ContentRepository instance
     ///
-    /// TODO(pr46-followup): the content body is still fixed to `MultiStorageRepository::in_memory`,
-    /// so even in `Sled` mode the local ciphertext cache is lost on restart.
-    /// Since the State Node is canonical, decryption itself is recoverable (CEK is persisted in sled),
-    /// but making the SDK local cache layer pluggable is handled in a separate PR (see PR #46 description).
+    /// TODO(pr46-followup): this is still fixed to `MultiStorageRepository::in_memory`, which only
+    /// means provider auth sessions are not persisted (no credentials file). Content records are
+    /// written by the `local` provider to `local://content/<id>.json` (resolved against the working
+    /// directory, since no `base_path` is configured), so they survive restarts but are not stored
+    /// under the `Sled` data dir. Making the SDK local storage layer pluggable is handled in a
+    /// separate PR (see PR #46 description).
     fn create_content_repository() -> monas_content::infrastructure::MultiStorageRepository {
         use monas_content::infrastructure::MultiStorageRepository;
         let registry = std::sync::Arc::new(monas_filesync::init_registry_default());

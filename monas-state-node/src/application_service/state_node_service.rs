@@ -367,8 +367,8 @@ where
 
     /// Authenticate a caller for read operations.
     ///
-    /// The request signature is bound to the specific `content_id` (message
-    /// `read:{content_id}:{timestamp}`), so a signature captured by one node
+    /// The request signature is bound to the specific `content_id` (`monas-request-v1` message
+    /// with operation `read` and resource `content_id`), so a signature captured by one node
     /// cannot be replayed to read other content. Mirrors the delete path,
     /// which already signs over the content id.
     ///
@@ -389,9 +389,9 @@ where
             .await
             .map_err(|e| StateNodeError::AuthenticationFailed(e.to_string()))?;
 
-        // Verify caller signature for all token types. The signed message is
-        // `read:{content_id}:{timestamp}` regardless of token kind; JWT tokens
-        // additionally have their own owner signature verified.
+        // Verify caller signature for all token types. The signed message is the
+        // `monas-request-v1` message for (`read`, content_id, timestamp, no body) regardless of
+        // token kind; JWT tokens additionally have their own owner signature verified.
         let sig = request_signature.ok_or_else(|| {
             StateNodeError::AuthenticationFailed("Request signature is required".to_string())
         })?;
@@ -4530,8 +4530,8 @@ mod tests {
     }
 
     /// The read request signature must be verified against a message bound to
-    /// the specific content id (`read:{content_id}:{timestamp}`), not a
-    /// generic `read:content:{timestamp}`. This keeps a signature forwarded to
+    /// the specific content id (resource = content id in the `monas-request-v1` message), not a
+    /// generic `content` resource. This keeps a signature forwarded to
     /// relay members (or leaked to a non-member node) from being replayed to
     /// read other content (PR #54 review).
     #[tokio::test]

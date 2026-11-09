@@ -686,7 +686,7 @@ where
             "plain content_id should not change during reencrypt"
         );
 
-        // Step 5: Save the CEK under the new ContentId
+        // Step 5: Save the new CEK under the existing file key (series_id), replacing the old CEK
         self.cek_store
             .save(&content_id, &new_cek)
             .map_err(ReencryptError::KeyStore)?;

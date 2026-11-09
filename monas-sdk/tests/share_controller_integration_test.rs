@@ -896,8 +896,9 @@ async fn concurrent_revokes_do_not_lose_either_removal() {
         );
     }
 
-    // Neither recipient can decrypt = both removals persisted.
-    // If one removal had been lost to a lost update, that recipient would be able to decrypt.
+    // Re-sharing to both succeeds = both removals persisted.
+    // If one removal had been lost to a lost update, that recipient would still be in the ACL
+    // and re-sharing would fail with `AlreadyShared`.
     for (label, recipient) in [("a", &recipient_a), ("b", &recipient_b)] {
         let shared_again = controller.share_content(ShareContentInput {
             file_id: created.file_id.clone(),
@@ -1035,9 +1036,10 @@ async fn revoke_reissues_a_valid_token_for_each_surviving_recipient() {
     cleanup_content_artifacts();
 }
 
-/// The share ACL is tied to the version ID. If it were not carried over when an edit changes the
-/// version ID, then when another recipient is revoked after the edit, recipients from before the
-/// edit would be locked out of the CEK rotation (neither an envelope nor a token is reissued).
+/// The share ACL is keyed by the fixed file ID, not the version ID, so it survives an edit that
+/// changes the version ID. If it were keyed by version ID, then when another recipient is revoked
+/// after the edit, recipients from before the edit would be locked out of the CEK rotation
+/// (neither an envelope nor a token is reissued).
 #[tokio::test(flavor = "multi_thread")]
 async fn share_acl_survives_an_edit_so_a_later_revoke_reissues_to_earlier_recipients() {
     let _guard = acquire_test_lock();
@@ -1676,9 +1678,9 @@ impl RevertFixture {
 ///
 /// Back when share settings were held per plainCid, reverting the body to "body A" made the
 /// plainCid the same as at creation, and the "Bob = write" left on the creation-time plainCid was
-/// picked up.
-/// Now share settings are held as a single entry under the file's key.
-/// In that state, demoting Carol would make Bob's collaterally reissued token write.
+/// picked up, so demoting Carol reissued Bob's collateral token as write.
+/// Now share settings are held as a single entry under the file's key, so Bob's reissued token
+/// stays read.
 #[tokio::test(flavor = "multi_thread")]
 async fn reverting_the_body_does_not_revive_a_downgraded_recipients_write() {
     let _guard = acquire_test_lock();

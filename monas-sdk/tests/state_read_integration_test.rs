@@ -844,8 +844,9 @@ async fn delegated_token_is_issued_for_the_remote_content_id() {
 }
 
 /// Read as a share recipient: when the caller passes the delegated token via
-/// `Authorization: Bearer` and passes no signature, the SDK signs `read:<id>:<ts>` with the
-/// account key while keeping the token as-is. The State Node verifies the signature with the
+/// `Authorization: Bearer` and passes no signature, the SDK signs the read request
+/// signature (`monas-request-v1`, operation `read`, resource = id) with the account key while
+/// keeping the token as-is. The State Node verifies the signature with the
 /// token's `aud` key, so swapping it for a `user:` token does not pass.
 #[tokio::test(flavor = "multi_thread")]
 async fn delegated_read_keeps_the_bearer_token_and_signs_with_the_account_key() {

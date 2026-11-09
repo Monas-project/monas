@@ -622,7 +622,9 @@ impl MonasController {
                 ) {
                     Ok(Some((at, reach))) => (Some(at), reach),
                     Ok(None) => (None, None),
-                    // No local state has been changed yet, so no rollback is needed.
+                    // The ACL change / CEK rotation has not been performed yet (only the step-2
+                    // head adoption may have advanced the record, which is kept), so no rollback
+                    // is needed.
                     Err(response) => return response,
                 }
             } else {
@@ -915,9 +917,9 @@ impl MonasController {
 
         // Issue the target's Token before updating the ACL. If issuance fails, the ACL keeps the
         // original permission, so a retry redoes the same decision (for a downgrade: revoke +
-        // reissue to other recipients). If the ACL were saved first, the retry would look like
-        // "read → read" and would no longer return the other recipients' Tokens invalidated by
-        // the first revocation.
+        // reissue to other recipients). If the ACL were saved first, the retry would look like an
+        // unchanged "read → read" request: it would still reissue the other recipients' Tokens
+        // (see `unchanged`) but would not redo the downgrade decision.
         let delegated_access = match self.issue_delegated_token(
             &state_node_content_id,
             &recipient_public_key_bytes,
@@ -1395,7 +1397,8 @@ impl MonasController {
             }
         };
 
-        // Sign the same `update:<content_id>:<ts>:<body digest>` as the owner's update with the
+        // Sign the same request signature as the owner's update (the `monas-request-v1` message
+        // over `update`, content_id, timestamp and the ciphertext's SHA-256 digest) with the
         // account key, and replace only the Authorization with the delegated Token.
         let signed_auth = match self.prepare_state_node_content_auth(
             auth,
