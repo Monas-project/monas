@@ -1,30 +1,30 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-/// SDK全体で使用する統一エラー型
+/// Unified error type used across the SDK
 ///
-/// `#[non_exhaustive]` を付けているため、将来 variant を追加しても SemVer 非破壊。
-/// 下流クレートは必ず `_ =>` のフォールスルーを入れて match すること。
+/// Marked `#[non_exhaustive]`, so adding variants in the future is SemVer-compatible.
+/// Downstream crates must always include a `_ =>` fallthrough when matching.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "message")]
 #[non_exhaustive]
 pub enum ApiError {
-    /// 入力データ不足・形式不一致 (400)
+    /// Missing input data / format mismatch (400)
     Validation(String),
-    /// 認証情報不備・署名無効 (401)
+    /// Missing/invalid credentials, invalid signature (401)
     Unauthorized(String),
-    /// 権限なし（所有者でない等） (403)
+    /// No permission (e.g. not the owner) (403)
     Forbidden(String),
-    /// リソース不存在 (404)
+    /// Resource does not exist (404)
     NotFound(String),
-    /// 削除済み (410)。State Node がコンテンツの履歴に delete を持つとき返す。
-    /// 404(まだ同期が届いていない等)とは区別する。
+    /// Deleted (410). Returned when the State Node has a delete in the content's history.
+    /// Distinguished from 404 (e.g. sync has not arrived yet).
     Gone(String),
-    /// 競合（同時更新等） (409)
+    /// Conflict (e.g. concurrent update) (409)
     Conflict(String),
-    /// State Nodeとの通信タイムアウト (408)
+    /// Communication timeout with the State Node (408)
     Timeout(String),
-    /// 予期せぬ例外 (500)
+    /// Unexpected exception (500)
     Internal(String),
 }
 
@@ -46,7 +46,7 @@ impl fmt::Display for ApiError {
 impl std::error::Error for ApiError {}
 
 impl ApiError {
-    /// HTTPステータスコードを返す
+    /// Return the HTTP status code
     pub fn status_code(&self) -> u16 {
         match self {
             ApiError::Validation(_) => 400,
@@ -60,10 +60,10 @@ impl ApiError {
         }
     }
 
-    /// ureq の送信系エラーを `ApiError` に変換する。
+    /// Convert a ureq send-side error into an `ApiError`.
     ///
-    /// `ureq::Error::Timeout(_)` は `ApiError::Timeout` にマップし、
-    /// それ以外は `ApiError::Internal` (先頭に `context` を付ける) にまとめる。
+    /// `ureq::Error::Timeout(_)` maps to `ApiError::Timeout`; everything else is collapsed into
+    /// `ApiError::Internal` (prefixed with `context`).
     pub fn from_ureq_error(context: &str, err: ureq::Error) -> Self {
         match err {
             ureq::Error::Timeout(_) => {

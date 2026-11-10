@@ -27,11 +27,12 @@ pub enum ContentEvent {
     Deleted,
 }
 
-/// ファイルの作成時刻(Unix エポックからのナノ秒)。プロセス内で単調に増える。
+/// File creation time (nanoseconds since the Unix epoch). Monotonically increasing within the
+/// process.
 ///
-/// 同じ時刻の読みが続いたときは前回値 + 1 を返すので、同じ本文のファイルを
-/// 続けて作っても `series_id` が重ならない(state node の
-/// `next_monotonic_timestamp` と同じ考え方)。
+/// When consecutive reads return the same time, the previous value + 1 is returned, so creating
+/// files with the same body in succession does not produce overlapping `series_id`s (same idea
+/// as the state node's `next_monotonic_timestamp`).
 fn next_creation_timestamp() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -52,22 +53,22 @@ fn next_creation_timestamp() -> u64 {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Content {
-    /// 今の版の plainCid(本文の SHA-256)。AAD と改ざん検出に使う値で、
-    /// 端末側の保存のキーには使わない。
+    /// plainCid of the current version (SHA-256 of the body). Used for the AAD and tamper
+    /// detection; not used as the key for device-side storage.
     raw_id: ContentId,
-    /// ファイルのキー。作成時に `ContentIdGenerator::generate_series` で
-    /// 1 回だけ決め、以後変えない。記録・CEK・共有設定はこのキーで持つ。
+    /// The file's key. Decided only once at creation via `ContentIdGenerator::generate_series`
+    /// and never changed afterwards. Records, CEKs, and share settings are kept under this key.
     series_id: ContentId,
     encrypted_id: ContentId,
     metadata: Metadata,
-    /// 永続化時は含めない（暗号化済みデータのみ保存）
+    /// Not included when persisted (only encrypted data is stored)
     #[serde(skip)]
     raw_content: Option<Vec<u8>>,
     encrypted_content: Option<Vec<u8>>,
     is_deleted: bool,
     content_status: ContentStatus,
-    // TODO: 必要性があるかもしれないので追加した
-    // last_updated_by: Option<StateNodeId>, // 最後に更新を行ったStateNodeのID
+    // TODO: added because it may turn out to be needed
+    // last_updated_by: Option<StateNodeId>, // ID of the StateNode that last updated it
 }
 
 impl Content {
@@ -115,7 +116,8 @@ impl Content {
         }
 
         let encrypted_content = encryption.encrypt(key, &raw_content)?;
-        // encCid は plainCid と暗号文から生成する（state-node 等が暗号文整合性を検証できるようにする）。
+        // encCid is generated from plainCid and the ciphertext (so that the state node etc. can
+        // verify ciphertext integrity).
         let enc_cid = id_generator.generate_encrypted(&cid, &encrypted_content);
 
         let content = Self {
@@ -132,11 +134,11 @@ impl Content {
         Ok((content, ContentEvent::Created))
     }
 
-    /// コンテンツ本体（バイナリ）のみを更新する。
+    /// Updates only the content body (binary).
     ///
-    /// - name / path / series_id は変更しない
-    /// - `raw_id`（plainCid）は新しいバイナリから再計算される（コンテンツアドレス化）
-    /// - `metadata.updated_at` は現在時刻に更新される
+    /// - Does not change name / path / series_id
+    /// - `raw_id` (plainCid) is recomputed from the new binary (content addressing)
+    /// - `metadata.updated_at` is updated to the current time
     pub fn update_content<G, E>(
         &self,
         raw_content: Vec<u8>,
@@ -159,7 +161,7 @@ impl Content {
         let encrypted_content = encryption.encrypt(key, &raw_content)?;
 
         let new_id = id_generator.generate(&raw_content);
-        // encCid は plainCid と暗号文から生成する。
+        // encCid is generated from plainCid and the ciphertext.
         let new_enc_id = id_generator.generate_encrypted(&new_id, &encrypted_content);
 
         let new_metadata = self.metadata.with_new_id(new_id.clone());
@@ -178,18 +180,19 @@ impl Content {
         Ok((content, ContentEvent::Updated))
     }
 
-    /// 他所で作られた版をこの系列の新しい版として取り込む。
+    /// Imports a version created elsewhere as a new version of this series.
     ///
-    /// [`update_content`](Self::update_content) と同じ形の新しい `Content` を
-    /// 作るが、暗号文は再暗号化せず与えられたものをそのまま持つ。State Node に
-    /// 既にある版(write 権限を委譲した受信者が書いた版)を owner が自分の
-    /// レコードへ取り込むための入口で、平文と暗号文の対応は呼び出し側
-    /// (application service)が同じ CEK で復号して確かめている前提。
-    /// 暗号文をそのまま持つのは、ローカルの暗号文と State Node の暗号文の
-    /// 一致(integrity 検証)を保つため。
+    /// Creates a new `Content` of the same shape as [`update_content`](Self::update_content),
+    /// but keeps the given ciphertext as-is without re-encrypting. This is the entry point for
+    /// the owner to import into their own record a version that already exists on the State
+    /// Node (a version written by a recipient delegated write permission); it assumes the caller
+    /// (application service) has verified the plaintext/ciphertext correspondence by decrypting
+    /// with the same CEK.
+    /// The ciphertext is kept as-is to preserve the match between the local ciphertext and the
+    /// State Node's ciphertext (integrity verification).
     ///
-    /// - name / path / series_id は変更しない
-    /// - `raw_id`(plainCid)は平文から再計算される
+    /// - Does not change name / path / series_id
+    /// - `raw_id` (plainCid) is recomputed from the plaintext
     pub fn adopt_version<G>(
         &self,
         raw_content: Vec<u8>,
@@ -219,10 +222,10 @@ impl Content {
         Ok((content, ContentEvent::Updated))
     }
 
-    /// コンテンツ名のみを変更する。
+    /// Changes only the content name.
     ///
-    /// - バイナリや暗号化データは変更しない
-    /// - `metadata.updated_at` は現在時刻に更新される
+    /// - Does not change the binary or encrypted data
+    /// - `metadata.updated_at` is updated to the current time
     pub fn rename(&self, new_name: String) -> Result<(Self, ContentEvent), ContentError> {
         self.ensure_not_deleted()?;
 
@@ -242,11 +245,12 @@ impl Content {
         Ok((content, ContentEvent::Updated))
     }
 
-    // 複数のノードでのコンセンサスやキャンセル可能性が必要な場合は段階的な削除処理が必要
+    // A staged deletion process is needed if consensus across multiple nodes or cancellability
+    // is required
     pub fn delete(&self) -> Result<(Self, ContentEvent), ContentError> {
         self.ensure_not_deleted()?;
 
-        // 削除操作も更新の一種なので updated_at を進める
+        // Deletion is also a kind of update, so advance updated_at
         let new_metadata = self.metadata.touch();
 
         let content = Self {
@@ -288,7 +292,7 @@ impl Content {
         encryption.decrypt(key, encrypted)
     }
 
-    /// - `is_deleted == true` の場合は `ContentError::AlreadyDeleted` を返す。
+    /// - Returns `ContentError::AlreadyDeleted` if `is_deleted == true`.
     fn ensure_not_deleted(&self) -> Result<(), ContentError> {
         if self.is_deleted {
             Err(ContentError::AlreadyDeleted)
@@ -336,8 +340,8 @@ mod tests {
     use crate::domain::content::encryption::{ContentEncryption, ContentEncryptionKey};
     use crate::domain::content_id::{ContentId, ContentIdGenerator};
 
-    /// テスト用の単純な暗号化実装。
-    /// encrypt: 各バイトに +1, decrypt: 各バイトに -1。
+    /// Simple encryption implementation for tests.
+    /// encrypt: +1 to each byte, decrypt: -1 from each byte.
     #[derive(Debug, Clone)]
     struct MockEncryption;
 
@@ -377,7 +381,7 @@ mod tests {
 
     impl ContentIdGenerator for MockIdGenerator {
         fn generate(&self, raw_content: &[u8]) -> ContentId {
-            // テスト用の単純な ID 生成: 長さに応じて異なる ID を返す。
+            // Simple ID generation for tests: returns different IDs depending on the length.
             ContentId::new(format!("test-content-id-{}", raw_content.len()))
         }
 
@@ -428,7 +432,7 @@ mod tests {
         assert_ne!(content.raw_id(), content.series_id());
     }
 
-    /// 同じ本文で作った 2 つのファイルは、別のファイルのキーを持つ。
+    /// Two files created with the same body have different file keys.
     #[test]
     fn two_files_created_from_the_same_body_get_different_series_ids() {
         let (key, encryption) = test_key_and_cipher();

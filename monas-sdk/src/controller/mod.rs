@@ -14,21 +14,21 @@ use monas_account::infrastructure::key_store::{InMemoryAccountKeyStore, SledAcco
 
 use crate::common::{ApiError, ApiResponse, MonasConfig, PersistenceConfig, StateNodeAuthContext};
 
-/// プライマリ操作が失敗し、補償 (rollback / restore) も失敗した場合に返すべき
-/// 単一 `ApiError` を組み立てる helper。
+/// Helper that builds the single `ApiError` to return when the primary operation failed and the
+/// compensation (rollback / restore) also failed.
 ///
-/// PR #29 review (design 軸 / `ApiError::Internal` collapse) で指摘されたとおり、
-/// 何も考えず `ApiError::Internal(format!(...))` に潰すと
-/// 元の 401 / 404 / 408 / 409 が一律 500 に化けて呼び出し側が誤った対応を取る。
+/// As pointed out in the PR #29 review (design axis / `ApiError::Internal` collapse),
+/// naively collapsing into `ApiError::Internal(format!(...))` turns
+/// the original 401 / 404 / 408 / 409 uniformly into 500, and the caller responds incorrectly.
 ///
-/// この helper は:
-/// - `primary` が `Internal` でない場合 → primary の variant を保ったまま、
-///   message に rollback 失敗情報を suffix として追記する。
-/// - `primary` が `Internal` の場合 → 従来通り `Internal` のまま結合する。
+/// This helper:
+/// - If `primary` is not `Internal` → keeps primary's variant and
+///   appends the rollback failure info to the message as a suffix.
+/// - If `primary` is `Internal` → combines them as `Internal`, as before.
 ///
-/// `context` は呼び出し側固有のラベル (例: "State Node create").
-/// `primary_label` / `rollback_label` は message を読みやすくするための識別子
-/// (例: "remote" / "rollback").
+/// `context` is a caller-specific label (e.g. "State Node create").
+/// `primary_label` / `rollback_label` are identifiers that make the message easier to read
+/// (e.g. "remote" / "rollback").
 pub(super) fn combine_rollback_failure(
     primary: ApiError,
     rollback_err: impl std::fmt::Display,
@@ -40,11 +40,11 @@ pub(super) fn combine_rollback_failure(
         "{context} failed and local {rollback_label} also failed: \
          {primary_label}={primary}, {rollback_label}={rollback_err}"
     );
-    // `ApiError` は `#[non_exhaustive]` だが crate 内では全 variant が見えるので、
-    // catch-all を置かずに全 variant を明示列挙する。
-    // 将来 `ApiError` に新 variant が追加された場合、ここが compile error になり
-    // 「variant をどう保持/分類するか」を決め忘れる事故を防ぐ
-    // (catch-all で `Internal` に collapse すると 401/404/408/409 が 500 化する旧バグの再発になる)。
+    // `ApiError` is `#[non_exhaustive]`, but all variants are visible inside the crate, so
+    // enumerate every variant explicitly without a catch-all.
+    // If a new variant is added to `ApiError` in the future, this becomes a compile error,
+    // preventing us from forgetting to decide "how to preserve/classify the variant"
+    // (collapsing to `Internal` via a catch-all would reintroduce the old bug where 401/404/408/409 became 500).
     match primary {
         ApiError::Validation(_) => ApiError::Validation(suffix),
         ApiError::Unauthorized(_) => ApiError::Unauthorized(suffix),
@@ -57,7 +57,7 @@ pub(super) fn combine_rollback_failure(
     }
 }
 
-/// SDK プロセスが持つ署名鍵ストア。
+/// Signing key store held by the SDK process.
 pub(super) enum AccountKeyStoreKind {
     InMemory(InMemoryAccountKeyStore),
     Sled(SledAccountKeyStore),
@@ -94,62 +94,65 @@ impl AccountKeyStore for AccountKeyStoreKind {
     }
 }
 
-/// MonasController - SDK のオーケストレーター
+/// MonasController - the SDK orchestrator
 pub struct MonasController {
-    /// State NodeのベースURL
+    /// Base URL of the State Node
     pub(super) state_node_url: String,
-    /// 署名と委譲。署名鍵ストアはサービスが持つ。プロセスにつき 1 本。
+    /// Signing and delegation. The service holds the signing key store. One per process.
     ///
-    /// 起動時には鍵を作らない。利用者が `create_signing_account` を呼んだときだけ
-    /// 作られ、それまでの署名・委譲は「署名アカウントが無い」エラーになる。
+    /// No key is created at startup. It is created only when the user calls
+    /// `create_signing_account`; until then, signing and delegation fail with a "no signing
+    /// account" error.
     ///
-    /// content の CEK 用 sled とは別ディレクトリに置く。署名鍵とコンテンツ鍵は別の秘密であり、
-    /// sled は path 単位で flock するため同じディレクトリを共有できない。
+    /// Kept in a separate directory from the sled for content CEKs. The signing key and the
+    /// content key are distinct secrets, and sled flocks per path, so they cannot share a
+    /// directory.
     pub(super) account_service: AccountService<AccountKeyStoreKind>,
-    /// 全 HTTP 呼び出しで共有する ureq Agent (タイムアウト等を保持)
+    /// ureq Agent shared by all HTTP calls (holds timeouts, etc.)
     pub(super) agent: ureq::Agent,
-    /// `X-Request-Timestamp` の許容 skew (Gateway 経由で渡された timestamp が古すぎる/未来すぎる場合 reject)
+    /// Allowed skew for `X-Request-Timestamp` (reject if the timestamp passed via the Gateway is too old / too far in the future)
     pub(super) request_timestamp_skew: std::time::Duration,
     /// ContentService
     content_service: ContentServiceInstance,
     /// ShareService
     share_service: ShareServiceInstance,
-    /// share 受信者側の送信者公開鍵ピン(TOFU)と受理済み CEK 鍵世代の記録
-    /// (KeyEnvelope の送信者認証と rotation 巻き戻し replay 防止)
+    /// Recipient-side record of sender public key pins (TOFU) and accepted CEK key epochs
+    /// (KeyEnvelope sender authentication and prevention of rotation-rollback replay)
     sender_pin_store: DynSenderPinStore,
-    /// ファイル(file_id)単位の書き込み直列化ロック。update・delete・pull と
-    /// share・revoke・権限変更が取る。記録・CEK・共有設定はファイルごとに
-    /// 1 件なので、失敗時の巻き戻しが並行する成功を消さないようにする。
+    /// Per-file (file_id) write serialization lock. Taken by update, delete, pull, and
+    /// share, revoke, permission changes. The record, CEK, and share settings are one entry
+    /// per file, so this keeps a rollback on failure from erasing a concurrent success.
     content_revoke_locks: ContentLocks,
 }
 
-/// SDK が使う送信者鍵ピンストアの動的型。
+/// Dynamic type of the sender key pin store used by the SDK.
 ///
-/// 参照するのは application 層のポートで、実装(In-memory / Sled)がある
-/// infrastructure 層ではない。SDK が特定の保存先実装に依存しないようにする。
+/// It refers to the application-layer port, not the infrastructure layer that holds the
+/// implementations (In-memory / Sled), so the SDK does not depend on a specific storage
+/// implementation.
 pub(super) type DynSenderPinStore =
     std::sync::Arc<dyn monas_content::application_service::share_service::SenderKeyPinStore>;
 
-/// content id ごとの相互排他ロック。
+/// Mutual-exclusion lock per content id.
 ///
-/// revoke は「ACL・CEK・ローカル ciphertext・state node の状態」を
-/// load-modify-save で更新する複合操作で、そのどれにも version CAS が無い。
-/// `MonasController` は gateway 等で `Arc` 共有され複数リクエストから同時に
-/// 呼ばれるため、同じ content への revoke が並行すると次が起こる:
+/// revoke is a compound operation that updates "ACL, CEK, local ciphertext, and state node
+/// state" via load-modify-save, and none of them has a version CAS.
+/// `MonasController` is shared via `Arc` in the gateway etc. and called concurrently from
+/// multiple requests, so concurrent revokes on the same content cause the following:
 ///
-/// - 双方が同じ Share を読み、後勝ちで save → 片方の受信者削除が消える
+/// - Both read the same Share and save last-writer-wins → one recipient removal is lost
 ///   (lost update)
-/// - 異なる CEK が同じ key_epoch として配られる
-/// - ローカル ACL/CEK と state node の ciphertext が別リクエスト由来になる
+/// - Different CEKs are distributed under the same key_epoch
+/// - Local ACL/CEK and the state node ciphertext come from different requests
 ///
-/// 根本解決は Share・CEK・ciphertext を1つの transactional CAS にまとめる
-/// ことだが、3ストア + リモート更新にまたがるため、まず content 単位の
-/// 直列化で「並行 revoke が状態を分岐させない」ことを保証する。
-/// ロックはプロセス内のみで、複数 gateway プロセスからの並行 revoke は
-/// カバーしない(その場合は state node 側の CAS が必要)。
+/// The fundamental fix is to combine Share, CEK, and ciphertext into one transactional CAS,
+/// but since that spans 3 stores + a remote update, we first guarantee via per-content
+/// serialization that "concurrent revokes do not fork the state".
+/// The lock is in-process only and does not cover concurrent revokes from multiple gateway
+/// processes (that requires a CAS on the state node side).
 #[derive(Default)]
 struct ContentLocksState {
-    /// 現在 revoke 中の content id。エントリが無い = 誰も触っていない。
+    /// Content ids currently being revoked. No entry = nobody is touching it.
     held: std::collections::HashSet<String>,
 }
 
@@ -159,27 +162,28 @@ pub(super) struct ContentLocks {
 }
 
 impl ContentLocks {
-    /// `content_id` の revoke 権を取り、保持している間だけ他を待たせるガードを
-    /// 返す。同じ id への revoke は直列化され、異なる id は互いに待たない。
+    /// Takes the revoke right for `content_id` and returns a guard that makes others wait
+    /// only while it is held. Revokes on the same id are serialized; different ids never wait
+    /// on each other.
     ///
-    /// ガードを drop するとエントリが表から消える(待っている者がいれば、その
-    /// 相手が起きて自分のエントリを立て直す)。**表は revoke 中の content 数
-    /// までしか伸びない** — 詳細は [`ContentLockGuard`]。
+    /// Dropping the guard removes the entry from the table (if someone is waiting, that
+    /// waiter wakes up and re-inserts its own entry). **The table grows only up to the number
+    /// of content being revoked** — see [`ContentLockGuard`] for details.
     pub(super) fn lock(&self, content_id: &str) -> ContentLockGuard {
         let (mutex, condvar) = &*self.inner;
         let mut state = mutex
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        // 既に誰かが持っているなら空くまで待つ。`wait` は mutex を手放すので、
-        // 待っている間に解放側が入れる。
+        // If someone already holds it, wait until it is free. `wait` releases the mutex, so
+        // the releasing side can get in while we wait.
         while state.held.contains(content_id) {
             state = condvar
                 .wait(state)
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
         }
 
-        // 空いていた: 自分が保持者になる。
+        // It was free: become the holder.
         state.held.insert(content_id.to_string());
         drop(state);
 
@@ -189,7 +193,7 @@ impl ContentLocks {
         }
     }
 
-    /// 現在このレジストリが保持しているエントリ数(テスト用)。
+    /// Number of entries currently held by this registry (for tests).
     #[cfg(test)]
     pub(super) fn tracked_len(&self) -> usize {
         let (mutex, _) = &*self.inner;
@@ -201,19 +205,21 @@ impl ContentLocks {
     }
 }
 
-/// 保持している間だけ、その content の revoke が直列化される。
+/// While held, revokes on that content are serialized.
 ///
-/// drop 時にエントリを表から取り除き、待っている者を起こす。取り除かないと、
-/// revoke した content の数だけ表が伸び続けて二度と縮まない — gateway は
-/// 動かしっぱなしなので、稼働時間と扱った content 数に比例してメモリを食う。
-/// 1 件あたりは数十バイトだが上限が無いのが問題で、PR #56 のレビューで
-/// 指摘された。
+/// On drop, removes the entry from the table and wakes the waiters. Without removal, the
+/// table keeps growing by the number of revoked content and never shrinks — the gateway runs
+/// continuously, so memory grows in proportion to uptime and the number of content handled.
+/// Each entry is only tens of bytes, but the lack of an upper bound is the problem; this was
+/// pointed out in the PR #56 review.
 ///
-/// エントリの有無そのものが「保持者がいるか」を表すので、drop では常に消す。
-/// 待っている者はこの削除を見て初めて自分が保持者になれる(`lock` の while は
-/// `contains_key` が false になるまで回る)。判定も削除も同じ mutex の下で
-/// 行うため、起きた側が保持者になるまでに別のリクエストが割り込む隙は無い。
-/// 結果として、**表のサイズは同時に revoke 中の content 数**で頭打ちになる。
+/// The presence of the entry itself means "there is a holder", so drop always removes it.
+/// A waiter can become the holder only after seeing this removal (the while in `lock` loops
+/// until `contains` is false). Both the check and the removal happen under the same mutex, so
+/// at most one request holds a given id at a time. This is not fair: a new request can take the
+/// id before a woken waiter re-acquires the mutex, in which case the waiter just waits again.
+/// As a result, **the table size is capped at the number of content concurrently being
+/// revoked**.
 pub(super) struct ContentLockGuard {
     locks: Arc<(std::sync::Mutex<ContentLocksState>, std::sync::Condvar)>,
     content_id: String,
@@ -226,7 +232,7 @@ impl Drop for ContentLockGuard {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        // エントリを落とすことが「解放」そのもの。これが無いと表が伸び続ける。
+        // Dropping the entry is the "release" itself. Without it the table keeps growing.
         state.held.remove(&self.content_id);
         drop(state);
         condvar.notify_all();
@@ -272,16 +278,16 @@ impl MonasController {
         Ok(ts)
     }
 
-    /// 明示的にState Node URLを指定してMonasControllerを生成 (in-memory persistence)。
+    /// Creates a MonasController with an explicitly specified State Node URL (in-memory persistence).
     ///
-    /// **このコンストラクタは test/開発専用。** 本番 gateway は必ず
-    /// `with_config` + `MonasConfig::with_persistence_dir(...)` を使うこと。
-    /// in-memory persistence のため、再起動で CEK / share / public-key directory が
-    /// 全て揮発する。
+    /// **This constructor is for test/development only.** Production gateways must use
+    /// `with_config` + `MonasConfig::with_persistence_dir(...)`.
+    /// Because persistence is in-memory, CEK / share / public-key directory are all lost on
+    /// restart.
     ///
-    /// TODO(pr46-followup): `#[cfg(any(test, feature = "test-util"))]` で
-    /// 本番 binary から完全に消す型レベル強制は別 PR で扱う。現時点では
-    /// `#[deprecated]` で build 時 warning を出すに留める。
+    /// TODO(pr46-followup): type-level enforcement that removes this entirely from production
+    /// binaries via `#[cfg(any(test, feature = "test-util"))]` is handled in a separate PR. For
+    /// now we only emit a build-time warning via `#[deprecated]`.
     #[deprecated(
         note = "test/dev-only constructor: use MonasController::with_config(MonasConfig::new(...).with_persistence_dir(...)) for production gateways"
     )]
@@ -290,14 +296,14 @@ impl MonasController {
             .expect("InMemory persistence must not fail to open")
     }
 
-    /// `MonasConfig` を使って `MonasController` を生成する。
+    /// Creates a `MonasController` from a `MonasConfig`.
     ///
-    /// `config.persistence` に応じて CEK ストアと Share repository を構築する。
-    /// `Sled { dir }` の場合、ディレクトリが存在しなければ作成する。
-    /// オープンに失敗した場合は `ApiError::Internal` を返す。
+    /// Builds the CEK store and Share repository according to `config.persistence`.
+    /// For `Sled { dir }`, creates the directory if it does not exist.
+    /// Returns `ApiError::Internal` if opening fails.
     ///
-    /// `InMemory` persistence は揮発するため、本番 gateway は必ず
-    /// `MonasConfig::with_persistence_dir(...)` で sled backend を指定すること。
+    /// `InMemory` persistence is volatile, so production gateways must specify the sled
+    /// backend via `MonasConfig::with_persistence_dir(...)`.
     pub fn with_config(config: MonasConfig) -> Result<Self, ApiError> {
         // TODO(pr46-followup architecture):
         // The SDK still constructs in-process `ContentService` + `ShareService`,
@@ -335,13 +341,13 @@ impl MonasController {
         })
     }
 
-    /// 設定から ureq::Agent を構築するヘルパーメソッド
+    /// Helper method that builds a ureq::Agent from the config
     ///
-    /// 非 2xx をエラーにしない: 各呼び出し側が status とレスポンス body から
-    /// `ApiError`(401/403/404/409 …)へ写す(`try_state_node_http_error` /
-    /// `try_account_http_error`)。ureq 既定のままだと 4xx が `send()` の Err に
-    /// なり、body ごと捨てて `Internal`(500)に潰れる — State Node の
-    /// 「Token 失効で 403」が gateway から 500 に見えていた。
+    /// Does not treat non-2xx as errors: each caller maps the status and response body to
+    /// an `ApiError` (401/403/404/409 …) (`try_state_node_http_error` /
+    /// `try_account_http_error`). With ureq's default, a 4xx becomes an Err from `send()`,
+    /// the body is discarded, and it collapses into `Internal` (500) — the State Node's
+    /// "403 due to Token revocation" was showing up as 500 from the gateway.
     fn build_agent(config: &MonasConfig) -> ureq::Agent {
         let ureq_config = ureq::Agent::config_builder()
             .timeout_global(Some(config.request_timeout))
@@ -350,28 +356,30 @@ impl MonasController {
         ureq::Agent::new_with_config(ureq_config)
     }
 
-    /// ContentRepositoryのインスタンスを作成するヘルパーメソッド
+    /// Helper method that creates a ContentRepository instance
     ///
-    /// TODO(pr46-followup): content body は依然 `MultiStorageRepository::in_memory` 固定で、
-    /// `Sled` モードを選んでも暗号文ローカルキャッシュは再起動で揮発する。
-    /// State Node が canonical なので decrypt 自体は復元可能 (CEK は sled で永続化済) だが、
-    /// SDK ローカルキャッシュ層も pluggable 化するのは別 PR で扱う (PR #46 description 参照)。
+    /// TODO(pr46-followup): this is still fixed to `MultiStorageRepository::in_memory`, which only
+    /// means provider auth sessions are not persisted (no credentials file). Content records are
+    /// written by the `local` provider to `local://content/<id>.json` (resolved against the working
+    /// directory, since no `base_path` is configured), so they survive restarts but are not stored
+    /// under the `Sled` data dir. Making the SDK local storage layer pluggable is handled in a
+    /// separate PR (see PR #46 description).
     fn create_content_repository() -> monas_content::infrastructure::MultiStorageRepository {
         use monas_content::infrastructure::MultiStorageRepository;
         let registry = std::sync::Arc::new(monas_filesync::init_registry_default());
         MultiStorageRepository::in_memory(registry, "local")
     }
 
-    /// `PersistenceConfig` から CEK ストア / Share repository / Public key directory の
-    /// 動的インスタンスを構築する。
+    /// Builds dynamic instances of the CEK store / Share repository / Public key directory
+    /// from a `PersistenceConfig`.
     ///
-    /// `InMemory` 選択時は揮発する旨の警告を stderr に 1 度だけ出す。
+    /// When `InMemory` is selected, prints a warning to stderr once that the data is volatile.
     ///
-    /// `Sled { dir }` 選択時は **単一の `sled::Db`** を 1 度だけ open し、
-    /// CEK / Share / Public key directory の 3 ストアに共有させる。sled は path 単位で
-    /// 排他 flock を取るため、同じディレクトリを 2 度 open すると 2 個目が
-    /// 失敗する (`MONAS_PERSISTENCE_DIR` 設定時の本番経路で必ず再現)。
-    /// キー空間は `cek:` / `share:` / `pubkey:` / `sender_pin:` プレフィックスで分離されている。
+    /// When `Sled { dir }` is selected, opens a **single `sled::Db`** exactly once and
+    /// shares it among the CEK / Share / Public key directory stores. sled takes an exclusive
+    /// flock per path, so opening the same directory twice makes the second open
+    /// fail (always reproduced on the production path when `MONAS_PERSISTENCE_DIR` is set).
+    /// Key spaces are separated by the `cek:` / `share:` / `pubkey:` / `sender_pin:` prefixes.
     fn create_persistence(
         persistence: &PersistenceConfig,
     ) -> Result<
@@ -409,8 +417,8 @@ impl MonasController {
                         "failed to create persistence dir {dir:?}: {e}"
                     )));
                 }
-                // sled は path 単位で flock を取るので 1 度だけ開く。
-                // `sled::Db` は Arc ベースで Clone 可能なので、4 つのストアに同じ Db を渡す。
+                // sled takes a flock per path, so open it only once.
+                // `sled::Db` is Arc-based and Clone-able, so pass the same Db to all 4 stores.
                 let db = sled::open(dir).map_err(|e| {
                     ApiError::Internal(format!("failed to open sled DB at {dir:?}: {e}"))
                 })?;
@@ -427,10 +435,10 @@ impl MonasController {
         }
     }
 
-    /// 署名主体の鍵ストアを作る。
+    /// Creates the key store for the signing principal.
     ///
-    /// content 用 sled (`dir` 直下) とは別の `dir/account` を開く。同じ path を
-    /// 二度 `sled::open` すると 2 個目が flock で失敗する。
+    /// Opens `dir/account`, separate from the content sled (directly under `dir`). Calling
+    /// `sled::open` twice on the same path makes the second one fail on the flock.
     fn create_account_key_store(
         persistence: &PersistenceConfig,
     ) -> Result<AccountKeyStoreKind, ApiError> {
@@ -455,7 +463,7 @@ impl MonasController {
         }
     }
 
-    /// ContentServiceのインスタンスを作成するヘルパーメソッド
+    /// Helper method that creates a ContentService instance
     fn create_content_service(
         content_repository: monas_content::infrastructure::MultiStorageRepository,
         cek_store: DynCekStore,
@@ -475,7 +483,7 @@ impl MonasController {
         }
     }
 
-    /// ShareServiceのインスタンスを作成するヘルパーメソッド
+    /// Helper method that creates a ShareService instance
     fn create_share_service(
         content_repository: monas_content::infrastructure::MultiStorageRepository,
         cek_store: DynCekStore,
@@ -499,10 +507,10 @@ impl MonasController {
 mod tests {
     use super::*;
 
-    /// ロックを手放したら、その content のエントリはレジストリから消える。
+    /// Once a lock is released, that content's entry disappears from the registry.
     ///
-    /// 消さないと revoke した content の数だけ表が伸び続け、gateway は
-    /// 動かしっぱなしなので稼働時間に比例してメモリを食う(PR #56 レビュー指摘)。
+    /// Without removal, the table keeps growing by the number of revoked content, and since
+    /// the gateway runs continuously, memory grows with uptime (pointed out in the PR #56 review).
     #[test]
     fn releasing_a_content_lock_drops_its_registry_entry() {
         let locks = ContentLocks::default();
@@ -510,23 +518,23 @@ mod tests {
 
         {
             let _guard = locks.lock("content-1");
-            assert_eq!(locks.tracked_len(), 1, "保持中はエントリがある");
+            assert_eq!(locks.tracked_len(), 1, "entry exists while held");
         }
-        assert_eq!(locks.tracked_len(), 0, "解放したら消える");
+        assert_eq!(locks.tracked_len(), 0, "removed once released");
 
-        // 別々の content を順に触っても溜まらない。
+        // Touching distinct content one after another does not accumulate entries.
         for i in 0..100 {
             let _guard = locks.lock(&format!("content-{i}"));
         }
         assert_eq!(
             locks.tracked_len(),
             0,
-            "順に revoke しただけでエントリが溜まってはならない"
+            "sequential revokes alone must not accumulate entries"
         );
     }
 
-    /// 表が縮んでも、同じ content への同時 revoke は直列化されたままである。
-    /// (エントリ削除で相互排他まで壊していないことの確認)
+    /// Even though the table shrinks, concurrent revokes on the same content stay serialized.
+    /// (Confirms that removing entries did not break mutual exclusion.)
     #[test]
     fn same_content_locks_are_still_mutually_exclusive() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -555,26 +563,26 @@ mod tests {
         assert_eq!(
             max_seen.load(Ordering::SeqCst),
             1,
-            "同じ content のクリティカルセクションに同時に 2 つ入ってはならない"
+            "two must never be inside the same content's critical section at once"
         );
-        assert_eq!(locks.tracked_len(), 0, "全部終われば空になる");
+        assert_eq!(locks.tracked_len(), 0, "empty once everything finishes");
     }
 
-    /// 異なる content は互いに待たない(id ごとに分けている意味の確認)。
+    /// Different content never wait on each other (confirms the point of splitting per id).
     #[test]
     fn different_contents_do_not_block_each_other() {
         let locks = ContentLocks::default();
         let _held = locks.lock("content-a");
-        // content-a を保持したまま content-b を取れる。ここで固まるなら
-        // レジストリ全体を 1 本のロックで守ってしまっている。
+        // content-b can be taken while holding content-a. If this hangs, the whole
+        // registry is guarded by a single lock.
         let _other = locks.lock("content-b");
         assert_eq!(locks.tracked_len(), 2);
     }
 
-    /// `combine_rollback_failure` は `primary` の variant を保ち、message に
-    /// rollback 情報を suffix として追加する。
-    /// PR #29 review (design 軸) で指摘された「ApiError::Internal collapse」を
-    /// regression として固定するためのテスト。
+    /// `combine_rollback_failure` keeps `primary`'s variant and appends the rollback info to
+    /// the message as a suffix.
+    /// Test that pins the "ApiError::Internal collapse" pointed out in the PR #29 review
+    /// (design axis) as a regression.
     #[test]
     fn combine_rollback_failure_preserves_validation_variant() {
         let combined = combine_rollback_failure(
@@ -669,7 +677,7 @@ mod tests {
         assert_eq!(combined.status_code(), 500);
     }
 
-    /// 起動しただけでは署名鍵を作らない。作るのは利用者の create_signing_account だけ。
+    /// Merely starting up does not create a signing key. Only the user's create_signing_account does.
     #[test]
     #[allow(deprecated)]
     fn fresh_controller_has_no_signing_key() {

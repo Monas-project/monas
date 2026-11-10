@@ -9,7 +9,7 @@ services:
       - P2P_PORT=9001
       - DATA_DIR=/data
       - LOG_LEVEL=info
-      # 本番同等の条件で検証するため mDNS を切る(VPC に mDNS は存在しない)。
+      # Disable mDNS to test under production-equivalent conditions (a VPC has no mDNS).
       - DISABLE_MDNS=true
     ports:
       - "8081:8080"
@@ -43,11 +43,11 @@ services:
     depends_on:
       node1:
         condition: service_healthy
-    # /dns4/ を使うこと。Docker の埋め込み DNS がダイヤル毎に node1 を再解決
-    # するため、node1 が別 IP で復帰しても再収束する。ここで IP に解決して
-    # しまうと本番で全断した「凍結アドレス」をそのまま再現してしまい、この
-    # ハーネスは修正を検証できない。--disable-mdns も同じ理由(mDNS が壊れた
-    # 探索経路を隠してしまう)。
+    # Use /dns4/. Docker's embedded DNS re-resolves node1 on every dial, so the
+    # cluster reconverges even if node1 comes back on a different IP. Resolving
+    # to an IP here would reproduce the "frozen address" that caused the full
+    # production outage, and this harness could not verify the fix. --disable-mdns
+    # is for the same reason (mDNS would mask a broken discovery path).
     entrypoint: ["/bin/bash", "-c"]
     command:
       - |
@@ -80,11 +80,11 @@ services:
     depends_on:
       node1:
         condition: service_healthy
-    # /dns4/ を使うこと。Docker の埋め込み DNS がダイヤル毎に node1 を再解決
-    # するため、node1 が別 IP で復帰しても再収束する。ここで IP に解決して
-    # しまうと本番で全断した「凍結アドレス」をそのまま再現してしまい、この
-    # ハーネスは修正を検証できない。--disable-mdns も同じ理由(mDNS が壊れた
-    # 探索経路を隠してしまう)。
+    # Use /dns4/. Docker's embedded DNS re-resolves node1 on every dial, so the
+    # cluster reconverges even if node1 comes back on a different IP. Resolving
+    # to an IP here would reproduce the "frozen address" that caused the full
+    # production outage, and this harness could not verify the fix. --disable-mdns
+    # is for the same reason (mDNS would mask a broken discovery path).
     entrypoint: ["/bin/bash", "-c"]
     command:
       - |

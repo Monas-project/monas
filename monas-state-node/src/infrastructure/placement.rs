@@ -13,8 +13,8 @@ pub struct DhtPlacementProof {
     pub capacity_evidence: Vec<(String, u64)>, // (peer_id, reported_capacity)
 }
 
-/// DHT に投入するキー（Kademlia 検索キー）の決定論的生成（最小版）
-/// - content_id から SHA-256 を計算し、32バイトを返す
+/// Deterministic generation of the key put into the DHT (Kademlia lookup key) (minimal version)
+/// - Computes SHA-256 from content_id and returns 32 bytes
 pub fn compute_dht_key(content_id: &str) -> Vec<u8> {
     let mut hasher = Sha256::new();
     hasher.update(content_id.as_bytes());

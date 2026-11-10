@@ -1,10 +1,11 @@
 use crate::domain::content_id::ContentId;
 use crate::domain::KeyId;
 
-/// 1 人分の CEK ラップ情報。
+/// CEK wrap information for a single recipient.
 ///
-/// - `key_id` ごとに HPKE でラップされた CEK と、その際に生成された `enc` を保持する。
-/// - 実際の HPKE アルゴリズムやパラメータは infra 層に委譲し、ここでは「結果としてのバイト列」のみを扱う。
+/// - Holds, per `key_id`, the HPKE-wrapped CEK and the `enc` produced during wrapping.
+/// - The actual HPKE algorithm and parameters are delegated to the infra layer; this only handles
+///   the resulting bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WrappedRecipientKey {
     key_id: KeyId,
@@ -34,20 +35,21 @@ impl WrappedRecipientKey {
     }
 }
 
-/// CEK をどの方式でラップしたかを表すアルゴリズム。
+/// Algorithm indicating how the CEK was wrapped.
 ///
-/// - 今フェーズでは HPKE 1 種類のみを想定するが、将来的な拡張に備えて enum として定義しておく。
+/// - Only HPKE is expected in this phase, but it is defined as an enum for future extension.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyWrapAlgorithm {
-    /// HPKE による CEK ラップ。
+    /// CEK wrap via HPKE.
     HpkeV1,
 }
 
-/// CEK 配送のための「封筒」。
+/// An "envelope" for delivering a CEK.
 ///
-/// - ある時点の `content_id` と `sender_key_id`、および 1 人分の CEK ラップ情報と
-///   コンテンツ本体の暗号データを束ねる。
-/// - ローカル環境など、単一のパッケージだけで復号を完結させたいユースケースを想定。
+/// - Bundles the `content_id` and `sender_key_id` at a point in time, the CEK wrap information for
+///   one recipient, and the encrypted content body.
+/// - Intended for use cases, such as local environments, where decryption should be completed from a
+///   single package alone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyEnvelope {
     content_id: ContentId,
@@ -55,9 +57,9 @@ pub struct KeyEnvelope {
     sender_key_id: KeyId,
     recipient: WrappedRecipientKey,
     ciphertext: Vec<u8>,
-    /// CEK の鍵世代。rotation(revoke による再暗号化)のたびに +1 される。
-    /// wrap の AAD に束縛されるため改ざんできず、受信者は記録済み世代より
-    /// 古い envelope を拒否することで旧 CEK への巻き戻し(replay)を防ぐ。
+    /// CEK key epoch. Incremented by 1 on each rotation (re-encryption due to revoke).
+    /// Bound to the wrap AAD so it cannot be tampered with; recipients reject envelopes older than
+    /// the recorded epoch to prevent rollback (replay) to an old CEK.
     key_epoch: u64,
 }
 

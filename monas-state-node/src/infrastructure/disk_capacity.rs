@@ -29,8 +29,8 @@ pub fn get_disk_capacity(path: &Path) -> Result<(u64, u64)> {
 /// In WASM environments, use navigator.storage.estimate() for actual values.
 #[cfg(target_arch = "wasm32")]
 pub fn get_disk_capacity(_path: &Path) -> Result<(u64, u64)> {
-    // WASM では navigator.storage.estimate() を使う（将来実装）
-    // 現時点では 0 を返す
+    // On WASM, use navigator.storage.estimate() (future implementation)
+    // Return 0 for now
     Ok((0, 0))
 }
 

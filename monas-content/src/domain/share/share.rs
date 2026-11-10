@@ -3,10 +3,10 @@ use std::collections::HashMap;
 use crate::domain::content_id::ContentId;
 use crate::domain::KeyId;
 
-/// コンテンツに対するアクセス権限。
+/// Access permission on a content.
 ///
-/// - `Write` は常に `Read` を内包するものとして扱う。
-/// - `Owner` は `Read` と `Write` を内包し、権限管理が可能。
+/// - `Write` is always treated as implying `Read`.
+/// - `Owner` implies `Read` and `Write`, and can manage permissions.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Permission {
     Read,
@@ -15,27 +15,27 @@ pub enum Permission {
 }
 
 impl Permission {
-    /// 読み取り可能かを判定するヘルパ。
+    /// Helper that checks whether reading is allowed.
     pub fn can_read(perms: &[Permission]) -> bool {
         perms
             .iter()
             .any(|p| matches!(p, Permission::Read | Permission::Write | Permission::Owner))
     }
 
-    /// 書き込み可能かを判定するヘルパ。
+    /// Helper that checks whether writing is allowed.
     pub fn can_write(perms: &[Permission]) -> bool {
         perms
             .iter()
             .any(|p| matches!(p, Permission::Write | Permission::Owner))
     }
 
-    /// 権限管理可能かを判定するヘルパ（Owner権限のみ）。
+    /// Helper that checks whether managing permissions is allowed (Owner permission only).
     pub fn can_manage_permissions(perms: &[Permission]) -> bool {
         perms.iter().any(|p| matches!(p, Permission::Owner))
     }
 }
 
-/// 1 人の受信者に対する共有情報。
+/// Share information for a single recipient.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ShareRecipient {
     key_id: KeyId,
@@ -91,25 +91,26 @@ pub enum ShareEvent {
     },
 }
 
-/// 1 つのコンテンツに対する共有状態（ACL）。
+/// Share state (ACL) for a single content.
 ///
-/// - `serde` によるシリアライズ/デシリアライズをサポートしており、
-///   sled などの KVS に JSON 形式で保存できる。
+/// - Supports serialization/deserialization via `serde`, so it can be stored as JSON in a KVS
+///   such as sled.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Share {
     content_id: ContentId,
     /// key = KeyId
     recipients: HashMap<KeyId, ShareRecipient>,
-    /// CEK の鍵世代。rotation(revoke による再暗号化)のたびに +1 される。
-    /// KeyEnvelope に載り、受信者側の旧世代 envelope 拒否(replay 防止)の基準になる。
+    /// Key epoch of the CEK. Incremented by 1 on every rotation (re-encryption due to revoke).
+    /// Carried in the KeyEnvelope and used by recipients as the basis for rejecting envelopes
+    /// from older epochs (replay prevention).
     #[serde(default)]
     key_epoch: u64,
 }
 
 impl Share {
-    /// 指定された content_id に対応する空の Share を生成する。
+    /// Creates an empty Share for the given content_id.
     ///
-    /// - DB 上にレコードが存在しない場合に、アプリケーション層で組み立てる用途を想定。
+    /// - Intended for the application layer to build one when no record exists in the DB.
     pub fn new(content_id: ContentId) -> Self {
         Self {
             content_id,
@@ -118,35 +119,35 @@ impl Share {
         }
     }
 
-    /// 現在の CEK 鍵世代。
+    /// Current CEK key epoch.
     pub fn key_epoch(&self) -> u64 {
         self.key_epoch
     }
 
-    /// CEK rotation(再暗号化)に合わせて鍵世代を進める。
+    /// Advances the key epoch along with a CEK rotation (re-encryption).
     pub fn bump_key_epoch(&mut self) {
         self.key_epoch += 1;
     }
 
-    /// Read 権限の付与。
+    /// Grants Read permission.
     ///
-    /// - 既に同じ KeyId の受信者が存在する場合は `AlreadyShared` を返す。
+    /// - Returns `AlreadyShared` if a recipient with the same KeyId already exists.
     pub fn grant_read(&mut self, key_id: KeyId) -> Result<ShareEvent, ShareError> {
         self.grant_with_permissions(key_id, vec![Permission::Read])
     }
 
-    /// Write 権限の付与。
+    /// Grants Write permission.
     ///
-    /// - `Write` は `Read` を内包する前提のため、ドメイン上は `Write` のみを持たせる。
-    /// - 既に同じ KeyId の受信者が存在する場合は `AlreadyShared` を返す。
+    /// - Since `Write` is assumed to imply `Read`, the domain holds only `Write`.
+    /// - Returns `AlreadyShared` if a recipient with the same KeyId already exists.
     pub fn grant_write(&mut self, key_id: KeyId) -> Result<ShareEvent, ShareError> {
         self.grant_with_permissions(key_id, vec![Permission::Write])
     }
 
-    /// 共通の権限付与ロジック。
+    /// Common permission-granting logic.
     ///
-    /// - 既に同じ KeyId の受信者が存在する場合は `AlreadyShared` を返す。
-    /// - 新しい `ShareRecipient` を追加し、`RecipientGranted` イベントを返す。
+    /// - Returns `AlreadyShared` if a recipient with the same KeyId already exists.
+    /// - Adds a new `ShareRecipient` and returns a `RecipientGranted` event.
     fn grant_with_permissions(
         &mut self,
         key_id: KeyId,
@@ -166,7 +167,7 @@ impl Share {
         })
     }
 
-    /// 共有関係の取り消し。
+    /// Revokes a share relationship.
     pub fn revoke(&mut self, key_id: &KeyId) -> Result<ShareEvent, ShareError> {
         if self.recipients.remove(key_id).is_none() {
             return Err(ShareError::RecipientNotFound);
@@ -178,10 +179,11 @@ impl Share {
         })
     }
 
-    /// 既存の受信者の権限を置き換える。
+    /// Replaces the permissions of an existing recipient.
     ///
-    /// - 受信者が存在しない場合は `RecipientNotFound` を返す(付与は `grant_*` で行う)。
-    /// - Owner への変更・Owner からの変更はここでは扱わない(`InvalidOperation`)。
+    /// - Returns `RecipientNotFound` if the recipient does not exist (granting is done via
+    ///   `grant_*`).
+    /// - Changes to or from Owner are not handled here (`InvalidOperation`).
     pub fn update_recipient_permissions(
         &mut self,
         key_id: &KeyId,
@@ -205,12 +207,12 @@ impl Share {
         Ok(())
     }
 
-    /// 指定された受信者の情報を取得する。
+    /// Gets the information of the given recipient.
     pub fn recipient(&self, key_id: &KeyId) -> Option<&ShareRecipient> {
         self.recipients.get(key_id)
     }
 
-    /// 指定された受信者の権限一覧を取得する。
+    /// Gets the list of permissions of the given recipient.
     pub fn permissions_of(&self, key_id: &KeyId) -> Option<&[Permission]> {
         self.recipients
             .get(key_id)
@@ -221,7 +223,8 @@ impl Share {
         &self.content_id
     }
 
-    /// 同一の受信者リスト（ACL）を保ったまま、紐づく `content_id` を差し替えた Share を生成する。
+    /// Creates a Share with the associated `content_id` replaced, keeping the same recipient
+    /// list (ACL).
     pub fn with_new_content_id(&self, new_content_id: ContentId) -> Self {
         Self {
             content_id: new_content_id,
@@ -238,27 +241,27 @@ impl Share {
         self.recipients.is_empty()
     }
 
-    /// Owner権限を付与。
+    /// Grants Owner permission.
     ///
-    /// - 既にOwner権限を持つユーザが存在する場合は `InvalidOperation` を返す。
+    /// - Returns `InvalidOperation` if a user with Owner permission already exists.
     pub fn grant_owner(&mut self, key_id: KeyId) -> Result<ShareEvent, ShareError> {
-        // 既にOwner権限を持つユーザが存在するか確認
+        // Check whether a user with Owner permission already exists
         if self.owner_key_id().is_some() {
             return Err(ShareError::InvalidOperation(
                 "Owner already exists".to_string(),
             ));
         }
 
-        // ShareRecipientにOwner権限を追加
+        // Add Owner permission to the ShareRecipient
         if let Some(recipient) = self.recipients.get_mut(&key_id) {
-            // 既存のShareRecipientにOwner権限を追加
+            // Add Owner permission to the existing ShareRecipient
             if !recipient.permissions().contains(&Permission::Owner) {
                 let mut perms = recipient.permissions().to_vec();
                 perms.push(Permission::Owner);
                 recipient.update_permissions(perms);
             }
         } else {
-            // 新しいShareRecipientを作成してOwner権限を付与
+            // Create a new ShareRecipient and grant it Owner permission
             let recipient = ShareRecipient::new(key_id.clone(), vec![Permission::Owner]);
             self.recipients.insert(key_id.clone(), recipient);
         }
@@ -270,7 +273,7 @@ impl Share {
         })
     }
 
-    /// Owner権限を持つKeyIdを取得（ShareRecipientから導出）。
+    /// Gets the KeyId with Owner permission (derived from ShareRecipient).
     pub fn owner_key_id(&self) -> Option<&KeyId> {
         self.recipients
             .iter()

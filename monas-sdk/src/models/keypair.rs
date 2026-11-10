@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-/// 鍵の種類
+/// Key type
 ///
-/// `#[non_exhaustive]` のため、将来新しい鍵種が追加されても下流の `match` は壊れない
-/// （必ず `_ =>` のフォールスルーを入れること）。
+/// Because of `#[non_exhaustive]`, downstream `match` does not break when new key types are
+/// added in the future (always include a `_ =>` fallthrough).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 #[non_exhaustive]
@@ -25,24 +25,24 @@ impl std::fmt::Display for KeyType {
 // generate_keypair
 // ============================================
 
-/// 鍵ペア生成のリクエスト
+/// Key pair generation request
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GenerateKeypairInput {
     pub key_type: KeyType,
 }
 
-/// 鍵ペア生成のレスポンス
+/// Key pair generation response
 #[derive(Clone, Serialize, Deserialize)]
 pub struct GenerateKeypairOutput {
     pub key_type: KeyType,
-    /// 公開鍵（base64url）
+    /// Public key (base64url)
     pub public_key: String,
-    /// 秘密鍵（base64url）
+    /// Private key (base64url)
     pub private_key: String,
 }
 
-// 秘密鍵が Debug 出力経由でログや panic メッセージへ混入するのを防ぐため、
-// derive(Debug) ではなく private_key を "<redacted>" に固定する手書き実装を用いる。
+// To prevent the private key from leaking into logs or panic messages via Debug output, use a
+// hand-written impl that fixes private_key to "<redacted>" instead of derive(Debug).
 impl std::fmt::Debug for GenerateKeypairOutput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GenerateKeypairOutput")
@@ -57,17 +57,18 @@ impl std::fmt::Debug for GenerateKeypairOutput {
 // create_signing_account
 // ============================================
 
-/// 署名アカウント作成のレスポンス。
+/// Signing account creation response.
 ///
-/// SDK が state node へのリクエスト署名と委譲 Token の発行に使う鍵を作り直し、
-/// その鍵ペアを返す。共有の封筒を開ける・送るときに呼び出し元が同じ鍵を渡せる
-/// よう秘密鍵も返す。鍵種は P-256 固定(state node が P-256 しか受け付けない)。
+/// Recreates the key the SDK uses to sign requests to the state node and to issue delegated
+/// tokens, and returns that key pair. The private key is also returned so the caller can pass the
+/// same key when opening or sending share envelopes. The key type is fixed to P-256 (the state
+/// node only accepts P-256).
 #[derive(Clone, Serialize, Deserialize)]
 pub struct CreateSigningAccountOutput {
     pub key_type: KeyType,
-    /// 公開鍵（base64url, SEC1 非圧縮）
+    /// Public key (base64url, SEC1 uncompressed)
     pub public_key: String,
-    /// 秘密鍵（base64url）
+    /// Private key (base64url)
     pub private_key: String,
 }
 

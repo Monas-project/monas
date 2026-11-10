@@ -49,7 +49,7 @@ impl LocalDesktopProvider {
         Ok(resolved)
     }
 
-    /// パスに親ディレクトリ参照（`..`）が含まれているかを判定する。
+    /// Determines whether the path contains a parent directory reference (`..`).
     fn has_parent_dir(path: &str) -> bool {
         let path_buf = PathBuf::from(path);
         for component in path_buf.components() {

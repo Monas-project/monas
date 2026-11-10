@@ -6,7 +6,7 @@ use crate::application_service::share_service::{ShareRepository, ShareRepository
 use crate::domain::content_id::ContentId;
 use crate::domain::share::Share;
 
-/// シンプルなインメモリ実装の ShareRepository。
+/// Simple in-memory ShareRepository implementation.
 ///
 /// - key: `content_id.as_str()`
 /// - value: `Share`
@@ -36,30 +36,30 @@ impl ShareRepository for InMemoryShareRepository {
     }
 }
 
-/// sled を用いた ShareRepository 実装。
+/// ShareRepository implementation backed by sled.
 ///
-/// - キー: `"share:{content_id.as_str()}"`（UTF-8 文字列）
-/// - 値: `Share` を JSON でシリアライズしたバイト列
+/// - Key: `"share:{content_id.as_str()}"` (UTF-8 string)
+/// - Value: `Share` serialized as JSON bytes
 ///
 /// NOTE:
-/// - CEK ストアなど、他の sled ベースストアと**同じ DB ファイルを共有してもよい**ことを想定し、
-///   `"share:"` プレフィックスによりキー空間を分離している。
+/// - Assumes it **may share the same DB file** with other sled-based stores such as the CEK store,
+///   so the key space is separated by the `"share:"` prefix.
 #[derive(Clone)]
 pub struct SledShareRepository {
     db: sled::Db,
 }
 
 impl SledShareRepository {
-    /// 指定されたパスに sled DB を開く。
+    /// Opens a sled DB at the given path.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, ShareRepositoryError> {
         let db = sled::open(path).map_err(|e| ShareRepositoryError::Storage(e.to_string()))?;
         Ok(Self { db })
     }
 
-    /// 既存の `sled::Db` ハンドルを共有してインスタンスを構築する。
+    /// Builds an instance that shares an existing `sled::Db` handle.
     ///
-    /// CEK ストアと同じ DB ファイルを共有したい場合に使う
-    /// (`SledContentEncryptionKeyStore::with_db` と同じ `sled::Db` を渡す)。
+    /// Use this to share the same DB file with the CEK store
+    /// (pass the same `sled::Db` as to `SledContentEncryptionKeyStore::with_db`).
     pub fn with_db(db: sled::Db) -> Self {
         Self { db }
     }

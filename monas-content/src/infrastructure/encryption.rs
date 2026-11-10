@@ -153,7 +153,7 @@ mod tests {
         let key = ContentEncryptionKey(vec![2u8; 32]);
         let encryptor = Aes256GcmContentEncryption;
 
-        // nonce + tag だけの長さ未満は即エラー
+        // Anything shorter than nonce + tag is an immediate error
         let too_short = vec![0u8; NONCE_LEN + TAG_LEN - 1];
         let result = encryptor.decrypt(&key, &too_short);
         assert!(matches!(result, Err(ContentError::DecryptionError(_))));

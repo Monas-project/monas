@@ -27,11 +27,11 @@ impl SignatureVerifier {
 
     /// Verify a JWT's signature over the exact wire bytes it was signed with.
     ///
-    /// JWS の署名対象は「受信した `<header_b64>.<payload_b64>` そのもの」であり、
-    /// パース後の構造体を再シリアライズして作り直してはならない(JSON のフィールド
-    /// 順序や空白が発行者と一致する保証がなく、正当なトークンを拒否する)。
-    /// この関数はワイヤ上のセグメントをそのまま検証するため、発行者側の
-    /// シリアライズ形と無関係に正しく検証できる。
+    /// The JWS signing input is "the received `<header_b64>.<payload_b64>` itself"; it must
+    /// not be rebuilt by re-serializing the parsed struct (there is no guarantee that JSON field
+    /// order and whitespace match the issuer's, so legitimate tokens would be rejected).
+    /// This function verifies the wire segments as-is, so it verifies correctly regardless of
+    /// the issuer's serialization.
     pub fn verify_jwt_signature_wire(jwt: &str, issuer_public_key: &[u8]) -> Result<()> {
         let parts: Vec<&str> = jwt.split('.').collect();
         if parts.len() != 3 {
@@ -174,13 +174,13 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// ECDSA の malleability を明示的に記録しておく。
+    /// Explicitly document ECDSA malleability.
     ///
-    /// 有効な `(r, s)` に対し `(r, n - s)` も同じメッセージ・同じ鍵で検証を通り、
-    /// バイト列は異なる。この検証器は**両方を受理する**(既存クライアントの
-    /// 署名を壊さないため)。したがって「署名バイト列は 1 リクエストにつき一意」
-    /// という前提を置いてはならない。mutation の再送防止はこの前提を使わず、
-    /// 署名対象メッセージから ID を導いている。
+    /// For a valid `(r, s)`, `(r, n - s)` also verifies with the same message and key, yet the
+    /// bytes differ. This verifier **accepts both** (so as not to break existing clients'
+    /// signatures). Therefore, do not assume that "signature bytes are unique per request".
+    /// Mutation replay prevention does not rely on this assumption and derives the ID from the
+    /// signed message.
     #[test]
     fn both_signature_encodings_verify_so_bytes_are_not_a_request_identity() {
         use p256::ecdsa::Signature;
@@ -287,9 +287,9 @@ mod wire_verification_tests {
         format!("{h}.{p}.{}", URL_SAFE_NO_PAD.encode(sig.to_bytes()))
     }
 
-    /// issue #60 の回帰テスト: 署名検証はワイヤ上のバイト列に対して行うため、
-    /// 発行者が構造体の再シリアライズ形と異なるフィールド順序・空白で
-    /// JSON を作っていても正しく検証できる。
+    /// Regression test for issue #60: signature verification is performed on the wire bytes,
+    /// so it verifies correctly even if the issuer built the JSON with a field order and
+    /// whitespace different from the struct's re-serialized form.
     #[test]
     fn wire_verification_is_independent_of_field_order() {
         let key = SigningKey::random(&mut OsRng);
@@ -299,8 +299,8 @@ mod wire_verification_tests {
             .as_bytes()
             .to_vec();
 
-        // 意図的に順序を崩し、空白も混ぜた JSON(serde の再シリアライズでは
-        // 再現されない形)
+        // JSON with deliberately shuffled order and mixed whitespace (a form that serde
+        // re-serialization does not reproduce)
         let header = r#"{ "typ":"JWT" , "alg":"ES256" }"#;
         let payload = r#"{ "jti":"j-1", "iss":"user:04aa", "iat":1, "aud":"user:04bb", "att":[] }"#;
         let jwt = sign_jwt(header, payload, &key);
@@ -323,7 +323,7 @@ mod wire_verification_tests {
             &key,
         );
 
-        // payload セグメントを差し替え
+        // Swap the payload segment
         let parts: Vec<&str> = jwt.split('.').collect();
         let forged_payload = URL_SAFE_NO_PAD
             .encode(r#"{"iss":"user:04aa","aud":"user:04EVIL","iat":1,"jti":"j-1","att":[]}"#);

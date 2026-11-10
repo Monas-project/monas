@@ -235,9 +235,9 @@ fn sign_request(args: &[String]) {
 
 /// Delegated-JWT payload used by `generate-share-token`.
 ///
-/// NOTE: 署名検証はワイヤ上の `header.payload` セグメントに対して行われる
-/// ようになったため(issue #60)、フィールド順序に検証上の意味はもう無い。
-/// 発行側の形として monas-account の `DelegationClaims` に揃えている。
+/// NOTE: signature verification is now performed on the wire `header.payload` segments
+/// (issue #60), so field order no longer matters for verification.
+/// The issuer-side shape is aligned with monas-account's `DelegationClaims`.
 #[derive(serde::Serialize)]
 struct ShareTokenPayload {
     iss: String,

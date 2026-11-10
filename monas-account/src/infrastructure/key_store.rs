@@ -3,10 +3,10 @@ use std::sync::{Arc, Mutex};
 
 use crate::application_service::{AccountKeyStore, AccountKeyStoreError, StoredAccountKey};
 
-/// プロセス内の `AccountKeyMaterial` を保存するインメモリ実装。
+/// In-memory implementation that stores `StoredAccountKey` in-process.
 ///
-/// - 永続化は行わず、プロセス終了とともに破棄される。
-/// - ローカル開発やテスト、PoC 用途を想定。
+/// - Not persisted; discarded when the process exits.
+/// - Intended for local development, tests, and PoCs.
 #[derive(Clone, Default)]
 pub struct InMemoryAccountKeyStore {
     inner: Arc<Mutex<Option<StoredAccountKey>>>,
@@ -43,10 +43,10 @@ impl AccountKeyStore for InMemoryAccountKeyStore {
     }
 }
 
-/// sled を用いたアカウント鍵ストア実装。
+/// Account key store implementation backed by sled.
 ///
-/// - キー: 固定文字列 `"account:signing_key"`（UTF-8 文字列）
-/// - 値: 1 バイトのアルゴリズム識別子 + 公開鍵バイト列(65バイト) + 秘密鍵バイト列(32バイト)
+/// - Key: fixed string `"account:signing_key"` (UTF-8 string)
+/// - Value: 1-byte algorithm identifier + public key bytes (65 bytes) + secret key bytes (32 bytes)
 pub struct SledAccountKeyStore {
     db: sled::Db,
 }
@@ -71,7 +71,7 @@ impl AccountKeyStore for SledAccountKeyStore {
             KeyAlgorithm::P256 => 2u8,
         };
 
-        // 現状どちらのアルゴリズムも secp256 系で、
+        // Currently both algorithms are secp256-family:
         // - public_key: 65 bytes
         // - secret_key: 32 bytes
         let mut value = Vec::with_capacity(1 + key.public_key.len() + key.secret_key.len());
@@ -178,7 +178,7 @@ mod tests {
         let stored = StoredAccountKey {
             algorithm: KeyAlgorithm::P256,
             public_key: vec![0; 65],
-            // 実際の鍵サイズ(32バイト)に合わせてテストデータを用意する
+            // Prepare test data matching the actual key size (32 bytes)
             secret_key: vec![2; 32],
         };
 

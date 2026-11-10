@@ -1,24 +1,24 @@
 #!/bin/bash
 
-# Monas State Node - 4ノード起動スクリプト
-# このスクリプトは4つのState Nodeを起動し、P2Pネットワークを構築します
+# Monas State Node - 4-node startup script
+# This script starts four State Nodes and builds a P2P network
 #
-# 4 ノードである理由: create_content は creator ノード自身を意図的に member から
-# 除外する(local CRDT コピーも持たない)ため、MIN_REPLICATION_FACTOR=3 の
-# member 定足数を満たすには creator + 3 members = 最低 4 ノードが必要。
-# さらに creator が必ず非 member になることで、creator 経由の read が
-# relay read 経路(#54/#55)を確実に通る。e2e は常にこの 4 ノード構成で行う。
+# Why 4 nodes: create_content intentionally excludes the creator node itself from
+# the members (it holds no local CRDT copy either), so meeting the member quorum
+# of MIN_REPLICATION_FACTOR=3 requires creator + 3 members = at least 4 nodes.
+# Also, since the creator is always a non-member, reads via the creator reliably
+# go through the relay read path (#54/#55). e2e always runs on this 4-node setup.
 
 set -e
 
-# カラー出力の定義
+# Color output definitions
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-# ログ関数
+# Logging functions
 log_info() {
     echo -e "${GREEN}[INFO]${NC} $1"
 }
@@ -31,63 +31,63 @@ log_warn() {
     echo -e "${YELLOW}[WARN]${NC} $1"
 }
 
-# State Nodeディレクトリに移動
+# Move to the State Node directory
 STATE_NODE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$STATE_NODE_DIR"
 
-log_info "State Nodeディレクトリ: $STATE_NODE_DIR"
+log_info "State Node directory: $STATE_NODE_DIR"
 
-# データディレクトリのクリーンアップ（オプション）
+# Clean up data directories (optional)
 if [ "$1" == "--clean" ]; then
-    log_warn "既存のデータを削除します..."
+    log_warn "Deleting existing data..."
     rm -rf data/node1 data/node2 data/node3 data/node4
 fi
 
-# データディレクトリの作成
+# Create data directories
 mkdir -p data/node1 data/node2 data/node3 data/node4
 
-# PIDを保存するファイル
+# File that stores the PIDs
 PID_FILE="$STATE_NODE_DIR/.local-nodes.pids"
 rm -f "$PID_FILE"
 
-# ログディレクトリの作成
+# Create the log directory
 LOG_DIR="$STATE_NODE_DIR/logs"
 mkdir -p "$LOG_DIR"
 
-# Ctrl+C のトラップ設定
+# Trap Ctrl+C
 cleanup() {
-    log_warn "\n終了シグナルを受信しました。ノードを停止します..."
+    log_warn "\nReceived termination signal. Stopping nodes..."
     if [ -f "$PID_FILE" ]; then
         while IFS= read -r pid; do
             if kill -0 "$pid" 2>/dev/null; then
-                log_info "PID $pid を停止します..."
+                log_info "Stopping PID $pid..."
                 kill "$pid" 2>/dev/null || true
             fi
         done < "$PID_FILE"
         rm -f "$PID_FILE"
     fi
-    log_info "クリーンアップ完了"
+    log_info "Cleanup complete"
     exit 0
 }
 
 trap cleanup INT TERM
 
-# creator + 3 members の定足数(上記コメント参照)。デフォルト 3 を明示する。
+# Quorum of creator + 3 members (see the comment above). Set the default 3 explicitly.
 export MIN_REPLICATION_FACTOR="${MIN_REPLICATION_FACTOR:-3}"
 
-# State Nodeバイナリのビルド
-log_info "State Nodeバイナリをビルドしています..."
+# Build the State Node binary
+log_info "Building the State Node binary..."
 cargo build --bin state-node --release
 
-# バイナリパスの確認
+# Check the binary path
 STATE_NODE_BIN="$STATE_NODE_DIR/../target/release/state-node"
 if [ ! -f "$STATE_NODE_BIN" ]; then
-    log_error "State Nodeバイナリが見つかりません: $STATE_NODE_BIN"
+    log_error "State Node binary not found: $STATE_NODE_BIN"
     exit 1
 fi
 
-# ノード1（ブートストラップノード）の起動
-log_info "ノード1（ブートストラップノード）を起動しています..."
+# Start node 1 (bootstrap node)
+log_info "Starting node 1 (bootstrap node)..."
 # The state-node defaults to a fixed P2P port (9090); give each node on this
 # host a distinct --p2p-port to avoid a bind collision.
 "$STATE_NODE_BIN" \
@@ -99,54 +99,54 @@ log_info "ノード1（ブートストラップノード）を起動していま
 NODE1_PID=$!
 echo "$NODE1_PID" >> "$PID_FILE"
 
-# ノード1の起動を待つ
-log_info "ノード1の起動を待っています..."
+# Wait for node 1 to start
+log_info "Waiting for node 1 to start..."
 for i in {1..30}; do
     if curl -s http://127.0.0.1:8080/health > /dev/null 2>&1; then
-        log_info "ノード1が起動しました"
+        log_info "Node 1 started"
         break
     fi
     if [ $i -eq 30 ]; then
-        log_error "ノード1の起動に失敗しました"
+        log_error "Node 1 failed to start"
         cleanup
         exit 1
     fi
     sleep 1
 done
 
-# ノード1のPeer IDとlistenアドレスを取得
-log_info "ノード1のPeer IDとlistenアドレスを取得しています..."
+# Get node 1's Peer ID and listen address
+log_info "Getting node 1's Peer ID and listen address..."
 NODE1_INFO=$(curl -s http://127.0.0.1:8080/node/info)
 NODE1_PEER_ID=$(echo "$NODE1_INFO" | jq -r '.node_id')
 NODE1_ADDR=$(echo "$NODE1_INFO" | jq -r '.listen_addrs[] | select(startswith("/ip4/127.0.0.1/tcp/"))' | head -1)
 
 if [ -z "$NODE1_PEER_ID" ]; then
-    log_error "ノード1のPeer IDが取得できませんでした"
+    log_error "Could not get node 1's Peer ID"
     cleanup
     exit 1
 fi
 
 if [ -z "$NODE1_ADDR" ]; then
-    # 127.0.0.1がない場合は0.0.0.0のアドレスを使う
+    # If there is no 127.0.0.1 address, use the 0.0.0.0 one
     NODE1_ADDR=$(echo "$NODE1_INFO" | jq -r '.listen_addrs[] | select(startswith("/ip4/0.0.0.0/tcp/"))' | head -1)
     if [ -n "$NODE1_ADDR" ]; then
-        # 0.0.0.0を127.0.0.1に置換
+        # Replace 0.0.0.0 with 127.0.0.1
         NODE1_ADDR=$(echo "$NODE1_ADDR" | sed 's|/ip4/0.0.0.0/|/ip4/127.0.0.1/|')
     fi
 fi
 
 if [ -z "$NODE1_ADDR" ]; then
-    log_error "ノード1のlistenアドレスが取得できませんでした"
+    log_error "Could not get node 1's listen address"
     cleanup
     exit 1
 fi
 
 BOOTSTRAP_ADDR="${NODE1_ADDR}/p2p/${NODE1_PEER_ID}"
-log_info "ノード1のPeer ID: $NODE1_PEER_ID"
-log_info "ブートストラップアドレス: $BOOTSTRAP_ADDR"
+log_info "Node 1 Peer ID: $NODE1_PEER_ID"
+log_info "Bootstrap address: $BOOTSTRAP_ADDR"
 
-# ノード2の起動（ノード1に接続）
-log_info "ノード2を起動しています..."
+# Start node 2 (connects to node 1)
+log_info "Starting node 2..."
 "$STATE_NODE_BIN" \
     --data-dir ./data/node2 \
     -l 127.0.0.1:8081 \
@@ -157,23 +157,23 @@ log_info "ノード2を起動しています..."
 NODE2_PID=$!
 echo "$NODE2_PID" >> "$PID_FILE"
 
-# ノード2の起動を待つ
-log_info "ノード2の起動を待っています..."
+# Wait for node 2 to start
+log_info "Waiting for node 2 to start..."
 for i in {1..30}; do
     if curl -s http://127.0.0.1:8081/health > /dev/null 2>&1; then
-        log_info "ノード2が起動しました"
+        log_info "Node 2 started"
         break
     fi
     if [ $i -eq 30 ]; then
-        log_error "ノード2の起動に失敗しました"
+        log_error "Node 2 failed to start"
         cleanup
         exit 1
     fi
     sleep 1
 done
 
-# ノード3の起動（ノード1に接続）
-log_info "ノード3を起動しています..."
+# Start node 3 (connects to node 1)
+log_info "Starting node 3..."
 "$STATE_NODE_BIN" \
     --data-dir ./data/node3 \
     -l 127.0.0.1:8082 \
@@ -184,23 +184,23 @@ log_info "ノード3を起動しています..."
 NODE3_PID=$!
 echo "$NODE3_PID" >> "$PID_FILE"
 
-# ノード3の起動を待つ
-log_info "ノード3の起動を待っています..."
+# Wait for node 3 to start
+log_info "Waiting for node 3 to start..."
 for i in {1..30}; do
     if curl -s http://127.0.0.1:8082/health > /dev/null 2>&1; then
-        log_info "ノード3が起動しました"
+        log_info "Node 3 started"
         break
     fi
     if [ $i -eq 30 ]; then
-        log_error "ノード3の起動に失敗しました"
+        log_error "Node 3 failed to start"
         cleanup
         exit 1
     fi
     sleep 1
 done
 
-# ノード4の起動（ノード1に接続）
-log_info "ノード4を起動しています..."
+# Start node 4 (connects to node 1)
+log_info "Starting node 4..."
 "$STATE_NODE_BIN" \
     --data-dir ./data/node4 \
     -l 127.0.0.1:8083 \
@@ -211,65 +211,65 @@ log_info "ノード4を起動しています..."
 NODE4_PID=$!
 echo "$NODE4_PID" >> "$PID_FILE"
 
-# ノード4の起動を待つ
-log_info "ノード4の起動を待っています..."
+# Wait for node 4 to start
+log_info "Waiting for node 4 to start..."
 for i in {1..30}; do
     if curl -s http://127.0.0.1:8083/health > /dev/null 2>&1; then
-        log_info "ノード4が起動しました"
+        log_info "Node 4 started"
         break
     fi
     if [ $i -eq 30 ]; then
-        log_error "ノード4の起動に失敗しました"
+        log_error "Node 4 failed to start"
         cleanup
         exit 1
     fi
     sleep 1
 done
 
-# P2P接続が確立されるのを待つ
-log_info "P2P接続が確立されるのを待っています..."
+# Wait for P2P connections to be established
+log_info "Waiting for P2P connections to be established..."
 sleep 3
 
-# ステータスの表示
+# Show status
 echo ""
 echo -e "${BLUE}========================================${NC}"
-echo -e "${BLUE}    4つのState Nodeが起動しました！    ${NC}"
+echo -e "${BLUE}      4 State Nodes are running!        ${NC}"
 echo -e "${BLUE}========================================${NC}"
 echo ""
-echo "ノード1: http://127.0.0.1:8080"
-echo "ノード2: http://127.0.0.1:8081"
-echo "ノード3: http://127.0.0.1:8082"
-echo "ノード4: http://127.0.0.1:8083 (create を受けるノードは member にならず relay 役になる)"
+echo "Node 1: http://127.0.0.1:8080"
+echo "Node 2: http://127.0.0.1:8081"
+echo "Node 3: http://127.0.0.1:8082"
+echo "Node 4: http://127.0.0.1:8083 (the node that receives a create does not become a member; it acts as relay)"
 echo ""
-echo "ログファイル:"
+echo "Log files:"
 echo "  - $LOG_DIR/node1.log"
 echo "  - $LOG_DIR/node2.log"
 echo "  - $LOG_DIR/node3.log"
 echo "  - $LOG_DIR/node4.log"
 echo ""
-echo "ログをリアルタイムで確認:"
+echo "Follow the logs in real time:"
 echo "  tail -f $LOG_DIR/node1.log"
 echo ""
-echo "機能テストを実行:"
+echo "Run the functional tests:"
 echo "  ./scripts/test-local-nodes.sh"
 echo ""
-echo "ノードを停止するには Ctrl+C を押してください"
+echo "Press Ctrl+C to stop the nodes"
 echo ""
 
-# ログの監視（オプション）
+# Follow the logs (optional)
 if [ "$2" == "--follow" ]; then
-    log_info "ログの監視を開始します..."
+    log_info "Following the logs..."
     tail -f "$LOG_DIR"/node*.log
 else
-    # バックグラウンドで実行を継続
+    # Keep running in the background
     while true; do
         sleep 1
-        # PIDが生きているかチェック
+        # Check that the PIDs are still alive
         if ! kill -0 "$NODE1_PID" 2>/dev/null || \
            ! kill -0 "$NODE2_PID" 2>/dev/null || \
            ! kill -0 "$NODE3_PID" 2>/dev/null || \
            ! kill -0 "$NODE4_PID" 2>/dev/null; then
-            log_error "いずれかのノードが停止しました"
+            log_error "One of the nodes has stopped"
             cleanup
             exit 1
         fi

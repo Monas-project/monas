@@ -127,9 +127,10 @@ impl TestKeyPair {
 
     /// Sign a request using this key pair
     ///
-    /// The request signature format is `{operation}:{resource}:{timestamp}` —
-    /// identical for every token type (issue #61). The old "{iss}:{aud}:{jti}"
-    /// fixed string is gone: freshness lives inside the signed message.
+    /// Signs the bare `{operation}:{resource}:{timestamp}` string. This is NOT the production
+    /// request signature message (`monas-request-v1`, `RequestMetadata::signing_message`), so
+    /// the result only suits tests that check signature presence (e.g. `UcanAdapter::authorize`),
+    /// not `verify_caller_signature`.
     ///
     /// # Returns
     /// The request signature bytes
@@ -252,7 +253,7 @@ mod tests {
         let request_sig = bob.sign_request("read", "content-1", ts);
         assert!(!request_sig.is_empty());
 
-        // 統一形式 `{operation}:{resource}:{timestamp}` に対する署名として検証できる
+        // Verifiable as a signature over the bare `{operation}:{resource}:{timestamp}` string
         let message = format!("read:content-1:{ts}");
         use p256::ecdsa::signature::Verifier;
         let vk = bob.secret_key.verifying_key();

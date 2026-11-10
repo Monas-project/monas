@@ -1,11 +1,12 @@
 #!/bin/bash
 
-# Monas State Node - 認証付き機能テストスクリプト
-# P-256鍵ペアを生成し、各ノードに登録後、認証付きリクエストをテストします
+# Monas State Node - authenticated feature test script
+# Generates a P-256 key pair (self-contained key_id, no node registration needed), then tests
+# authenticated requests
 
 set -e
 
-# カラー出力の定義
+# Color output definitions
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -13,7 +14,7 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
-# ログ関数
+# Logging functions
 log_info() {
     echo -e "${GREEN}[INFO]${NC} $1"
 }
@@ -38,18 +39,18 @@ log_fail() {
     echo -e "${RED}✗${NC} $1"
 }
 
-# State Nodeディレクトリに移動
+# Move to the State Node directory
 STATE_NODE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$STATE_NODE_DIR"
 
-# テスト結果を記録する変数
+# Variables to record test results
 TESTS_PASSED=0
 TESTS_FAILED=0
 
-# test-auth-generator バイナリのビルド
-log_info "test-auth-generatorをビルドしています..."
+# Build the test-auth-generator binary
+log_info "Building test-auth-generator..."
 cargo build --bin test-auth-generator 2>/dev/null || {
-    log_error "ビルドに失敗しました"
+    log_error "Build failed"
     cargo build --bin test-auth-generator
     exit 1
 }
@@ -57,11 +58,11 @@ cargo build --bin test-auth-generator 2>/dev/null || {
 AUTH_GEN="cargo run --bin test-auth-generator --"
 
 # ============================================================================
-# ヘルパー関数
+# Helper functions
 # ============================================================================
 
-# 署名を生成する関数
-# 引数: private_key operation resource [body_base64]
+# Generate a signature
+# Arguments: private_key operation resource [body_base64]
 generate_signature() {
     local private_key="$1"
     local operation="$2"
@@ -83,46 +84,46 @@ generate_signature() {
     LAST_TIMESTAMP=$(echo "$output" | grep "^TIMESTAMP=" | sed 's/^TIMESTAMP=//')
 }
 
-# ノードの起動確認
+# Check that nodes are running
 check_nodes_running() {
-    log_info "ノードの起動状態を確認しています..."
+    log_info "Checking node status..."
 
     local all_running=true
     for port in 8080 8081 8082 8083; do
         if curl -s "http://127.0.0.1:$port/health" > /dev/null 2>&1; then
-            log_success "ノード (ポート $port) は起動しています"
+            log_success "Node (port $port) is running"
         else
-            log_fail "ノード (ポート $port) は起動していません"
+            log_fail "Node (port $port) is not running"
             all_running=false
         fi
     done
 
     if [ "$all_running" = false ]; then
-        log_warn "一部のノードが起動していません。最低1つのノードで動作確認を行います"
+        log_warn "Some nodes are not running. Testing with at least one node"
         if ! curl -s "http://127.0.0.1:8080/health" > /dev/null 2>&1 && \
            ! curl -s "http://127.0.0.1:8081/health" > /dev/null 2>&1 && \
            ! curl -s "http://127.0.0.1:8082/health" > /dev/null 2>&1 && \
            ! curl -s "http://127.0.0.1:8083/health" > /dev/null 2>&1; then
-            log_error "ノードが1つも起動していません。先に ./scripts/start-local-nodes.sh を実行してください"
+            log_error "No nodes are running. Run ./scripts/start-local-nodes.sh first"
             exit 1
         fi
     fi
 }
 
 # ============================================================================
-# メイン処理
+# Main
 # ============================================================================
 
 echo ""
 echo -e "${BLUE}========================================${NC}"
-echo -e "${BLUE}  Monas State Node 認証付き機能テスト  ${NC}"
+echo -e "${BLUE}  Monas State Node Authenticated Tests  ${NC}"
 echo -e "${BLUE}========================================${NC}"
 echo ""
 
-# ノードの起動確認
+# Check that nodes are running
 check_nodes_running
 
-# 使用するポートを決定（最初に起動しているノード）
+# Choose the port to use (first running node)
 TEST_PORT=8080
 if ! curl -s "http://127.0.0.1:8080/health" > /dev/null 2>&1; then
     if curl -s "http://127.0.0.1:8081/health" > /dev/null 2>&1; then
@@ -135,55 +136,55 @@ if ! curl -s "http://127.0.0.1:8080/health" > /dev/null 2>&1; then
 fi
 
 BASE_URL="http://127.0.0.1:$TEST_PORT"
-log_info "テスト対象ノード: $BASE_URL"
+log_info "Target node: $BASE_URL"
 
 # ============================================================================
-# 認証データの生成と登録
+# Generate auth data
 # ============================================================================
 
 echo ""
-echo -e "${BLUE}=== 認証データの生成 ===${NC}"
+echo -e "${BLUE}=== Generating auth data ===${NC}"
 echo ""
 
-log_info "テスト用鍵ペアを生成しています..."
+log_info "Generating test key pair..."
 AUTH_OUTPUT=$($AUTH_GEN test-auth 2>/dev/null)
 TEST_PRIVATE_KEY=$(echo "$AUTH_OUTPUT" | grep "^PRIVATE_KEY=" | sed 's/^PRIVATE_KEY=//')
 TEST_PUBLIC_KEY=$(echo "$AUTH_OUTPUT" | grep "^PUBLIC_KEY=" | sed 's/^PUBLIC_KEY=//')
 TEST_KEY_ID=$(echo "$AUTH_OUTPUT" | grep "^KEY_ID=" | sed 's/^KEY_ID=//')
 
 if [ -z "$TEST_PRIVATE_KEY" ] || [ -z "$TEST_PUBLIC_KEY" ] || [ -z "$TEST_KEY_ID" ]; then
-    log_error "鍵ペアの生成に失敗しました"
+    log_error "Failed to generate key pair"
     echo "$AUTH_OUTPUT"
     exit 1
 fi
 
-log_success "鍵ペアを生成しました"
+log_success "Generated key pair"
 log_info "Key ID: $TEST_KEY_ID"
 
-# 自己完結型key_idなのでノードへの公開鍵登録は不要
-log_success "自己完結型key_id: 公開鍵登録不要"
+# key_id is self-contained, so no public key registration with nodes is needed
+log_success "Self-contained key_id: no public key registration needed"
 
 # ============================================================================
-# コンテンツ作成テスト（認証付き）
+# Content creation test (authenticated)
 # ============================================================================
 
 echo ""
-echo -e "${BLUE}=== コンテンツ作成テスト（認証付き） ===${NC}"
+echo -e "${BLUE}=== Content creation test (authenticated) ===${NC}"
 echo ""
 
-# base64デコードされたバイナリデータのbase64表現
+# base64 representation of the base64-decoded binary data
 CONTENT_B64="SGVsbG8sIFdvcmxkIQ=="  # "Hello, World!"
 
-# Create用の署名を生成（bodyベース）
-# HTTP APIはJSON bodyをbase64デコードするので、署名はデコード後のバイトに対して行う
-# ただし verify_caller_signature() は create_content(&data, ...) で data はデコード済みバイト
-# => bodyとしてはデコード済みバイトを渡す
+# Generate the signature for create (body-based)
+# The HTTP API base64-decodes the JSON body, so the signature is over the decoded bytes
+# Note: verify_caller_signature() is called in create_content(&data, ...), where data is the decoded bytes
+# => pass the decoded bytes as the body
 DECODED_BODY=$(echo -n "$CONTENT_B64" | base64 -d 2>/dev/null | base64)
 generate_signature "$TEST_PRIVATE_KEY" "create" "content" "$DECODED_BODY"
 CREATE_SIGNATURE="$LAST_SIGNATURE"
 CREATE_TIMESTAMP="$LAST_TIMESTAMP"
 
-log_test "新しいコンテンツを作成"
+log_test "Create new content"
 CONTENT_RESPONSE=$(curl -s -X POST "$BASE_URL/content" \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer $TEST_KEY_ID" \
@@ -196,30 +197,30 @@ status_code=$(echo "$CONTENT_RESPONSE" | tail -n1)
 response_body=$(echo "$CONTENT_RESPONSE" | sed '$d')
 
 if [ "$status_code" = "201" ]; then
-    log_success "新しいコンテンツを作成 (HTTP 201)"
+    log_success "Create new content (HTTP 201)"
     TESTS_PASSED=$((TESTS_PASSED + 1))
     echo "$response_body" | jq -C '.' 2>/dev/null || echo "$response_body"
     CONTENT_ID=$(echo "$response_body" | jq -r '.content_id // empty' 2>/dev/null)
 else
-    log_fail "新しいコンテンツを作成 (期待: HTTP 201, 実際: HTTP $status_code)"
+    log_fail "Create new content (expected: HTTP 201, actual: HTTP $status_code)"
     TESTS_FAILED=$((TESTS_FAILED + 1))
     echo "$response_body"
     CONTENT_ID=""
 fi
 
 if [ -n "$CONTENT_ID" ]; then
-    log_info "作成されたコンテンツID: $CONTENT_ID"
+    log_info "Created content ID: $CONTENT_ID"
 
     echo ""
-    echo -e "${BLUE}=== コンテンツ操作テスト ===${NC}"
+    echo -e "${BLUE}=== Content operation tests ===${NC}"
     echo ""
 
-    # コンテンツの更新
+    # Update the content
     UPDATED_B64="VXBkYXRlZCBjb250ZW50"  # "Updated content"
     DECODED_UPDATED_BODY=$(echo -n "$UPDATED_B64" | base64 -d 2>/dev/null | base64)
     generate_signature "$TEST_PRIVATE_KEY" "update" "$CONTENT_ID" "$DECODED_UPDATED_BODY"
 
-    log_test "コンテンツを更新"
+    log_test "Update content"
     UPDATE_RESPONSE=$(curl -s -X PUT "$BASE_URL/content/$CONTENT_ID" \
         -H "Content-Type: application/json" \
         -H "Authorization: Bearer $TEST_KEY_ID" \
@@ -230,19 +231,19 @@ if [ -n "$CONTENT_ID" ]; then
     UPDATE_STATUS=$(echo "$UPDATE_RESPONSE" | tail -n1)
     UPDATE_BODY=$(echo "$UPDATE_RESPONSE" | sed '$d')
     if [ "$UPDATE_STATUS" = "200" ]; then
-        log_success "コンテンツを更新 (HTTP 200)"
+        log_success "Update content (HTTP 200)"
         TESTS_PASSED=$((TESTS_PASSED + 1))
     else
-        log_fail "コンテンツを更新 (期待: HTTP 200, 実際: HTTP $UPDATE_STATUS)"
+        log_fail "Update content (expected: HTTP 200, actual: HTTP $UPDATE_STATUS)"
         TESTS_FAILED=$((TESTS_FAILED + 1))
         echo "$UPDATE_BODY"
     fi
 
-    # 直前の更新とまったく同じ署名・timestamp・body を再送する。
-    # 鮮度チェックだけなら 5 分窓の中なので通ってしまうが、mutation の署名は
-    # 使い切りなので 409 で拒否される。通してしまうと、攻撃者が署名済みの
-    # 旧 ciphertext 更新を後から再送して最新版を巻き戻せる。
-    log_test "同じ署名での更新の再送を拒否"
+    # Resend the exact same signature, timestamp, and body as the previous update.
+    # A freshness check alone would accept it since it is within the 5-minute window,
+    # but mutation signatures are single-use, so it is rejected with 409. If accepted,
+    # an attacker could later replay a signed old ciphertext update to roll back the latest version.
+    log_test "Reject replayed update with the same signature"
     REPLAY_RESPONSE=$(curl -s -X PUT "$BASE_URL/content/$CONTENT_ID" \
         -H "Content-Type: application/json" \
         -H "Authorization: Bearer $TEST_KEY_ID" \
@@ -252,19 +253,19 @@ if [ -n "$CONTENT_ID" ]; then
         -w "\n%{http_code}" 2>/dev/null)
     REPLAY_STATUS=$(echo "$REPLAY_RESPONSE" | tail -n1)
     if [ "$REPLAY_STATUS" = "409" ]; then
-        log_success "更新の再送を拒否 (HTTP 409)"
+        log_success "Reject replayed update (HTTP 409)"
         TESTS_PASSED=$((TESTS_PASSED + 1))
     else
-        log_fail "更新の再送を拒否 (期待: HTTP 409, 実際: HTTP $REPLAY_STATUS)"
+        log_fail "Reject replayed update (expected: HTTP 409, actual: HTTP $REPLAY_STATUS)"
         TESTS_FAILED=$((TESTS_FAILED + 1))
         echo "$REPLAY_RESPONSE" | sed '$d'
     fi
 
-    # メンバー追加（count形式）
-    # count は署名対象。body を差し替えると署名検証で落ちる
+    # Add members (count form)
+    # count is covered by the signature; substituting the body fails signature verification
     generate_signature "$TEST_PRIVATE_KEY" "manage" "$CONTENT_ID" "" "1"
 
-    log_test "コンテンツネットワークにメンバーを追加"
+    log_test "Add a member to the content network"
     MEMBER_RESPONSE=$(curl -s -X POST "$BASE_URL/content/$CONTENT_ID/members" \
         -H "Content-Type: application/json" \
         -H "Authorization: Bearer $TEST_KEY_ID" \
@@ -274,37 +275,37 @@ if [ -n "$CONTENT_ID" ]; then
         -w "\n%{http_code}" 2>/dev/null)
     MEMBER_STATUS=$(echo "$MEMBER_RESPONSE" | tail -n1)
     MEMBER_BODY=$(echo "$MEMBER_RESPONSE" | sed '$d')
-    # このスクリプトはコンテンツを作成したノードへ直接送る。作成ノードは
-    # 自分自身を member にしないので(relay 役)、add_members は member 判定で
-    # 403 になるのが正常系。200/503 はこのノードが member だった場合。
+    # This script sends directly to the node that created the content. The creating
+    # node does not make itself a member (it acts as a relay), so add_members returning
+    # 403 from the member check is the expected path. 200/503 means this node was a member.
     #
-    # count が署名に束縛されていることの検証は、この 403 が member 判定で
-    # 起きる以上ここでは行えない。ユニットテスト
-    # (`test_add_members_count_cannot_be_substituted`)が担当する。
+    # Since this 403 comes from the member check, we cannot verify here that count is
+    # bound to the signature. The unit test
+    # (`test_add_members_count_cannot_be_substituted`) covers that.
     if [ "$MEMBER_STATUS" = "403" ]; then
-        log_success "メンバー追加: 作成ノードは非memberなので拒否 (HTTP 403 - 想定内)"
+        log_success "Add member: rejected because the creating node is not a member (HTTP 403 - expected)"
         TESTS_PASSED=$((TESTS_PASSED + 1))
     elif [ "$MEMBER_STATUS" = "200" ]; then
-        log_success "メンバー追加成功 (HTTP 200)"
+        log_success "Add member succeeded (HTTP 200)"
         TESTS_PASSED=$((TESTS_PASSED + 1))
         echo "$MEMBER_BODY" | jq -C '.' 2>/dev/null || echo "$MEMBER_BODY"
     elif [ "$MEMBER_STATUS" = "503" ]; then
-        log_warn "メンバー追加: DHT peer discovery で利用可能ノードが見つかりません (HTTP 503 - 小規模クラスタでは想定内)"
+        log_warn "Add member: no available nodes found via DHT peer discovery (HTTP 503 - expected in small clusters)"
         TESTS_PASSED=$((TESTS_PASSED + 1))
     else
-        log_fail "メンバー追加 (期待: HTTP 403, 200 or 503, 実際: HTTP $MEMBER_STATUS)"
+        log_fail "Add member (expected: HTTP 403, 200 or 503, actual: HTTP $MEMBER_STATUS)"
         TESTS_FAILED=$((TESTS_FAILED + 1))
         echo "$MEMBER_BODY"
     fi
 
     echo ""
-    echo -e "${BLUE}=== CRDT操作テスト ===${NC}"
+    echo -e "${BLUE}=== CRDT operation tests ===${NC}"
     echo ""
 
-    # CRDTデータの取得（認証ヘッダー付き）
+    # Fetch CRDT data (with auth headers)
     generate_signature "$TEST_PRIVATE_KEY" "read" "$CONTENT_ID"
 
-    log_test "CRDTデータの取得"
+    log_test "Fetch CRDT data"
     DATA_RESPONSE=$(curl -s -X GET "$BASE_URL/content/$CONTENT_ID/data" \
         -H "Authorization: Bearer $TEST_KEY_ID" \
         -H "X-Request-Signature: $LAST_SIGNATURE" \
@@ -313,18 +314,18 @@ if [ -n "$CONTENT_ID" ]; then
     DATA_STATUS=$(echo "$DATA_RESPONSE" | tail -n1)
     DATA_BODY=$(echo "$DATA_RESPONSE" | sed '$d')
     if [ "$DATA_STATUS" = "200" ]; then
-        log_success "CRDTデータの取得 (HTTP 200)"
+        log_success "Fetch CRDT data (HTTP 200)"
         TESTS_PASSED=$((TESTS_PASSED + 1))
     else
-        log_fail "CRDTデータの取得 (期待: HTTP 200, 実際: HTTP $DATA_STATUS)"
+        log_fail "Fetch CRDT data (expected: HTTP 200, actual: HTTP $DATA_STATUS)"
         TESTS_FAILED=$((TESTS_FAILED + 1))
         echo "$DATA_BODY"
     fi
 
-    # CRDT履歴の取得（認証ヘッダー付き）
+    # Fetch CRDT history (with auth headers)
     generate_signature "$TEST_PRIVATE_KEY" "read" "$CONTENT_ID"
 
-    log_test "CRDT履歴の取得"
+    log_test "Fetch CRDT history"
     HIST_RESPONSE=$(curl -s -X GET "$BASE_URL/content/$CONTENT_ID/history" \
         -H "Authorization: Bearer $TEST_KEY_ID" \
         -H "X-Request-Signature: $LAST_SIGNATURE" \
@@ -333,22 +334,22 @@ if [ -n "$CONTENT_ID" ]; then
     HIST_STATUS=$(echo "$HIST_RESPONSE" | tail -n1)
     HIST_BODY=$(echo "$HIST_RESPONSE" | sed '$d')
     if [ "$HIST_STATUS" = "200" ]; then
-        log_success "CRDT履歴の取得 (HTTP 200)"
+        log_success "Fetch CRDT history (HTTP 200)"
         TESTS_PASSED=$((TESTS_PASSED + 1))
     else
-        log_fail "CRDT履歴の取得 (期待: HTTP 200, 実際: HTTP $HIST_STATUS)"
+        log_fail "Fetch CRDT history (expected: HTTP 200, actual: HTTP $HIST_STATUS)"
         TESTS_FAILED=$((TESTS_FAILED + 1))
         echo "$HIST_BODY"
     fi
 
     echo ""
-    echo -e "${BLUE}=== コンテンツ削除テスト ===${NC}"
+    echo -e "${BLUE}=== Content deletion test ===${NC}"
     echo ""
 
-    # コンテンツの削除
+    # Delete the content
     generate_signature "$TEST_PRIVATE_KEY" "delete" "$CONTENT_ID"
 
-    log_test "コンテンツを削除"
+    log_test "Delete content"
     DEL_RESPONSE=$(curl -s -X DELETE "$BASE_URL/content/$CONTENT_ID" \
         -H "Authorization: Bearer $TEST_KEY_ID" \
         -H "X-Request-Signature: $LAST_SIGNATURE" \
@@ -357,29 +358,29 @@ if [ -n "$CONTENT_ID" ]; then
     DEL_STATUS=$(echo "$DEL_RESPONSE" | tail -n1)
     DEL_BODY=$(echo "$DEL_RESPONSE" | sed '$d')
     if [ "$DEL_STATUS" = "200" ]; then
-        log_success "コンテンツを削除 (HTTP 200)"
+        log_success "Delete content (HTTP 200)"
         TESTS_PASSED=$((TESTS_PASSED + 1))
     else
-        log_fail "コンテンツを削除 (期待: HTTP 200, 実際: HTTP $DEL_STATUS)"
+        log_fail "Delete content (expected: HTTP 200, actual: HTTP $DEL_STATUS)"
         TESTS_FAILED=$((TESTS_FAILED + 1))
         echo "$DEL_BODY"
     fi
 fi
 
 # ============================================================================
-# 複数ノード間の同期テスト
+# Multi-node sync test
 # ============================================================================
 
 echo ""
-echo -e "${BLUE}=== 複数ノード間の同期テスト ===${NC}"
+echo -e "${BLUE}=== Multi-node sync test ===${NC}"
 echo ""
 
-# 3つのノードすべてが起動している場合のみ同期テストを実行
+# Run the sync test only if all 3 nodes are running
 if curl -s "http://127.0.0.1:8080/health" > /dev/null 2>&1 && \
    curl -s "http://127.0.0.1:8081/health" > /dev/null 2>&1 && \
    curl -s "http://127.0.0.1:8082/health" > /dev/null 2>&1; then
 
-    log_test "ノード1でコンテンツを作成"
+    log_test "Create content on node 1"
 
     SYNC_B64="U3luYyBUZXN0IERhdGE="  # "Sync Test Data"
     DECODED_SYNC_BODY=$(echo -n "$SYNC_B64" | base64 -d 2>/dev/null | base64)
@@ -393,34 +394,34 @@ if curl -s "http://127.0.0.1:8080/health" > /dev/null 2>&1 && \
         -d "{\"data\": \"$SYNC_B64\"}" 2>/dev/null)
 
     if [ $? -eq 0 ]; then
-        log_success "コンテンツ作成成功"
+        log_success "Content created successfully"
 
-        # 同期を待つ
-        log_info "P2P同期を待っています (3秒)..."
+        # Wait for sync
+        log_info "Waiting for P2P sync (3s)..."
         sleep 3
 
-        # 各ノードでコンテンツを確認
-        log_test "各ノードでコンテンツリストを確認"
+        # Check content on each node
+        log_test "Check the content list on each node"
         for port in 8080 8081 8082 8083; do
             count=$(curl -s "http://127.0.0.1:$port/contents" | jq '. | length' 2>/dev/null || echo "0")
-            log_info "ノード (ポート $port): $count 個のコンテンツ"
+            log_info "Node (port $port): $count content items"
         done
     fi
 else
-    log_error "すべてのノードが起動していないため、同期テストを実行できません"
+    log_error "Not all nodes are running, so the sync test cannot run"
     TESTS_FAILED=$((TESTS_FAILED + 1))
 fi
 
 # ============================================================================
-# 認証エラーのテスト
+# Authentication error tests
 # ============================================================================
 
 echo ""
-echo -e "${BLUE}=== 認証エラーのテスト ===${NC}"
+echo -e "${BLUE}=== Authentication error tests ===${NC}"
 echo ""
 
-# 無効なトークンでのリクエスト
-log_test "無効なトークンでのリクエスト（401を期待）"
+# Request with an invalid token
+log_test "Request with an invalid token (expect 401)"
 generate_signature "$TEST_PRIVATE_KEY" "create" "content"
 response=$(curl -s -X POST "$BASE_URL/content" \
     -H "Content-Type: application/json" \
@@ -432,15 +433,15 @@ response=$(curl -s -X POST "$BASE_URL/content" \
 
 status_code=$(echo "$response" | tail -n1)
 if [ "$status_code" = "401" ]; then
-    log_success "無効なトークンが正しく拒否されました"
+    log_success "Invalid token was correctly rejected"
     TESTS_PASSED=$((TESTS_PASSED + 1))
 else
-    log_fail "無効なトークンが拒否されませんでした (HTTP $status_code)"
+    log_fail "Invalid token was not rejected (HTTP $status_code)"
     TESTS_FAILED=$((TESTS_FAILED + 1))
 fi
 
-# 署名なしのリクエスト
-log_test "署名なしのリクエスト（401を期待）"
+# Request without a signature
+log_test "Request without a signature (expect 401)"
 response=$(curl -s -X POST "$BASE_URL/content" \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer $TEST_KEY_ID" \
@@ -449,35 +450,35 @@ response=$(curl -s -X POST "$BASE_URL/content" \
 
 status_code=$(echo "$response" | tail -n1)
 if [ "$status_code" = "401" ]; then
-    log_success "署名なしリクエストが正しく拒否されました"
+    log_success "Unsigned request was correctly rejected"
     TESTS_PASSED=$((TESTS_PASSED + 1))
 else
-    log_fail "署名なしリクエストが拒否されませんでした (HTTP $status_code)"
+    log_fail "Unsigned request was not rejected (HTTP $status_code)"
     TESTS_FAILED=$((TESTS_FAILED + 1))
 fi
 
 # ============================================================================
-# テスト結果サマリー
+# Test result summary
 # ============================================================================
 
 echo ""
 echo -e "${BLUE}========================================${NC}"
-echo -e "${BLUE}        テスト結果サマリー              ${NC}"
+echo -e "${BLUE}        Test Result Summary             ${NC}"
 echo -e "${BLUE}========================================${NC}"
 echo ""
 
 total_tests=$((TESTS_PASSED + TESTS_FAILED))
-echo -e "実行したテスト: ${BLUE}$total_tests${NC}"
-echo -e "成功: ${GREEN}$TESTS_PASSED${NC}"
-echo -e "失敗: ${RED}$TESTS_FAILED${NC}"
+echo -e "Tests run: ${BLUE}$total_tests${NC}"
+echo -e "Passed: ${GREEN}$TESTS_PASSED${NC}"
+echo -e "Failed: ${RED}$TESTS_FAILED${NC}"
 
 if [ $TESTS_FAILED -eq 0 ]; then
     echo ""
-    echo -e "${GREEN}すべてのテストが成功しました！${NC}"
+    echo -e "${GREEN}All tests passed!${NC}"
     exit 0
 else
     echo ""
-    echo -e "${YELLOW}一部のテストが失敗しました${NC}"
-    echo "詳細なログは logs/node*.log で確認できます"
+    echo -e "${YELLOW}Some tests failed${NC}"
+    echo "See logs/node*.log for detailed logs"
     exit 1
 fi

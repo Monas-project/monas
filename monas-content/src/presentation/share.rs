@@ -20,11 +20,11 @@ use super::{decode_base64, decode_key_id_base64, AppState};
 
 #[derive(Deserialize)]
 pub struct GrantShareRequest {
-    /// 対象ファイルのキー(`/contents` の作成応答の `series_id`)。
-    /// `/shares/...` のパスの `content_id` も同じ。
+    /// Key of the target file (`series_id` from the `/contents` create response).
+    /// The `content_id` in `/shares/...` paths is the same.
     pub content_id: String,
     pub sender_key_id_base64: String,
-    /// 送信者の秘密鍵(base64)。HPKE Auth モードの wrap(送信者認証)に用いる。
+    /// Sender's secret key (base64). Used for the HPKE Auth mode wrap (sender authentication).
     pub sender_private_key_base64: String,
     pub recipient_public_key_base64: String,
     pub permission: String,
@@ -32,7 +32,7 @@ pub struct GrantShareRequest {
 
 #[derive(Serialize)]
 pub struct GrantShareResponse {
-    /// envelope が指す版の plainCid。
+    /// plainCid of the version the envelope points to.
     pub content_id: String,
     pub sender_key_id: String,
     pub recipient_key_id: String,
@@ -47,14 +47,14 @@ pub struct GrantShareResponse {
 pub struct UnwrapCekRequest {
     pub content_id: String,
     pub sender_key_id_base64: String,
-    /// 送信者の公開鍵(base64)。HPKE Auth モードの unwrap(送信者検証)に用いる。
+    /// Sender's public key (base64). Used for the HPKE Auth mode unwrap (sender verification).
     pub sender_public_key_base64: String,
     pub recipient_key_id_base64: String,
     pub enc_base64: String,
     pub wrapped_cek_base64: String,
     pub ciphertext_base64: String,
     pub recipient_private_key_base64: String,
-    /// envelope の CEK 鍵世代。wrap 時の AAD と一致しなければ復号は失敗する。
+    /// CEK key epoch of the envelope. Decryption fails if it does not match the AAD used at wrap.
     #[serde(default)]
     pub key_epoch: u64,
 }
@@ -85,7 +85,8 @@ pub struct KeyEnvelopeResponse {
 #[derive(Deserialize)]
 pub struct RevokeShareQuery {
     pub sender_key_id_base64: String,
-    /// 送信者の秘密鍵(base64)。残存受信者向け envelope 再発行の wrap に用いる。
+    /// Sender's secret key (base64). Used for the wrap when reissuing envelopes for the remaining
+    /// recipients.
     pub sender_private_key_base64: String,
 }
 
@@ -140,8 +141,8 @@ async fn grant_share(
         }
     };
 
-    // 記録と CEK を読んで envelope を作り、共有設定を書き戻す。並行する
-    // 更新・再暗号化と混ざらないよう、他の書き込みと同じロックを取る。
+    // Reads the record and CEK, builds the envelope, and writes back the share settings. Takes the
+    // same lock as other writes so it does not interleave with concurrent updates/re-encryption.
     let _file_guard = state.file_locks.lock(content_id.as_str()).await;
     let cmd = GrantShareCommand {
         content_id,
