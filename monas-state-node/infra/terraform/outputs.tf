@@ -25,5 +25,5 @@ output "target_group_arn" {
 
 output "node_info_command" {
   description = "Command to get peer ID after deployment"
-  value       = "curl -s https://${var.domain}/node/info | jq '.peer_id'"
+  value       = "curl -s https://${var.domain}/node/info | jq '.node_id'"
 }
