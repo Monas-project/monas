@@ -396,7 +396,8 @@ impl MonasController {
     }
 
     /// Sends `POST /content` to the State Node (same contract as `http_api::create_content`).
-    /// On success, returns the content_id returned by the State Node (`None` for an empty string).
+    /// On success, returns the content_id returned by the State Node (always `Some`; an empty
+    /// response body or an empty content_id is returned as `Err`).
     fn send_create_to_state_node<T>(
         &self,
         encrypted_content: &[u8],
@@ -608,9 +609,11 @@ impl MonasController {
     /// write Token stays valid until its TTL expires, so without calling this "the party that
     /// should have been revoked can keep writing to the new state".
     ///
-    /// Returns `new_min_valid_issued_at` on success. On failure, returns the `ApiResponse`
-    /// in `Err` (unlike the `send_*_to_state_node` family, to force the caller to always handle
-    /// the result).
+    /// On success returns `Some((new_min_valid_issued_at, reach))`. `reach` reports which
+    /// members received the new boundary, and is `None` when the State Node predates propagation
+    /// reporting (unknown, not "reached everyone"). Returns `Ok(None)` if the response body is
+    /// empty. On failure, returns the `ApiResponse` in `Err` (unlike the `send_*_to_state_node`
+    /// family, to force the caller to always handle the result).
     pub(super) fn send_invalidate_to_state_node<T>(
         &self,
         content_id: &str,

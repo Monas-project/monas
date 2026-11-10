@@ -215,9 +215,11 @@ impl UcanAdapter {
     ///
     /// Request proof-of-possession (the request signature contents) is not verified here.
     /// The authentication layer (`verify_caller_signature`), which every path passes before
-    /// authorize, verifies it in the `{operation}:{resource}:{timestamp}` format regardless of
-    /// token type. Replay defense is consolidated into the in-signature timestamp freshness check
-    /// (5-minute window).
+    /// authorize, verifies it against the `monas-request-v1` message
+    /// (`RequestMetadata::signing_message_with_body_digest`) regardless of token type. Replay
+    /// defense is the in-signature timestamp freshness check (5-minute window) plus, for
+    /// mutations, single-use consumption of the signed request
+    /// (`verify_and_consume_mutation_signature`).
     ///
     /// Note: We cannot directly call AuthTokenVerifier::verify() because the infra and
     /// domain AuthToken use different JWT serialization formats for iss/aud fields
@@ -300,12 +302,13 @@ impl UcanAdapter {
         // 6. Require a request signature to be present.
         //
         // Proof-of-possession itself has already been verified by the authentication layer
-        // (`verify_caller_signature`) in the `{operation}:{resource}:{timestamp}` format (every path
-        // always passes it before authorize). Replay defense is consolidated into the in-signature
-        // timestamp freshness check, and the old single-use jti consumption (independent per node,
-        // and conflicting with the SDK design of "hand over one delegated token and reuse it within
-        // its TTL") was removed (issue #61). Here we only do a presence check to prevent paths
-        // where authorize is called without a signature from slipping in.
+        // (`verify_caller_signature`) against the `monas-request-v1` message (every path always
+        // passes it before authorize). Replay defense is the in-signature timestamp freshness
+        // check plus single-use consumption of mutation signatures
+        // (`verify_and_consume_mutation_signature`); the old single-use jti consumption
+        // (independent per node, and conflicting with the SDK design of "hand over one delegated
+        // token and reuse it within its TTL") was removed (issue #61). Here we only do a presence
+        // check to prevent paths where authorize is called without a signature from slipping in.
         if request.request_signature.is_none() {
             anyhow::bail!("Request signature is required for AuthToken-based authorization");
         }

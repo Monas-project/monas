@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Monas State Node - functional test script
-# Tests various features while three nodes are running
+# Tests various features while four nodes are running
 
 set -e
 

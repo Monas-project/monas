@@ -11,8 +11,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 /// The serde representation is a **base64url string**. With the derived `Vec<u8>` impl it becomes
 /// an array in JSON, and serialization fails with `key must be a string` as soon as it is used as
 /// a `HashMap<KeyId, _>` key, as in `Share.recipients` (JSON object keys must be strings). Since
-/// KeyId is also represented as base64url at the API boundary, the persisted representation
-/// matches it.
+/// the SDK API also represents KeyId as base64url, the persisted representation matches it (the
+/// standalone monas-content HTTP API uses standard Base64 instead).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct KeyId(Vec<u8>);
 

@@ -49,7 +49,8 @@ pub trait AuthenticationService: Send + Sync {
     /// # Arguments
     /// * `token` - The authentication token identifying the caller
     /// * `signature` - The raw signature bytes
-    /// * `message` - The message that was signed (format: "{operation}:{resource}:{timestamp}")
+    /// * `message` - The message that was signed (the `monas-request-v1` message built by
+    ///   `RequestMetadata::signing_message_with_body_digest`)
     /// * `timestamp` - Optional Unix timestamp for replay attack prevention
     async fn verify_request_signature(
         &self,

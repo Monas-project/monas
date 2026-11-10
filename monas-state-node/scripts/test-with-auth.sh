@@ -1,7 +1,8 @@
 #!/bin/bash
 
 # Monas State Node - authenticated feature test script
-# Generates a P-256 key pair, registers it with each node, then tests authenticated requests
+# Generates a P-256 key pair (self-contained key_id, no node registration needed), then tests
+# authenticated requests
 
 set -e
 
@@ -138,7 +139,7 @@ BASE_URL="http://127.0.0.1:$TEST_PORT"
 log_info "Target node: $BASE_URL"
 
 # ============================================================================
-# Generate and register auth data
+# Generate auth data
 # ============================================================================
 
 echo ""

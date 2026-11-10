@@ -238,7 +238,8 @@ pub struct UpdateSharePermissionOutput {
 pub struct ReissuedDelegatedToken {
     /// Recipient key id (base64url)
     pub recipient_key_id: String,
-    /// `None` if issuing failed (that recipient needs to receive it again from the owner)
+    /// Always `Some` in responses from the current SDK (a failure to issue fails the whole
+    /// request). `Option` is kept only for wire compatibility: deserializes to `None` if absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delegated_access: Option<DelegatedAccessToken>,
 }

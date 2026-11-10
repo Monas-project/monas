@@ -52,8 +52,9 @@ impl MonasController {
     /// Resolves the auth context for the State Node read API.
     ///
     /// If the caller explicitly provides both Authorization and a signature, pass them through.
-    /// If there is no signature, sign `read:<content_id>:<timestamp>` with monas-account, the
-    /// same as for writes (create/update/delete). Authorization is then:
+    /// If there is no signature, sign the State Node request signature (the `monas-request-v1`
+    /// message for operation `read` and resource `content_id`, no body digest) with
+    /// monas-account, the same as for writes (create/update/delete). Authorization is then:
     /// - `user:<hex(pubkey)>` if absent (reading as the owner)
     /// - kept as-is if it is `Bearer <delegated token>` (reading as a share recipient).
     ///   The State Node verifies the signature with the Token's `aud` key, so the recipient
@@ -391,7 +392,8 @@ impl MonasController {
     ///
     /// The actual read path for `docs/design.md` §10 "read response integrity
     /// verification". Flow:
-    /// 1. Resolve the auth context for the `read:{content_id}:{timestamp}` signature
+    /// 1. Resolve the auth context for the read request signature (`monas-request-v1` message,
+    ///    operation `read`, resource `content_id`)
     /// 2. Decide the version (the version given in `input.version` if any, otherwise the latest
     ///    in the history)
     /// 3. Fetch the Node CBOR and verify against tampering by recomputing the CID

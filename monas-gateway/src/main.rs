@@ -29,7 +29,7 @@ struct AppState {
 
 #[tokio::main]
 async fn main() {
-    // monas-sdk also reads the env, but reading it explicitly here makes the behavior clearer
+    // monas-sdk does not read the env; the gateway reads it here and passes it via MonasConfig
     let state_node_url =
         std::env::var("MONAS_STATE_NODE_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".into());
 

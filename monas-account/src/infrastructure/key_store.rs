@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::application_service::{AccountKeyStore, AccountKeyStoreError, StoredAccountKey};
 
-/// In-memory implementation that stores `AccountKeyMaterial` in-process.
+/// In-memory implementation that stores `StoredAccountKey` in-process.
 ///
 /// - Not persisted; discarded when the process exits.
 /// - Intended for local development, tests, and PoCs.

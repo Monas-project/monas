@@ -49,7 +49,8 @@ pub struct GetHistoryOutput {
 /// Verified read request from the State Node.
 ///
 /// - `content_id`: content id on the State Node side (remote id). Used to fetch history and
-///   version data and to bind the read signature (`read:{content_id}:{timestamp}`).
+///   version data, and is the resource the read request signature (`monas-request-v1`,
+///   operation `read`) is bound to.
 /// - `local_content_id`: SDK-local content id (plain CID). Used to look up the CEK and for the
 ///   post-decryption integrity check (match against the plain CID recomputed from plaintext).
 ///   There is no local↔remote mapping table, so the caller passes both
@@ -97,8 +98,9 @@ pub struct ReadContentFromStateNodeInput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReadContentFromStateNodeOutput {
     pub content_id: String,
-    /// content_id the decrypted plaintext points to. Same as the input `local_content_id` unless
-    /// `accept_any_version`.
+    /// content_id the decrypted plaintext points to. Unless `accept_any_version`, this equals the
+    /// input `local_content_id` (share recipient) or the file record's current plainCid (owner
+    /// read via `file_id`, where `local_content_id` is empty).
     pub local_content_id: String,
     /// Version CID actually read (verified by CID recomputation)
     pub version: String,

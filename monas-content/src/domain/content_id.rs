@@ -47,7 +47,9 @@ pub trait ContentIdGenerator {
     /// - Deriving it from the body alone would give separate files created with the same body
     ///   the same key (mixing records, CEKs, and share settings). The creation time is included
     ///   to distinguish them.
-    /// - Since it contains a hash of the plaintext, it never leaves the device (state node,
-    ///   package).
+    /// - Since it contains a hash of the plaintext, it is not sent to the state node or included
+    ///   in share packages. It is still part of the serialized `Content`, so it is stored by the
+    ///   content repository (including cloud storage providers when the `filesync` feature is
+    ///   enabled).
     fn generate_series(&self, initial_plain_cid: &ContentId, created_at: u64) -> ContentId;
 }

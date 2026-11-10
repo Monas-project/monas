@@ -211,7 +211,10 @@ where
 
     /// Revokes the share relationship with the specified recipient.
     ///
-    /// - Only updates the ACL; KeyEnvelope revocation and content deletion are not handled here.
+    /// - Removes the recipient from the ACL, advances `key_epoch`, and reissues KeyEnvelopes
+    ///   (under the current CEK and new epoch) for the remaining recipients, returning them.
+    /// - Assumes the caller already ran reencrypt to rotate the CEK. Revoking or deleting
+    ///   previously distributed KeyEnvelopes and deleting content are not handled here.
     pub fn revoke_share(
         &self,
         cmd: RevokeShareCommand,
