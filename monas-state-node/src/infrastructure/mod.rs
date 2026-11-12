@@ -13,3 +13,4 @@ pub mod outbox_persistence;
 pub mod persistence;
 pub mod placement;
 pub mod reliable_event_publisher;
+pub mod resource_stats;
