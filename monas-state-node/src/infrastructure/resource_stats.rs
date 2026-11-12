@@ -6,8 +6,9 @@
 //!
 //! - `/proc/net/dev`: bytes received/sent on every interface except loopback.
 //!   With awsvpc networking this is the task's own network namespace.
-//! - `/proc/self/mountstats`: bytes actually exchanged with the NFS server
-//!   (`serverread`/`serverwrite`) for every nfs/nfs4 mount.
+//! - `/proc/self/mountstats`: data bytes carried by NFS READ/WRITE calls
+//!   (`serverread`/`serverwrite`) for every nfs/nfs4 mount. Metadata calls
+//!   (GETATTR, COMMIT, ...) and TLS overhead are not included.
 //!
 //! All values are cumulative since the counters were created (task start for
 //! the network namespace, mount time for NFS). Readers compute rates from the
@@ -42,7 +43,8 @@ impl ResourceStats {
 }
 
 /// `net_rx_bytes=.. net_tx_bytes=.. nfs_read_bytes=.. nfs_write_bytes=.. nfs_mounts=..`
-/// Missing sources are omitted, so a node without an NFS mount logs no nfs_* keys.
+/// A source is omitted only when its procfs file cannot be read. A readable
+/// mountstats with no NFS mount still logs `nfs_*=0 nfs_mounts=0`.
 impl fmt::Display for ResourceStats {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut parts = Vec::new();
@@ -103,7 +105,8 @@ pub fn parse_net_dev(content: &str) -> Option<NetBytes> {
 /// `device <dev> mounted on <dir> with fstype <type> ...`; NFS sections carry a
 /// `bytes:` line whose fields are normalread normalwrite directread directwrite
 /// serverread serverwrite readpages writepages. serverread/serverwrite are the
-/// bytes that actually crossed the wire, so page-cache hits are not counted.
+/// data bytes of NFS READ/WRITE calls sent to the server, so page-cache hits
+/// are not counted; metadata calls and TLS overhead are not included either.
 pub fn parse_mountstats(content: &str) -> NfsBytes {
     let mut total = NfsBytes::default();
     let mut in_nfs = false;
