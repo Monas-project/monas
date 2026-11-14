@@ -410,7 +410,7 @@ mod tests {
         let signature: p256::ecdsa::Signature = signing_key.sign(message.as_bytes());
         let signature = signature.to_vec();
 
-        // Use timestamp from 10 minutes ago (exceeds MAX_AGE_SECS)
+        // Use timestamp from 10 minutes ago (exceeds MAX_REQUEST_AGE_SECS)
         let old_timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
