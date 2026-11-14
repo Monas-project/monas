@@ -8,9 +8,12 @@ resource "aws_efs_access_point" "node" {
   }
 
   root_directory {
-    # v5 starts fresh: ciphertext is now a byte string (base64 in JSON),
-    # which changes version CIDs. v4 added the body_updated_at field.
-    path = "/${var.node_name}-v5"
+    # Fixed path, no generation suffix. Changing it replaces the access point
+    # and boots the node on another directory, so do not bump it to reset a
+    # store: empty this directory instead. /<node> and /<node>-v3 .. -v6 are
+    # retired stores left on the EFS; never point back at them (creation_info
+    # only applies to a new directory, so the old data would be reused).
+    path = "/stores/${var.node_name}"
 
     creation_info {
       owner_uid   = 1000
