@@ -1,27 +1,27 @@
 use serde::{Deserialize, Serialize};
 
-/// State Nodeへのコンテンツ作成リクエスト
+/// Content creation request to the State Node
 #[derive(Debug, Serialize)]
 pub struct StateNodeCreateContentRequest {
-    /// Base64エンコードされたコンテンツデータ
+    /// Base64-encoded content data
     pub data: String,
 }
 
-/// State Nodeからのコンテンツ作成レスポンス（`POST /content` → 201 Created）
+/// Content creation response from the State Node (`POST /content` → 201 Created)
 #[derive(Debug, Deserialize)]
 pub struct StateNodeCreateContentResponse {
     #[serde(default)]
     pub content_id: String,
 }
 
-/// State Nodeへのコンテンツ更新リクエスト
+/// Content update request to the State Node
 #[derive(Debug, Serialize)]
 pub struct StateNodeUpdateContentRequest {
-    /// Base64エンコードされたコンテンツデータ
+    /// Base64-encoded content data
     pub data: String,
 }
 
-/// State Nodeからのコンテンツ更新レスポンス（`PUT /content/:id`）
+/// Content update response from the State Node (`PUT /content/:id`)
 #[derive(Debug, Deserialize)]
 pub struct StateNodeUpdateContentResponse {
     #[serde(default)]
@@ -30,7 +30,7 @@ pub struct StateNodeUpdateContentResponse {
     pub updated: bool,
 }
 
-/// State Nodeからのコンテンツ削除レスポンス（`DELETE /content/:id`）
+/// Content deletion response from the State Node (`DELETE /content/:id`)
 #[derive(Debug, Deserialize)]
 pub struct StateNodeDeleteContentResponse {
     #[serde(default)]
@@ -39,34 +39,34 @@ pub struct StateNodeDeleteContentResponse {
     pub deleted: bool,
 }
 
-/// State Nodeからのトークン失効レスポンス（`POST /content/:id/access/invalidate`）
+/// Token revocation response from the State Node (`POST /content/:id/access/invalidate`)
 #[derive(Debug, Deserialize)]
 pub struct StateNodeInvalidateTokensResponse {
     #[serde(default)]
     pub content_id: String,
-    /// この時刻より前に発行されたTokenはすべて無効になる
+    /// All tokens issued before this time become invalid
     #[serde(default)]
     pub new_min_valid_issued_at: u64,
-    /// この呼び出しで新しい失効境界を受け取ったメンバー。
+    /// Members that received the new revocation boundary in this call.
     #[serde(default)]
     pub notified_members: Vec<String>,
-    /// 失効境界を届けられなかったメンバー。次回 sync まで旧ポリシーで
-    /// 認可し続ける = 失効済み Token の書き込みを受理しうる。
+    /// Members the revocation boundary could not be delivered to. They keep authorizing with the
+    /// old policy until the next sync = they may accept writes with revoked tokens.
     #[serde(default)]
     pub unreached_members: Vec<StateNodeUnreachedMember>,
-    /// State Node が自分で commit せず member へ relay した。上の2つは
-    /// 「空」ではなく「不明」。
+    /// The State Node relayed to a member instead of committing itself. The two fields above
+    /// are "unknown", not "empty".
     #[serde(default)]
     pub relayed: bool,
-    /// 伝播情報を返す State Node かどうか。旧 State Node のレスポンスには
-    /// `notified_members` 等が無く、serde の default で空になる — それを
-    /// 「全員に届いた」と読んではいけないので、フィールドの有無を別に取る。
+    /// Whether the State Node returns propagation info. Responses from older State Nodes lack
+    /// `notified_members` etc., which become empty via serde's default — that must not be read
+    /// as "reached everyone", so the presence of the fields is captured separately.
     #[serde(skip)]
     pub reports_reach: bool,
 }
 
 impl StateNodeInvalidateTokensResponse {
-    /// JSON からパースし、伝播フィールドの有無を `reports_reach` に立てる。
+    /// Parse from JSON and set `reports_reach` according to whether propagation fields are present.
     pub fn from_json(body: &str) -> Result<Self, serde_json::Error> {
         let raw: serde_json::Value = serde_json::from_str(body)?;
         let reports_reach = raw
@@ -83,30 +83,30 @@ impl StateNodeInvalidateTokensResponse {
     }
 }
 
-/// `StateNodeInvalidateTokensResponse::unreached_members` の1件。
+/// One entry of `StateNodeInvalidateTokensResponse::unreached_members`.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct StateNodeUnreachedMember {
     pub node_id: String,
     pub error: String,
 }
 
-/// State Nodeからのコンテンツ履歴レスポンス
+/// Content history response from the State Node
 #[derive(Debug, Deserialize)]
 pub struct StateNodeContentHistoryResponse {
     pub content_id: String,
     pub versions: Vec<String>,
 }
 
-/// State Nodeからのコンテンツデータレスポンス
+/// Content data response from the State Node
 #[derive(Debug, Deserialize)]
 pub struct StateNodeContentDataResponse {
     pub content_id: String,
-    /// Base64(Standard)エンコードされたデータ
+    /// Base64 (Standard) encoded data
     pub data: String,
     pub version: Option<String>,
 }
 
-/// State Nodeのエラーレスポンス
+/// State Node error response
 #[derive(Debug, Deserialize)]
 pub struct StateNodeErrorResponse {
     pub error: String,

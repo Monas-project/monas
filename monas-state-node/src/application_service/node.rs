@@ -223,12 +223,12 @@ impl StateNode {
         ));
 
         // Create auth services.
-        // NOTE: 旧 jti nonce ストア(委譲トークンの TTL 内再利用と矛盾していた)は
-        // 廃止した(issue #61)。リプレイ防御は「署名内 timestamp の鮮度チェック」
-        // と「mutation の署名を使い切りにする消費記録」の2層が担う。後者は
-        // `StateNodeService` が保持するので、ここで組み立てる必要はない。
-        // 失効させる単位が *トークン* から *リクエスト署名* へ変わったのが要点で、
-        // これならトークンの再利用を妨げずに mutation の再送だけを止められる。
+        // NOTE: the old jti nonce store (which conflicted with reusing delegated tokens within their
+        // TTL) was removed (issue #61). Replay defense is handled by two layers: the "in-signature
+        // timestamp freshness check" and the "consumption record that makes mutation signatures
+        // single-use". The latter is held by `StateNodeService`, so it need not be assembled here.
+        // The key point is that the unit of revocation changed from *token* to *request signature*,
+        // which stops only mutation replays without preventing token reuse.
         let auth_service = MonasAccountAdapter::new();
         let authz_service = UcanAdapter::new(crdt_repo_dyn.clone());
 

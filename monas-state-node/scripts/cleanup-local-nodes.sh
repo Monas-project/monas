@@ -1,18 +1,18 @@
 #!/bin/bash
 
-# Monas State Node - クリーンアップスクリプト
-# 実行中のノードを停止し、データファイルを削除します
+# Monas State Node - cleanup script
+# Stops running nodes and deletes data files
 
 set -e
 
-# カラー出力の定義
+# Color output definitions
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-# ログ関数
+# Logging functions
 log_info() {
     echo -e "${GREEN}[INFO]${NC} $1"
 }
@@ -25,145 +25,145 @@ log_warn() {
     echo -e "${YELLOW}[WARN]${NC} $1"
 }
 
-# State Nodeディレクトリに移動
+# Move to the State Node directory
 STATE_NODE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$STATE_NODE_DIR"
 
-log_info "State Nodeディレクトリ: $STATE_NODE_DIR"
+log_info "State Node directory: $STATE_NODE_DIR"
 
 echo ""
 echo -e "${BLUE}========================================${NC}"
-echo -e "${BLUE}     State Node クリーンアップ開始      ${NC}"
+echo -e "${BLUE}      Starting State Node cleanup       ${NC}"
 echo -e "${BLUE}========================================${NC}"
 echo ""
 
-# PIDファイルの確認
+# Check the PID file
 PID_FILE="$STATE_NODE_DIR/.local-nodes.pids"
 
-# 実行中のノードを停止
+# Stop running nodes
 if [ -f "$PID_FILE" ]; then
-    log_info "実行中のノードを停止しています..."
+    log_info "Stopping running nodes..."
 
     while IFS= read -r pid; do
         if [ -n "$pid" ]; then
             if kill -0 "$pid" 2>/dev/null; then
-                log_info "PID $pid のプロセスを停止します..."
+                log_info "Stopping process PID $pid..."
                 kill "$pid" 2>/dev/null || true
 
-                # プロセスが終了するのを待つ（最大5秒）
+                # Wait for the process to exit (up to 5 seconds)
                 for i in {1..10}; do
                     if ! kill -0 "$pid" 2>/dev/null; then
-                        log_info "PID $pid が停止しました"
+                        log_info "PID $pid stopped"
                         break
                     fi
                     if [ $i -eq 10 ]; then
-                        log_warn "PID $pid の通常停止に失敗しました。強制終了します..."
+                        log_warn "PID $pid did not stop gracefully. Force killing..."
                         kill -9 "$pid" 2>/dev/null || true
                     fi
                     sleep 0.5
                 done
             else
-                log_info "PID $pid は既に停止しています"
+                log_info "PID $pid is already stopped"
             fi
         fi
     done < "$PID_FILE"
 
     rm -f "$PID_FILE"
-    log_info "PIDファイルを削除しました"
+    log_info "Deleted the PID file"
 else
-    log_info "PIDファイルが見つかりません。実行中のノードはないようです"
+    log_info "PID file not found. No nodes appear to be running"
 fi
 
-# ポートが使用されているか確認
-log_info "ポートの使用状況を確認しています..."
+# Check whether the ports are in use
+log_info "Checking port usage..."
 for port in 8080 8081 8082 8083; do
     if lsof -i:$port > /dev/null 2>&1; then
-        log_warn "ポート $port がまだ使用されています"
-        # ポートを使用しているプロセスを表示
+        log_warn "Port $port is still in use"
+        # Show the processes using the port
         lsof -i:$port || true
     else
-        log_info "ポート $port は解放されています"
+        log_info "Port $port is free"
     fi
 done
 
-# データディレクトリの削除
+# Delete data directories
 if [ "$1" = "--all" ] || [ "$1" = "--data" ]; then
-    log_warn "データディレクトリを削除しています..."
+    log_warn "Deleting data directories..."
 
     for node in node1 node2 node3 node4; do
         if [ -d "data/$node" ]; then
             rm -rf "data/$node"
-            log_info "data/$node を削除しました"
+            log_info "Deleted data/$node"
         else
-            log_info "data/$node は存在しません"
+            log_info "data/$node does not exist"
         fi
     done
 
-    # dataディレクトリが空なら削除
+    # Delete the data directory if it is empty
     if [ -d "data" ]; then
         if [ -z "$(ls -A data 2>/dev/null)" ]; then
             rmdir "data"
-            log_info "dataディレクトリを削除しました"
+            log_info "Deleted the data directory"
         fi
     fi
 else
-    log_info "データディレクトリは保持されます (削除する場合は --data オプションを使用)"
+    log_info "Data directories are kept (use the --data option to delete them)"
 fi
 
-# ログファイルの削除
+# Delete log files
 if [ "$1" = "--all" ] || [ "$1" = "--logs" ]; then
-    log_warn "ログファイルを削除しています..."
+    log_warn "Deleting log files..."
 
     if [ -d "logs" ]; then
         rm -f logs/node*.log
-        log_info "ログファイルを削除しました"
+        log_info "Deleted the log files"
 
-        # logsディレクトリが空なら削除
+        # Delete the logs directory if it is empty
         if [ -z "$(ls -A logs 2>/dev/null)" ]; then
             rmdir "logs"
-            log_info "logsディレクトリを削除しました"
+            log_info "Deleted the logs directory"
         fi
     else
-        log_info "logsディレクトリは存在しません"
+        log_info "The logs directory does not exist"
     fi
 else
-    log_info "ログファイルは保持されます (削除する場合は --logs オプションを使用)"
+    log_info "Log files are kept (use the --logs option to delete them)"
 fi
 
-# すべて削除
+# Delete everything
 if [ "$1" = "--all" ]; then
-    log_info "すべてのテストデータがクリーンアップされました"
+    log_info "All test data has been cleaned up"
 fi
 
-# プロセスの確認
-log_info "残存プロセスを確認しています..."
+# Check for processes
+log_info "Checking for remaining processes..."
 remaining_processes=false
 
 for pattern in "state-node" "state_node"; do
     if pgrep -f "$pattern" > /dev/null 2>&1; then
-        log_warn "まだ実行中の $pattern プロセスがあります:"
+        log_warn "$pattern processes are still running:"
         pgrep -f "$pattern" -l || true
         remaining_processes=true
     fi
 done
 
 if [ "$remaining_processes" = false ]; then
-    log_info "State Node関連のプロセスはすべて停止しています"
+    log_info "All State Node processes have stopped"
 fi
 
 echo ""
 echo -e "${BLUE}========================================${NC}"
-echo -e "${BLUE}      クリーンアップが完了しました      ${NC}"
+echo -e "${BLUE}           Cleanup complete             ${NC}"
 echo -e "${BLUE}========================================${NC}"
 echo ""
 
-# 使用方法の表示
+# Show usage
 if [ -z "$1" ]; then
-    echo "使用方法:"
-    echo "  $0           # ノードの停止のみ"
-    echo "  $0 --data    # ノードの停止とデータ削除"
-    echo "  $0 --logs    # ノードの停止とログ削除"
-    echo "  $0 --all     # すべて削除（データとログ）"
+    echo "Usage:"
+    echo "  $0           # Stop nodes only"
+    echo "  $0 --data    # Stop nodes and delete data"
+    echo "  $0 --logs    # Stop nodes and delete logs"
+    echo "  $0 --all     # Delete everything (data and logs)"
     echo ""
 fi
 

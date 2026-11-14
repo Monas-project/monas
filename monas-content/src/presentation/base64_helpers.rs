@@ -5,18 +5,18 @@ use base64::Engine;
 use crate::domain::{content::encryption::ContentEncryptionKey, KeyId};
 
 // ============================================================================
-// Base64デコードヘルパー関数
+// Base64 decode helper functions
 // ============================================================================
 
-/// base64エンコードされたバイト列をデコードする汎用ヘルパー関数。
+/// Generic helper that decodes base64-encoded bytes.
 ///
-/// # 引数
-/// - `base64_str`: base64エンコードされた文字列
-/// - `field_name`: フィールド名（エラーメッセージに使用）
+/// # Arguments
+/// - `base64_str`: base64-encoded string
+/// - `field_name`: field name (used in the error message)
 ///
-/// # 戻り値
-/// - 成功時: デコードされたバイト列
-/// - 失敗時: `(StatusCode::BAD_REQUEST, エラーメッセージ)`
+/// # Returns
+/// - On success: the decoded bytes
+/// - On failure: `(StatusCode::BAD_REQUEST, error message)`
 pub(super) fn decode_base64(
     base64_str: &str,
     field_name: &str,
@@ -29,15 +29,15 @@ pub(super) fn decode_base64(
     })
 }
 
-/// base64エンコードされたKeyIdをデコードするヘルパー関数。
+/// Helper that decodes a base64-encoded KeyId.
 ///
-/// # 引数
-/// - `base64_str`: base64エンコードされたKeyId文字列
-/// - `field_name`: フィールド名（エラーメッセージに使用）
+/// # Arguments
+/// - `base64_str`: base64-encoded KeyId string
+/// - `field_name`: field name (used in the error message)
 ///
-/// # 戻り値
-/// - 成功時: デコードされたKeyId
-/// - 失敗時: `(StatusCode::BAD_REQUEST, エラーメッセージ)`
+/// # Returns
+/// - On success: the decoded KeyId
+/// - On failure: `(StatusCode::BAD_REQUEST, error message)`
 pub(super) fn decode_key_id_base64(
     base64_str: &str,
     field_name: &str,
@@ -46,15 +46,15 @@ pub(super) fn decode_key_id_base64(
     Ok(KeyId::new(bytes))
 }
 
-/// base64エンコードされたContentEncryptionKeyをデコードするヘルパー関数。
+/// Helper that decodes a base64-encoded ContentEncryptionKey.
 ///
-/// # 引数
-/// - `base64_str`: base64エンコードされたCEK文字列
-/// - `field_name`: フィールド名（エラーメッセージに使用）
+/// # Arguments
+/// - `base64_str`: base64-encoded CEK string
+/// - `field_name`: field name (used in the error message)
 ///
-/// # 戻り値
-/// - 成功時: デコードされたContentEncryptionKey
-/// - 失敗時: `(StatusCode::BAD_REQUEST, エラーメッセージ)`
+/// # Returns
+/// - On success: the decoded ContentEncryptionKey
+/// - On failure: `(StatusCode::BAD_REQUEST, error message)`
 pub(super) fn decode_cek_base64(
     base64_str: &str,
     field_name: &str,
@@ -63,16 +63,16 @@ pub(super) fn decode_cek_base64(
     Ok(ContentEncryptionKey(bytes))
 }
 
-/// base64エンコードされたバイト列をデコードするヘルパー関数（Option対応）。
+/// Helper that decodes base64-encoded bytes (Option-aware).
 ///
-/// # 引数
-/// - `base64_str_opt`: base64エンコードされた文字列（Option）
-/// - `field_name`: フィールド名（エラーメッセージに使用）
+/// # Arguments
+/// - `base64_str_opt`: base64-encoded string (Option)
+/// - `field_name`: field name (used in the error message)
 ///
-/// # 戻り値
-/// - `None`の場合: `Ok(None)`
-/// - `Some(base64_str)`の場合: デコード結果を`Some`でラップ
-/// - 失敗時: `(StatusCode::BAD_REQUEST, エラーメッセージ)`
+/// # Returns
+/// - If `None`: `Ok(None)`
+/// - If `Some(base64_str)`: the decode result wrapped in `Some`
+/// - On failure: `(StatusCode::BAD_REQUEST, error message)`
 pub(super) fn decode_base64_optional(
     base64_str_opt: Option<&str>,
     field_name: &str,

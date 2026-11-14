@@ -1,9 +1,10 @@
 use serde::{Deserialize, Serialize};
 
-/// ストレージプロバイダーを表す列挙型。
+/// Enum representing a storage provider.
 ///
-/// サポートされているストレージプロバイダーを型安全に表現します。
-/// serdeの`rename_all = "kebab-case"`により、JSONでは`"ipfs"`, `"google-drive"`などの形式でシリアライズされます。
+/// Type-safe representation of the supported storage providers.
+/// With serde's `rename_all = "kebab-case"`, it serializes in JSON as `"ipfs"`, `"google-drive"`,
+/// etc.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum StorageProvider {
@@ -13,14 +14,14 @@ pub enum StorageProvider {
     GoogleDrive,
     /// OneDrive
     OneDrive,
-    /// ローカルデスクトップストレージ
+    /// Local desktop storage
     Local,
-    /// ローカルモバイルストレージ
+    /// Local mobile storage
     LocalMobile,
 }
 
 impl StorageProvider {
-    /// `StorageProvider`を文字列に変換する
+    /// Converts a `StorageProvider` to a string
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Ipfs => "ipfs",

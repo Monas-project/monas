@@ -1,31 +1,32 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// SDK のローカル persistence backend 選択。
+/// Selection of the SDK's local persistence backend.
 ///
-/// `MonasController` がローカルに持つ CEK ストアと共有 (Share) リポジトリの
-/// 永続化方式を決定する。
+/// Determines how the CEK store and share (Share) repository held locally by `MonasController`
+/// are persisted.
 ///
-/// - `InMemory`: プロセス内メモリのみ。再起動でデータが揮発する。
-///   開発・テスト・PoC 用途。本番 gateway で使うと、再起動した瞬間に
-///   既存コンテンツが復号不能になる。
-/// - `Sled { dir }`: 指定ディレクトリ配下に sled DB を開いて CEK と Share を保存する。
-///   プロセス再起動を跨いで CEK を保持できる本番想定の構成。
+/// - `InMemory`: in-process memory only. Data is lost on restart.
+///   For development, testing, and PoC use. If used in a production gateway, existing content
+///   becomes undecryptable the moment it restarts.
+/// - `Sled { dir }`: opens a sled DB under the given directory and stores CEKs and Shares there.
+///   The intended production setup, able to retain CEKs across process restarts.
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub enum PersistenceConfig {
-    /// In-memory backend. テスト用既定値。
+    /// In-memory backend. Default for tests.
     #[default]
     InMemory,
-    /// sled-backed backend. 指定ディレクトリ配下に DB を開く。
+    /// sled-backed backend. Opens the DB under the given directory.
     Sled { dir: PathBuf },
 }
 
-/// SDK の設定値。
+/// SDK configuration.
 ///
-/// State Node の接続先 URL、HTTP タイムアウト、ローカル persistence backend を保持する。
-/// 署名と委譲は account プロセスへの HTTP ではなく、SDK 内の `AccountService` が行う。
-/// `#[non_exhaustive]` を付けているため、将来フィールドを追加しても SemVer 非破壊。
+/// Holds the State Node URL, HTTP timeout, and local persistence backend.
+/// Signing and delegation are done by the in-SDK `AccountService`, not via HTTP to an account
+/// process.
+/// Marked `#[non_exhaustive]`, so adding fields in the future is SemVer-compatible.
 ///
 /// # Example
 /// ```ignore
@@ -41,32 +42,32 @@ pub enum PersistenceConfig {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct MonasConfig {
-    /// State Node のベース URL
+    /// State Node base URL
     pub state_node_url: String,
-    /// HTTP 呼び出し全体のタイムアウト (connect + read + write の合計上限)
+    /// Timeout for the whole HTTP call (total cap on connect + read + write)
     pub request_timeout: Duration,
-    /// ローカル persistence backend (CEK + Share)
+    /// Local persistence backend (CEK + Share)
     pub persistence: PersistenceConfig,
-    /// Gateway 側から転送された `X-Request-Timestamp` の許容ズレ幅。
+    /// Allowed skew of the `X-Request-Timestamp` forwarded from the gateway.
     ///
-    /// SDK は `prepare_state_node_*_auth` で `|now - ts| <= skew` を検証してから
-    /// 署名する。範囲外なら `ApiError::Unauthorized` を返し、リプレイ防御線を SDK に置く。
-    /// State Node 側でも window check されているはずだが、両側で検証する方が安全。
+    /// The SDK verifies `|now - ts| <= skew` in `prepare_state_node_*_auth` before signing. If
+    /// out of range it returns `ApiError::Unauthorized`, placing a replay defense line in the SDK.
+    /// The State Node should also do a window check, but verifying on both sides is safer.
     pub request_timestamp_skew: Duration,
 }
 
-/// `MonasConfig` の既定タイムアウト。
+/// Default timeout for `MonasConfig`.
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// `MonasConfig` の既定 timestamp skew (60 秒)。
+/// Default timestamp skew for `MonasConfig` (60 seconds).
 ///
-/// ノード間時刻同期の現実的な誤差 (数秒〜数十秒) を許容しつつ、
-/// 数分以上ずれた timestamp は受け付けない。
+/// Tolerates realistic inter-node clock sync error (a few seconds to tens of seconds) while
+/// rejecting timestamps that are off by several minutes or more.
 pub const DEFAULT_REQUEST_TIMESTAMP_SKEW: Duration = Duration::from_secs(60);
 
 impl MonasConfig {
-    /// 最小限の設定で `MonasConfig` を生成する。タイムアウトは `DEFAULT_REQUEST_TIMEOUT`、
-    /// persistence は `InMemory` (テスト用既定値)、skew は `DEFAULT_REQUEST_TIMESTAMP_SKEW`。
+    /// Create a `MonasConfig` with minimal settings. Timeout is `DEFAULT_REQUEST_TIMEOUT`,
+    /// persistence is `InMemory` (default for tests), and skew is `DEFAULT_REQUEST_TIMESTAMP_SKEW`.
     pub fn new(state_node_url: impl Into<String>) -> Self {
         Self {
             state_node_url: state_node_url.into(),
@@ -76,28 +77,28 @@ impl MonasConfig {
         }
     }
 
-    /// リクエストタイムアウトを差し替える。
+    /// Replace the request timeout.
     pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = timeout;
         self
     }
 
-    /// persistence backend を sled に切り替える。
+    /// Switch the persistence backend to sled.
     ///
-    /// 指定ディレクトリ配下に sled DB を開いて CEK と Share を保存する。
-    /// 本番 gateway はこのメソッドで明示的に永続化先を渡すこと。
+    /// Opens a sled DB under the given directory and stores CEKs and Shares there.
+    /// A production gateway must pass the persistence location explicitly via this method.
     pub fn with_persistence_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.persistence = PersistenceConfig::Sled { dir: dir.into() };
         self
     }
 
-    /// persistence backend を任意の `PersistenceConfig` に差し替える。
+    /// Replace the persistence backend with an arbitrary `PersistenceConfig`.
     pub fn with_persistence(mut self, persistence: PersistenceConfig) -> Self {
         self.persistence = persistence;
         self
     }
 
-    /// `X-Request-Timestamp` の許容 skew を差し替える。
+    /// Replace the allowed skew for `X-Request-Timestamp`.
     pub fn with_request_timestamp_skew(mut self, skew: Duration) -> Self {
         self.request_timestamp_skew = skew;
         self

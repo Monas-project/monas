@@ -11,12 +11,13 @@ use monas_account::infrastructure::key_store::InMemoryAccountKeyStore;
 use super::MonasController;
 
 impl MonasController {
-    /// 署名アカウントを作る。
+    /// Creates a signing account.
     ///
-    /// SDK が state node へのリクエスト署名と委譲 Token 発行に使う P-256 鍵を新しく
-    /// 作り、署名鍵ストアを置き換える。SDK は起動時に鍵を作らないので、利用者が
-    /// これを呼ぶまで署名を要する操作は `NotFound` で失敗する。置き換えた後は、
-    /// 以前の鍵で作ったコンテンツや受け取った共有はこの SDK から操作できない。
+    /// Creates a new P-256 key that the SDK uses to sign requests to the state node and to issue
+    /// delegated Tokens, and replaces the signing key store with it. The SDK does not create a key
+    /// at startup, so operations that require signing fail with `NotFound` until the user calls
+    /// this. After the replacement, content created and shares received with the previous key
+    /// can no longer be operated on from this SDK.
     pub fn create_signing_account(&self) -> ApiResponse<CreateSigningAccountOutput> {
         let trace_id = generate_trace_id();
         match self.account_service.create(KeyTypeMapper::P256) {
@@ -35,20 +36,20 @@ impl MonasController {
         }
     }
 
-    /// 鍵ペアを生成する
+    /// Generates a key pair
     pub fn generate_keypair(
         &self,
         input: GenerateKeypairInput,
     ) -> ApiResponse<GenerateKeypairOutput> {
         let trace_id = generate_trace_id();
 
-        // KeyType → KeyTypeMapper 変換
+        // KeyType → KeyTypeMapper conversion
         let key_type_mapper = match input.key_type {
             KeyType::Secp256k1 => KeyTypeMapper::K256,
             KeyType::Secp256r1 => KeyTypeMapper::P256,
         };
 
-        // 呼び出し元へ返す鍵であり、署名主体の AccountService には書かない。
+        // This key is returned to the caller; it is not written to the signer's AccountService.
         let ephemeral = AccountService {
             key_store: InMemoryAccountKeyStore::default(),
         };
@@ -75,7 +76,7 @@ impl MonasController {
 mod tests {
     use super::*;
 
-    /// テスト用コントローラ。generate_keypair は HTTP を使わないため URL は任意のダミー値でよい。
+    /// Test controller. generate_keypair does not use HTTP, so any dummy URL will do.
     fn test_controller() -> MonasController {
         MonasController::with_state_node_url("http://127.0.0.1:8080")
     }
@@ -124,11 +125,11 @@ mod tests {
         let response = controller.generate_keypair(input);
         let output = response.data.unwrap();
 
-        // base64url デコードして長さを確認
+        // Decode base64url and check the lengths
         let public_key_bytes = URL_SAFE_NO_PAD.decode(&output.public_key).unwrap();
         let private_key_bytes = URL_SAFE_NO_PAD.decode(&output.private_key).unwrap();
 
-        // secp256k1: 公開鍵 65 bytes (非圧縮), 秘密鍵 32 bytes
+        // secp256k1: public key 65 bytes (uncompressed), secret key 32 bytes
         assert_eq!(public_key_bytes.len(), 65);
         assert_eq!(private_key_bytes.len(), 32);
     }
@@ -143,11 +144,11 @@ mod tests {
         let response = controller.generate_keypair(input);
         let output = response.data.unwrap();
 
-        // base64url デコードして長さを確認
+        // Decode base64url and check the lengths
         let public_key_bytes = URL_SAFE_NO_PAD.decode(&output.public_key).unwrap();
         let private_key_bytes = URL_SAFE_NO_PAD.decode(&output.private_key).unwrap();
 
-        // secp256r1: 公開鍵 65 bytes (非圧縮), 秘密鍵 32 bytes
+        // secp256r1: public key 65 bytes (uncompressed), secret key 32 bytes
         assert_eq!(public_key_bytes.len(), 65);
         assert_eq!(private_key_bytes.len(), 32);
     }
@@ -161,7 +162,7 @@ mod tests {
 
         let response = controller.generate_keypair(input);
 
-        // trace_id が正しい形式か確認
+        // Check that trace_id has the correct format
         assert!(response.trace_id.starts_with("trace_"));
         assert_eq!(response.trace_id.len(), 22); // "trace_" (6) + 16 chars
     }
@@ -183,7 +184,7 @@ mod tests {
         let output1 = response1.data.unwrap();
         let output2 = response2.data.unwrap();
 
-        // 2回生成しても異なる鍵が生成される
+        // Generating twice yields different keys
         assert_ne!(output1.public_key, output2.public_key);
         assert_ne!(output1.private_key, output2.private_key);
     }
@@ -205,7 +206,7 @@ mod tests {
         assert_ne!(response1.trace_id, response2.trace_id);
     }
 
-    /// 作った鍵が署名鍵ストアに入り、返した公開鍵と一致する。
+    /// The created key is stored in the signing key store and matches the returned public key.
     #[test]
     fn create_signing_account_stores_returned_p256_key() {
         use monas_account::application_service::AccountKeyStore;
@@ -233,7 +234,7 @@ mod tests {
         );
     }
 
-    /// 2 回目は鍵を置き換える(署名鍵は 1 本だけ)。
+    /// The second call replaces the key (there is only one signing key).
     #[test]
     fn create_signing_account_replaces_previous_key() {
         let controller = test_controller();

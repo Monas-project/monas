@@ -2,27 +2,28 @@ use crate::domain::content::encryption::ContentEncryptionKey;
 use crate::domain::content_id::ContentId;
 use crate::domain::KeyId;
 
-/// CEK を受信者の公開鍵でラップ / 秘密鍵でアンラップ（HPKE など）するためのポート。
+/// Port for wrapping a CEK with a recipient's public key / unwrapping it with a private key
+/// (HPKE, etc.).
 ///
-/// - 具体的な HPKE アルゴリズムは infra 層の実装に委譲する。
-/// - KeyId -> PublicKeyBytes / PrivateKeyBytes の解決は application 層や別ポートに任せ、
-///   このポートは「公開鍵 / 秘密鍵バイト列と CEK から (enc, wrapped_cek) を生成／復元する」
-///   純粋な暗号処理のみを担当する。
+/// - The concrete HPKE algorithm is delegated to the infra-layer implementation.
+/// - Resolving KeyId -> PublicKeyBytes / PrivateKeyBytes is left to the application layer or
+///   another port; this port is responsible only for the pure cryptographic operation of
+///   "generating / restoring (enc, wrapped_cek) from public / private key bytes and a CEK".
 #[derive(Debug)]
 pub enum KeyWrappingError {
-    /// 暗号処理に失敗した場合（hpke-rs などからのエラーをラップ）。
+    /// A cryptographic operation failed (wraps errors from hpke-rs, etc.).
     CryptoError(String),
-    /// 入力値（鍵やパラメータなど）が不正な場合。
+    /// An input value (key, parameter, etc.) is invalid.
     InvalidInput(String),
-    /// その他のエラー。
+    /// Other errors.
     Other(String),
 }
 
-/// CEK ラップに暗号学的に束縛する関連データ(AAD)。
+/// Associated data (AAD) cryptographically bound to the CEK wrap.
 ///
-/// `(content_id, recipient_key_id, key_epoch)` を wrap 計算に混ぜることで、
-/// envelope の「どのコンテンツの・誰宛の・どの鍵世代の」ラップかを改ざん不能にする。
-/// いずれかのフィールドを書き換えた envelope は unwrap(復号)自体が失敗する。
+/// Mixing `(content_id, recipient_key_id, key_epoch)` into the wrap computation makes it
+/// impossible to tamper with "which content, which recipient, and which key epoch" an envelope's
+/// wrap is for. An envelope with any of these fields rewritten fails to unwrap (decrypt) at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnvelopeAad<'a> {
     pub content_id: &'a ContentId,
@@ -31,8 +32,8 @@ pub struct EnvelopeAad<'a> {
 }
 
 impl EnvelopeAad<'_> {
-    /// AAD のバイト列表現。フィールドは長さプレフィクス付きで連結し、
-    /// 連結の曖昧さ(フィールド境界の付け替え)を排除する。
+    /// Byte representation of the AAD. Fields are concatenated with length prefixes to
+    /// eliminate concatenation ambiguity (shifting field boundaries).
     pub fn to_bytes(&self) -> Vec<u8> {
         let cid = self.content_id.as_str().as_bytes();
         let kid = self.recipient_key_id.as_bytes();
@@ -46,20 +47,21 @@ impl EnvelopeAad<'_> {
     }
 }
 
-/// CEK を受信者の公開鍵でラップし、秘密鍵でアンラップするためのポート。
+/// Port for wrapping a CEK with a recipient's public key and unwrapping it with a private key.
 ///
-/// ラップは送信者認証付き(HPKE Auth モード相当)であること:
-/// 送信者秘密鍵が wrap 計算に混ざり、受信者は送信者の公開鍵を使って unwrap する。
-/// 送信者が本物でなければ unwrap(復号)が失敗するため、別途の署名は不要。
+/// Wrapping must be sender-authenticated (equivalent to HPKE Auth mode):
+/// the sender's private key is mixed into the wrap computation, and the recipient unwraps using
+/// the sender's public key. If the sender is not genuine, unwrap (decryption) fails, so no
+/// separate signature is needed.
 pub trait KeyWrapping {
-    /// 1 つの CEK を、指定された受信者公開鍵向けにラップする。
+    /// Wraps a single CEK for the given recipient public key.
     ///
-    /// - `cek`: コンテンツ本体の暗号化に用いた共有鍵。
-    /// - `recipient_public_key`: 受信者の公開鍵バイト列。
-    /// - `sender_private_key`: 送信者の秘密鍵バイト列(送信者認証に用いる)。
-    /// - `aad`: wrap に束縛する関連データ(コンテンツ ID・宛先 key id・鍵世代)。
+    /// - `cek`: the shared key used to encrypt the content body.
+    /// - `recipient_public_key`: the recipient's public key bytes.
+    /// - `sender_private_key`: the sender's private key bytes (used for sender authentication).
+    /// - `aad`: associated data bound to the wrap (content ID, recipient key id, key epoch).
     ///
-    /// 戻り値のタプルは `(enc, wrapped_cek)` を表す。
+    /// The returned tuple is `(enc, wrapped_cek)`.
     fn wrap_cek(
         &self,
         cek: &ContentEncryptionKey,
@@ -68,14 +70,14 @@ pub trait KeyWrapping {
         aad: &EnvelopeAad<'_>,
     ) -> Result<(Vec<u8>, Vec<u8>), KeyWrappingError>;
 
-    /// 1 つの CEK を、指定された受信者秘密鍵を用いてアンラップする。
+    /// Unwraps a single CEK using the given recipient private key.
     ///
-    /// - `enc`: HPKE の送信者公開値。
-    /// - `wrapped_cek`: HPKE でラップされた CEK のバイト列。
-    /// - `recipient_private_key`: 受信者の秘密鍵バイト列。
-    /// - `sender_public_key`: 送信者の公開鍵バイト列。unwrap 成功 =
-    ///   この鍵の持ち主が作った envelope であることの証明になる。
-    /// - `aad`: wrap 時と同一の関連データ。一致しなければ unwrap は失敗する。
+    /// - `enc`: the HPKE sender's public value.
+    /// - `wrapped_cek`: the HPKE-wrapped CEK bytes.
+    /// - `recipient_private_key`: the recipient's private key bytes.
+    /// - `sender_public_key`: the sender's public key bytes. A successful unwrap proves that
+    ///   the envelope was created by the holder of this key.
+    /// - `aad`: the same associated data used at wrap time. If it does not match, unwrap fails.
     fn unwrap_cek(
         &self,
         enc: &[u8],

@@ -1,10 +1,10 @@
-//! monas-filesync を使った ContentRepository 実装。
+//! ContentRepository implementation using monas-filesync.
 //!
-//! `filesync` feature が有効な場合のみコンパイルされる。
+//! Compiled only when the `filesync` feature is enabled.
 //!
-//! ## 提供するリポジトリ
+//! ## Provided repositories
 //!
-//! - [`MultiStorageRepository`] - 複数のストレージプロバイダーを使い分け
+//! - [`MultiStorageRepository`] - switches between multiple storage providers
 
 use crate::application_service::content_service::{
     ContentRepository, ContentRepositoryError, MultiStorageContentRepository,
@@ -17,12 +17,12 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use tokio::runtime::Handle;
 
-/// 複数のストレージプロバイダーを使い分けられる ContentRepository 実装。
+/// ContentRepository implementation that can switch between multiple storage providers.
 ///
-/// 内部で `Arc` を使用しているため、`Clone` で安価に共有可能。
-/// 複数のサービスで同じリポジトリを共有する場合に便利。
+/// Uses `Arc` internally, so it can be cheaply shared via `Clone`.
+/// Useful when sharing the same repository across multiple services.
 ///
-/// # 使用例
+/// # Example
 ///
 /// ```ignore
 /// use monas_filesync::{FilesyncConfig, FetcherRegistry, AuthSession};
@@ -31,23 +31,23 @@ use tokio::runtime::Handle;
 /// let config = FilesyncConfig::from_env();
 /// let registry = Arc::new(FetcherRegistry::from_config(&config));
 ///
-/// // リポジトリを作成（永続化あり）
+/// // Create the repository (with persistence)
 /// let repo = MultiStorageRepository::new(
 ///     registry,
 ///     "local",
 ///     "~/.monas/credentials.json",
 /// )?;
 ///
-/// // Clone で共有可能
+/// // Shareable via Clone
 /// let repo_clone = repo.clone();
 ///
-/// // ユーザーが Google Drive を接続したとき（自動的にファイルに保存される）
+/// // When the user connects Google Drive (automatically saved to the file)
 /// repo.connect("google-drive", AuthSession { access_token: "...".into() })?;
 ///
-/// // 特定のストレージに保存
+/// // Save to a specific storage
 /// repo.save_to("google-drive", &content_id, &content)?;
 ///
-/// // デフォルトストレージに保存（ContentRepository トレイト経由）
+/// // Save to the default storage (via the ContentRepository trait)
 /// repo.save(&content_id, &content)?;
 /// ```
 #[derive(Clone)]
@@ -55,35 +55,35 @@ pub struct MultiStorageRepository {
     inner: Arc<MultiStorageRepositoryInner>,
 }
 
-/// MultiStorageRepository の内部状態
+/// Internal state of MultiStorageRepository
 struct MultiStorageRepositoryInner {
     registry: Arc<FetcherRegistry>,
-    /// プロバイダーごとの認証セッション
+    /// Auth session per provider
     auth_sessions: RwLock<HashMap<String, AuthSession>>,
-    /// デフォルトで使用するプロバイダー
+    /// Provider used by default
     default_provider: RwLock<String>,
-    /// 認証情報の保存先パス（None の場合は永続化しない）
+    /// Path where credentials are saved (no persistence if None)
     credentials_path: Option<PathBuf>,
 }
 
-/// ファイルに保存する認証情報の形式
+/// Format of the credentials saved to the file
 #[derive(serde::Serialize, serde::Deserialize)]
 struct PersistedCredentials {
-    /// プロバイダー名 → アクセストークン
+    /// Provider name → access token
     sessions: HashMap<String, String>,
 }
 
 impl MultiStorageRepository {
-    /// 新しい MultiStorageRepository を作成する（永続化あり）。
+    /// Creates a new MultiStorageRepository (with persistence).
     ///
-    /// 認証情報は指定されたパスに JSON 形式で保存される。
-    /// 既存のファイルがあれば読み込んで復元する。
+    /// Credentials are saved as JSON at the given path.
+    /// If the file already exists, it is loaded and restored.
     ///
     /// # Arguments
     ///
-    /// * `registry` - 登録済みのプロバイダーを持つ FetcherRegistry
-    /// * `default_provider` - デフォルトで使用するストレージプロバイダー
-    /// * `credentials_path` - 認証情報の保存先パス
+    /// * `registry` - FetcherRegistry holding the registered providers
+    /// * `default_provider` - storage provider used by default
+    /// * `credentials_path` - path where credentials are saved
     ///
     /// # Example
     ///
@@ -102,25 +102,25 @@ impl MultiStorageRepository {
         let path = credentials_path.into();
         let repo = Self::create(registry, default_provider.into(), Some(path));
 
-        // 既存のファイルがあれば読み込む
+        // Load the existing file if present
         repo.load_credentials()?;
 
         Ok(repo)
     }
 
-    /// テスト用の MultiStorageRepository を作成する（永続化なし）。
+    /// Creates a MultiStorageRepository for tests (no persistence).
     ///
-    /// 認証情報はメモリ内にのみ保持され、アプリ終了時に失われる。
+    /// Credentials are kept only in memory and are lost when the app exits.
     ///
     /// # Arguments
     ///
-    /// * `registry` - 登録済みのプロバイダーを持つ FetcherRegistry
-    /// * `default_provider` - デフォルトで使用するストレージプロバイダー
+    /// * `registry` - FetcherRegistry holding the registered providers
+    /// * `default_provider` - storage provider used by default
     pub fn in_memory(registry: Arc<FetcherRegistry>, default_provider: impl Into<String>) -> Self {
         Self::create(registry, default_provider.into(), None)
     }
 
-    /// 内部用のコンストラクタ
+    /// Internal constructor
     fn create(
         registry: Arc<FetcherRegistry>,
         default_provider: String,
@@ -128,7 +128,7 @@ impl MultiStorageRepository {
     ) -> Self {
         let mut auth_sessions = HashMap::new();
 
-        // ローカルストレージはデフォルトで接続済み（認証不要）
+        // Local storage is connected by default (no auth required)
         auth_sessions.insert(
             "local".to_string(),
             AuthSession {
@@ -152,10 +152,10 @@ impl MultiStorageRepository {
         }
     }
 
-    /// ストレージプロバイダーを接続する（認証セッションを登録）。
+    /// Connects a storage provider (registers an auth session).
     ///
-    /// ユーザーがUIで「Google Drive を接続」などを選択したときに呼び出す。
-    /// 永続化が有効な場合、自動的にファイルに保存される。
+    /// Called when the user selects e.g. "Connect Google Drive" in the UI.
+    /// If persistence is enabled, it is automatically saved to the file.
     pub fn connect(
         &self,
         provider: impl Into<String>,
@@ -176,15 +176,15 @@ impl MultiStorageRepository {
             sessions.insert(provider, auth);
         }
 
-        // 永続化が有効なら保存
+        // Save if persistence is enabled
         self.save_credentials()?;
 
         Ok(())
     }
 
-    /// ストレージプロバイダーを切断する（認証セッションを削除）。
+    /// Disconnects a storage provider (removes the auth session).
     ///
-    /// 永続化が有効な場合、自動的にファイルから削除される。
+    /// If persistence is enabled, it is automatically removed from the file.
     pub fn disconnect(&self, provider: &str) -> Result<(), ContentRepositoryError> {
         {
             let mut sessions = self.inner.auth_sessions.write().map_err(|e| {
@@ -193,19 +193,19 @@ impl MultiStorageRepository {
             sessions.remove(provider);
         }
 
-        // 永続化が有効なら保存
+        // Save if persistence is enabled
         self.save_credentials()?;
 
         Ok(())
     }
 
-    /// 認証情報をファイルに保存する。
+    /// Saves credentials to the file.
     ///
-    /// `credentials_path` が設定されている場合のみ保存される。
+    /// Saved only when `credentials_path` is set.
     pub fn save_credentials(&self) -> Result<(), ContentRepositoryError> {
         let path = match &self.inner.credentials_path {
             Some(p) => p,
-            None => return Ok(()), // 永続化が無効なら何もしない
+            None => return Ok(()), // Do nothing if persistence is disabled
         };
 
         let sessions =
@@ -213,7 +213,7 @@ impl MultiStorageRepository {
                 ContentRepositoryError::Storage(format!("failed to acquire lock: {e}"))
             })?;
 
-        // ローカルストレージ以外のセッションのみ保存（ローカルは認証不要なので）
+        // Save only non-local-storage sessions (local needs no auth)
         let persisted = PersistedCredentials {
             sessions: sessions
                 .iter()
@@ -222,7 +222,7 @@ impl MultiStorageRepository {
                 .collect(),
         };
 
-        // 親ディレクトリを作成
+        // Create the parent directory
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
                 ContentRepositoryError::Storage(format!(
@@ -231,7 +231,7 @@ impl MultiStorageRepository {
             })?;
         }
 
-        // JSON として保存
+        // Save as JSON
         let json = serde_json::to_string_pretty(&persisted).map_err(|e| {
             ContentRepositoryError::Storage(format!("failed to serialize credentials: {e}"))
         })?;
@@ -243,16 +243,16 @@ impl MultiStorageRepository {
         Ok(())
     }
 
-    /// 認証情報をファイルから読み込む。
+    /// Loads credentials from the file.
     ///
-    /// `credentials_path` が設定されており、ファイルが存在する場合のみ読み込まれる。
+    /// Loaded only when `credentials_path` is set and the file exists.
     fn load_credentials(&self) -> Result<(), ContentRepositoryError> {
         let path = match &self.inner.credentials_path {
             Some(p) => p,
-            None => return Ok(()), // 永続化が無効なら何もしない
+            None => return Ok(()), // Do nothing if persistence is disabled
         };
 
-        // ファイルが存在しなければスキップ
+        // Skip if the file does not exist
         if !path.exists() {
             return Ok(());
         }
@@ -270,7 +270,7 @@ impl MultiStorageRepository {
                 ContentRepositoryError::Storage(format!("failed to acquire lock: {e}"))
             })?;
 
-        // 読み込んだセッションを追加（registry に存在するもののみ）
+        // Add the loaded sessions (only those present in the registry)
         for (provider, token) in persisted.sessions {
             if self.inner.registry.resolve(&provider).is_some() {
                 sessions.insert(
@@ -285,7 +285,7 @@ impl MultiStorageRepository {
         Ok(())
     }
 
-    /// 接続済みのプロバイダー一覧を取得する。
+    /// Returns the list of connected providers.
     pub fn connected_providers(&self) -> Result<Vec<String>, ContentRepositoryError> {
         let sessions =
             self.inner.auth_sessions.read().map_err(|e| {
@@ -295,7 +295,7 @@ impl MultiStorageRepository {
         Ok(sessions.keys().cloned().collect())
     }
 
-    /// 現在のデフォルトプロバイダーを取得する。
+    /// Returns the current default provider.
     pub fn default_provider(&self) -> Result<String, ContentRepositoryError> {
         let default =
             self.inner.default_provider.read().map_err(|e| {
@@ -305,7 +305,7 @@ impl MultiStorageRepository {
         Ok(default.clone())
     }
 
-    /// 指定したストレージプロバイダーにコンテンツを保存する。
+    /// Saves content to the specified storage provider.
     pub fn save_to(
         &self,
         provider: &str,
@@ -325,7 +325,7 @@ impl MultiStorageRepository {
         })
     }
 
-    /// 指定したストレージプロバイダーからコンテンツを取得する。
+    /// Fetches content from the specified storage provider.
     pub fn find_from(
         &self,
         provider: &str,
@@ -355,7 +355,7 @@ impl MultiStorageRepository {
         }
     }
 
-    /// プロバイダーと認証セッションを取得する。
+    /// Returns the provider and its auth session.
     fn get_provider_and_auth(
         &self,
         provider: &str,
@@ -380,13 +380,13 @@ impl MultiStorageRepository {
         Ok((storage_provider, auth.clone()))
     }
 
-    /// コンテンツIDからストレージパスを生成する。
+    /// Builds a storage path from a content ID.
     ///
-    /// ID は 1 つのファイル名にそのまま使える文字(ASCII 小文字・数字・`-`・`_`)
-    /// に限る。`./<id>`・`x/../<id>`・大文字(大文字小文字を区別しないファイル
-    /// システム)のような別表記が同じ記録に届くと、文字列で取っている呼び出し
-    /// 側のファイル単位ロックが別扱いになり、同じファイルへの書き込みが並行
-    /// してしまう。ディレクトリの外を指すパスも作らせない。
+    /// The ID is limited to characters usable as-is in a single file name (ASCII lowercase,
+    /// digits, `-`, `_`). If alternative spellings such as `./<id>`, `x/../<id>`, or uppercase
+    /// (on case-insensitive file systems) reached the same record, the callers' per-file locks,
+    /// keyed by string, would treat them as different, letting writes to the same file run
+    /// concurrently. Paths pointing outside the directory are not allowed either.
     fn content_path(
         provider: &str,
         content_id: &ContentId,
@@ -405,7 +405,7 @@ impl MultiStorageRepository {
     }
 }
 
-/// ContentRepository トレイトの実装（デフォルトプロバイダーを使用）
+/// ContentRepository trait implementation (uses the default provider)
 impl ContentRepository for MultiStorageRepository {
     fn save(
         &self,
@@ -425,7 +425,7 @@ impl ContentRepository for MultiStorageRepository {
     }
 }
 
-/// MultiStorageContentRepository トレイトの実装
+/// MultiStorageContentRepository trait implementation
 impl MultiStorageContentRepository for MultiStorageRepository {
     fn save_to(
         &self,
@@ -474,12 +474,12 @@ mod tests {
     use tempfile::TempDir;
 
     // ========================================================================
-    // テストヘルパー関数
+    // Test helper functions
     // ========================================================================
 
-    /// テスト用の FetcherRegistry を作成する。
+    /// Creates a FetcherRegistry for tests.
     ///
-    /// 指定された一時ディレクトリを base_path としたローカルプロバイダーを含む。
+    /// Includes a local provider whose base_path is the given temp directory.
     fn create_test_registry(temp_dir: &TempDir) -> Arc<monas_filesync::FetcherRegistry> {
         let config_str = format!(
             r#"[local]
@@ -491,13 +491,13 @@ base_path = "{}""#,
         Arc::new(monas_filesync::FetcherRegistry::from_config(&config))
     }
 
-    /// テスト用の Content を作成する。
+    /// Creates a Content for tests.
     fn create_test_content(id: &str) -> Content {
         serde_json::from_value(serde_json::json!({
             "raw_id": id,
             "series_id": id,
-            // v2: 暗号文由来の ContentId（encCid）
-            // テストでは互換性確認が主目的のため、plainCid と同値で固定する。
+            // v2: ContentId derived from the ciphertext (encCid)
+            // Tests mainly check compatibility, so fix it to the same value as plainCid.
             "encrypted_id": id,
             "metadata": {
                 "name": "test",
@@ -515,7 +515,7 @@ base_path = "{}""#,
     }
 
     // ========================================================================
-    // MultiStorageRepository のテスト
+    // MultiStorageRepository tests
     // ========================================================================
 
     #[test]
@@ -525,10 +525,10 @@ base_path = "{}""#,
 
         let repo = MultiStorageRepository::in_memory(registry, "local");
 
-        // デフォルトプロバイダーを確認
+        // Check the default provider
         assert_eq!(repo.default_provider().unwrap(), "local");
 
-        // ローカルは自動接続されている
+        // Local is connected automatically
         let connected = repo.connected_providers().unwrap();
         assert!(connected.contains(&"local".to_string()));
     }
@@ -542,11 +542,11 @@ base_path = "{}""#,
         let content_id = ContentId::new("multi-test-123".to_string());
         let content = create_test_content("multi-test-123");
 
-        // デフォルトプロバイダー（local）に保存
+        // Save to the default provider (local)
         repo.save(&content_id, &content)
             .expect("failed to save content");
 
-        // デフォルトプロバイダー（local）から取得
+        // Fetch from the default provider (local)
         let found = repo
             .find_by_id(&content_id)
             .expect("failed to find content")
@@ -564,11 +564,11 @@ base_path = "{}""#,
         let content_id = ContentId::new("specific-provider-test".to_string());
         let content = create_test_content("specific-provider-test");
 
-        // 明示的に "local" を指定して保存
+        // Save with "local" specified explicitly
         repo.save_to("local", &content_id, &content)
             .expect("failed to save content");
 
-        // 明示的に "local" を指定して取得
+        // Fetch with "local" specified explicitly
         let found = repo
             .find_from("local", &content_id)
             .expect("failed to find content")
@@ -585,7 +585,7 @@ base_path = "{}""#,
         let content_id = ContentId::new("test".to_string());
         let content = create_test_content("test");
 
-        // google-drive は接続していない
+        // google-drive is not connected
         let result = repo.save_to("google-drive", &content_id, &content);
 
         assert!(result.is_err());
@@ -598,20 +598,20 @@ base_path = "{}""#,
         let registry = Arc::new(init_registry_default());
         let repo = MultiStorageRepository::in_memory(registry, "local");
 
-        // Google Drive を接続
+        // Connect Google Drive
         let auth = AuthSession {
             access_token: "test-token".to_string(),
         };
         repo.connect("google-drive", auth).unwrap();
 
-        // 接続済みプロバイダーに含まれる
+        // Included in the connected providers
         let connected = repo.connected_providers().unwrap();
         assert!(connected.contains(&"google-drive".to_string()));
 
-        // 切断
+        // Disconnect
         repo.disconnect("google-drive").unwrap();
 
-        // 接続済みプロバイダーから削除されている
+        // Removed from the connected providers
         let connected = repo.connected_providers().unwrap();
         assert!(!connected.contains(&"google-drive".to_string()));
     }
@@ -625,7 +625,7 @@ base_path = "{}""#,
             access_token: "test-token".to_string(),
         };
 
-        // 存在しないプロバイダーに接続しようとするとエラー
+        // Connecting to a nonexistent provider is an error
         let result = repo.connect("unknown-provider", auth);
         assert!(result.is_err());
         assert!(result
@@ -635,7 +635,7 @@ base_path = "{}""#,
     }
 
     // ========================================================================
-    // 永続化のテスト
+    // Persistence tests
     // ========================================================================
 
     #[test]
@@ -645,24 +645,24 @@ base_path = "{}""#,
 
         let registry = Arc::new(init_registry_default());
 
-        // 永続化付きでリポジトリを作成
+        // Create a repository with persistence
         let repo = MultiStorageRepository::new(registry.clone(), "local", &credentials_path)
             .expect("failed to create repo");
 
-        // Google Drive を接続
+        // Connect Google Drive
         let auth = AuthSession {
             access_token: "test-google-token".to_string(),
         };
         repo.connect("google-drive", auth).unwrap();
 
-        // ファイルが作成されていることを確認
+        // Verify that the file was created
         assert!(credentials_path.exists());
 
-        // 新しいリポジトリを作成し、ファイルから読み込む
+        // Create a new repository and load from the file
         let repo2 = MultiStorageRepository::new(registry, "local", &credentials_path)
             .expect("failed to create repo2");
 
-        // Google Drive が接続済みになっていることを確認
+        // Verify that Google Drive is connected
         let connected = repo2.connected_providers().unwrap();
         assert!(connected.contains(&"google-drive".to_string()));
     }
@@ -677,7 +677,7 @@ base_path = "{}""#,
         let repo = MultiStorageRepository::new(registry.clone(), "local", &credentials_path)
             .expect("failed to create repo");
 
-        // 接続
+        // Connect
         repo.connect(
             "google-drive",
             AuthSession {
@@ -686,14 +686,14 @@ base_path = "{}""#,
         )
         .unwrap();
 
-        // 切断
+        // Disconnect
         repo.disconnect("google-drive").unwrap();
 
-        // 新しいリポジトリを作成し、ファイルから読み込む
+        // Create a new repository and load from the file
         let repo2 = MultiStorageRepository::new(registry, "local", &credentials_path)
             .expect("failed to create repo2");
 
-        // Google Drive が接続されていないことを確認
+        // Verify that Google Drive is not connected
         let connected = repo2.connected_providers().unwrap();
         assert!(!connected.contains(&"google-drive".to_string()));
     }
@@ -702,10 +702,10 @@ base_path = "{}""#,
     fn test_multi_storage_repository_in_memory() {
         let registry = Arc::new(init_registry_default());
 
-        // 永続化なしで作成（in_memory）
+        // Create without persistence (in_memory)
         let repo = MultiStorageRepository::in_memory(registry, "local");
 
-        // 接続してもエラーにならない（ファイルは作成されない）
+        // Connecting does not error (no file is created)
         repo.connect(
             "google-drive",
             AuthSession {
@@ -714,7 +714,7 @@ base_path = "{}""#,
         )
         .unwrap();
 
-        // 切断してもエラーにならない
+        // Disconnecting does not error
         repo.disconnect("google-drive").unwrap();
     }
 }

@@ -2,7 +2,7 @@ use crate::domain::{
     content::encryption::ContentEncryptionKey, content::Content, content_id::ContentId,
 };
 
-/// コンテンツを永続化するポート。
+/// Port for persisting content.
 pub trait ContentRepository {
     fn save(&self, content_id: &ContentId, content: &Content)
         -> Result<(), ContentRepositoryError>;
@@ -10,12 +10,12 @@ pub trait ContentRepository {
         -> Result<Option<Content>, ContentRepositoryError>;
 }
 
-/// 複数のストレージプロバイダーを扱える ContentRepository の拡張トレイト。
+/// Extension trait of ContentRepository that can handle multiple storage providers.
 ///
-/// このトレイトを実装するリポジトリでは、プロバイダーを指定して
-/// コンテンツの保存・取得が可能になる。
+/// Repositories implementing this trait can save and fetch content with a specified
+/// provider.
 pub trait MultiStorageContentRepository: ContentRepository {
-    /// 指定したプロバイダーにコンテンツを保存する。
+    /// Saves content to the specified provider.
     fn save_to(
         &self,
         provider: &str,
@@ -23,33 +23,33 @@ pub trait MultiStorageContentRepository: ContentRepository {
         content: &Content,
     ) -> Result<(), ContentRepositoryError>;
 
-    /// 指定したプロバイダーからコンテンツを取得する。
+    /// Fetches content from the specified provider.
     fn find_from(
         &self,
         provider: &str,
         content_id: &ContentId,
     ) -> Result<Option<Content>, ContentRepositoryError>;
 
-    /// 接続済みのプロバイダー一覧を取得する。
+    /// Gets the list of connected providers.
     fn connected_providers(&self) -> Result<Vec<String>, ContentRepositoryError>;
 
-    /// 現在のデフォルトプロバイダーを取得する。
+    /// Gets the current default provider.
     fn default_provider(&self) -> Result<String, ContentRepositoryError>;
 
-    /// ストレージプロバイダーを接続する（認証セッションを登録）。
+    /// Connects a storage provider (registers an auth session).
     ///
-    /// このメソッドは実装によっては利用できない場合がある。
-    /// 利用可能な場合は `Ok(())` を返し、利用できない場合はエラーを返す。
+    /// This method may be unavailable depending on the implementation.
+    /// Returns `Ok(())` if available, and an error otherwise.
     fn connect_provider(
         &self,
         provider: &str,
         access_token: String,
     ) -> Result<(), ContentRepositoryError>;
 
-    /// ストレージプロバイダーを切断する（認証セッションを削除）。
+    /// Disconnects a storage provider (deletes the auth session).
     ///
-    /// このメソッドは実装によっては利用できない場合がある。
-    /// 利用可能な場合は `Ok(())` を返し、利用できない場合はエラーを返す。
+    /// This method may be unavailable depending on the implementation.
+    /// Returns `Ok(())` if available, and an error otherwise.
     fn disconnect_provider(&self, provider: &str) -> Result<(), ContentRepositoryError>;
 }
 
@@ -59,10 +59,10 @@ pub enum ContentRepositoryError {
     Storage(String),
 }
 
-/// CEK（コンテンツ暗号化鍵）を保存・取得・削除するためのポート。
+/// Port for saving, loading, and deleting CEKs (content encryption keys).
 ///
-/// - 実装は infra 層（インメモリ / sled / その他のKVS など）に置く。
-/// - application 層では、このポート越しにのみ CEK にアクセスする。
+/// - Implementations live in the infra layer (in-memory / sled / other KVS, etc.).
+/// - The application layer accesses CEKs only through this port.
 pub trait ContentEncryptionKeyStore {
     fn save(
         &self,
@@ -78,10 +78,10 @@ pub trait ContentEncryptionKeyStore {
     fn delete(&self, content_id: &ContentId) -> Result<(), ContentEncryptionKeyStoreError>;
 }
 
-/// `Arc<dyn ContentEncryptionKeyStore + Send + Sync>` を `ContentService` の
-/// 型パラメータに直接渡せるようにする blanket impl。
+/// Blanket impl so that `Arc<dyn ContentEncryptionKeyStore + Send + Sync>` can be passed
+/// directly as a type parameter of `ContentService`.
 ///
-/// SDK 側で persistence backend を実行時に切り替える (in-memory / sled / その他) ために必要。
+/// Needed so the SDK can switch the persistence backend at runtime (in-memory / sled / others).
 impl<T: ContentEncryptionKeyStore + ?Sized> ContentEncryptionKeyStore for std::sync::Arc<T> {
     fn save(
         &self,

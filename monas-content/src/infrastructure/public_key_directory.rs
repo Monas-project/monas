@@ -6,17 +6,17 @@ use crate::application_service::share_service::{PublicKeyDirectory, PublicKeyDir
 use crate::domain::share::KeyId;
 use sha2::{Digest, Sha256};
 
-/// テストや PoC 用のインメモリ公開鍵ディレクトリ実装。
+/// In-memory public key directory implementation for tests and PoCs.
 ///
-/// - key: `KeyId`（バイト列そのもの）
-/// - value: HPKE 用の公開鍵バイト列（P-256 の uncompressed など）
+/// - key: `KeyId` (the raw bytes)
+/// - value: public key bytes for HPKE (e.g. P-256 uncompressed)
 #[derive(Clone, Default)]
 pub struct InMemoryPublicKeyDirectory {
     inner: Arc<Mutex<HashMap<KeyId, Vec<u8>>>>,
 }
 
 impl InMemoryPublicKeyDirectory {
-    /// 直接 KeyId を指定して登録したい場合のヘルパ（主にテスト用）。
+    /// Helper for registering with an explicitly specified KeyId (mainly for tests).
     pub fn insert(&self, key_id: KeyId, public_key: Vec<u8>) {
         if let Ok(mut guard) = self.inner.lock() {
             guard.insert(key_id, public_key);
@@ -25,7 +25,7 @@ impl InMemoryPublicKeyDirectory {
 }
 
 impl InMemoryPublicKeyDirectory {
-    /// SHA-256 の先頭 16 バイトから KeyId を計算する。
+    /// Computes the KeyId from the first 16 bytes of SHA-256.
     fn hash_to_key_id(public_key: &[u8]) -> KeyId {
         let digest = Sha256::digest(public_key);
         let id_bytes = digest[..16].to_vec();
@@ -70,29 +70,29 @@ impl PublicKeyDirectory for InMemoryPublicKeyDirectory {
     }
 }
 
-/// sled を用いた公開鍵ディレクトリ実装。
+/// Public key directory implementation backed by sled.
 ///
-/// - キー: `"pubkey:{hex(key_id.as_bytes())}"`（UTF-8 文字列）
-/// - 値: HPKE 用の公開鍵バイト列
+/// - Key: `"pubkey:{hex(key_id.as_bytes())}"` (UTF-8 string)
+/// - Value: public key bytes for HPKE
 ///
 /// NOTE:
-/// - `"pubkey:"` プレフィックスによりキー空間を分離している。
+/// - The key space is separated by the `"pubkey:"` prefix.
 #[derive(Clone)]
 pub struct SledPublicKeyDirectory {
     db: sled::Db,
 }
 
 impl SledPublicKeyDirectory {
-    /// 指定されたパスに sled DB を開く。
+    /// Opens a sled DB at the given path.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, PublicKeyDirectoryError> {
         let db = sled::open(path).map_err(|e| PublicKeyDirectoryError::Lookup(e.to_string()))?;
         Ok(Self { db })
     }
 
-    /// 既存の `sled::Db` ハンドルを共有してインスタンスを構築する。
+    /// Builds an instance that shares an existing `sled::Db` handle.
     ///
-    /// `SledContentEncryptionKeyStore` / `SledShareRepository` と同一の sled DB を
-    /// 共有する場合に使う (キー空間は `pubkey:` プレフィックスで分離)。
+    /// Use this when sharing the same sled DB with `SledContentEncryptionKeyStore` /
+    /// `SledShareRepository` (the key space is separated by the `pubkey:` prefix).
     pub fn with_db(db: sled::Db) -> Self {
         Self { db }
     }

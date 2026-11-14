@@ -20,18 +20,19 @@ fn compute_content_id(raw_content: &[u8]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-/// `X-Request-Timestamp` の skew チェックを実質的に無効化した `MonasController`。
+/// `MonasController` with the `X-Request-Timestamp` skew check effectively disabled.
 ///
-/// 古い固定値 (e.g. `1_717_171_717`) で署名検証する旧来テスト用のヘルパ。
-/// 本番運用ではこの設定を使わない。
+/// Helper for legacy tests that verify signatures with an old fixed value (e.g. `1_717_171_717`).
+/// Do not use this setting in production.
 fn controller_for_legacy_timestamps(state_node_url: String) -> MonasController {
     let config = MonasConfig::new(state_node_url)
-        // 100 年以上の skew を許容することで、テスト固定 timestamp の絶対値を気にしなくてよくする。
+        // Allowing 100+ years of skew means the absolute value of the fixed test timestamp
+        // doesn't matter.
         .with_request_timestamp_skew(Duration::from_secs(60 * 60 * 24 * 365 * 100));
     MonasController::with_config(config).expect("with_config")
 }
 
-/// 署名アカウントを作った controller。SDK は自分では署名鍵を作らない。
+/// A controller with a signing account created. The SDK does not create signing keys on its own.
 fn controller_with_signing_account(state_node_url: String) -> MonasController {
     let controller = controller_for_legacy_timestamps(state_node_url);
     controller
@@ -720,13 +721,13 @@ async fn delete_content_uses_account_signature_for_metadata_request() {
     cleanup_content_artifacts();
 }
 
-/// §4: State Node が content_id を返さない場合 (例: `{"ok":true}`) は成功扱いせず
-/// `ApiError::Internal` にする。
+/// §4: When the State Node does not return a content_id (e.g. `{"ok":true}`), do not treat
+/// it as success; return `ApiError::Internal`.
 ///
-/// 以前は `StateNodeCreateContentResponse.content_id` が `#[serde(default)]` で
-/// 空文字を許容していたため、silent に `remote_content_id=None` の CreateContentOutput が
-/// 返り、後続の update/delete で `remote_content_id` が必須になると二度と操作できない
-/// コンテンツが量産される状態だった。
+/// Previously `StateNodeCreateContentResponse.content_id` was `#[serde(default)]` and
+/// accepted an empty string, so a CreateContentOutput with `remote_content_id=None` was silently
+/// returned, and since later update/delete require `remote_content_id`, content that could
+/// never be operated on again was being mass-produced.
 #[tokio::test(flavor = "multi_thread")]
 async fn create_content_fails_when_state_node_omits_content_id() {
     let _guard = acquire_test_lock();
@@ -773,17 +774,17 @@ async fn create_content_fails_when_state_node_omits_content_id() {
     cleanup_content_artifacts();
 }
 
-/// §2: `MonasConfig::with_request_timeout` が効き、State Node がハングする場合に
-/// `ApiError::Timeout` が設定した時間内に返ることを検証する。
+/// §2: Verifies that `MonasConfig::with_request_timeout` takes effect, and that when the State
+/// Node hangs, `ApiError::Timeout` is returned within the configured time.
 ///
-/// TcpListener を bind するが accept しないダミーサーバを立てる。
-/// OS によっては connect は成功するが read/write が応答しないため、
-/// 設定したグローバルタイムアウトで打ち切られるはず。
+/// Starts a dummy server that binds a TcpListener but never accepts.
+/// Depending on the OS, connect succeeds but read/write never respond,
+/// so the request should be cut off by the configured global timeout.
 #[tokio::test(flavor = "multi_thread")]
 async fn create_content_returns_timeout_when_state_node_hangs() {
     let _guard = acquire_test_lock();
 
-    // accept しないダミーサーバ
+    // Dummy server that never accepts
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("local_addr");
     let url = format!("http://{addr}");
@@ -815,19 +816,19 @@ async fn create_content_returns_timeout_when_state_node_hangs() {
         "timeout should fire well under 3s, took {elapsed:?}"
     );
 
-    // listener は drop で自動的に閉じる。念のため明示。
+    // The listener closes automatically on drop. Made explicit just in case.
     drop(listener);
     cleanup_content_artifacts();
 }
 
-/// `X-Request-Timestamp` が許容 skew (default 60s) を大きく超える場合、
-/// SDK は signing 前に `ApiError::Unauthorized` を返し HTTP を一切叩かない
-/// ことを確認する。PR #29 review (blocker 3) で導入した clamp の regression test。
+/// Checks that when `X-Request-Timestamp` far exceeds the allowed skew (default 60s),
+/// the SDK returns `ApiError::Unauthorized` before signing and makes no HTTP calls at all.
+/// Regression test for the clamp introduced in the PR #29 review (blocker 3).
 #[tokio::test(flavor = "multi_thread")]
 async fn create_content_rejects_far_future_timestamp_with_unauthorized() {
     let _guard = acquire_test_lock();
 
-    // ダミー URL で十分。clamp が先に発火して HTTP は走らない。
+    // A dummy URL is enough. The clamp fires first, so no HTTP is issued.
     let controller = MonasController::with_state_node_url("http://127.0.0.1:1");
 
     let now = std::time::SystemTime::now()
@@ -837,7 +838,7 @@ async fn create_content_rejects_far_future_timestamp_with_unauthorized() {
     let auth = StateNodeAuthContext {
         authorization: Some("Bearer x".into()),
         request_signature: None,
-        // 1 時間先の timestamp。default 60s skew を遥かに超える。
+        // A timestamp 1 hour ahead. Far exceeds the default 60s skew.
         request_timestamp: Some(now + 3600),
     };
 
@@ -869,9 +870,9 @@ async fn create_content_rejects_far_future_timestamp_with_unauthorized() {
     cleanup_content_artifacts();
 }
 
-/// `auth: Some` で timestamp が欠落している場合は、SDK が現在時刻で補完して
-/// 再署名してはいけない。Gateway 側の parse failure / missing header が `None`
-/// に潰れた場合の replay bypass を防ぐ regression test。
+/// When `auth: Some` but the timestamp is missing, the SDK must not fill in the current time
+/// and re-sign. Regression test preventing a replay bypass when a gateway-side parse failure /
+/// missing header collapses into `None`.
 #[tokio::test(flavor = "multi_thread")]
 async fn create_content_rejects_missing_timestamp_with_unauthorized() {
     let _guard = acquire_test_lock();
@@ -906,8 +907,8 @@ async fn create_content_rejects_missing_timestamp_with_unauthorized() {
     cleanup_content_artifacts();
 }
 
-/// `X-Request-Timestamp` が許容 skew を「過去側」に大きく超える場合も
-/// `ApiError::Unauthorized` を返す。replay 防御の対称性確認。
+/// Also returns `ApiError::Unauthorized` when `X-Request-Timestamp` far exceeds the allowed
+/// skew "in the past" direction. Checks the symmetry of the replay defense.
 #[tokio::test(flavor = "multi_thread")]
 async fn create_content_rejects_far_past_timestamp_with_unauthorized() {
     let _guard = acquire_test_lock();
@@ -920,7 +921,7 @@ async fn create_content_rejects_far_past_timestamp_with_unauthorized() {
     let auth = StateNodeAuthContext {
         authorization: None,
         request_signature: None,
-        // 1 時間前 (default 60s skew を遥かに超える)
+        // 1 hour ago (far exceeds the default 60s skew)
         request_timestamp: Some(now.saturating_sub(3600)),
     };
 
@@ -942,8 +943,8 @@ async fn create_content_rejects_far_past_timestamp_with_unauthorized() {
     cleanup_content_artifacts();
 }
 
-/// 署名アカウントを作るまでは state node へ署名付きリクエストを送らない。
-/// SDK が起動時に勝手に鍵を作っていないことの回帰テスト。
+/// No signed requests are sent to the state node until a signing account is created.
+/// Regression test that the SDK does not create keys on its own at startup.
 #[tokio::test(flavor = "multi_thread")]
 async fn create_content_without_signing_account_is_refused_before_contacting_state_node() {
     let _guard = acquire_test_lock();

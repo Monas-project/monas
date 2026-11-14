@@ -1,6 +1,6 @@
-//! プレゼンテーション層（API ルーター）。
+//! Presentation layer (API router).
 //!
-//! `filesync` feature が有効な場合のみコンパイルされる。
+//! Compiled only when the `filesync` feature is enabled.
 
 #![cfg(feature = "filesync")]
 
@@ -29,13 +29,13 @@ use base64_helpers::{
     decode_base64, decode_base64_optional, decode_cek_base64, decode_key_id_base64,
 };
 
-/// ファイル単位の書き込みロック。
+/// Per-file write lock.
 ///
-/// 記録・CEK・共有設定はファイルのキーごとに 1 件で、更新・削除・再暗号化・
-/// 共有・revoke はそれぞれ「読んで書き戻す」。同じファイルへの書き込みが
-/// 並行すると、記録と CEK の最後の書き込みが別々の要求のものになり得る
-/// (例: 更新の本文 + 再暗号化の新 CEK で復号できなくなる)。SDK のファイル
-/// 単位ロックと同じく、同じファイルへの書き込みを 1 つずつにする。
+/// There is one record, CEK, and share setting per file key, and update, delete, re-encrypt,
+/// share, and revoke each "read and write back". If writes to the same file run concurrently,
+/// the last writes of the record and the CEK can come from different requests
+/// (e.g. the body from an update + the new CEK from a re-encrypt makes it undecryptable). Like
+/// the SDK's per-file lock, this serializes writes to the same file.
 #[derive(Default)]
 struct FileLocks {
     held: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -57,8 +57,8 @@ impl FileLocks {
     }
 }
 
-/// drop で表から自分のエントリを消す(誰も待っていなければ)。表は書き込み中の
-/// ファイル数までしか伸びない。
+/// On drop, removes its own entry from the table (if no one is waiting). The table grows only up
+/// to the number of files being written.
 struct FileLockGuard<'a> {
     locks: &'a FileLocks,
     file_id: String,
@@ -70,7 +70,7 @@ impl Drop for FileLockGuard<'_> {
     fn drop(&mut self) {
         self._guard.take();
         let mut held = self.locks.held.lock().unwrap_or_else(|p| p.into_inner());
-        // 表と自分の分だけなら、他に保持者も待機者もいない。
+        // If only the table and this guard hold it, there are no other holders or waiters.
         if Arc::strong_count(&self.mutex) == 2 {
             held.remove(&self.file_id);
         }
@@ -105,7 +105,7 @@ async fn health() -> &'static str {
 }
 
 pub fn create_router() -> Router {
-    // 共通の infra 実装を生成し、ContentService / ShareService の両方で共有する。
+    // Create the common infra implementations and share them between ContentService / ShareService.
     let registry = Arc::new(monas_filesync::init_registry_default());
     let content_repository = MultiStorageRepository::in_memory(registry, "local");
 

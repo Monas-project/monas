@@ -7,10 +7,10 @@ use crate::application_service::content_service::{
 };
 use crate::domain::{content::encryption::ContentEncryptionKey, content_id::ContentId};
 
-/// プロセス内の `HashMap` に CEK を保存するインメモリ実装。
+/// In-memory implementation that stores CEKs in an in-process `HashMap`.
 ///
-/// - 永続化は行わず、プロセス終了とともに破棄される。
-/// - ローカル開発やテスト、PoC 用途を想定。
+/// - Not persisted; discarded when the process exits.
+/// - Intended for local development, tests, and PoCs.
 #[derive(Clone, Default)]
 pub struct InMemoryContentEncryptionKeyStore {
     inner: Arc<Mutex<HashMap<String, ContentEncryptionKey>>>,
@@ -54,16 +54,16 @@ impl ContentEncryptionKeyStore for InMemoryContentEncryptionKeyStore {
     }
 }
 
-/// sled を用いた CEK ストア実装。
+/// CEK store implementation backed by sled.
 ///
-/// - キー: `"cek:{content_id.as_str()}"`（UTF-8 文字列）
-/// - 値: CEK のバイト列（`ContentEncryptionKey.0`）
+/// - Key: `"cek:{content_id.as_str()}"` (UTF-8 string)
+/// - Value: CEK bytes (`ContentEncryptionKey.0`)
 ///
 /// NOTE:
-/// - 他の sled ベースのストア（例: `SledShareRepository`）と
-///   同じ DB ファイルを共有しても、プレフィックスによりキー空間が分離される。
-/// - sled 実装はあくまでローカル用の暫定実装であり、
-///   本番環境では別の KVS / ストレージに置き換える可能性がある。
+/// - Even when sharing the same DB file with other sled-based stores (e.g. `SledShareRepository`),
+///   the key space is separated by the prefix.
+/// - The sled implementation is only a provisional, local-use implementation;
+///   it may be replaced by another KVS / storage in production.
 pub struct SledContentEncryptionKeyStore {
     db: sled::Db,
 }
@@ -75,12 +75,12 @@ impl SledContentEncryptionKeyStore {
         Ok(Self { db })
     }
 
-    /// 既存の `sled::Db` ハンドルを共有してインスタンスを構築する。
+    /// Builds an instance that shares an existing `sled::Db` handle.
     ///
-    /// sled は path 単位で排他 flock を取るため、同じプロセスから同一ディレクトリを
-    /// 2 度 `sled::open` することはできない。CEK ストアと Share repository を
-    /// 同じ DB ファイルに同居させたい場合は、外側で 1 度だけ `sled::open` した
-    /// `sled::Db` をこのコンストラクタ経由で渡す。
+    /// sled takes an exclusive flock per path, so the same process cannot `sled::open` the same
+    /// directory twice. To colocate the CEK store and the Share repository in the same DB file,
+    /// `sled::open` once on the outside and pass the resulting `sled::Db` through this
+    /// constructor.
     pub fn with_db(db: sled::Db) -> Self {
         Self { db }
     }

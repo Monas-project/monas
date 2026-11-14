@@ -30,7 +30,7 @@ impl KeyPairGenerateFactory {
         }
     }
 
-    /// 永続化された鍵バイト列から鍵ペアを復元する。
+    /// Restores a key pair from persisted key bytes.
     pub fn from_key_bytes(
         key_type: KeyAlgorithm,
         public_key: &[u8],

@@ -525,9 +525,9 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// issue #61: 委譲 JWT の PoP も非 JWT と同じ `{op}:{resource}:{timestamp}`
-    /// 形式で、宛先(aud)の鍵に対して検証される。同じトークンを別の
-    /// リクエスト(新しい timestamp・新しい署名)で再利用できる。
+    /// issue #61: the PoP of a delegated JWT is also verified against the key of the recipient
+    /// (aud), in the same `{op}:{resource}:{timestamp}` format as non-JWT. The same token can be
+    /// reused for a different request (new timestamp, new signature).
     #[tokio::test]
     async fn test_verify_request_signature_jwt_unified_message() {
         use crate::infrastructure::auth::test_helpers::TestKeyPair;
@@ -548,8 +548,8 @@ mod tests {
             .unwrap()
             .as_secs();
 
-        // 同じトークンで 2 リクエスト(履歴取得 → データ取得を模す)。
-        // それぞれ新しい timestamp を署名の中に入れる。
+        // Two requests with the same token (simulating history fetch → data fetch).
+        // Each puts a new timestamp inside the signature.
         for i in 0..2u64 {
             let ts = now + i;
             let message = format!("read:content-1:{ts}");
@@ -560,7 +560,7 @@ mod tests {
             assert!(result.is_ok(), "request {i} should verify: {result:?}");
         }
 
-        // 宛先(aud)以外の鍵で署名したものは拒否される
+        // A signature made with a key other than the recipient's (aud) is rejected
         let ts = now;
         let message = format!("read:content-1:{ts}");
         let forged = owner.sign(message.as_bytes());
@@ -570,10 +570,10 @@ mod tests {
             .is_err());
     }
 
-    /// cross-resource / cross-operation replay の回帰テスト。
-    /// ある content の update 用に取得した body+署名を、別 content や
-    /// create へ転用できてはならない(署名対象が operation / resource に
-    /// 束縛されているので検証が落ちる)。
+    /// Regression test for cross-resource / cross-operation replay.
+    /// A body+signature obtained for an update of one content must not be reusable for another
+    /// content or for create (verification fails because the signed message is bound to
+    /// operation / resource).
     #[tokio::test]
     async fn test_body_signature_cannot_be_replayed_across_resource_or_operation() {
         use crate::port::auth_token::RequestMetadata;
@@ -598,13 +598,13 @@ mod tests {
         let signature: p256::ecdsa::Signature = signing_key.sign(captured_message.as_bytes());
         let signature_bytes = signature.to_vec();
 
-        // 正規の組み合わせは通る
+        // The legitimate combination passes
         assert!(adapter
             .verify_request_signature(&token, &signature_bytes, &captured_message, Some(ts))
             .await
             .is_ok());
 
-        // 同じ body・同じ署名を別 content へ転用 → 拒否
+        // Reuse the same body and signature for another content → rejected
         let other_resource = RequestMetadata {
             resource: "content-2".to_string(),
             ..captured.clone()
@@ -619,7 +619,7 @@ mod tests {
             .await
             .is_err());
 
-        // 同じ body・同じ署名を create へ転用 → 拒否
+        // Reuse the same body and signature for create → rejected
         let other_operation = RequestMetadata {
             operation: "create".to_string(),
             ..captured.clone()
@@ -634,7 +634,7 @@ mod tests {
             .await
             .is_err());
 
-        // body を差し替えても拒否
+        // Swapping the body is also rejected
         assert!(adapter
             .verify_request_signature(
                 &token,
@@ -648,10 +648,11 @@ mod tests {
             .is_err());
     }
 
-    /// add-members の `count` は HTTP body 由来で、実際に追加される member 数を
-    /// 決める。署名対象に入っていないと、同じ token・署名・timestamp のまま
-    /// count だけ差し替えられる(上限で clamp されるが 1 → 上限への改ざんは成立
-    /// してしまう)。canonical encoding した body が署名へ束縛されることを確認する。
+    /// The add-members `count` comes from the HTTP body and determines how many members are
+    /// actually added. If it were not in the signed message, count alone could be swapped while
+    /// keeping the same token, signature, and timestamp (it is clamped to the cap, but tampering
+    /// 1 → cap still succeeds). Verify that the canonically encoded body is bound to the
+    /// signature.
     #[tokio::test]
     async fn test_add_members_count_cannot_be_substituted() {
         use crate::port::auth_token::{add_members_signing_body, RequestMetadata};
@@ -673,7 +674,7 @@ mod tests {
         let digest_for =
             |count: usize| hex::encode(sha2::Sha256::digest(add_members_signing_body(count)));
 
-        // caller は count=1 に対して署名する
+        // The caller signs for count=1
         let signed_message = metadata.signing_message_with_body_digest(&digest_for(1));
         let signature: p256::ecdsa::Signature = signing_key.sign(signed_message.as_bytes());
         let signature_bytes = signature.to_vec();
@@ -683,7 +684,7 @@ mod tests {
             .await
             .is_ok());
 
-        // body の count を差し替えた request は検証で落ちる
+        // A request with the body's count swapped fails verification
         for tampered in [0usize, 2, 8, 1000] {
             assert!(
                 adapter
@@ -695,11 +696,11 @@ mod tests {
                     )
                     .await
                     .is_err(),
-                "count={tampered} への差し替えが通ってしまった"
+                "swapping to count={tampered} was accepted"
             );
         }
 
-        // body なしの manage 署名としても転用できない
+        // It also cannot be reused as a body-less manage signature
         assert!(adapter
             .verify_request_signature(
                 &token,
@@ -711,10 +712,10 @@ mod tests {
             .is_err());
     }
 
-    /// revoke の `new_min_valid_issued_at` は「どこまでの Token を失効させるか」
-    /// を決めるので、署名対象に入っていなければならない。入っていないと、
-    /// 同じ token・署名・timestamp のまま失効時刻だけ差し替えられる
-    /// (add-members の `count` と同種の欠落)。
+    /// revoke's `new_min_valid_issued_at` determines "up to which Tokens are revoked", so
+    /// it must be in the signed message. Otherwise, the revocation time alone could be swapped
+    /// while keeping the same token, signature, and timestamp
+    /// (the same kind of omission as add-members' `count`).
     #[tokio::test]
     async fn test_revoke_cutoff_cannot_be_substituted() {
         use crate::domain::access_control::AccessControlUpdate;
@@ -739,7 +740,7 @@ mod tests {
             hex::encode(sha2::Sha256::digest(update.signing_message()))
         };
 
-        // caller は cutoff=2000 に対して署名する
+        // The caller signs for cutoff=2000
         let signed_message = metadata.signing_message_with_body_digest(&digest_for(2000));
         let signature: p256::ecdsa::Signature = signing_key.sign(signed_message.as_bytes());
         let signature_bytes = signature.to_vec();
@@ -749,7 +750,7 @@ mod tests {
             .await
             .is_ok());
 
-        // cutoff を差し替えた request は検証で落ちる
+        // A request with the cutoff swapped fails verification
         for tampered in [0u64, 1, 1999, 2001, u64::MAX] {
             assert!(
                 adapter
@@ -761,7 +762,7 @@ mod tests {
                     )
                     .await
                     .is_err(),
-                "cutoff={tampered} への差し替えが通ってしまった"
+                "swapping to cutoff={tampered} was accepted"
             );
         }
     }

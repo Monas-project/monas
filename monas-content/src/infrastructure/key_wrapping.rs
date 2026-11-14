@@ -5,22 +5,23 @@ use hpke_rs::hpke_types::{AeadAlgorithm, KdfAlgorithm, KemAlgorithm};
 use hpke_rs::prelude::*;
 use hpke_rs_rust_crypto::HpkeRustCrypto;
 
-/// HPKE (RFC 9180) **Auth モード**を用いた CEK ラップ実装。
+/// CEK wrap implementation using HPKE (RFC 9180) **Auth mode**.
 ///
-/// - Mode: Auth（送信者認証付き。送信者秘密鍵が KEM 計算に混ざり、
-///   受信者は送信者の公開鍵で unwrap する。送信者が本物でなければ復号が失敗する）
+/// - Mode: Auth (with sender authentication. The sender's secret key is mixed into the KEM
+///   computation and the recipient unwraps with the sender's public key. Decryption fails if the
+///   sender is not genuine)
 /// - KEM: DH KEM P-256
 /// - KDF: HKDF-SHA256
 /// - AEAD: AES-GCM-256
-/// - AAD: `EnvelopeAad`（content_id・recipient_key_id・key_epoch）を束縛する。
+/// - AAD: binds `EnvelopeAad` (content_id, recipient_key_id, key_epoch).
 ///
-/// 公開鍵は P-256 の uncompressed form (0x04 || X || Y, 65 バイト)、
-/// 秘密鍵は P-256 スカラー (32 バイト) として渡されることを想定する。
+/// Public keys are expected in P-256 uncompressed form (0x04 || X || Y, 65 bytes),
+/// and secret keys as P-256 scalars (32 bytes).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct HpkeV1KeyWrapping;
 
 impl HpkeV1KeyWrapping {
-    /// この実装で利用する HPKE の設定値を返す。
+    /// Returns the HPKE configuration used by this implementation.
     fn hpke_config() -> (Mode, KemAlgorithm, KdfAlgorithm, AeadAlgorithm) {
         (
             Mode::Auth,
@@ -151,8 +152,8 @@ mod tests {
 
     #[test]
     fn unwrap_fails_with_wrong_sender_public_key() {
-        // 送信者認証の核心: 偽送信者(別鍵)が作った envelope は、
-        // 受信者が期待する送信者公開鍵での unwrap に失敗する。
+        // Core of sender authentication: an envelope made by a fake sender (different key)
+        // fails to unwrap with the sender public key the recipient expects.
         let wrapper = HpkeV1KeyWrapping;
         let cek = ContentEncryptionKey(vec![0xAA; 32]);
         let keys = generate_keys();
@@ -161,12 +162,12 @@ mod tests {
         let kid = recipient_key_id();
         let aad = aad_with(&cid, &kid, 0);
 
-        // 攻撃者が自分の秘密鍵で envelope を鋳造
+        // The attacker forges an envelope with their own secret key
         let (enc, wrapped) = wrapper
             .wrap_cek(&cek, &keys.recipient_pk, &attacker.sender_sk, &aad)
             .expect("attacker wrap should succeed");
 
-        // 受信者は正規送信者の公開鍵で unwrap する → 失敗する
+        // The recipient unwraps with the legitimate sender's public key -> fails
         let result = wrapper.unwrap_cek(&enc, &wrapped, &keys.recipient_sk, &keys.sender_pk, &aad);
         assert!(
             matches!(result, Err(KeyWrappingError::CryptoError(_))),
@@ -176,7 +177,7 @@ mod tests {
 
     #[test]
     fn unwrap_fails_with_tampered_key_epoch() {
-        // AAD 束縛の検証: key_epoch を書き換えた envelope は復号に失敗する。
+        // AAD binding check: an envelope with a rewritten key_epoch fails to decrypt.
         let wrapper = HpkeV1KeyWrapping;
         let cek = ContentEncryptionKey(vec![0xBB; 32]);
         let keys = generate_keys();

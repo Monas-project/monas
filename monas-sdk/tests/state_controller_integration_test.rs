@@ -255,8 +255,9 @@ async fn verify_integrity_keeps_false_only_for_actual_content_mismatch() {
     let _guard = acquire_test_lock();
     let mut server = Server::new_async().await;
 
-    // State Node は Node CBOR を返す。CID 検証は通し、payload("world")と
-    // 引数の content("hello")の不一致だけで valid=false になることを確認する。
+    // The State Node returns Node CBOR. Verify that CID verification passes and that valid=false
+    // results solely from the mismatch between the payload ("world") and the argument content
+    // ("hello").
     let node_bytes = support::node_mirror::make_node_bytes(b"world", vec![], None);
     let version_cid =
         monas_content::infrastructure::node_verification::recompute_node_cid(&node_bytes).unwrap();
@@ -308,11 +309,11 @@ async fn verify_integrity_rejects_forged_node_with_self_reported_version() {
     let _guard = acquire_test_lock();
     let mut server = Server::new_async().await;
 
-    // 攻撃シナリオ: クライアントは version V の検証を要求しているのに、
-    // state node(攻撃者)は「クライアントの content と一致する偽 Node」と
-    // その偽 Node 自身の CID を version フィールドに詰めて返す。
-    // 応答内の自己申告 version に対して CID 照合すると必ず通ってしまうため、
-    // 照合はクライアントが選択した version に束縛されなければならない。
+    // Attack scenario: the client requests verification of version V, but the state node
+    // (attacker) returns "a forged Node matching the client's content" with the forged Node's
+    // own CID stuffed into the version field.
+    // CID matching against the self-reported version in the response would always pass, so the
+    // matching must be bound to the version the client selected.
     let real_node_bytes = support::node_mirror::make_node_bytes(b"secret-original", vec![], None);
     let real_version =
         monas_content::infrastructure::node_verification::recompute_node_cid(&real_node_bytes)

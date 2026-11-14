@@ -323,13 +323,12 @@ mod tests {
         assert!(ac.is_token_valid(1001));
     }
 
-    /// revoke と同じ秒に発行された Token も失効する。
+    /// Tokens issued in the same second as the revoke are also revoked.
     ///
-    /// 両者とも秒精度なので、`iat == cutoff` の Token が revoke の前に
-    /// 発行されたのか後なのかは区別できない。等値を valid 扱いにすると、
-    /// 取り消したはずの相手の Token がそのまま生き残る
-    /// (「それ以前に発行されたすべての Token を失効」という revoke の定義への
-    /// 直接の反例)。
+    /// Both have second precision, so whether a Token with `iat == cutoff` was issued before
+    /// or after the revoke cannot be determined. Treating equality as valid would let the revoked
+    /// party's Token survive as is
+    /// (a direct counterexample to the revoke definition "revoke all Tokens issued before it").
     #[test]
     fn a_token_issued_in_the_same_second_as_the_revoke_is_invalidated() {
         let mut ac = ContentAccessControl::new("content-1".to_string());
@@ -345,8 +344,8 @@ mod tests {
         assert!(ac.is_token_valid(cutoff + 1), "strictly after the revoke");
     }
 
-    /// 一度も revoke していない状態(cutoff = 0)は全 Token を受理する。
-    /// 排他にしたことで `iat = 0` まで弾いてしまうと、意味のない挙動変更になる。
+    /// The never-revoked state (cutoff = 0) accepts all Tokens.
+    /// If making it exclusive also rejected `iat = 0`, that would be a meaningless behavior change.
     #[test]
     fn an_untouched_policy_accepts_every_token() {
         let ac = ContentAccessControl::new("content-1".to_string());

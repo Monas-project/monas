@@ -1,9 +1,9 @@
-//! [`SenderKeyPinStore`] の実装。
+//! Implementations of [`SenderKeyPinStore`].
 //!
-//! ポート定義(トレイトと [`SenderKeyPin`])は
-//! `application_service::share_service::sender_key_pin_port` にある。
-//! ここにあるのは保存先ごとの実装だけで、SDK など上位のレイヤーは
-//! トレイトの方を参照する。
+//! The port definition (the trait and [`SenderKeyPin`]) lives in
+//! `application_service::share_service::sender_key_pin_port`.
+//! This module contains only the per-backend implementations; upper layers such as the SDK
+//! refer to the trait.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -12,7 +12,8 @@ use crate::application_service::share_service::sender_key_pin_port::{
     SenderKeyPin, SenderKeyPinStore, SenderKeyPinStoreError,
 };
 
-/// プロセス内 `HashMap` 実装。テスト・開発用（再起動で揮発 = 毎回 TOFU に戻る）。
+/// In-process `HashMap` implementation. For tests/development (volatile across restarts = back to
+/// TOFU every time).
 #[derive(Clone, Default)]
 pub struct InMemorySenderKeyPinStore {
     inner: Arc<Mutex<HashMap<String, SenderKeyPin>>>,
@@ -54,8 +55,8 @@ impl SenderKeyPinStore for InMemorySenderKeyPinStore {
     }
 }
 
-/// sled 実装。キーは `"sender_pin:{content_id}"`、値は `SenderKeyPin` の JSON。
-/// CEK / share / pubkey ストアと同じ `sled::Db` を共有できる。
+/// sled implementation. The key is `"sender_pin:{content_id}"`, the value is the JSON of the
+/// `SenderKeyPin`. Can share the same `sled::Db` as the CEK / share / pubkey stores.
 pub struct SledSenderKeyPinStore {
     db: sled::Db,
 }
@@ -101,10 +102,10 @@ impl SenderKeyPinStore for SledSenderKeyPinStore {
         expected: Option<&SenderKeyPin>,
         pin: &SenderKeyPin,
     ) -> Result<bool, SenderKeyPinStoreError> {
-        // 比較は保存形式(JSON バイト列)で行う。`SenderKeyPin` のフィールド順は
-        // 固定で serde_json も宣言順に出すため、同じ値は同じバイト列になる。
-        // `cek: None` は `skip_serializing_if` で欄ごと省かれるが、これも
-        // 値ごとに一意なので比較は成立する(旧形式レコードとも一致する)。
+        // Compare in the stored form (JSON bytes). `SenderKeyPin`'s field order is fixed and
+        // serde_json emits fields in declaration order, so equal values yield equal bytes.
+        // `cek: None` omits the field entirely via `skip_serializing_if`, but that is also
+        // unique per value, so the comparison still holds (it also matches legacy records).
         let expected_bytes = expected
             .map(serde_json::to_vec)
             .transpose()
@@ -145,7 +146,7 @@ mod tests {
         store.save("content-a", &pin_v0).unwrap();
         assert_eq!(store.load("content-a").unwrap(), Some(pin_v0.clone()));
 
-        // rotation 後の epoch 更新
+        // Epoch update after rotation
         let pin_v1 = SenderKeyPin {
             key_epoch: 1,
             ..pin_v0
@@ -155,7 +156,7 @@ mod tests {
 
         assert!(store.load("content-b").unwrap().is_none());
 
-        // compare-and-advance: 期待値が現在値と一致すれば進む
+        // compare-and-advance: advances if the expected value matches the current value
         let pin_v2 = SenderKeyPin {
             sender_public_key: vec![0x04, 1, 2, 3],
             key_epoch: 2,
@@ -167,7 +168,7 @@ mod tests {
             .unwrap());
         assert_eq!(store.load("content-a").unwrap(), Some(pin_v2.clone()));
 
-        // 期待値が古ければ(並行処理が先に進めていれば)巻き戻さない
+        // If the expected value is stale (a concurrent operation advanced first), do not roll back
         let stale = SenderKeyPin {
             sender_public_key: vec![0x04, 1, 2, 3],
             key_epoch: 1,
@@ -178,7 +179,7 @@ mod tests {
             .unwrap());
         assert_eq!(store.load("content-a").unwrap(), Some(pin_v2));
 
-        // 未記録(None)期待の初回書き込み / 既に記録がある場合は失敗
+        // First write expecting no record (None) / fails if a record already exists
         let first = SenderKeyPin {
             sender_public_key: vec![0x04, 9, 9, 9],
             key_epoch: 0,
@@ -193,10 +194,10 @@ mod tests {
         roundtrip(&InMemorySenderKeyPinStore::default());
     }
 
-    /// 並行処理の巻き戻し防止: epoch N と N+1 が同じ pin を観測して開始し、
-    /// N+1 が先に前進した後に N が完了しても、pin は後退しない。
-    /// SDK 側は「CAS が成功したときだけ CEK を公開する」ため、この CAS が
-    /// false を返すことが CEK 巻き戻しを止める最後の砦になる。
+    /// Rollback prevention under concurrency: if epochs N and N+1 start having observed the same
+    /// pin, and N completes after N+1 has advanced first, the pin does not move backwards.
+    /// Since the SDK "publishes the CEK only when the CAS succeeds", this CAS returning false is
+    /// the last line of defense against a CEK rollback.
     fn concurrent_epochs_do_not_roll_back(store: &dyn SenderKeyPinStore) {
         let key = vec![0x04, 1, 2, 3];
         let epoch0 = SenderKeyPin {
@@ -206,7 +207,7 @@ mod tests {
         };
         store.save("c", &epoch0).unwrap();
 
-        // 2 つの処理が同じ pin(epoch 0)を観測して開始する
+        // Two operations start having observed the same pin (epoch 0)
         let observed = store.load("c").unwrap();
 
         let epoch2 = SenderKeyPin {
@@ -220,21 +221,21 @@ mod tests {
             cek: None,
         };
 
-        // 新しい世代が先に前進する
+        // The newer epoch advances first
         assert!(store
             .compare_and_save("c", observed.as_ref(), &epoch2)
             .unwrap());
 
-        // 後から完了した古い世代は CAS に失敗し、pin を巻き戻せない
+        // The older epoch that completes later fails the CAS and cannot roll back the pin
         assert!(!store
             .compare_and_save("c", observed.as_ref(), &epoch1)
             .unwrap());
         assert_eq!(store.load("c").unwrap(), Some(epoch2));
     }
 
-    /// 3つ組が1レコードなので、世代と CEK が食い違った状態を CAS 経由では
-    /// 作れない。旧設計(pin と CEK が別ストア・別 commit)では、epoch N の
-    /// 処理が CEK だけを書き戻して `pin = N+1, CEK = N` を作れた。
+    /// Since the triple is a single record, a state where the epoch and CEK disagree cannot be
+    /// produced via CAS. In the old design (pin and CEK in separate stores / separate commits),
+    /// an epoch-N operation could write back only the CEK and produce `pin = N+1, CEK = N`.
     fn epoch_and_cek_advance_together(store: &dyn SenderKeyPinStore) {
         let key = vec![0x04, 1, 2, 3];
         let cek_of = |epoch: u64| Some(vec![epoch as u8; 32]);
@@ -246,7 +247,7 @@ mod tests {
         };
         store.save("c", &epoch0).unwrap();
 
-        // epoch 1 と epoch 2 の処理が、同じ pin(epoch 0)を観測して開始する
+        // The epoch 1 and epoch 2 operations start having observed the same pin (epoch 0)
         let observed = store.load("c").unwrap();
 
         let epoch2 = SenderKeyPin {
@@ -263,15 +264,19 @@ mod tests {
         assert!(store
             .compare_and_save("c", observed.as_ref(), &epoch2)
             .unwrap());
-        // 後から完了した古い世代は CAS に負ける。CEK も一緒に載っているので、
-        // 「世代だけ新しく CEK は古い」状態は生じ得ない。
+        // The older epoch that completes later loses the CAS. Since the CEK is carried along,
+        // a state of "new epoch but old CEK" cannot arise.
         assert!(!store
             .compare_and_save("c", observed.as_ref(), &epoch1)
             .unwrap());
 
         let current = store.load("c").unwrap().expect("record should exist");
         assert_eq!(current.key_epoch, 2);
-        assert_eq!(current.cek, cek_of(2), "CEK は世代と一緒に進む");
+        assert_eq!(
+            current.cek,
+            cek_of(2),
+            "CEK advances together with the epoch"
+        );
     }
 
     #[test]
@@ -286,8 +291,8 @@ mod tests {
         epoch_and_cek_advance_together(&SledSenderKeyPinStore::with_db(db));
     }
 
-    /// この修正より前に書かれたレコード(CEK 欄なし)を読めること。
-    /// 読めないと、既存の受信者が全員 TOFU からやり直しになる。
+    /// Records written before this fix (without the CEK field) must be readable.
+    /// Otherwise, every existing recipient would have to start over from TOFU.
     #[test]
     fn legacy_record_without_cek_deserializes() {
         let legacy = br#"{"sender_public_key":[4,1,2,3],"key_epoch":7}"#;
@@ -296,8 +301,8 @@ mod tests {
         assert_eq!(pin.cek, None);
     }
 
-    /// CEK が `Debug` 出力に出ないこと。ログや panic メッセージ経由で
-    /// 鍵素材が漏れるのを防ぐ。
+    /// The CEK must not appear in `Debug` output. Prevents key material from leaking via logs or
+    /// panic messages.
     #[test]
     fn debug_output_redacts_the_cek() {
         let pin = SenderKeyPin {
