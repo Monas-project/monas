@@ -18,19 +18,20 @@ use monas_content::domain::content_id::ContentId;
 
 use super::MonasController;
 
-/// 検証付き read で、誰がどの鍵で読むか。
+/// Who reads with which key in a verified read.
 pub(super) enum StateReader<'a> {
-    /// owner が自分のファイルを読む。CEK と照合する plainCid はそのファイルの
-    /// 記録(キー = file_id)から取る。
+    /// The owner reads their own file. The CEK is looked up by file_id, and the expected
+    /// plainCid (compared with the one recomputed from the decrypted body) is taken from that
+    /// file's record (key = file_id).
     Owner { file_id: &'a str },
-    /// share 受信者が読む。CEK は送信者ピン(系列ID)か、共有された版の
-    /// plainCid の下にある。
+    /// A share recipient reads. The CEK is under the sender pin (series ID) or under the
+    /// plainCid of the shared version.
     Recipient { local_content_id: &'a str },
 }
 
-/// `MonasController::adopt_remote_head` の結果。
+/// Result of `MonasController::adopt_remote_head`.
 pub(super) struct AdoptedHead {
-    /// 取り込み後の今の版の plainCid。
+    /// plainCid of the current version after adoption.
     pub local_content_id: ContentId,
     pub version: String,
     pub adopted: bool,
@@ -48,21 +49,22 @@ impl MonasController {
         None
     }
 
-    /// State Node の読み取り API 用の認証コンテキストを解決する。
+    /// Resolves the auth context for the State Node read API.
     ///
-    /// 呼び出し元が Authorization と署名の両方を明示していればそのまま透過する。
-    /// 署名が無ければ書き込み系（create/update/delete）と同じく monas-account で
-    /// `read:<content_id>:<timestamp>` に署名する。そのとき Authorization は:
-    /// - 無ければ `user:<hex(pubkey)>`(owner としての読み取り)
-    /// - `Bearer <委譲 Token>` があればそれを残す(share 受信者としての読み取り)。
-    ///   State Node は Token の `aud` 鍵で署名を検証するので、受信者は Token の
-    ///   宛先鍵 = この gateway の account 鍵で署名しなければならない。Token を
-    ///   渡すだけで署名しないと "Request signature is required" で拒否される。
+    /// If the caller explicitly provides both Authorization and a signature, pass them through.
+    /// If there is no signature, sign the State Node request signature (the `monas-request-v1`
+    /// message for operation `read` and resource `content_id`, no body digest) with
+    /// monas-account, the same as for writes (create/update/delete). Authorization is then:
+    /// - `user:<hex(pubkey)>` if absent (reading as the owner)
+    /// - kept as-is if it is `Bearer <delegated token>` (reading as a share recipient).
+    ///   The State Node verifies the signature with the Token's `aud` key, so the recipient
+    ///   must sign with the Token's audience key = this gateway's account key. Passing the
+    ///   Token without signing is rejected with "Request signature is required".
     ///
-    /// State Node 側は読み取り時にこの署名メッセージを検証する
-    /// （`verify_read_access` → `verify_caller_signature("read", content_id, ..)`）。
-    /// 署名を content_id にバインドすることで、relay 先ノード等に渡った署名を
-    /// 他コンテンツの読み取りに再利用されることを防ぐ。
+    /// The State Node verifies this signed message on read
+    /// (`verify_read_access` → `verify_caller_signature("read", content_id, ..)`).
+    /// Binding the signature to content_id prevents a signature handed to a relay node etc.
+    /// from being reused to read other content.
     fn resolve_state_read_auth<T>(
         &self,
         auth: Option<&StateNodeAuthContext>,
@@ -160,9 +162,9 @@ impl MonasController {
         })
     }
 
-    /// コンテンツの最新バージョン（CID）を取得する。
+    /// Gets the latest version (CID) of a content.
     ///
-    /// `auth` は State Node の `GET /content/:id/history` に転送する認証ヘッダ。本番では `Some` が必要。
+    /// `auth` is the auth header forwarded to the State Node's `GET /content/:id/history`. `Some` is required in production.
     pub fn get_latest_version(
         &self,
         input: GetLatestVersionInput,
@@ -208,9 +210,9 @@ impl MonasController {
         )
     }
 
-    /// コンテンツの更新履歴を取得する。
+    /// Gets the update history of a content.
     ///
-    /// `auth` は State Node の `GET /content/:id/history` に転送する認証ヘッダ。本番では `Some` が必要。
+    /// `auth` is the auth header forwarded to the State Node's `GET /content/:id/history`. `Some` is required in production.
     pub fn get_history(
         &self,
         input: GetHistoryInput,
@@ -240,7 +242,7 @@ impl MonasController {
             Err(e) => return e,
         };
 
-        // limit はState Node側に無いので、SDK側で適用（末尾=最新側を優先）
+        // limit does not exist on the State Node side, so apply it in the SDK (prefer the tail = newest side)
         let mut versions = history.versions;
         let limit = input.limit as usize;
         if limit > 0 && versions.len() > limit {
@@ -256,8 +258,8 @@ impl MonasController {
         )
     }
 
-    /// 検証付き read の本体。`read_content_from_state_node` と
-    /// `pull_content_from_state_node` が共有する。読んだ版 CID と検証結果を返す。
+    /// Body of the verified read. Shared by `read_content_from_state_node` and
+    /// `pull_content_from_state_node`. Returns the version CID read and the verification result.
     #[allow(clippy::too_many_arguments)]
     fn verified_read_from_state_node<T>(
         &self,
@@ -271,10 +273,11 @@ impl MonasController {
         let auth = self.resolve_state_read_auth::<T>(auth, content_id, &trace_id)?;
         let auth = auth.as_ref();
 
-        // 版の決定。明示指定が無ければ履歴の最新を読む。
-        // 履歴は署名も系列検証も無いため「どの版を読むか」の選択にしか使えない。
-        // 選ばれた版の payload は下の CID 検証が守るが、その版が最新である
-        // ことは保証されない(上記「保証範囲」を参照)。
+        // Decide the version. Without an explicit one, read the latest in the history.
+        // The history has neither signatures nor series verification, so it can only be used to
+        // choose "which version to read". The chosen version's payload is protected by the CID
+        // verification below, but that version being the latest is not guaranteed
+        // (see "Guarantee scope" above).
         let version = match version {
             Some(v) => v.to_string(),
             None => self
@@ -285,7 +288,7 @@ impl MonasController {
                 .unwrap_or_else(|| content_id.to_string()),
         };
 
-        // Node CBOR の取得 + CID 検証(A)
+        // Fetch the Node CBOR + CID verification (A)
         let state_node_data =
             self.get_state_node_version_data::<T>(content_id, &version, auth, trace_id.clone())?;
 
@@ -299,21 +302,21 @@ impl MonasController {
             }
         };
 
-        // CID 再計算による改ざん検証 + CEK ロード + AES-GCM 復号 + plain CID 照合
+        // Tamper verification by CID recomputation + CEK load + AES-GCM decryption + plain CID check
         //
-        // 検証は `verify_and_decrypt_relay_read` の中で必ず最初に走るので、
-        // ここで先に `verify_and_extract` を呼ぶ必要はない(同じ引数で 2 回
-        // 走らせていた)。検証は content 層の責務として一箇所に置く。
+        // Verification always runs first inside `verify_and_decrypt_relay_read`, so there is no
+        // need to call `verify_and_extract` here beforehand (it used to run twice with the same
+        // arguments). Verification lives in one place as the content layer's responsibility.
         //
-        // CEK は「送信者ピンの権威レコード」を優先する。CEK ストアは、その
-        // レコードから導出されるキャッシュに過ぎず、CAS 成功後の書き込み順が
-        // 入れ替わると古い世代へ巻き戻り得る(世代 N の handler が CAS 後に
-        // 停止し、その間に N+1 が権威レコードとキャッシュを進め、その後 N が
-        // 再開してキャッシュだけを N に戻す)。権威レコードから直接引けば、
-        // その巻き戻りは read に影響しない。
+        // For the CEK, prefer the "authoritative sender-pin record". The CEK store is merely a
+        // cache derived from that record, and if the write order after a successful CAS gets
+        // swapped it can roll back to an older epoch (the epoch N handler stalls after its CAS,
+        // meanwhile N+1 advances the authoritative record and the cache, then N resumes and
+        // reverts only the cache to N). Reading directly from the authoritative record keeps
+        // that rollback from affecting reads.
         //
-        // owner の読み取りは、ファイルの記録の CEK と plainCid を使う
-        // (送信者ピンは受信者側のもの)。
+        // An owner read uses the CEK and plainCid from the file's record
+        // (the sender pin is a recipient-side thing).
         let local_content_id = match reader {
             StateReader::Owner { file_id } => {
                 let read = self
@@ -334,9 +337,9 @@ impl MonasController {
         let local_id = ContentId::new(local_content_id.to_string());
 
         //
-        // ピンは系列ID(= ここでの `content_id`)でも版ID(`local_content_id`)でも
-        // 保存され得る: share 受信者は `remote_content_id` を渡して系列IDに、
-        // それを渡さない古い呼び出しは版IDに。系列を先に引く。
+        // The pin may be stored under either the series ID (= `content_id` here) or the version
+        // ID (`local_content_id`): share recipients pass `remote_content_id` and get the series
+        // ID; older calls that don't pass it get the version ID. Look up the series first.
         let pinned_cek = {
             let load = |key: &str| self.sender_pin_store.load(key);
             let by_series = load(content_id);
@@ -357,10 +360,10 @@ impl MonasController {
                 }
             }
         };
-        // share 受信者は「共有された版の id」の下に CEK を持つが、owner がその後に
-        // 書いた版の平文 CID は知り得ない。`accept_any_version` ではその照合を
-        // 省き、復号した平文が実際に指す id を返す(Node CID と AES-GCM の検証は
-        // そのまま)。
+        // A share recipient holds the CEK under "the id of the shared version", but cannot know
+        // the plaintext CID of versions the owner wrote afterwards. `accept_any_version` skips
+        // that check and returns the id the decrypted plaintext actually points to (the Node CID
+        // and AES-GCM verification remain as-is).
         let read = if accept_any_version {
             self.content_service
                 .verify_and_decrypt_relay_read_any_version(
@@ -384,24 +387,29 @@ impl MonasController {
         Ok((version, read))
     }
 
-    /// State Node から content を読み、検証・復号して平文を返す(検証付き read)。
+    /// Reads content from the State Node, verifies and decrypts it, and returns the plaintext
+    /// (verified read).
     ///
-    /// `docs/design.md` §10「read応答の完全性検証」の実 read 経路。処理フロー:
-    /// 1. `read:{content_id}:{timestamp}` 署名の認証コンテキストを解決
-    /// 2. 版を決定(`input.version` 指定があればその版、無ければ履歴の最新)
-    /// 3. Node CBOR を取得し、CID 再計算で改ざん検証
-    /// 4. ローカル cek_store から CEK を引き、AES-GCM 復号 + plain CID 照合
+    /// The actual read path for `docs/design.md` §10 "read response integrity
+    /// verification". Flow:
+    /// 1. Resolve the auth context for the read request signature (`monas-request-v1` message,
+    ///    operation `read`, resource `content_id`)
+    /// 2. Decide the version (the version given in `input.version` if any, otherwise the latest
+    ///    in the history)
+    /// 3. Fetch the Node CBOR and verify against tampering by recomputing the CID
+    /// 4. Look up the CEK from the local cek_store, AES-GCM decrypt + plain CID check
     ///
-    /// CEK は「自分が作成した content」または「share の KeyEnvelope を処理済みの
-    /// content」(`decrypt_shared_content` が保存する)についてローカルに存在する。
+    /// The CEK exists locally for "content you created" or "content whose share KeyEnvelope
+    /// has been processed" (stored by `decrypt_shared_content`).
     ///
-    /// **保証範囲**: 検証できるのは「返された Node の payload が、要求した版 CID に
-    /// 対して真正であること」まで。「その版が本当に最新か」「正規の writer が書いた
-    /// 版か」は保証しない — 版メタデータ(parents 等)に真正性が無く、観測済みの
-    /// 正規暗号文を任意の parents で包み直した Node は CID 検証を通過するため。
-    /// 版の真正性とロールバック耐性には owner 署名等の trust anchor が必要
-    /// (issue #59)。分散システムである以上、sync 遅延による stale read は
-    /// 正常な挙動であり、それと攻撃を応答単体で区別することはできない。
+    /// **Guarantee scope**: what can be verified is only that "the returned Node's payload is
+    /// authentic for the requested version CID". It does not guarantee "that the version is
+    /// really the latest" or "that the version was written by a legitimate writer" — version
+    /// metadata (parents, etc.) has no authenticity, and a Node that rewraps an observed
+    /// legitimate ciphertext with arbitrary parents passes CID verification.
+    /// Version authenticity and rollback resistance require a trust anchor such as an owner
+    /// signature (issue #59). In a distributed system, stale reads due to sync delay are
+    /// normal behavior and cannot be distinguished from an attack by a single response.
     pub fn read_content_from_state_node(
         &self,
         input: ReadContentFromStateNodeInput,
@@ -454,18 +462,18 @@ impl MonasController {
         )
     }
 
-    /// State Node の head を owner のローカルレコードへ取り込む(pull)。
+    /// Adopts the State Node head into the owner's local record (pull).
     ///
-    /// write 権限を委譲した受信者が書いた版は State Node にだけあり、owner の
-    /// ローカルレコードは古いまま。owner の `update_content` / `revoke_share`
-    /// (再暗号化)はローカル平文から再発行するので、その前にこれを呼ばないと
-    /// 受信者の版を黙って上書きする。`revoke_share` は `remote_content_id` と
-    /// `auth` があれば自分で呼ぶ。
+    /// Versions written by a recipient who was delegated write permission exist only on the
+    /// State Node, and the owner's local record stays stale. The owner's `update_content` /
+    /// `revoke_share` (re-encryption) reissue from the local plaintext, so not calling this
+    /// first silently overwrites the recipient's version. `revoke_share` calls it itself if
+    /// `remote_content_id` and `auth` are present.
     ///
-    /// 検証付き read(Node CID 再計算 + 自分の CEK での AES-GCM 復号)を通った
-    /// 版だけを取り込み、暗号文は State Node のものをそのまま保存する
-    /// (`verify_integrity` が一致し続ける)。head がローカル版と同じなら
-    /// `adopted: false` で平文だけ返す。
+    /// Adopts only versions that pass the verified read (Node CID recomputation + AES-GCM
+    /// decryption with our own CEK), and stores the State Node's ciphertext as-is
+    /// (so `verify_integrity` keeps matching). If the head is the same as the local version,
+    /// returns only the plaintext with `adopted: false`.
     pub fn pull_content_from_state_node(
         &self,
         input: PullContentFromStateNodeInput,
@@ -482,9 +490,9 @@ impl MonasController {
                 trace_id,
             );
         }
-        // 取り込みは記録を書き換えるので、同じファイルへの他の書き込み
-        // (update・delete・revoke)と同じロックで直列化する。revoke は
-        // `adopt_remote_head` をロックを持ったまま呼ぶので、ロックはここで取る。
+        // Adoption rewrites the record, so serialize it with other writes to the same file
+        // (update, delete, revoke) under the same lock. revoke calls
+        // `adopt_remote_head` while holding the lock, so the lock is taken here.
         let _file_guard = self.content_revoke_locks.lock(&input.file_id);
         match self.adopt_remote_head::<PullContentFromStateNodeOutput>(
             &input.content_id,
@@ -506,12 +514,12 @@ impl MonasController {
         }
     }
 
-    /// `pull_content_from_state_node` の本体。`revoke_share` からも呼ぶ。
+    /// Body of `pull_content_from_state_node`. Also called from `revoke_share`.
     ///
-    /// head がファイルの記録と違えば(plainCid か暗号文が違えば)
-    /// `ContentService::adopt_version` で記録を head へ進める。記録・CEK・
-    /// 共有設定はファイルのキーで持つので、plainCid が変わっても引き継ぐ
-    /// ものは無い。
+    /// If the head differs from the file's record (plainCid or ciphertext differs), advances
+    /// the record to the head via `ContentService::adopt_version`. The record, CEK, and
+    /// share settings are keyed by the file key, so nothing needs to be carried over even if
+    /// the plainCid changes.
     pub(super) fn adopt_remote_head<T>(
         &self,
         content_id: &str,
@@ -562,9 +570,9 @@ impl MonasController {
         })
     }
 
-    /// `verify_and_decrypt_relay_read` のエラーを、呼び出し側が対処を判断できる
-    /// `ApiError` へ写像する。特に「CEK が無い」「CEK が合わない」は
-    /// share / rotation / revoke のどの状況かをメッセージで区別する。
+    /// Maps errors from `verify_and_decrypt_relay_read` to an `ApiError` the caller can act
+    /// on. In particular, "no CEK" and "CEK mismatch" distinguish via the message which of
+    /// share / rotation / revoke the situation is.
     fn map_verified_read_error(
         e: monas_content::application_service::content_service::VerifiedReadError,
         local_content_id: &str,
@@ -601,14 +609,14 @@ impl MonasController {
         }
     }
 
-    /// 取得したコンテンツの整合性を検証する。
+    /// Verifies the integrity of the fetched content.
     ///
-    /// `auth` は State Node の履歴・バージ取得 API に転送する認証ヘッダ。本番では `Some` が必要。
+    /// `auth` is the auth header forwarded to the State Node history / version fetch APIs. `Some` is required in production.
     ///
-    /// 処理フロー:
-    /// 1. コンテンツのハッシュを計算
-    /// 2. State Nodeから取得した情報と比較
-    /// 3. 一致すれば valid: true
+    /// Flow:
+    /// 1. Compute the content hash
+    /// 2. Compare with the information fetched from the State Node
+    /// 3. valid: true if they match
     pub fn verify_integrity(
         &self,
         input: VerifyIntegrityInput,
@@ -692,11 +700,11 @@ impl MonasController {
             }
         };
 
-        // State Node は read 応答として「Node 全体(CBOR)」を返す。まず CID を
-        // 再計算して version と一致することを検証し(改ざん検知)、その上で
-        // payload の暗号文を取り出す(§8.1)。照合先はクライアントが選択した
-        // version に固定する。応答内の version は自己申告なので、それに対して
-        // 照合すると任意の Node + その CID を返すだけで検証が通ってしまう。
+        // The State Node returns "the whole Node (CBOR)" as the read response. First recompute
+        // the CID and verify it matches version (tamper detection), then extract the payload
+        // ciphertext (§8.1). The comparison target is pinned to the version chosen by the
+        // client. The version inside the response is self-reported, so comparing against it
+        // would let verification pass by simply returning any Node + its CID.
         let state_bytes = match monas_content::infrastructure::node_verification::verify_and_extract(
             &node_bytes,
             &version_to_check,
@@ -714,9 +722,9 @@ impl MonasController {
             }
         };
 
-        // State Node が保持するのは SDK が送信した「暗号文」なので、
-        // file_id があればそのファイルの記録の暗号文とバイト比較する。
-        // （平文 `content` と State Node のバイト列は一致し得ない。）
+        // What the State Node holds is the "ciphertext" the SDK sent, so
+        // if a file_id is given, compare bytes against the ciphertext in that file's record.
+        // (The plaintext `content` can never match the State Node's bytes.)
         let (valid, reason) = if let Some(local_id) = input.file_id.as_deref() {
             match self.content_service.fetch_encrypted(
                 monas_content::domain::content_id::ContentId::new(local_id.to_string()),

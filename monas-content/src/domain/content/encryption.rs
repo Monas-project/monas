@@ -1,19 +1,21 @@
 use crate::domain::content::ContentError;
 
-/// コンテンツ暗号化に用いる共有鍵 (CEK: Content Encryption Key) を表す値オブジェクト。
+/// Value object representing the symmetric key used for content encryption (CEK: Content
+/// Encryption Key).
 ///
-/// 具体的な鍵素材の生成アルゴリズムや長さ（AES-256 など）は infra 側の実装に委ねる。
+/// The concrete key material generation algorithm and length (e.g. AES-256) are left to the infra
+/// implementation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContentEncryptionKey(pub Vec<u8>);
 
-/// CEK を生成するためのポート。
+/// Port for generating CEKs.
 pub trait ContentEncryptionKeyGenerator {
     fn generate(&self) -> ContentEncryptionKey;
 }
 
-/// CEK を用いてコンテンツを暗号化/復号するためのポート。
+/// Port for encrypting/decrypting content with a CEK.
 ///
-/// 実装は AES-GCM などの AEAD を用いる infra 層に置く想定。
+/// Implementations are expected to live in the infra layer, using an AEAD such as AES-GCM.
 pub trait ContentEncryption {
     fn encrypt(
         &self,

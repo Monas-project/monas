@@ -34,10 +34,10 @@ use monas_content::infrastructure::{
 
 use super::MonasController;
 
-/// ContentServiceの型エイリアス（可読性向上のため）。
+/// Type alias for ContentService (for readability).
 ///
-/// CEK ストアは `Arc<dyn ContentEncryptionKeyStore + Send + Sync>` を受けるので、
-/// 実行時に in-memory / sled などの persistence backend を切り替えられる。
+/// The CEK store takes `Arc<dyn ContentEncryptionKeyStore + Send + Sync>`, so the persistence
+/// backend (in-memory / sled, etc.) can be switched at runtime.
 pub(super) type ContentServiceInstance = ContentService<
     Sha256ContentIdGenerator,
     MultiStorageRepository,
@@ -46,7 +46,7 @@ pub(super) type ContentServiceInstance = ContentService<
     DynCekStore,
 >;
 
-/// SDK が共通で使う CEK ストアの動的型。
+/// Dynamic type of the CEK store shared by the SDK.
 pub(super) type DynCekStore = std::sync::Arc<
     dyn monas_content::application_service::content_service::ContentEncryptionKeyStore
         + Send
@@ -79,15 +79,15 @@ impl MonasController {
         req
     }
 
-    /// Domain separation tag. State Node 側 `REQUEST_SIGNATURE_DOMAIN` と一致させる。
+    /// Domain separation tag. Must match `REQUEST_SIGNATURE_DOMAIN` on the State Node side.
     const REQUEST_SIGNATURE_DOMAIN: &'static str = "monas-request-v1";
 
-    /// リクエスト署名の署名対象を組み立てる。
+    /// Builds the signing target of a request signature.
     ///
-    /// body の有無によらず operation / resource / timestamp に必ず束縛し、
-    /// body がある場合はその digest も含める。State Node 側
-    /// (`RequestMetadata::signing_message_with_body_digest`)と同一形式でなければ
-    /// 署名検証が通らないため、変更するときは両方を揃えること。
+    /// Always binds to operation / resource / timestamp regardless of whether there is a body,
+    /// and also includes the body's digest when present. Signature verification fails unless
+    /// this matches the State Node side (`RequestMetadata::signing_message_with_body_digest`)
+    /// exactly, so keep both in sync when changing it.
     fn build_request_signature_message(
         operation: &str,
         resource: &str,
@@ -170,11 +170,11 @@ impl MonasController {
         })
     }
 
-    /// body を伴う書き込み(create / update)の署名を用意する。
+    /// Prepares the signature for a write that carries a body (create / update).
     ///
-    /// `operation` / `resource` は State Node 側が
-    /// `verify_caller_signature` へ渡す値と一致させること
-    /// (create は `("create", "content")`、update は `("update", content_id)`)。
+    /// `operation` / `resource` must match the values the State Node side passes to
+    /// `verify_caller_signature`
+    /// (create is `("create", "content")`, update is `("update", content_id)`).
     pub(super) fn prepare_state_node_content_auth<T>(
         &self,
         auth: Option<&StateNodeAuthContext>,
@@ -238,7 +238,7 @@ impl MonasController {
         }
     }
 
-    /// HTTP ステータスが 2xx でなければ `Some(エラー)`。2xx のときは `None`。
+    /// `Some(error)` if the HTTP status is not 2xx; `None` when it is 2xx.
     pub(super) fn try_state_node_http_error<T>(
         status: u16,
         body: &str,
@@ -260,7 +260,7 @@ impl MonasController {
         ))
     }
 
-    /// FetchErrorをApiErrorにマッピング
+    /// Maps FetchError to ApiError
     fn map_fetch_error(e: FetchError) -> ApiError {
         match e {
             FetchError::NotFound => ApiError::NotFound("Content not found".into()),
@@ -274,7 +274,7 @@ impl MonasController {
         }
     }
 
-    /// UpdateErrorをApiErrorにマッピング
+    /// Maps UpdateError to ApiError
     fn map_update_error(e: UpdateError) -> ApiError {
         match e {
             UpdateError::NotFound => ApiError::NotFound("Content not found".into()),
@@ -288,7 +288,7 @@ impl MonasController {
         }
     }
 
-    /// DeleteErrorをApiErrorにマッピング
+    /// Maps DeleteError to ApiError
     fn map_delete_error(e: DeleteError) -> ApiError {
         match e {
             DeleteError::NotFound => ApiError::NotFound("Content not found".into()),
@@ -298,8 +298,8 @@ impl MonasController {
         }
     }
 
-    /// content_idのバリデーション
-    /// エラーがある場合はSome(ApiResponse)を返し、成功時はNoneを返す
+    /// Validates content_id
+    /// Returns Some(ApiResponse) on error, None on success
     fn validate_content_id<T>(content_id: &str, trace_id: String) -> Option<ApiResponse<T>> {
         if content_id.is_empty() {
             return Some(ApiResponse::error(
@@ -310,8 +310,8 @@ impl MonasController {
         None
     }
 
-    /// base64urlデコードされたコンテンツのバリデーション
-    /// エラーがある場合はApiResponse<T>を返し、成功時はVec<u8>を返す
+    /// Validates the base64url-decoded content
+    /// Returns ApiResponse<T> on error, Vec<u8> on success
     pub(super) fn decode_and_validate_content<T>(
         content_base64url: &str,
         trace_id: String,
@@ -395,8 +395,9 @@ impl MonasController {
             .map_err(Self::map_delete_error)
     }
 
-    /// State Node に `POST /content` を送る（`http_api::create_content` と同じ契約）。
-    /// 成功時は State Node が返した content_id（空文字は `None`）を返す。
+    /// Sends `POST /content` to the State Node (same contract as `http_api::create_content`).
+    /// On success, returns the content_id returned by the State Node (always `Some`; an empty
+    /// response body or an empty content_id is returned as `Err`).
     fn send_create_to_state_node<T>(
         &self,
         encrypted_content: &[u8],
@@ -470,8 +471,9 @@ impl MonasController {
 
         match serde_json::from_str::<StateNodeCreateContentResponse>(&body) {
             Ok(parsed) => {
-                // 空 content_id は update/delete 以降で必須のキーとなるため成功扱いにしない。
-                // silent に None を返すと「二度と操作できないコンテンツ」を量産してしまう。
+                // An empty content_id is not treated as success, since it is the key required by
+                // update/delete onward. Silently returning None would mass-produce "content that
+                // can never be operated on again".
                 if parsed.content_id.trim().is_empty() {
                     return Err(ApiResponse::error(
                         ApiError::Internal("State Node responded without content_id".into()),
@@ -487,7 +489,7 @@ impl MonasController {
         }
     }
 
-    /// State Node に `PUT /content/:id` を送る（`http_api::update_content` と同じ契約）。
+    /// Sends `PUT /content/:id` to the State Node (same contract as `http_api::update_content`).
     pub(super) fn send_update_to_state_node<T>(
         &self,
         content_id: &str,
@@ -517,13 +519,13 @@ impl MonasController {
         )
     }
 
-    /// `PUT /content/:id` を、署名済みの認証コンテキストでそのまま送る。
+    /// Sends `PUT /content/:id` as-is with an already-signed auth context.
     ///
-    /// owner の update は [`send_update_to_state_node`] が account 鍵で署名して
-    /// ここへ来る。share 受信者の update(`update_shared_content`)も同じ
-    /// メッセージに account 鍵で署名するが、Authorization は owner の
-    /// `user:<pubkey>` ではなく委譲 Token の `Bearer` のままにするので、
-    /// 署名の付け方を呼び出し側に委ねている。
+    /// An owner's update reaches here via [`send_update_to_state_node`], which signs with the
+    /// account key. A share recipient's update (`update_shared_content`) also signs the same
+    /// message with the account key, but keeps Authorization as the delegated Token's
+    /// `Bearer` rather than the owner's `user:<pubkey>`, so how the signature is attached is
+    /// left to the caller.
     pub(super) fn send_signed_update_to_state_node<T>(
         &self,
         content_id: &str,
@@ -599,17 +601,19 @@ impl MonasController {
         }
     }
 
-    /// State Node に `POST /content/:id/access/invalidate` を送る
-    /// （`http_api::invalidate_tokens_handler` と同じ契約）。
+    /// Sends `POST /content/:id/access/invalidate` to the State Node
+    /// (same contract as `http_api::invalidate_tokens_handler`).
     ///
-    /// `min_valid_issued_at` をサーバ時刻へ進め、それ以前に発行された委譲 Token を
-    /// 一括失効させる。revoke で CEK をローテーションしても、取り消された受信者の
-    /// 委譲 write Token は TTL 満了まで有効なまま残るため、これを呼ばないと
-    /// 「取り消したはずの相手が新しい状態へ書き込み続けられる」。
+    /// Advances `min_valid_issued_at` to the server time, revoking in bulk all delegated Tokens
+    /// issued at or before it. Even if revoke rotates the CEK, a revoked recipient's delegated
+    /// write Token stays valid until its TTL expires, so without calling this "the party that
+    /// should have been revoked can keep writing to the new state".
     ///
-    /// 戻り値は成功時の `new_min_valid_issued_at`。失敗時は `Err` に
-    /// `ApiResponse` を入れて返す（`send_*_to_state_node` 系と違い、
-    /// 呼び出し側で必ず結果を扱わせるため）。
+    /// On success returns `Some((new_min_valid_issued_at, reach))`. `reach` reports which
+    /// members received the new boundary, and is `None` when the State Node predates propagation
+    /// reporting (unknown, not "reached everyone"). Returns `Ok(None)` if the response body is
+    /// empty. On failure, returns the `ApiResponse` in `Err` (unlike the `send_*_to_state_node`
+    /// family, to force the caller to always handle the result).
     pub(super) fn send_invalidate_to_state_node<T>(
         &self,
         content_id: &str,
@@ -690,7 +694,7 @@ impl MonasController {
         }
     }
 
-    /// State Node に `DELETE /content/:id` を送る（`http_api::delete_content` と同じ契約）。
+    /// Sends `DELETE /content/:id` to the State Node (same contract as `http_api::delete_content`).
     fn send_delete_to_state_node<T>(
         &self,
         content_id: &str,
@@ -753,20 +757,20 @@ impl MonasController {
             )),
         }
     }
-    /// 新しいコンテンツを作成し、State Node に登録する。
+    /// Creates new content and registers it with the State Node.
     ///
-    /// `auth` は State Node に転送する認証ヘッダ（ゲートウェイ等から透過）。本番では `Some` が必要。
+    /// `auth` is the auth header forwarded to the State Node (passed through from the gateway etc.). `Some` is required in production.
     ///
-    /// 処理フロー:
-    /// 1. 入力のバリデーション（content, metadata.name）
-    /// 2. コンテンツをbase64urlデコード
-    /// 3. ContentService::createを呼び出して以下を実行:
-    ///    - ファイルのキー(file_id)と版の plainCid の生成
-    ///    - コンテンツの暗号化
-    ///    - 暗号化コンテンツをリポジトリに保存
-    ///    - CEKをキーストアに保存
-    /// 4. State Nodeに暗号化されたコンテンツを送信
-    /// 5. 結果を返却
+    /// Flow:
+    /// 1. Validate input (content, metadata.name)
+    /// 2. base64url-decode the content
+    /// 3. Call ContentService::create, which does:
+    ///    - generate the file key (file_id) and the version's plainCid
+    ///    - encrypt the content
+    ///    - store the encrypted content in the repository
+    ///    - store the CEK in the key store
+    /// 4. Send the encrypted content to the State Node
+    /// 5. Return the result
     pub fn create_content(
         &self,
         input: CreateContentInput,
@@ -865,18 +869,18 @@ impl MonasController {
         ApiResponse::success(output, trace_id)
     }
 
-    /// 通常コンテンツをローカル状態から取得し、復号する
+    /// Fetches normal content from local state and decrypts it
     ///
-    /// 処理フロー:
-    /// 1. 入力のバリデーション（content_id）
-    /// 2. ContentIdに変換
-    /// 3. ContentService::fetchを呼び出して以下を実行:
-    ///    - リポジトリから暗号化されたコンテンツを取得
-    ///    - キーストアからCEKを取得
-    ///    - CEKでコンテンツを復号
-    /// 4. 復号されたコンテンツをbase64urlエンコード
-    /// 5. メタデータを変換
-    /// 6. 結果を返却
+    /// Flow:
+    /// 1. Validate input (content_id)
+    /// 2. Convert to ContentId
+    /// 3. Call ContentService::fetch, which does:
+    ///    - fetch the encrypted content from the repository
+    ///    - fetch the CEK from the key store
+    ///    - decrypt the content with the CEK
+    /// 4. base64url-encode the decrypted content
+    /// 5. Convert the metadata
+    /// 6. Return the result
     pub fn get_content(&self, input: GetContentInput) -> ApiResponse<GetContentOutput> {
         let trace_id = generate_trace_id();
 
@@ -913,21 +917,21 @@ impl MonasController {
         ApiResponse::success(output, trace_id)
     }
 
-    /// 既存のコンテンツを更新する。
+    /// Updates existing content.
     ///
-    /// `auth` は State Node に転送する認証ヘッダ（ゲートウェイ等から透過）。本番では `Some` が必要。
+    /// `auth` is the auth header forwarded to the State Node (passed through from the gateway etc.). `Some` is required in production.
     ///
-    /// 処理フロー:
-    /// 1. 入力のバリデーション（local_content_id, remote_content_id, contentまたはmetadata.name）
-    /// 2. ContentIdに変換（更新元の版IDを保存）
-    /// 3. 更新内容を準備（new_name, new_raw_content）
-    /// 4. ContentService::updateを呼び出して以下を実行:
-    ///    - 既存コンテンツを取得
-    ///    - 新しいコンテンツがある場合は暗号化
-    ///    - リポジトリに保存
-    ///    - CEKを更新（必要に応じて）
-    /// 5. State Nodeに暗号化されたコンテンツを送信
-    /// 6. 結果を返却
+    /// Flow:
+    /// 1. Validate input (local_content_id, remote_content_id, content or metadata.name)
+    /// 2. Convert to ContentId (keep the source version ID)
+    /// 3. Prepare the update (new_name, new_raw_content)
+    /// 4. Call ContentService::update, which does:
+    ///    - fetch the existing content
+    ///    - encrypt the new content if present
+    ///    - store it in the repository
+    ///    - update the CEK (as needed)
+    /// 5. Send the encrypted content to the State Node
+    /// 6. Return the result
     pub fn update_content(
         &self,
         input: UpdateContentInput,
@@ -935,7 +939,7 @@ impl MonasController {
     ) -> ApiResponse<UpdateContentOutput> {
         let trace_id = generate_trace_id();
 
-        // 1. 入力のバリデーション
+        // 1. Validate input
         if input.file_id.is_empty() {
             return ApiResponse::error(
                 ApiError::Validation("file_id must not be empty".into()),
@@ -949,13 +953,13 @@ impl MonasController {
             );
         }
 
-        // 2. ファイルのキーで記録を取る(失敗時はこの記録と CEK をそのまま戻す)。
+        // 2. Take the record by file key (on failure, restore this record and the CEK as-is).
         //
-        // 記録・CEK はファイルごとに 1 件なので、巻き戻しは「保存前の記録を
-        // 丸ごと戻す」になる。同じファイルへの他の書き込み(別タブの保存・
-        // revoke・削除・取り込み)と並行させると、こちらの失敗の巻き戻しが
-        // その間に成功した書き込みを消す。revoke と同じファイル単位のロックで、
-        // 記録の取得から State Node への送信・巻き戻しまでを直列化する。
+        // The record and CEK are one entry per file, so a rollback means "restore the whole
+        // pre-save record". If run concurrently with other writes to the same file (a save from
+        // another tab, revoke, delete, adoption), rolling back our failure would erase a write
+        // that succeeded in between. Using the same per-file lock as revoke, serialize
+        // everything from taking the record through sending to the State Node and rolling back.
         let content_id = ContentId::new(input.file_id.clone());
         let _file_guard = self.content_revoke_locks.lock(content_id.as_str());
         let before_update = match self.capture_stored_content_snapshot(&content_id) {
@@ -964,20 +968,20 @@ impl MonasController {
         };
         let base_version_id = before_update.content.raw_id().as_str().to_string();
 
-        // 3. new_nameとnew_raw_contentを準備
+        // 3. Prepare new_name and new_raw_content
         let new_name = input.metadata.as_ref().and_then(|m| m.name.clone());
 
         let new_raw_content = if input.content.is_empty() {
             None
         } else {
-            // コンテンツをbase64urlデコード
+            // base64url-decode the content
             match Self::decode_and_validate_content(&input.content, trace_id.clone()) {
                 Ok(bytes) => Some(bytes),
                 Err(response) => return response,
             }
         };
 
-        // 4. new_nameとnew_raw_contentのどちらか一方以上が指定されていることを確認
+        // 4. Ensure at least one of new_name and new_raw_content is specified
         if new_name.is_none() && new_raw_content.is_none() {
             return ApiResponse::error(
                 ApiError::Validation(
@@ -1037,18 +1041,18 @@ impl MonasController {
         ApiResponse::success(output, trace_id)
     }
 
-    /// コンテンツを削除する。
+    /// Deletes content.
     ///
-    /// `auth` は State Node に転送する認証ヘッダ（ゲートウェイ等から透過）。本番では `Some` が必要。
+    /// `auth` is the auth header forwarded to the State Node (passed through from the gateway etc.). `Some` is required in production.
     ///
-    /// 処理フロー:
-    /// 1. 入力のバリデーション（content_id）
-    /// 2. ContentIdに変換
-    /// 3. ContentService::deleteを呼び出して以下を実行:
-    ///    - リポジトリからコンテンツを削除（論理削除）
-    ///    - キーストアからCEKを削除
-    /// 4. State Node へ削除を通知
-    /// 5. 結果を返却
+    /// Flow:
+    /// 1. Validate input (content_id)
+    /// 2. Convert to ContentId
+    /// 3. Call ContentService::delete, which does:
+    ///    - delete the content from the repository (logical delete)
+    ///    - delete the CEK from the key store
+    /// 4. Notify the State Node of the deletion
+    /// 5. Return the result
     pub fn delete_content(
         &self,
         input: DeleteContentInput,
@@ -1056,7 +1060,7 @@ impl MonasController {
     ) -> ApiResponse<DeleteContentOutput> {
         let trace_id = generate_trace_id();
 
-        // 1. 入力のバリデーション
+        // 1. Validate input
         if let Some(response) = Self::validate_content_id(&input.file_id, trace_id.clone()) {
             return response;
         }
@@ -1067,11 +1071,11 @@ impl MonasController {
             );
         }
 
-        // 2. ファイルのキーで記録と CEK を取る。State Node が削除を拒否したら
-        //    これをそのまま戻す(作り直さないので、ファイルのキー・CEK・暗号文・
-        //    共有設定は削除前と同じ)。
+        // 2. Take the record and CEK by file key. If the State Node rejects the deletion,
+        //    restore them as-is (nothing is recreated, so the file key, CEK, ciphertext, and
+        //    share settings are the same as before the deletion).
         let content_id = ContentId::new(input.file_id.clone());
-        // update と同じ理由で、同じファイルへの書き込みと直列化する。
+        // For the same reason as update, serialize with writes to the same file.
         let _file_guard = self.content_revoke_locks.lock(content_id.as_str());
 
         let snapshot = match self.capture_stored_content_snapshot(&content_id) {
@@ -1079,16 +1083,16 @@ impl MonasController {
             Err(e) => return ApiResponse::error(e, trace_id),
         };
 
-        // 3. ContentServiceを使用
+        // 3. Use ContentService
         let content_service = &self.content_service;
 
-        // 4. DeleteContentCommandを作成
+        // 4. Create the DeleteContentCommand
         let cmd = DeleteContentCommand {
             content_id,
             provider: None,
         };
 
-        // 5. ContentService::deleteを呼び出してコンテンツを削除
+        // 5. Call ContentService::delete to delete the content
         let result = match content_service.delete(cmd) {
             Ok(result) => result,
             Err(e) => {
@@ -1136,7 +1140,7 @@ mod tests {
         let base = MonasController::build_request_signature_message("delete", "c1", 42, None);
         assert!(base.starts_with("monas-request-v1:"), "msg={base}");
 
-        // 4 つのフィールドはどれが変わっても署名対象が変わる
+        // Changing any of the 4 fields changes the signing target
         assert_ne!(
             base,
             MonasController::build_request_signature_message("read", "c1", 42, None)
@@ -1156,13 +1160,13 @@ mod tests {
         let with_body =
             MonasController::build_request_signature_message("update", "c1", 42, Some(b"abc"));
 
-        // body が変われば署名対象も変わる
+        // A different body changes the signing target too
         assert_ne!(
             with_body,
             MonasController::build_request_signature_message("update", "c1", 42, Some(b"abd"))
         );
-        // body 付きでも operation / resource に束縛される(cross-resource /
-        // cross-operation replay を防ぐ)
+        // Even with a body, it is bound to operation / resource (prevents cross-resource /
+        // cross-operation replay)
         assert_ne!(
             with_body,
             MonasController::build_request_signature_message("update", "c2", 42, Some(b"abc"))
@@ -1171,14 +1175,14 @@ mod tests {
             with_body,
             MonasController::build_request_signature_message("create", "c1", 42, Some(b"abc"))
         );
-        // body 有無も区別される
+        // Presence/absence of a body is also distinguished
         assert_ne!(
             with_body,
             MonasController::build_request_signature_message("update", "c1", 42, None)
         );
     }
 
-    /// 署名鍵が P-256 でないときは state node へ送る前に拒否する。
+    /// Rejects before sending to the state node when the signing key is not P-256.
     #[test]
     #[allow(deprecated)]
     fn state_node_signing_rejects_non_p256_account_key() {
@@ -1203,7 +1207,7 @@ mod tests {
         }
     }
 
-    /// 区切り文字を含む値でフィールド境界がずれない(長さ前置のおかげ)。
+    /// Values containing the delimiter do not shift field boundaries (thanks to length prefixes).
     #[test]
     fn request_signature_message_is_unambiguous_with_colons() {
         assert_ne!(

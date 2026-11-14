@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
 
-/// AuthToken のヘッダー
+/// AuthToken header
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AuthTokenHeader {
     /// Algorithm: "ES256" (P256 only)
@@ -30,37 +30,37 @@ impl Default for AuthTokenHeader {
     }
 }
 
-/// AuthToken のペイロード
+/// AuthToken payload
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AuthTokenPayload {
-    /// Issuer: 発行者のKeyId（"monas:type:id" 形式、例: "monas:user:alice"）
+    /// Issuer: KeyId of the issuer ("monas:type:id" format, e.g. "monas:user:alice")
     pub iss: String,
-    /// Audience: 受信者のKeyId（"monas:type:id" 形式、例: "monas:user:bob"）
+    /// Audience: KeyId of the recipient ("monas:type:id" format, e.g. "monas:user:bob")
     pub aud: String,
-    /// Expiration: 有効期限（Unix timestamp）
+    /// Expiration: expiry time (Unix timestamp)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exp: Option<u64>,
-    /// Issued At: 発行日時（Unix timestamp）
+    /// Issued At: issuance time (Unix timestamp)
     pub iat: u64,
-    /// JWT ID: 一意識別子（UUID v4）
+    /// JWT ID: unique identifier (UUID v4)
     pub jti: String,
-    /// Attenuations: 権限リスト
+    /// Attenuations: list of permissions
     pub att: Vec<Capability>,
-    /// Facts: 事実情報（オプション）
+    /// Facts: factual information (optional)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fct: Option<serde_json::Value>,
 }
 
-/// 単一の権限定義
+/// A single permission definition
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Capability {
-    /// Resource: リソース "monas://content/{id}"
+    /// Resource: resource "monas://content/{id}"
     pub with: String,
-    /// Action: アクション
+    /// Action: action
     pub can: CapabilityAction,
 }
 
-/// アクション種別（AuthToken用）
+/// Action kind (for AuthToken)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CapabilityAction {
     #[serde(rename = "read")]
@@ -87,7 +87,7 @@ impl CapabilityAction {
             AuthCapability::DeleteContent => Self::Delete,
             AuthCapability::ShareContent => Self::Share,
             AuthCapability::RevokeAccess => Self::Revoke,
-            AuthCapability::ManageMembers => Self::Share, // ManageMembersはShareに相当
+            AuthCapability::ManageMembers => Self::Share, // ManageMembers corresponds to Share
         }
     }
 
@@ -100,7 +100,7 @@ impl CapabilityAction {
             Self::Delete => AuthCapability::DeleteContent,
             Self::Share => AuthCapability::ShareContent,
             Self::Revoke => AuthCapability::RevokeAccess,
-            Self::Reencrypt => AuthCapability::ManageMembers, // 暫定マッピング
+            Self::Reencrypt => AuthCapability::ManageMembers, // provisional mapping
         }
     }
 
@@ -125,12 +125,12 @@ impl CapabilityAction {
     }
 }
 
-/// AuthToken 本体
+/// The AuthToken itself
 #[derive(Debug, Clone)]
 pub struct AuthToken {
     pub header: AuthTokenHeader,
     pub payload: AuthTokenPayload,
-    pub signature: Vec<u8>, // 署名（バイナリ形式）
+    pub signature: Vec<u8>, // signature (binary)
 }
 
 impl AuthToken {
@@ -143,7 +143,7 @@ impl AuthToken {
         }
     }
 
-    /// JWT文字列からパース
+    /// Parse from a JWT string
     ///
     /// # Format
     /// `<base64url(header)>.<base64url(payload)>.<base64url(signature)>`
@@ -182,7 +182,7 @@ impl AuthToken {
         })
     }
 
-    /// JWT文字列にエンコード
+    /// Encode into a JWT string
     pub fn to_jwt(&self) -> Result<String> {
         // JSON serialize
         let header_json = serde_json::to_string(&self.header)?;
@@ -196,7 +196,7 @@ impl AuthToken {
         Ok(format!("{}.{}.{}", header_b64, payload_b64, signature_b64))
     }
 
-    /// 署名対象メッセージ（header.payload）を取得
+    /// Get the signed message (header.payload)
     pub fn signing_message(&self) -> Result<Vec<u8>> {
         let header_json = serde_json::to_string(&self.header)?;
         let payload_json = serde_json::to_string(&self.payload)?;
@@ -238,7 +238,7 @@ impl AuthToken {
     }
 }
 
-/// AuthToken エラー型
+/// AuthToken error type
 #[derive(Debug, thiserror::Error)]
 pub enum AuthTokenError {
     #[error("Invalid JWT format: {0}")]

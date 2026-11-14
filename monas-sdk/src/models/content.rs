@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-/// コンテンツのメタデータ
+/// Content metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContentMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -17,23 +17,23 @@ pub struct ContentMetadata {
 // create_content
 // ============================================
 
-/// コンテンツ作成リクエスト
+/// Content creation request
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateContentInput {
-    /// コンテンツデータ（base64url）
+    /// Content data (base64url)
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<ContentMetadata>,
 }
 
-/// コンテンツ作成レスポンス
+/// Content creation response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateContentOutput {
-    /// このファイルのキー。端末だけで使う値で、以後の owner 側の操作
-    /// (取得・更新・削除・共有・取り消し・権限変更・state の取り込み)は
-    /// これで対象を指定する。state node や受信者には渡さない。
+    /// Key of this file. A value used only on the device; subsequent owner-side operations
+    /// (get, update, delete, share, revoke, permission change, state pull) specify the target
+    /// with this. Never passed to the state node or recipients.
     pub file_id: String,
-    /// 作成した版の plainCid(本文の SHA-256)。
+    /// plainCid of the created version (SHA-256 of the body).
     pub content_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_content_id: Option<String>,
@@ -45,19 +45,19 @@ pub struct CreateContentOutput {
 // get_content
 // ============================================
 
-/// コンテンツ取得リクエスト
+/// Content get request
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetContentInput {
-    /// 対象ファイルのキー(`CreateContentOutput::file_id`)。
+    /// Key of the target file (`CreateContentOutput::file_id`).
     pub file_id: String,
 }
 
-/// コンテンツ取得レスポンス
+/// Content get response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetContentOutput {
-    /// 今の版の plainCid。
+    /// plainCid of the current version.
     pub content_id: String,
-    /// 復号されたコンテンツ（base64url）
+    /// Decrypted content (base64url)
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<ContentMetadata>,
@@ -67,27 +67,27 @@ pub struct GetContentOutput {
 // update_content
 // ============================================
 
-/// コンテンツ更新リクエスト
+/// Content update request
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateContentInput {
-    /// 対象ファイルのキー(`CreateContentOutput::file_id`)
+    /// Key of the target file (`CreateContentOutput::file_id`)
     pub file_id: String,
-    /// State Node へ送る系列ID
+    /// Series ID sent to the State Node
     pub remote_content_id: String,
-    /// 新しいコンテンツデータ（base64url）
+    /// New content data (base64url)
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<ContentMetadata>,
 }
 
-/// コンテンツ更新レスポンス
+/// Content update response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateContentOutput {
-    /// 対象ファイルのキー(入力と同じ。編集では変わらない)
+    /// Key of the target file (same as the input; does not change on edit)
     pub file_id: String,
-    /// 更新前の版の plainCid
+    /// plainCid of the version before the update
     pub previous_version_id: String,
-    /// 更新後の版の plainCid
+    /// plainCid of the version after the update
     pub version_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
@@ -97,16 +97,16 @@ pub struct UpdateContentOutput {
 // delete_content
 // ============================================
 
-/// コンテンツ削除リクエスト
+/// Content deletion request
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeleteContentInput {
-    /// 対象ファイルのキー(`CreateContentOutput::file_id`)
+    /// Key of the target file (`CreateContentOutput::file_id`)
     pub file_id: String,
-    /// State Node へ送る系列ID
+    /// Series ID sent to the State Node
     pub remote_content_id: String,
 }
 
-/// コンテンツ削除レスポンス
+/// Content deletion response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeleteContentOutput {
     pub content_id: String,

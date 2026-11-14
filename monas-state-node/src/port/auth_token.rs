@@ -187,9 +187,9 @@ mod tests {
         assert_ne!(token1, token3);
     }
 
-    /// 署名対象が operation / resource / timestamp / body digest すべてに
-    /// 束縛されることの回帰テスト。ここが緩むと、ある content 向けに
-    /// 取得した署名を別 content や別 operation へ転用できてしまう。
+    /// Regression test that the signed message is bound to all of operation / resource /
+    /// timestamp / body digest. If this loosens, a signature obtained for one content could be
+    /// reused for another content or another operation.
     #[test]
     fn signing_message_binds_operation_resource_and_timestamp() {
         let base = RequestMetadata {
@@ -227,7 +227,7 @@ mod tests {
         let digest = "aa".repeat(32);
         let signed = update_c1.signing_message_with_body_digest(&digest);
 
-        // 同じ body でも別 resource / 別 operation なら署名対象が変わる
+        // Even with the same body, a different resource / operation changes the signed message
         let update_c2 = RequestMetadata {
             resource: "content-2".to_string(),
             ..update_c1.clone()
@@ -239,7 +239,7 @@ mod tests {
         assert_ne!(signed, update_c2.signing_message_with_body_digest(&digest));
         assert_ne!(signed, create_c1.signing_message_with_body_digest(&digest));
 
-        // body が変われば署名対象も変わる / body 有無も区別される
+        // A different body changes the signed message / body presence is also distinguished
         assert_ne!(
             signed,
             update_c1.signing_message_with_body_digest(&"bb".repeat(32))
@@ -247,8 +247,8 @@ mod tests {
         assert_ne!(signed, update_c1.signing_message());
     }
 
-    /// count ごとに異なるバイト列になること。ここが衝突すると、
-    /// ある count 用の署名を別の count へ転用できてしまう。
+    /// Each count must produce a different byte sequence. If they collide,
+    /// a signature for one count could be reused for another count.
     #[test]
     fn add_members_signing_body_is_distinct_per_count() {
         let bodies: Vec<Vec<u8>> = [0usize, 1, 2, 10, 100]
@@ -263,7 +263,7 @@ mod tests {
         assert_eq!(add_members_signing_body(3), b"add-members:count=3".to_vec());
     }
 
-    /// 長さ前置により、区切り文字を含む値でもフィールド境界がずれない。
+    /// Length prefixing keeps field boundaries intact even for values containing the delimiter.
     #[test]
     fn signing_message_is_unambiguous_with_colons() {
         let a = RequestMetadata {

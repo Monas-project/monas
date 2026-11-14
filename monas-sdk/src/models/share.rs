@@ -2,10 +2,10 @@ use serde::{Deserialize, Serialize};
 
 use super::content::ContentMetadata;
 
-/// 権限の種類
+/// Permission kind
 ///
-/// `#[non_exhaustive]` のため、将来 variant 追加時に下流の `match` が壊れないよう
-/// 必ず `_ =>` のフォールスルーを入れること。
+/// Because of `#[non_exhaustive]`, always include a `_ =>` fallthrough so downstream `match`
+/// does not break when a variant is added in the future.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 #[non_exhaustive]
@@ -14,18 +14,18 @@ pub enum Permission {
     Write,
 }
 
-/// KeyEnvelope（暗号化されたCEK + 関連データ）
+/// KeyEnvelope (encrypted CEK + associated data)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeyEnvelope {
-    /// HPKEのカプセル化された公開鍵（base64url）
+    /// HPKE encapsulated public key (base64url)
     pub enc: String,
-    /// 暗号化されたCEK（base64url）
+    /// Encrypted CEK (base64url)
     pub wrapped_cek: String,
-    /// 暗号化されたコンテンツ（base64url）
+    /// Encrypted content (base64url)
     pub ciphertext: String,
-    /// CEK の鍵世代。rotation(revoke)のたびに +1 される。wrap の AAD に
-    /// 束縛されているため書き換えると復号自体が失敗する。受信者は記録済み
-    /// 世代より古い envelope を拒否する(旧 CEK への巻き戻し replay 防止)。
+    /// Key epoch of the CEK. Incremented by 1 on every rotation (revoke). It is bound into the
+    /// wrap AAD, so tampering with it makes decryption itself fail. The recipient rejects
+    /// envelopes older than the recorded epoch (prevents replay rolling back to an old CEK).
     #[serde(default)]
     pub key_epoch: u64,
 }
@@ -34,25 +34,25 @@ pub struct KeyEnvelope {
 // share_content
 // ============================================
 
-/// コンテンツ共有リクエスト
+/// Content share request
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShareContentInput {
-    /// 対象ファイルのキー(`CreateContentOutput::file_id`)。包む CEK・暗号文・
-    /// envelope の content_id(plainCid)は、このファイルの今の版のもの。
+    /// Key of the target file (`CreateContentOutput::file_id`). The wrapped CEK, ciphertext,
+    /// and envelope content_id (plainCid) are those of this file's current version.
     pub file_id: String,
-    /// State Node へ登録済みの系列ID(`UpdateContentInput` / `RevokeShareInput` と
-    /// 同じ区別)。委譲 Token の resource はこれで発行される: State Node は
-    /// `monas://content/<系列ID>` で capability を照合する。未指定なら
-    /// (State Node 未登録のローカル専用コンテンツ)Token は発行しない。
-    /// ファイルのキーは端末の外に出さないので、代わりに使うことはない。
+    /// Series ID registered with the State Node (same distinction as `UpdateContentInput` /
+    /// `RevokeShareInput`). The delegated token's resource is issued with this: the State Node
+    /// matches capabilities against `monas://content/<series ID>`. If unset (local-only content
+    /// not registered with a State Node), no token is issued.
+    /// The file key never leaves the device, so it is never used in its place.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_content_id: Option<String>,
-    /// 送信者の公開鍵（base64url） - sender_key_idを計算するために使用
+    /// Sender's public key (base64url) - used to compute sender_key_id
     pub sender_public_key: String,
-    /// 送信者の秘密鍵（base64url）。KeyEnvelope の HPKE Auth モード wrap
-    /// (送信者認証)に用いる。SDK には保存されない。
+    /// Sender's private key (base64url). Used for the KeyEnvelope HPKE Auth mode wrap
+    /// (sender authentication). Not stored by the SDK.
     pub sender_private_key: String,
-    /// 共有先の公開鍵（base64url）
+    /// Public key of the share target (base64url)
     pub recipient_public_key: String,
     #[serde(default = "default_permissions")]
     pub permissions: Vec<Permission>,
@@ -62,14 +62,15 @@ fn default_permissions() -> Vec<Permission> {
     vec![Permission::Read]
 }
 
-/// コンテンツ共有レスポンス
+/// Content share response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShareContentOutput {
-    /// envelope が指す版の plainCid(今の版)。
+    /// plainCid of the version the envelope points to (the current version).
     pub content_id: String,
     pub recipient_public_key: String,
-    /// 送信者の公開鍵（base64url）。受信者はこれを `decrypt_shared_content` に
-    /// 渡し、初回処理時に TOFU でピン留めする(以後の envelope 検証の根になる)。
+    /// Sender's public key (base64url). The recipient passes this to `decrypt_shared_content`
+    /// and pins it via TOFU on first processing (it becomes the root of later envelope
+    /// verification).
     pub sender_public_key: String,
     pub sender_key_id: String,
     pub recipient_key_id: String,
@@ -80,7 +81,7 @@ pub struct ShareContentOutput {
     pub shared_at: Option<String>,
 }
 
-/// delegated token の発行結果
+/// Result of issuing a delegated token
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DelegatedAccessToken {
     pub delegated_token: String,
@@ -93,73 +94,74 @@ pub struct DelegatedAccessToken {
 // revoke_share
 // ============================================
 
-/// 共有取り消しリクエスト
+/// Share revocation request
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RevokeShareInput {
-    /// 対象ファイルのキー(`CreateContentOutput::file_id`)
+    /// Key of the target file (`CreateContentOutput::file_id`)
     pub file_id: String,
-    /// State Node へ送る系列ID。未指定ならローカル専用コンテンツとして扱い、
-    /// State Node への失効・再暗号化後の書き込み・Token の再発行をしない。
+    /// Series ID sent to the State Node. If unset, the content is treated as local-only, and no
+    /// revocation on the State Node, post-re-encryption write, or token reissue is performed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_content_id: Option<String>,
-    /// 送信者の公開鍵（base64url） - sender_key_idを計算するために使用
+    /// Sender's public key (base64url) - used to compute sender_key_id
     pub sender_public_key: String,
-    /// 送信者の秘密鍵（base64url）。残存受信者向け KeyEnvelope 再発行の
-    /// HPKE Auth モード wrap に用いる。SDK には保存されない。
+    /// Sender's private key (base64url). Used for the HPKE Auth mode wrap when reissuing
+    /// KeyEnvelopes for remaining recipients. Not stored by the SDK.
     pub sender_private_key: String,
     pub recipient_public_key: String,
 }
 
-/// 共有取り消しレスポンス
+/// Share revocation response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RevokeShareOutput {
-    /// 再暗号化後の今の版の plainCid(再発行 envelope が指す版)。
+    /// plainCid of the current version after re-encryption (the version reissued envelopes
+    /// point to).
     pub content_id: String,
     pub recipient_public_key: String,
     pub revoked: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub revoked_at: Option<String>,
-    /// 取り消し後も共有が残っている受信者向けに、ローテーション後の CEK で
-    /// 再発行された KeyEnvelope。呼び出し側(owner)はこれを各受信者へ配布し、
-    /// 受信者は `decrypt_shared_content` で処理することでローカル保存済み CEK が
-    /// 新しいものへ更新される(state node 経由の read が引き続き復号できる)。
+    /// KeyEnvelopes reissued with the rotated CEK for recipients whose share remains after the
+    /// revocation. The caller (owner) distributes these to each recipient; by processing them
+    /// with `decrypt_shared_content`, the recipient's locally stored CEK is updated to the new
+    /// one (reads via the state node can still be decrypted).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reissued_envelopes: Vec<ReissuedKeyEnvelope>,
-    /// state node が設定した新しい `min_valid_issued_at`（Unix 秒）。
-    /// これより前に発行された委譲 Token はすべて失効している。
-    /// state node 連携なしで実行した場合は `None`。
+    /// New `min_valid_issued_at` (Unix seconds) set by the state node.
+    /// All delegated tokens issued before this are revoked.
+    /// `None` when run without state node integration.
     ///
-    /// CEK ローテーションと違い、これは「取り消した相手がまだ書き込めるか」を
-    /// 決める。残存受信者には、この時刻より後に発行した Token を配り直す必要がある。
+    /// Unlike CEK rotation, this decides "whether the revoked party can still write". Remaining
+    /// recipients must be redistributed tokens issued after this time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_invalidated_at: Option<u64>,
-    /// revoke は再暗号化の前に State Node の head をローカルへ取り込む
-    /// (write を委譲した受信者の版を巻き戻さないため)。その取り込みに失敗
-    /// したときの理由。revoke 自体はローカルの版で続行している — 取り消しは
-    /// 書き手に妨げられてはならない — ので、呼び出し側はこれを見て
-    /// 「head が失われたかもしれない」と扱うこと。
+    /// Before re-encrypting, revoke pulls the State Node head into the local record (so as not
+    /// to roll back versions written by recipients delegated write). This is the reason that
+    /// pull failed. The revoke itself proceeds with the local version — a revocation must not
+    /// be blockable by a writer — so the caller should treat this as "the head may have been
+    /// lost".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head_pull_error: Option<String>,
-    /// 失効境界(`token_invalidated_at`)がどこまで届いたか。
+    /// How far the revocation boundary (`token_invalidated_at`) reached.
     ///
-    /// State Node の認可はメンバーごとのローカル判断なので、境界を受け取って
-    /// いないメンバーは次回 sync まで**失効済み Token の書き込みを受理する**。
-    /// revoke 自体はそれを待たない(書き手に取り消しを妨げさせない)ため、
-    /// 呼び出し側は「全員に届いた」と「N 台にまだ届いていない」を
-    /// ここで区別する。state node 連携なしの場合は `None`。
+    /// State Node authorization is a local decision per member, so members that have not
+    /// received the boundary **accept writes with revoked tokens** until the next sync.
+    /// The revoke itself does not wait for that (a writer must not block a revocation), so the
+    /// caller distinguishes "reached everyone" from "not yet reached N nodes" here.
+    /// `None` without state node integration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_invalidation_reach: Option<TokenInvalidationReach>,
 }
 
-/// revoke の失効境界がメンバーへどこまで伝わったか。
+/// How far a revoke's revocation boundary propagated to members.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TokenInvalidationReach {
-    /// 境界を受け取り、以後それで認可するメンバー。
+    /// Members that received the boundary and authorize with it from now on.
     pub notified_members: Vec<String>,
-    /// 届かなかったメンバーと最後のエラー。空 = 既知の全メンバーに届いた
-    /// (`relayed` でない限り)。
+    /// Members that were not reached, with the last error. Empty = reached all known members
+    /// (unless `relayed`).
     pub unreached_members: Vec<UnreachedMember>,
-    /// State Node が commit せず relay した。上の2つは不明。
+    /// The State Node relayed instead of committing. The two fields above are unknown.
     pub relayed: bool,
 }
 
@@ -169,17 +171,16 @@ pub struct UnreachedMember {
     pub error: String,
 }
 
-/// revoke 後に残存受信者向けへ再発行された KeyEnvelope。
+/// KeyEnvelope reissued for a remaining recipient after a revoke.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReissuedKeyEnvelope {
-    /// 再発行先の受信者 key id(base64url)
+    /// Key id of the recipient the envelope was reissued to (base64url)
     pub recipient_key_id: String,
     pub key_envelope: KeyEnvelope,
-    /// 再発行した委譲 Token。revoke は State Node の `min_valid_issued_at` を
-    /// 進めるので、残存受信者が持っていた Token も一緒に失効している。
-    /// 新しい envelope と一緒に届けなければ、その受信者は復号はできても
-    /// State Node からは読めない。発行に失敗した場合は `None`(envelope の
-    /// 再発行自体は成立している)。
+    /// Reissued delegated token. A revoke advances the State Node's `min_valid_issued_at`, so
+    /// the tokens held by remaining recipients are revoked as well. Unless delivered together
+    /// with the new envelope, that recipient can decrypt but cannot read from the State Node.
+    /// `None` if issuing failed (the envelope reissue itself still succeeded).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delegated_access: Option<DelegatedAccessToken>,
 }
@@ -188,54 +189,57 @@ pub struct ReissuedKeyEnvelope {
 // update_share_permission
 // ============================================
 
-/// 既存の共有先の権限を変更するリクエスト。
+/// Request to change the permission of an existing share target.
 ///
-/// 再共有(`share_content`)は同じ受信者に `AlreadyShared` で失敗するので、
-/// read ⇄ write の切り替えはこちらで行う。CEK は回さない(権限は委譲 Token
-/// にだけ載る)。
+/// Re-sharing (`share_content`) fails with `AlreadyShared` for the same recipient, so switching
+/// read ⇄ write is done here. The CEK is not rotated (permissions live only in the delegated
+/// token).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateSharePermissionInput {
-    /// 対象ファイルのキー(`CreateContentOutput::file_id`)
+    /// Key of the target file (`CreateContentOutput::file_id`)
     pub file_id: String,
-    /// State Node の系列ID。Token の resource と、降格時の Token 失効先。
-    /// 権限は Token にだけ載るので必須(未指定は Validation エラー)。
+    /// State Node series ID. Used as the token's resource and as the target of token revocation
+    /// on downgrade. Required because permissions live only in the token (unset is a
+    /// Validation error).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_content_id: Option<String>,
     pub recipient_public_key: String,
     pub permissions: Vec<Permission>,
 }
 
-/// 権限変更レスポンス。
+/// Permission change response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateSharePermissionOutput {
-    /// 今の版の plainCid。
+    /// plainCid of the current version.
     pub content_id: String,
     pub recipient_public_key: String,
     pub recipient_key_id: String,
-    /// 変更後の権限(`read` / `write`)
+    /// Permissions after the change (`read` / `write`)
     pub permissions: Vec<Permission>,
-    /// 変更後の権限で発行し直した、この受信者向けの委譲 Token。
+    /// Delegated token for this recipient, reissued with the changed permissions.
     pub delegated_access: DelegatedAccessToken,
-    /// 降格(write → read)では古い write Token を止めるため State Node の
-    /// `min_valid_issued_at` を進める。それで失効した他の受信者の Token を
-    /// 発行し直したもの。権限が変わらない要求(降格の応答を失ったあとの
-    /// やり直しなど)でも、失効はせずに同じく他の受信者分を返す。昇格では空。
+    /// A downgrade (write → read) advances the State Node's `min_valid_issued_at` to stop the
+    /// old write token. These are the reissued tokens of other recipients revoked by that. A
+    /// request that does not change permissions (e.g. a retry after losing a downgrade's
+    /// response) also returns the other recipients' tokens, without revoking. Empty on upgrade.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reissued_tokens: Vec<ReissuedDelegatedToken>,
-    /// 降格で進めた `min_valid_issued_at`。失効させていなければ `None`。
+    /// `min_valid_issued_at` advanced by the downgrade. `None` if nothing was revoked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_invalidated_at: Option<u64>,
-    /// 失効境界がメンバーへどこまで届いたか(`RevokeShareOutput` と同じ意味)。
+    /// How far the revocation boundary reached members (same meaning as `RevokeShareOutput`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_invalidation_reach: Option<TokenInvalidationReach>,
 }
 
-/// 権限変更に伴う失効で、他の受信者向けに発行し直した委譲 Token。
+/// Delegated token reissued for another recipient after a revocation caused by a permission
+/// change.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReissuedDelegatedToken {
-    /// 受信者 key id(base64url)
+    /// Recipient key id (base64url)
     pub recipient_key_id: String,
-    /// 発行に失敗した場合は `None`(その受信者は owner から再度受け取る必要がある)
+    /// Always `Some` in responses from the current SDK (a failure to issue fails the whole
+    /// request). `Option` is kept only for wire compatibility: deserializes to `None` if absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delegated_access: Option<DelegatedAccessToken>,
 }
@@ -244,21 +248,21 @@ pub struct ReissuedDelegatedToken {
 // decrypt_shared_content
 // ============================================
 
-/// 共有コンテンツ復号リクエスト
+/// Shared content decryption request
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DecryptSharedContentInput {
     pub content_id: String,
-    /// State Node の系列ID。送信者ピン(TOFU の送信者鍵・鍵世代・CEK)は
-    /// これをキーに保存する。`content_id` は owner 側の版IDで編集のたびに
-    /// 変わるので、版IDでピンすると「編集前の古い envelope」が新しい世代の
-    /// 記録と別の場所に落ちて replay 検出をすり抜ける。未指定なら
-    /// `content_id`(State Node 未登録のローカル専用コンテンツ向け)。
+    /// State Node series ID. The sender pin (TOFU sender key, key epoch, CEK) is stored keyed by
+    /// this. `content_id` is the owner-side version ID and changes on every edit, so pinning by
+    /// version ID would put "an old pre-edit envelope" in a different place from the new epoch's
+    /// record and slip past replay detection. If unset, `content_id` is used (for local-only
+    /// content not registered with a State Node).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_content_id: Option<String>,
     pub private_key: String,
-    /// 送信者の公開鍵（base64url）。HPKE Auth モードの unwrap に用いる。
-    /// この content で初めての envelope 処理なら TOFU でピン留めされ、
-    /// 以後はピン済みの鍵と一致しない場合は拒否される。
+    /// Sender's public key (base64url). Used for the HPKE Auth mode unwrap.
+    /// If this is the first envelope processed for this content it is pinned via TOFU, and
+    /// afterwards it is rejected if it does not match the pinned key.
     pub sender_public_key: String,
     pub recipient_key_id: String,
     pub key_envelope: KeyEnvelope,
@@ -266,38 +270,38 @@ pub struct DecryptSharedContentInput {
     pub version: Option<String>,
 }
 
-/// 共有コンテンツ復号レスポンス
+/// Shared content decryption response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DecryptSharedContentOutput {
     pub content_id: String,
-    /// 復号されたコンテンツ（base64url）
+    /// Decrypted content (base64url)
     pub content: String,
     pub version: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<ContentMetadata>,
 }
 
-/// 共有を受けた側がコンテンツを更新するリクエスト。
+/// Request for the share recipient to update the content.
 ///
-/// 受信者はローカルに content レコードを持たない(持つのは envelope から
-/// 取り出した CEK と送信者ピンだけ)。新しい平文をその CEK で暗号化し、
-/// owner の Content Network(`remote_content_id`)へ write 委譲 Token 付きで
-/// PUT する。State Node は Token の `aud` 鍵(この端末の account 鍵)で
-/// 署名を検証し、Token の capability で書き込みを許可する。
+/// The recipient has no local content record (it only has the CEK extracted from the envelope
+/// and the sender pin). The new plaintext is encrypted with that CEK and PUT to the owner's
+/// Content Network (`remote_content_id`) with a write delegated token. The State Node verifies
+/// the signature with the token's `aud` key (this device's account key) and permits the write
+/// via the token's capability.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateSharedContentInput {
-    /// State Node の系列ID(owner の share package の `remote_content_id`)。
+    /// State Node series ID (`remote_content_id` of the owner's share package).
     pub remote_content_id: String,
-    /// 新しい平文(base64url)。
+    /// New plaintext (base64url).
     pub content: String,
 }
 
-/// 共有を受けた側の更新レスポンス
+/// Update response for the share recipient
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateSharedContentOutput {
     pub remote_content_id: String,
-    /// 新しい平文の content id(plain CID)。owner 側の版IDと同じ規則で
-    /// 導出されるので、以後この版を読むときの `local_content_id` になる。
+    /// Content id (plain CID) of the new plaintext. Derived by the same rule as the owner-side
+    /// version ID, so it becomes the `local_content_id` when reading this version later.
     pub version_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
@@ -397,9 +401,9 @@ mod tests {
         let json = serde_json::to_string(&output).unwrap();
         assert!(json.contains("\"revoked\":true"));
         assert!(!json.contains("head_pull_error"));
-        // 空の envelope リストは serialize されない(後方互換)
+        // An empty envelope list is not serialized (backward compatible)
         assert!(!json.contains("reissued_envelopes"));
-        // state node 連携なしなら失効時刻も出さない
+        // Without state node integration, the revocation time is not emitted either
         assert!(!json.contains("token_invalidated_at"));
     }
 

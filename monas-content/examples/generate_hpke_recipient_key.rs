@@ -4,17 +4,17 @@ use p256::elliptic_curve::sec1::ToEncodedPoint;
 use p256::{EncodedPoint, PublicKey, SecretKey};
 use rand_core::OsRng;
 
-/// 開発者向けの HPKE 受信者鍵生成ツール。
+/// Developer tool for generating an HPKE recipient key.
 ///
-/// - 公開鍵: uncompressed form (0x04 || X || Y, 65バイト) を base64 化
-/// - 秘密鍵: 32バイトスカラーを base64 化
-///   として標準出力に出す。
+/// Prints to stdout:
+/// - Public key: uncompressed form (0x04 || X || Y, 65 bytes), base64-encoded
+/// - Secret key: 32-byte scalar, base64-encoded
 ///
-/// サーバ側の `HpkeV1KeyWrapping` は「受信者公開鍵 = P-256 uncompressed」としているので、
-/// `recipient_public_key_base64` をそのまま API の `recipient_public_key_base64` に渡せば OK。
+/// The server-side `HpkeV1KeyWrapping` treats the recipient public key as P-256 uncompressed, so
+/// `recipient_public_key_base64` can be passed as-is to the API's `recipient_public_key_base64`.
 ///
-/// 本番コンテナにはこのバイナリを含めない想定。
-/// 利用時は以下のように実行する:
+/// This binary is not meant to be included in production containers.
+/// Run it as follows:
 /// `cargo run -p monas-content --example generate_hpke_recipient_key`
 fn main() {
     let mut rng = OsRng;

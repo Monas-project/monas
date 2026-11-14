@@ -1,18 +1,18 @@
-//! `MonasController` の sync API を tokio runtime 上で安全に呼び出すための
-//! 薄い async ラッパー群。
+//! Thin async wrappers for safely calling the sync API of `MonasController` on a
+//! tokio runtime.
 //!
-//! 背景:
-//! `MonasController` は内部で `ureq` (sync HTTP) を使っており、メソッドは sync。
-//! axum (tokio) ハンドラから直接呼ぶと、HTTP の往復中ずっと tokio worker thread が
-//! ブロックされ、同時リクエスト数が tokio worker 数 + キューに直撃する。
+//! Background:
+//! `MonasController` uses `ureq` (sync HTTP) internally, so its methods are sync.
+//! Calling them directly from an axum (tokio) handler blocks a tokio worker thread for the
+//! whole HTTP round trip, so concurrent requests hit the tokio worker count + queue directly.
 //!
-//! このモジュールは各 public sync メソッドに `_async` 版を提供し、
-//! `tokio::task::spawn_blocking` 経由で sync 版を blocking pool に流す。
-//! 呼び出し側 (gateway) はこちらの async API だけを使えば、ureq の sync I/O が
-//! tokio worker をブロックしない。
+//! This module provides an `_async` variant for each public sync method, which runs the
+//! sync variant on the blocking pool via `tokio::task::spawn_blocking`.
+//! As long as callers (the gateway) use only this async API, ureq's sync I/O does not
+//! block tokio workers.
 //!
-//! sync API は引き続き直接呼べるが、tokio runtime 上で呼ぶときは必ず
-//! async ラッパー側を使うこと。
+//! The sync API can still be called directly, but always use the async wrappers when
+//! calling from a tokio runtime.
 
 use std::sync::Arc;
 
@@ -37,7 +37,7 @@ use crate::models::state::{
 
 use super::MonasController;
 
-/// `spawn_blocking` 内で panic した場合に caller へ返すエラーを生成するヘルパ。
+/// Helper that builds the error returned to the caller when `spawn_blocking` panics.
 fn map_join_error<T>(err: tokio::task::JoinError, trace_id: String) -> ApiResponse<T> {
     let msg = if err.is_panic() {
         "blocking task panicked".to_string()
@@ -49,14 +49,14 @@ fn map_join_error<T>(err: tokio::task::JoinError, trace_id: String) -> ApiRespon
     ApiResponse::error(ApiError::Internal(msg), trace_id)
 }
 
-/// 内部の trace_id を `JoinError` 経路でも一貫させるため、
-/// `generate_trace_id` の prefix を借用したダミー id を作る。
+/// Creates a dummy id borrowing the `generate_trace_id` prefix, so the internal trace_id stays
+/// consistent on the `JoinError` path too.
 fn fallback_trace_id() -> String {
     crate::common::generate_trace_id()
 }
 
 impl MonasController {
-    /// `create_content` の async 版。`spawn_blocking` 経由で sync 版を呼ぶ。
+    /// Async variant of `create_content`. Calls the sync variant via `spawn_blocking`.
     pub async fn create_content_async(
         self: Arc<Self>,
         input: CreateContentInput,
@@ -68,7 +68,7 @@ impl MonasController {
         }
     }
 
-    /// `get_content` の async 版。
+    /// Async variant of `get_content`.
     pub async fn get_content_async(
         self: Arc<Self>,
         input: GetContentInput,
@@ -79,7 +79,7 @@ impl MonasController {
         }
     }
 
-    /// `update_content` の async 版。
+    /// Async variant of `update_content`.
     pub async fn update_content_async(
         self: Arc<Self>,
         input: UpdateContentInput,
@@ -91,7 +91,7 @@ impl MonasController {
         }
     }
 
-    /// `delete_content` の async 版。
+    /// Async variant of `delete_content`.
     pub async fn delete_content_async(
         self: Arc<Self>,
         input: DeleteContentInput,
@@ -103,7 +103,7 @@ impl MonasController {
         }
     }
 
-    /// `share_content` の async 版。
+    /// Async variant of `share_content`.
     pub async fn share_content_async(
         self: Arc<Self>,
         input: ShareContentInput,
@@ -114,7 +114,7 @@ impl MonasController {
         }
     }
 
-    /// `revoke_share` の async 版。
+    /// Async variant of `revoke_share`.
     pub async fn revoke_share_async(
         self: Arc<Self>,
         input: RevokeShareInput,
@@ -126,7 +126,7 @@ impl MonasController {
         }
     }
 
-    /// `update_share_permission` の async 版。
+    /// Async variant of `update_share_permission`.
     pub async fn update_share_permission_async(
         self: Arc<Self>,
         input: UpdateSharePermissionInput,
@@ -142,7 +142,7 @@ impl MonasController {
         }
     }
 
-    /// `decrypt_shared_content` の async 版。
+    /// Async variant of `decrypt_shared_content`.
     pub async fn decrypt_shared_content_async(
         self: Arc<Self>,
         input: DecryptSharedContentInput,
@@ -153,7 +153,7 @@ impl MonasController {
         }
     }
 
-    /// `pull_content_from_state_node` の async 版。
+    /// Async variant of `pull_content_from_state_node`.
     pub async fn pull_content_from_state_node_async(
         self: Arc<Self>,
         input: PullContentFromStateNodeInput,
@@ -169,7 +169,7 @@ impl MonasController {
         }
     }
 
-    /// `update_shared_content` の async 版。
+    /// Async variant of `update_shared_content`.
     pub async fn update_shared_content_async(
         self: Arc<Self>,
         input: UpdateSharedContentInput,
@@ -183,7 +183,7 @@ impl MonasController {
         }
     }
 
-    /// `create_signing_account` の async 版。
+    /// Async variant of `create_signing_account`.
     pub async fn create_signing_account_async(
         self: Arc<Self>,
     ) -> ApiResponse<CreateSigningAccountOutput> {
@@ -193,8 +193,9 @@ impl MonasController {
         }
     }
 
-    /// `generate_keypair` の async 版。
-    /// (HTTP は呼ばないが、CPU bound な鍵生成を tokio worker から外すため同様に wrap する。)
+    /// Async variant of `generate_keypair`.
+    /// (It does not call HTTP, but is wrapped the same way to move CPU-bound key generation off
+    /// the tokio workers.)
     pub async fn generate_keypair_async(
         self: Arc<Self>,
         input: GenerateKeypairInput,
@@ -205,7 +206,7 @@ impl MonasController {
         }
     }
 
-    /// `get_latest_version` の async 版。
+    /// Async variant of `get_latest_version`.
     pub async fn get_latest_version_async(
         self: Arc<Self>,
         input: GetLatestVersionInput,
@@ -219,7 +220,7 @@ impl MonasController {
         }
     }
 
-    /// `get_history` の async 版。
+    /// Async variant of `get_history`.
     pub async fn get_history_async(
         self: Arc<Self>,
         input: GetHistoryInput,
@@ -231,7 +232,7 @@ impl MonasController {
         }
     }
 
-    /// `read_content_from_state_node` の async 版。
+    /// Async variant of `read_content_from_state_node`.
     pub async fn read_content_from_state_node_async(
         self: Arc<Self>,
         input: ReadContentFromStateNodeInput,
@@ -247,7 +248,7 @@ impl MonasController {
         }
     }
 
-    /// `verify_integrity` の async 版。
+    /// Async variant of `verify_integrity`.
     pub async fn verify_integrity_async(
         self: Arc<Self>,
         input: VerifyIntegrityInput,

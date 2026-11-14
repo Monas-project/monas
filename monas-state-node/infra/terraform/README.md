@@ -49,7 +49,7 @@ terraform apply \
 ### 2. Get Bootstrap Node's Peer ID
 
 ```bash
-curl -s https://node1.monas.example.com/node/info | jq '.peer_id'
+curl -s https://node1.monas.example.com/node/info | jq '.node_id'
 # -> "12D3KooW..."
 ```
 

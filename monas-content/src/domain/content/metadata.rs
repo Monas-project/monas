@@ -15,7 +15,7 @@ pub struct Metadata {
 }
 
 impl Metadata {
-    /// ContentId を伴うメタデータの生成。
+    /// Creates metadata with a ContentId.
     pub fn new(
         name: String,
         path: String,
@@ -33,7 +33,8 @@ impl Metadata {
         }
     }
 
-    /// コンテンツ本体やメタ情報の更新に伴い `updated_at` のみを更新した新しい Metadata を返す。
+    /// Returns a new Metadata with only `updated_at` updated, following an update of the content body
+    /// or metadata.
     pub fn touch(&self) -> Self {
         let now = Utc::now();
         Self {
@@ -46,10 +47,10 @@ impl Metadata {
         }
     }
 
-    /// 新しい ContentId に差し替えつつ、`updated_at` を現在時刻に更新した Metadata を返す。
+    /// Returns a Metadata with the ContentId replaced by a new one and `updated_at` set to now.
     ///
-    /// - name / path / created_at / provider は維持する。
-    /// - id のみ新しい値に更新する。
+    /// - name / path / created_at / provider are kept.
+    /// - Only id is updated to the new value.
     pub fn with_new_id(&self, new_id: ContentId) -> Self {
         let now = Utc::now();
         Self {
@@ -62,7 +63,7 @@ impl Metadata {
         }
     }
 
-    /// 名前を変更し、`updated_at` を更新した新しい Metadata を返す。
+    /// Returns a new Metadata with the name changed and `updated_at` updated.
     pub fn rename(&self, new_name: String) -> Self {
         let now = Utc::now();
         Self {

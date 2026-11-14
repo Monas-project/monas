@@ -216,9 +216,9 @@ impl IntoResponse for StateNodeError {
                 tracing::warn!("authentication failed: {detail}");
                 "Authentication failed".to_string()
             }
-            // 再送であることは呼び出し側に伝えてよい。伝えないと、正規の
-            // クライアントは「認証に失敗した」と読んで同じ署名で延々と
-            // 再試行してしまう(正しい対処は新しい timestamp で署名し直すこと)。
+            // It is fine to tell the caller that this is a replay. Otherwise, a legitimate
+            // client reads it as "authentication failed" and keeps retrying with the same
+            // signature forever (the correct remedy is to re-sign with a new timestamp).
             StateNodeError::RequestAlreadyApplied(detail) => {
                 tracing::warn!("replayed request rejected: {detail}");
                 "This signed request has already been applied. Re-sign the request with a fresh \
@@ -780,7 +780,7 @@ async fn get_content_data(
     // Return the whole Node (CBOR), matching the relay branch above, so the
     // client always verifies the same format (recompute CID) regardless of
     // whether this node held the content locally or relayed the read.
-    // (docs/design.md §10「read応答の完全性検証」)
+    // (docs/design.md §10 "read response integrity verification")
     let data_result: Result<Option<(Vec<u8>, String)>, _> = if let Some(version) = &query.version {
         crdt_repo
             .get_version_node_bytes(&content_id, version)

@@ -3,7 +3,7 @@ use uuid::Uuid;
 
 use super::api_error::ApiError;
 
-/// SDK全体で使用する統一レスポンス型
+/// Unified response type used across the SDK
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiResponse<T> {
     pub success: bool,
@@ -15,7 +15,7 @@ pub struct ApiResponse<T> {
 }
 
 impl<T> ApiResponse<T> {
-    /// 成功レスポンスを生成
+    /// Create a success response
     pub fn success(data: T, trace_id: String) -> Self {
         Self {
             success: true,
@@ -25,7 +25,7 @@ impl<T> ApiResponse<T> {
         }
     }
 
-    /// エラーレスポンスを生成
+    /// Create an error response
     pub fn error(error: ApiError, trace_id: String) -> Self {
         Self {
             success: false,
@@ -35,18 +35,18 @@ impl<T> ApiResponse<T> {
         }
     }
 
-    /// 成功レスポンスを自動生成されたtrace_idで生成
+    /// Create a success response with an auto-generated trace_id
     pub fn success_with_new_trace_id(data: T) -> Self {
         Self::success(data, generate_trace_id())
     }
 
-    /// エラーレスポンスを自動生成されたtrace_idで生成
+    /// Create an error response with an auto-generated trace_id
     pub fn error_with_new_trace_id(error: ApiError) -> Self {
         Self::error(error, generate_trace_id())
     }
 }
 
-/// トレースIDを生成
+/// Generate a trace ID
 pub fn generate_trace_id() -> String {
     format!("trace_{}", &Uuid::new_v4().simple().to_string()[..16])
 }

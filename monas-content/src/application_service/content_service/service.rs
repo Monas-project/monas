@@ -11,7 +11,7 @@ use super::{
     ReencryptContentResult, UpdateContentCommand, UpdateContentResult,
 };
 
-/// コンテンツ作成ユースケースのアプリケーションサービス。
+/// Application service for the content creation use case.
 pub struct ContentService<G, R, K, E, S> {
     pub content_id_generator: G,
     pub content_repository: R,
@@ -28,7 +28,7 @@ where
     E: ContentEncryption,
     S: ContentEncryptionKeyStore,
 {
-    /// ファイルのキーで記録を引く(プロバイダー指定があればそこから)。
+    /// Looks up a record by file key (from the given provider, if specified).
     fn find(
         &self,
         provider: Option<&crate::domain::content::StorageProvider>,
@@ -42,7 +42,7 @@ where
         }
     }
 
-    /// 記録をファイルのキーで保存する(上書き)。
+    /// Saves a record under the file key (overwrite).
     fn store(
         &self,
         provider: Option<&crate::domain::content::StorageProvider>,
@@ -57,7 +57,7 @@ where
         }
     }
 
-    /// ファイルのキーで記録と CEK を引く。
+    /// Looks up the record and CEK by file key.
     pub fn load_record(
         &self,
         series_id: &ContentId,
@@ -76,10 +76,11 @@ where
         Ok(Some((content, key)))
     }
 
-    /// [`load_record`](Self::load_record) で取った記録と CEK をそのまま戻す。
+    /// Restores the record and CEK obtained by [`load_record`](Self::load_record) as-is.
     ///
-    /// 失敗した操作(state node が拒否した削除・更新など)の巻き戻しに使う。
-    /// 作り直さないので、ファイルのキー・CEK・暗号文は操作の前と同じになる。
+    /// Used to roll back failed operations (deletes, updates, etc. rejected by the state node).
+    /// Nothing is recreated, so the file key, CEK, and ciphertext end up the same as before the
+    /// operation.
     pub fn put_record(
         &self,
         content: &Content,
@@ -95,15 +96,15 @@ where
     }
 
     pub fn create(&self, cmd: CreateContentCommand) -> Result<CreateContentResult, CreateError> {
-        // 簡易バリデーション
+        // Simple validation
         Self::validate_create_command(&cmd)?;
 
-        // CEK の生成
+        // Generate the CEK
         let key = self.key_generator.generate();
 
-        // ドメインの Content::create を呼び出し、ContentId生成＋暗号化＋メタデータ生成。
-        // ファイルのキー(series_id)は作成時刻を含むので通常は重ならないが、
-        // 既存のファイルの記録を上書きしないよう、使われていれば作り直す。
+        // Call the domain's Content::create: generates the ContentId, encrypts, and builds metadata.
+        // The file key (series_id) includes the creation time, so it normally does not collide, but
+        // regenerate it if already in use so an existing file's record is not overwritten.
         let mut attempts = 0;
         let content = loop {
             let (content, _event) = Content::create(
@@ -131,12 +132,12 @@ where
             }
         };
 
-        // CEK を保存(ファイルのキー)
+        // Save the CEK (by file key)
         self.cek_store
             .save(content.series_id(), &key)
             .map_err(CreateError::KeyStore)?;
 
-        // コンテンツを永続化（プロバイダー指定があればそちらに、なければデフォルト）
+        // Persist the content (to the given provider if specified, otherwise to the default)
         self.store(cmd.provider.as_ref(), &content)
             .map_err(CreateError::Repository)?;
 
@@ -153,12 +154,12 @@ where
             content_id,
             series_id,
             metadata,
-            public_key: String::new(), // TODO: 将来的に公開鍵を設定
+            public_key: String::new(), // TODO: set the public key in the future
             encrypted_content,
         })
     }
 
-    /// CreateContentCommand の簡易バリデーション。
+    /// Simple validation of CreateContentCommand.
     fn validate_create_command(cmd: &CreateContentCommand) -> Result<(), CreateError> {
         if cmd.raw_content.is_empty() {
             return Err(CreateError::Validation(
@@ -174,24 +175,24 @@ where
         Ok(())
     }
 
-    /// コンテンツ更新ユースケース。
+    /// Content update use case.
     ///
-    /// - `new_name` と `new_raw_content` はどちらか片方だけ、あるいは両方指定可能
-    /// - どちらも `None` の場合は Validation エラーとする
+    /// - `new_name` and `new_raw_content` may be specified individually or together
+    /// - If both are `None`, it is a Validation error
     pub fn update(&self, cmd: UpdateContentCommand) -> Result<UpdateContentResult, UpdateError> {
-        // 簡易バリデーション
+        // Simple validation
         Self::validate_update_command(&cmd)?;
 
-        // 既存コンテンツの取得（`content_id` はファイルのキー）
+        // Fetch the existing content (`content_id` is the file key)
         let mut content = self
             .find(cmd.provider.as_ref(), &cmd.content_id)
             .map_err(UpdateError::Repository)?
             .ok_or(UpdateError::NotFound)?;
 
-        // バイナリ更新が指定されている場合
+        // If a binary update is specified
         if let Some(raw) = cmd.new_raw_content {
-            // 既存の CEK をキーストアから取得して再利用する。
-            // コンテンツごとに 1 つの CEK を持ち、暗号化のたびに IV のみランダムにする前提。
+            // Fetch the existing CEK from the key store and reuse it.
+            // Assumes one CEK per content, with only the IV randomized on each encryption.
             let key = self
                 .cek_store
                 .load(content.series_id())
@@ -209,13 +210,13 @@ where
             content = updated;
         }
 
-        // 名前変更が指定されている場合
+        // If a rename is specified
         if let Some(name) = cmd.new_name {
             let (updated, _event) = content.rename(name).map_err(UpdateError::Domain)?;
             content = updated;
         }
 
-        // コンテンツを永続化（ファイルのキーの記録を上書き）
+        // Persist the content (overwriting the record under the file key)
         self.store(content.metadata().provider(), &content)
             .map_err(UpdateError::Repository)?;
 
@@ -236,10 +237,10 @@ where
         })
     }
 
-    /// UpdateContentCommand の簡易バリデーション。
+    /// Simple validation of UpdateContentCommand.
     ///
-    /// - `new_name` / `new_raw_content` のいずれか一方以上が指定されていること。
-    /// - 指定されている場合、それぞれの値が妥当であること。
+    /// - At least one of `new_name` / `new_raw_content` must be specified.
+    /// - Each specified value must be valid.
     fn validate_update_command(cmd: &UpdateContentCommand) -> Result<(), UpdateError> {
         if cmd.new_name.as_ref().is_none() && cmd.new_raw_content.as_ref().is_none() {
             return Err(UpdateError::Validation(
@@ -261,11 +262,11 @@ where
         Ok(())
     }
 
-    /// コンテンツ本体を復号して取得するユースケース（fetch）。
+    /// Use case that fetches the content body and decrypts it (fetch).
     ///
-    /// - `content_id` に対応するコンテンツを取得し、CEK を用いて復号したバイト列を返す。
-    /// - `provider` を指定した場合はそのプロバイダーから、指定しない場合はデフォルトプロバイダーから取得。
-    /// - 削除済みコンテンツや CEK が存在しない場合はエラーとなる。
+    /// - Fetches the content for `content_id` and returns the bytes decrypted with the CEK.
+    /// - Fetches from `provider` if specified, otherwise from the default provider.
+    /// - Returns an error if the content is deleted or the CEK does not exist.
     pub fn fetch(
         &self,
         content_id: ContentId,
@@ -282,14 +283,14 @@ where
             return Err(FetchError::Deleted);
         }
 
-        // CEK をキーストアから取得(ファイルのキー)
+        // Fetch the CEK from the key store (by file key)
         let key = self
             .cek_store
             .load(content.series_id())
             .map_err(FetchError::KeyStore)?
             .ok_or(FetchError::MissingKey)?;
 
-        // ドメインの decrypt を用いて復号
+        // Decrypt using the domain's decrypt
         let raw_content = content
             .decrypt(&key, &self.encryptor)
             .map_err(FetchError::Domain)?;
@@ -302,12 +303,11 @@ where
         })
     }
 
-    /// ローカルに保存された「暗号化済み」バイト列を取得する。
+    /// Returns the locally stored "encrypted" bytes.
     ///
-    /// State Node 整合性検証用途：State Node が保持するのは SDK が送信した
-    /// 暗号文なので、復号せずローカル暗号文とバイト比較することで
-    /// 「State Node が改ざんされていない同一の暗号文を保持しているか」を
-    /// 確認できる。
+    /// For State Node integrity verification: the State Node holds the ciphertext sent by the
+    /// SDK, so comparing it byte-for-byte with the local ciphertext, without decrypting,
+    /// confirms "whether the State Node holds the same, untampered ciphertext".
     pub fn fetch_encrypted(&self, content_id: ContentId) -> Result<Vec<u8>, FetchError> {
         let content = self
             .content_repository
@@ -325,11 +325,12 @@ where
             .ok_or(FetchError::NotFound)
     }
 
-    /// 外部でアンラップされた CEK と暗号化済みコンテンツを用いて復号するユースケース。
+    /// Use case that decrypts encrypted content using an externally unwrapped CEK.
     ///
-    /// - 共有フロー（Share）で KeyEnvelope から CEK を取り出した後の復号処理を想定。
-    /// - 復号結果のバイト列から ContentId を再計算し、引数の `content_id` と一致することを検証する。
-    ///   （コンテンツアドレス化に基づく整合性チェック）
+    /// - Intended for decryption after the CEK has been extracted from a KeyEnvelope in the share
+    ///   flow.
+    /// - Recomputes the ContentId from the decrypted bytes and verifies that it matches the
+    ///   `content_id` argument (integrity check based on content addressing).
     pub fn decrypt_with_cek(
         &self,
         expected_content_id: ContentId,
@@ -341,8 +342,8 @@ where
             .decrypt(&key, &ciphertext)
             .map_err(DecryptWithCekError::Domain)?;
 
-        // 復号したプレーンテキストから ContentId(plainCid) を再生成し、
-        // 期待される ID と一致するか確認する（改ざん検知）。
+        // Regenerate the ContentId (plainCid) from the decrypted plaintext and
+        // check that it matches the expected ID (tamper detection).
         let actual_id = self.content_id_generator.generate(&plaintext);
         if actual_id != expected_content_id {
             return Err(DecryptWithCekError::ContentIdMismatch {
@@ -462,7 +463,7 @@ where
     /// 3. Loads the CEK for `local_content_id` and AES-GCM-decrypts.
     ///
     /// This is the client-side core of the verified read path
-    /// (`docs/design.md` §10「read応答の完全性検証」). It verifies **payload
+    /// (`docs/design.md` §10, "read response integrity verification"). It verifies **payload
     /// authenticity only**: that these bytes are the ones named by
     /// `expected_version_cid`. It does not establish that the version is the
     /// canonical head, the latest, or the work of an authorized writer.
@@ -476,11 +477,11 @@ where
     /// Returns the plaintext and the verified node's parent CIDs. The parents
     /// are returned for callers that want to inspect the DAG; nothing in the
     /// SDK currently consumes them.
-    /// `cek` を渡した場合はそれを使い、`None` の場合だけローカルの CEK ストアを
-    /// 引く。呼び出し側が「どの CEK が正しいか」をより確実に知っている場合
-    /// (share 受信者は送信者ピンの権威レコードに CEK を持つ)、ストアより
-    /// そちらを優先させるための引数である。ストアは書き込み順が入れ替わると
-    /// 巻き戻り得るキャッシュに過ぎない。
+    /// If `cek` is given it is used; the local CEK store is consulted only when it is `None`.
+    /// This argument lets the caller's CEK take precedence over the store when the caller knows
+    /// more reliably "which CEK is correct" (a share recipient holds the CEK in the sender
+    /// pin's authoritative record). The store is merely a cache that can roll back if writes
+    /// are reordered.
     pub fn verify_and_decrypt_relay_read(
         &self,
         node_bytes: &[u8],
@@ -604,25 +605,26 @@ where
         })
     }
 
-    /// コンテンツ削除ユースケース。
+    /// Content deletion use case.
     ///
-    /// - 物理削除ではなく、ドメインオブジェクト上で `is_deleted` フラグとバッファをクリアして保存する「論理削除」
+    /// - A "logical delete", not a physical one: sets the `is_deleted` flag and clears the buffer
+    ///   on the domain object, then saves it
     pub fn delete(&self, cmd: DeleteContentCommand) -> Result<DeleteContentResult, DeleteError> {
-        // 既存コンテンツの取得
+        // Fetch the existing content
         let content = self
             .find(cmd.provider.as_ref(), &cmd.content_id)
             .map_err(DeleteError::Repository)?
             .ok_or(DeleteError::NotFound)?;
 
-        // ドメインの削除処理（状態遷移とバリデーション）
+        // Domain deletion logic (state transition and validation)
         let (deleted_content, _event) = content.delete().map_err(DeleteError::Domain)?;
 
-        // CEK を削除
+        // Delete the CEK
         self.cek_store
             .delete(deleted_content.series_id())
             .map_err(DeleteError::KeyStore)?;
 
-        // 論理削除済みの状態を保存
+        // Save the logically deleted state
         self.store(deleted_content.metadata().provider(), &deleted_content)
             .map_err(DeleteError::Repository)?;
 
@@ -631,15 +633,15 @@ where
         Ok(DeleteContentResult { content_id })
     }
 
-    /// コンテンツ再暗号化ユースケース。
+    /// Content re-encryption use case.
     ///
-    /// Owner権限を持つユーザが、特定のReadまたはWrite権限ユーザのアクセスを拒否するために、
-    /// コンテンツを再暗号化する機能。
+    /// Re-encrypts content so that a user with Owner permission can deny access to a specific
+    /// user with Read or Write permission.
     pub fn reencrypt(
         &self,
         cmd: ReencryptContentCommand,
     ) -> Result<ReencryptContentResult, ReencryptError> {
-        // Step 1: コンテンツの取得と検証
+        // Step 1: Fetch and validate the content
         let content = self
             .content_repository
             .find_by_id(&cmd.content_id)
@@ -650,8 +652,8 @@ where
             return Err(ReencryptError::ContentDeleted);
         }
 
-        // Step 2: 既存のCEKで復号
-        // reencrypt は「同じファイルのキーのまま暗号化だけを更新する」前提。
+        // Step 2: Decrypt with the existing CEK
+        // reencrypt assumes "only the encryption is updated, keeping the same file key".
         let content_id = content.series_id().clone();
         let old_cek = self
             .cek_store
@@ -663,10 +665,10 @@ where
             .decrypt(&old_cek, &self.encryptor)
             .map_err(ReencryptError::Domain)?;
 
-        // Step 3: 新しいCEKを生成
+        // Step 3: Generate a new CEK
         let new_cek = self.key_generator.generate();
 
-        // Step 4: 再暗号化されたContentを作成
+        // Step 4: Create the re-encrypted Content
         let (reencrypted_content, _event) = content
             .update_content(
                 plaintext,
@@ -676,31 +678,33 @@ where
             )
             .map_err(ReencryptError::Domain)?;
 
-        // reencrypt では平文（復号結果）が同一なので、ContentId（plainCid）は変わらない前提。
+        // In reencrypt the plaintext (decryption result) is identical, so the ContentId (plainCid)
+        // is assumed not to change.
         debug_assert_eq!(
             reencrypted_content.raw_id(),
             content.raw_id(),
             "plain content_id should not change during reencrypt"
         );
 
-        // Step 5: 新しいContentIdでCEKを保存
+        // Step 5: Save the new CEK under the existing file key (series_id), replacing the old CEK
         self.cek_store
             .save(&content_id, &new_cek)
             .map_err(ReencryptError::KeyStore)?;
 
-        // Step 6: ファイルのキーでContentを保存
+        // Step 6: Save the Content under the file key
         if let Err(e) = self.store(
             reencrypted_content.metadata().provider(),
             &reencrypted_content,
         ) {
-            // ロールバック:
-            // - このケースでは content_id が変わらない前提なので delete は危険（旧CEKまで消える）
-            // - 旧CEKへ戻して整合性を保つ
+            // Rollback:
+            // - content_id is assumed not to change in this case, so delete is dangerous (it would
+            //   also erase the old CEK)
+            // - Restore the old CEK to keep consistency
             let _ = self.cek_store.save(&content_id, &old_cek);
             return Err(ReencryptError::ContentRepository(e));
         }
 
-        // Step 7: 結果を返す
+        // Step 7: Return the result
         let encrypted_content = reencrypted_content
             .encrypted_content()
             .ok_or(ReencryptError::MissingEncryptedContent)?
@@ -714,17 +718,17 @@ where
         })
     }
 
-    /// 接続済みのプロバイダー一覧を取得する。
+    /// Returns the list of connected providers.
     pub fn connected_providers(&self) -> Result<Vec<String>, ContentRepositoryError> {
         self.content_repository.connected_providers()
     }
 
-    /// 現在のデフォルトプロバイダーを取得する。
+    /// Returns the current default provider.
     pub fn default_provider(&self) -> Result<String, ContentRepositoryError> {
         self.content_repository.default_provider()
     }
 
-    /// ストレージプロバイダーを接続する（認証トークンを登録）。
+    /// Connects a storage provider (registers an auth token).
     pub fn connect_provider(
         &self,
         provider: String,
@@ -734,14 +738,14 @@ where
             .connect_provider(&provider, access_token)
     }
 
-    /// ストレージプロバイダーを切断する（認証トークンを削除）。
+    /// Disconnects a storage provider (removes the auth token).
     pub fn disconnect_provider(&self, provider: String) -> Result<(), ContentRepositoryError> {
         self.content_repository.disconnect_provider(&provider)
     }
 
-    /// 既存コンテンツを別のプロバイダーにコピーする。
+    /// Copies existing content to another provider.
     ///
-    /// 例：ローカルに保存されているコンテンツをクラウドにバックアップする場合など。
+    /// E.g., backing up locally stored content to the cloud.
     pub fn copy_to(
         &self,
         from_provider: &str,
@@ -891,7 +895,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
-    /// テスト用のシンプルな ContentIdGenerator。
+    /// Simple ContentIdGenerator for tests.
     #[derive(Clone)]
     struct TestIdGenerator;
 
@@ -917,7 +921,7 @@ mod tests {
         }
     }
 
-    /// テスト用の固定キー生成器。
+    /// Fixed key generator for tests.
     #[derive(Clone)]
     struct TestKeyGenerator;
 
@@ -927,7 +931,8 @@ mod tests {
         }
     }
 
-    /// 呼び出しごとに異なるCEKを返すテスト用キー生成器（create と reencrypt で鍵が変わることを再現）。
+    /// Test key generator that returns a different CEK on each call (reproduces the key changing
+    /// between create and reencrypt).
     #[derive(Clone)]
     struct ToggleKeyGenerator {
         state: Arc<Mutex<bool>>,
@@ -957,7 +962,7 @@ mod tests {
         }
     }
 
-    /// 常に成功するテスト用暗号化実装（ダミー）。
+    /// Test encryption implementation that always succeeds (dummy).
     #[derive(Clone)]
     struct TestEncryptor;
 
@@ -967,7 +972,7 @@ mod tests {
             _key: &ContentEncryptionKey,
             plaintext: &[u8],
         ) -> Result<Vec<u8>, ContentError> {
-            // ここでは実際の暗号化は行わず、そのままコピーを返す。
+            // No real encryption here; just return a copy.
             Ok(plaintext.to_vec())
         }
 
@@ -980,12 +985,13 @@ mod tests {
         }
     }
 
-    /// CEKに依存して暗号文が変わるテスト用暗号化。
+    /// Test encryption whose ciphertext depends on the CEK.
     ///
     /// - encrypt: `ciphertext = key_bytes || plaintext`
-    /// - decrypt: 先頭 `key_len` を捨てて残りを平文として返す
+    /// - decrypt: discards the leading `key_len` bytes and returns the rest as plaintext
     ///
-    /// ※ セキュリティ目的ではなく、テストで「CEKが変われば暗号文も変わる」を再現するための実装。
+    /// Note: not for security purposes; implemented to reproduce "if the CEK changes, the
+    /// ciphertext changes too" in tests.
     #[derive(Clone)]
     struct KeyPrefixEncryptor {
         key_len: usize,
@@ -1004,7 +1010,7 @@ mod tests {
             plaintext: &[u8],
         ) -> Result<Vec<u8>, ContentError> {
             let mut out = Vec::with_capacity(self.key_len + plaintext.len());
-            // keyが短い場合は0埋めして一定長にする（テストの都合）
+            // If the key is short, zero-pad it to a fixed length (for test convenience)
             if key.0.len() >= self.key_len {
                 out.extend_from_slice(&key.0[..self.key_len]);
             } else {
@@ -1029,7 +1035,7 @@ mod tests {
         }
     }
 
-    /// 暗号化時に必ずエラーを返すテスト用実装（ドメインエラー発生用）。
+    /// Test implementation that always fails on encryption (to trigger a domain error).
     #[derive(Clone)]
     #[allow(dead_code)]
     struct FailingEncryptor;
@@ -1056,7 +1062,7 @@ mod tests {
         }
     }
 
-    /// Arc<Mutex<HashMap<...>>> を内部に持つテスト用リポジトリ。
+    /// Test repository backed by an internal Arc<Mutex<HashMap<...>>>.
     #[derive(Clone)]
     struct TestContentRepository {
         inner: Arc<Mutex<HashMap<String, Content>>>,
@@ -1117,7 +1123,7 @@ mod tests {
             content_id: &ContentId,
             content: &Content,
         ) -> Result<(), ContentRepositoryError> {
-            // テスト用：プロバイダーを無視して通常の save に委譲
+            // For tests: ignore the provider and delegate to the regular save
             self.save(content_id, content)
         }
 
@@ -1126,7 +1132,7 @@ mod tests {
             _provider: &str,
             content_id: &ContentId,
         ) -> Result<Option<Content>, ContentRepositoryError> {
-            // テスト用：プロバイダーを無視して通常の find_by_id に委譲
+            // For tests: ignore the provider and delegate to the regular find_by_id
             self.find_by_id(content_id)
         }
 
@@ -1151,7 +1157,7 @@ mod tests {
         }
     }
 
-    /// テスト用のインメモリ CEK ストア。
+    /// In-memory CEK store for tests.
     #[derive(Clone, Default)]
     struct TestKeyStore {
         inner: Arc<Mutex<HashMap<String, ContentEncryptionKey>>>,
@@ -1226,8 +1232,8 @@ mod tests {
         }
     }
 
-    /// crsl-lib `Node` と同じ CBOR 形状のバイト列を作る
-    /// (`node_verification` が受理する最小構成)。
+    /// Builds bytes in the same CBOR shape as a crsl-lib `Node`
+    /// (the minimal structure accepted by `node_verification`).
     fn make_test_node_bytes(ciphertext: &[u8]) -> Vec<u8> {
         #[derive(serde::Serialize)]
         struct Payload<'a> {
@@ -1341,7 +1347,8 @@ mod tests {
             content_id: &ContentId,
             content: &Content,
         ) -> Result<(), ContentRepositoryError> {
-            // テスト用：プロバイダーを無視して通常の save に委譲（2回目で失敗させる挙動を共有）
+            // For tests: ignore the provider and delegate to the regular save (shares the behavior of
+            // failing on the second call)
             self.save(content_id, content)
         }
 
@@ -1350,7 +1357,7 @@ mod tests {
             _provider: &str,
             content_id: &ContentId,
         ) -> Result<Option<Content>, ContentRepositoryError> {
-            // テスト用：プロバイダーを無視して通常の find_by_id に委譲
+            // For tests: ignore the provider and delegate to the regular find_by_id
             self.find_by_id(content_id)
         }
 
@@ -1432,7 +1439,7 @@ mod tests {
         assert_eq!(fetched.raw_content, b"hello".to_vec());
     }
 
-    /// 同じ本文で作った 2 つのファイルは、記録も CEK も別に持つ(上書きしない)。
+    /// Two files created from the same body each keep their own record and CEK (no overwrite).
     #[test]
     fn two_files_with_the_same_body_keep_separate_records_and_keys() {
         let (repo, storage) = TestContentRepository::new(false);
@@ -1680,7 +1687,7 @@ mod tests {
         };
         let created = service.create(cmd).expect("create should succeed");
 
-        // CEK ストアから該当コンテンツのエントリを削除して「鍵がない」状態を再現。
+        // Remove this content's entry from the CEK store to reproduce the "no key" state.
         {
             let mut guard = key_storage.lock().unwrap();
             guard.remove(created.series_id.as_str());
@@ -1712,18 +1719,18 @@ mod tests {
         assert_eq!(result, plaintext);
     }
 
-    /// `verify_and_decrypt_relay_read` は、明示的に渡された CEK を
-    /// ローカルの CEK ストアより優先する。
+    /// `verify_and_decrypt_relay_read` prefers an explicitly passed CEK over
+    /// the local CEK store.
     ///
-    /// ストアは権威レコード(送信者ピン)から導出されるキャッシュに過ぎず、
-    /// CAS の外で書かれるため書き込み順が入れ替わると古い世代へ巻き戻り得る
-    /// (世代 N の handler が CAS 後に停止し、その間に N+1 が権威レコードと
-    ///  キャッシュを進め、その後 N が再開してキャッシュだけを N へ戻す)。
-    /// read が権威レコード側の CEK を使えば、その巻き戻りは影響しない。
+    /// The store is merely a cache derived from the authoritative record (sender pin), and since
+    /// it is written outside the CAS, reordered writes can roll it back to an older generation
+    /// (the generation-N handler stalls after its CAS; meanwhile N+1 advances the authoritative
+    ///  record and the cache; then N resumes and moves only the cache back to N).
+    /// If read uses the CEK from the authoritative record, that rollback has no effect.
     #[test]
     fn verified_read_prefers_the_explicit_cek_over_the_store() {
-        /// 鍵を実際に見る暗号化器。鍵の 1 バイト目を XOR するだけだが、
-        /// 「どの CEK で復号したか」がテストから観測できるようになる。
+        /// Encryptor that actually looks at the key. It only XORs with the key's first byte, but it
+        /// lets tests observe "which CEK was used for decryption".
         struct KeySensitiveEncryptor;
         impl ContentEncryption for KeySensitiveEncryptor {
             fn encrypt(
@@ -1746,7 +1753,7 @@ mod tests {
         let (key_store, _key_storage) = TestKeyStore::new(false, false);
         let service = build_service(repo, TestKeyGenerator, KeySensitiveEncryptor, key_store);
 
-        // 権威レコード側の(正しい)CEK と、巻き戻ったキャッシュ側の CEK
+        // The (correct) CEK from the authoritative record, and the CEK from the rolled-back cache
         let authoritative = ContentEncryptionKey(vec![0x11]);
         let stale_cache = ContentEncryptionKey(vec![0x22]);
 
@@ -1757,7 +1764,7 @@ mod tests {
             .expect("encrypt");
         let content_id = service.content_id_generator.generate(&plaintext);
 
-        // キャッシュには古い世代の CEK が入っている
+        // The cache holds an older generation's CEK
         service
             .cek_store
             .save(&content_id, &stale_cache)
@@ -1767,7 +1774,7 @@ mod tests {
         let version =
             crate::infrastructure::node_verification::recompute_node_cid(&node_bytes).unwrap();
 
-        // 権威レコードの CEK を渡せば復号できる
+        // Passing the authoritative record's CEK decrypts successfully
         let read = service
             .verify_and_decrypt_relay_read(
                 &node_bytes,
@@ -1778,8 +1785,8 @@ mod tests {
             .expect("the explicit CEK must be used");
         assert_eq!(read.plaintext, plaintext);
 
-        // 渡さなければ巻き戻ったキャッシュが使われ、平文が一致しない
-        // (= この経路に依存していると read が壊れる)
+        // Without it, the rolled-back cache is used and the plaintext does not match
+        // (= read breaks if it depends on this path)
         let fallback =
             service.verify_and_decrypt_relay_read(&node_bytes, &version, content_id, None);
         assert!(
@@ -1893,16 +1900,16 @@ mod tests {
                 .clone()
         };
 
-        // reencrypt（ボディ無し想定）
+        // reencrypt (assuming no body)
         let re_cmd = ReencryptContentCommand {
             content_id: created.series_id.clone(),
         };
         let result = service.reencrypt(re_cmd).expect("reencrypt should succeed");
 
-        // plainCid は変わらない
+        // plainCid does not change
         assert_eq!(result.raw_id, created.content_id);
 
-        // ただし暗号文はCEK変更により変わる
+        // But the ciphertext changes because the CEK changed
         let after = {
             let guard = storage.lock().unwrap();
             guard
@@ -1917,7 +1924,7 @@ mod tests {
         assert_ne!(before.encrypted_id(), after.encrypted_id());
         assert_eq!(&result.encrypted_id, after.encrypted_id());
 
-        // CEK も新しいものに更新されている
+        // The CEK has also been updated to the new one
         let kguard = key_storage.lock().unwrap();
         assert_eq!(
             kguard
@@ -1947,7 +1954,7 @@ mod tests {
         };
         let created = service.create(create_cmd).expect("create should succeed");
 
-        // create後は old CEK
+        // After create, the old CEK
         {
             let kguard = key_storage.lock().unwrap();
             assert_eq!(
@@ -1966,7 +1973,7 @@ mod tests {
             .expect_err("reencrypt should fail when repository save fails");
         assert!(matches!(err, ReencryptError::ContentRepository(_)));
 
-        // 失敗後も old CEK に戻っている（ロールバック）
+        // Even after the failure, it is back to the old CEK (rollback)
         let kguard = key_storage.lock().unwrap();
         assert_eq!(
             kguard
@@ -1990,7 +1997,7 @@ mod tests {
         };
         let created = service.create(create_cmd).expect("create should succeed");
 
-        // CEK を消して MissingContentEncryptionKey を再現
+        // Remove the CEK to reproduce MissingContentEncryptionKey
         {
             let mut guard = key_storage.lock().unwrap();
             guard.remove(created.series_id.as_str());

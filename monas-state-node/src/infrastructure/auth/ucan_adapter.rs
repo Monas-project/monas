@@ -213,10 +213,13 @@ impl UcanAdapter {
     /// Domain-level verification (signature, expiration, TTL, access control, audience,
     /// capability) uses the same logic as domain::auth_token_verifier::AuthTokenVerifier.
     ///
-    /// Request proof-of-possession(リクエスト署名の中身)の検証はここでは行わない。
-    /// 全経路が authorize より前に通る認証層(`verify_caller_signature`)が、
-    /// トークン種別によらず `{operation}:{resource}:{timestamp}` 形式で検証する。
-    /// リプレイ防御は署名内 timestamp の鮮度チェック(5 分窓)に一本化されている。
+    /// Request proof-of-possession (the request signature contents) is not verified here.
+    /// The authentication layer (`verify_caller_signature`), which every path passes before
+    /// authorize, verifies it against the `monas-request-v1` message
+    /// (`RequestMetadata::signing_message_with_body_digest`) regardless of token type. Replay
+    /// defense is the in-signature timestamp freshness check (5-minute window) plus, for
+    /// mutations, single-use consumption of the signed request
+    /// (`verify_and_consume_mutation_signature`).
     ///
     /// Note: We cannot directly call AuthTokenVerifier::verify() because the infra and
     /// domain AuthToken use different JWT serialization formats for iss/aud fields
@@ -224,8 +227,9 @@ impl UcanAdapter {
     /// ContentAccessControl for access control checks and delegate signature verification
     /// to the shared crypto layer.
     ///
-    /// `token_str` は受信したままの JWT 文字列。署名検証はワイヤ上のバイト列に
-    /// 対して行う(再シリアライズ形とフィールド順序が異なっても正しく検証できる)。
+    /// `token_str` is the JWT string as received. Signature verification is performed on the
+    /// wire bytes (so it verifies correctly even if field order differs from the re-serialized
+    /// form).
     async fn verify_auth_token(
         &self,
         token_str: &str,
@@ -297,14 +301,14 @@ impl UcanAdapter {
 
         // 6. Require a request signature to be present.
         //
-        // Proof-of-possession 自体は認証層(`verify_caller_signature`)が
-        // `{operation}:{resource}:{timestamp}` 形式で検証済みである(全経路が
-        // authorize より前に必ず通る)。リプレイ防御は署名内 timestamp の
-        // 鮮度チェックに一本化されており、旧実装の jti 単回消費
-        // (ノードごとに独立で、SDK の「委譲トークンを 1 個渡して TTL 内で
-        // 再利用する」設計と矛盾していた)は廃止した(issue #61)。
-        // ここでは「署名なしで authorize が呼ばれる」経路の混入を防ぐ
-        // 存在チェックのみを行う。
+        // Proof-of-possession itself has already been verified by the authentication layer
+        // (`verify_caller_signature`) against the `monas-request-v1` message (every path always
+        // passes it before authorize). Replay defense is the in-signature timestamp freshness
+        // check plus single-use consumption of mutation signatures
+        // (`verify_and_consume_mutation_signature`); the old single-use jti consumption
+        // (independent per node, and conflicting with the SDK design of "hand over one delegated
+        // token and reuse it within its TTL") was removed (issue #61). Here we only do a presence
+        // check to prevent paths where authorize is called without a signature from slipping in.
         if request.request_signature.is_none() {
             anyhow::bail!("Request signature is required for AuthToken-based authorization");
         }
@@ -888,10 +892,10 @@ mod tests {
         );
     }
 
-    /// 委譲トークンは TTL 内で何度でも使える(issue #61)。
-    /// リプレイ防御は認証層の署名内 timestamp(鮮度窓)が担い、
-    /// 旧 jti 単回消費(1 トークン 1 リクエストになり、履歴取得 → データ取得
-    /// という通常の read すら成立しなかった)は廃止された。
+    /// Delegated tokens can be used any number of times within their TTL (issue #61).
+    /// Replay defense is handled by the authentication layer's in-signature timestamp (freshness
+    /// window), and the old single-use jti consumption (one token per request, which made even a
+    /// normal read of history fetch → data fetch impossible) was removed.
     #[tokio::test]
     async fn test_auth_token_reusable_across_requests() {
         use crate::infrastructure::auth::test_helpers::TestKeyPair;
@@ -930,7 +934,7 @@ mod tests {
         let bob_identity = identity_from_key(&bob);
         let token = AuthToken::new(auth_token.to_jwt().unwrap());
 
-        // 同じトークンで複数リクエスト(履歴取得 → データ取得を模す)が全部通る
+        // Multiple requests with the same token (simulating history fetch → data fetch) all pass
         for i in 0..3 {
             let request = AuthorizationRequest {
                 identity: bob_identity.clone(),
@@ -949,8 +953,9 @@ mod tests {
         }
     }
 
-    /// authorize は request_signature の存在を要求する(検証自体は認証層で
-    /// 済んでいる前提だが、署名なしで authorize が呼ばれる経路の混入を防ぐ)。
+    /// authorize requires request_signature to be present (verification itself is assumed done
+    /// in the authentication layer, but this prevents paths that call authorize without a
+    /// signature).
     #[tokio::test]
     async fn test_auth_token_authorization_requires_request_signature() {
         use crate::infrastructure::auth::test_helpers::TestKeyPair;

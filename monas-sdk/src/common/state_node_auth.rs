@@ -1,6 +1,7 @@
-/// State Node 連携で利用する認証コンテキスト。
+/// Auth context used for State Node integration.
 ///
-/// Gateway が受け取ったヘッダを SDK へ透過し、State Node 呼び出し時に再設定する。
+/// Passes the headers received by the gateway through to the SDK and re-sets them when calling
+/// the State Node.
 #[derive(Debug, Clone, Default)]
 pub struct StateNodeAuthContext {
     pub authorization: Option<String>,
