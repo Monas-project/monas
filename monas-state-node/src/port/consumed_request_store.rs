@@ -22,17 +22,31 @@
 //!
 //! ## Retention
 //!
-//! Records may be discarded once they exceed the signature freshness window
-//! (`MAX_REQUEST_AGE_SECS`), because a signature outside the window is rejected by the
-//! freshness check even without this record. So the store does not grow without bound, and GC
-//! only needs to "delete expired entries".
+//! Records may be discarded once no signature they could match is still fresh: that is
+//! `CONSUMED_REQUEST_RETENTION_SECS` after acceptance, which accounts for the freshness window
+//! (`MAX_REQUEST_AGE_SECS`) and the allowed future clock skew (`MAX_CLOCK_SKEW_SECS`). A
+//! signature past that point is rejected by the freshness check even without this record, so
+//! the store does not grow without bound and GC only needs to delete expired entries.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-/// Signature freshness window. Keep in sync with `MAX_AGE_SECS` in `MonasAccountAdapter`.
-/// Keeping records beyond this is pointless (the signature expires first).
-pub const CONSUMED_REQUEST_RETENTION_SECS: u64 = 300;
+/// How old a signed request's timestamp may be (signature freshness window).
+/// Enforced by `MonasAccountAdapter`.
+pub const MAX_REQUEST_AGE_SECS: u64 = 300;
+
+/// How far in the future a signed request's timestamp may be (clock skew allowance).
+/// Enforced by `MonasAccountAdapter`.
+pub const MAX_CLOCK_SKEW_SECS: u64 = 30;
+
+/// How long a consumed request is remembered, counted from when the server accepted it.
+///
+/// A request accepted at `T` may carry a timestamp up to `T + MAX_CLOCK_SKEW_SECS`, and that
+/// signature stays fresh until `timestamp + MAX_REQUEST_AGE_SECS` inclusive. The record must
+/// outlive that whole span; the `+ 1` covers the inclusive boundary second. Dropping it at
+/// `MAX_REQUEST_AGE_SECS` alone reopened a replay window of up to `MAX_CLOCK_SKEW_SECS + 1`
+/// seconds.
+pub const CONSUMED_REQUEST_RETENTION_SECS: u64 = MAX_REQUEST_AGE_SECS + MAX_CLOCK_SKEW_SECS + 1;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConsumedRequestStoreError {
@@ -164,5 +178,33 @@ mod tests {
             1,
             "expired records must be pruned rather than accumulate"
         );
+    }
+
+    /// A request whose timestamp is as far in the future as allowed is still fresh
+    /// `MAX_REQUEST_AGE_SECS` after that timestamp, i.e. `MAX_CLOCK_SKEW_SECS` later than
+    /// acceptance + `MAX_REQUEST_AGE_SECS`. Its record must survive until then, including the
+    /// inclusive boundary second, or the same signed request is accepted a second time.
+    #[test]
+    fn record_outlives_a_future_dated_signature_freshness() {
+        let store = InMemoryConsumedRequestStore::default();
+        let accepted_at = 1_000_000;
+        let signed_timestamp = accepted_at + MAX_CLOCK_SKEW_SECS;
+
+        assert!(store.record_if_absent(b"sig", accepted_at).unwrap());
+
+        // The last second at which the freshness check still accepts this signature
+        // (`MonasAccountAdapter` rejects only `now > timestamp + MAX_REQUEST_AGE_SECS`).
+        let last_fresh_second = signed_timestamp + MAX_REQUEST_AGE_SECS;
+        for replay_at in [
+            accepted_at + MAX_REQUEST_AGE_SECS,
+            accepted_at + MAX_REQUEST_AGE_SECS + 1,
+            last_fresh_second,
+        ] {
+            assert!(
+                !store.record_if_absent(b"sig", replay_at).unwrap(),
+                "replay at +{}s is still fresh and must be rejected",
+                replay_at - accepted_at
+            );
+        }
     }
 }
