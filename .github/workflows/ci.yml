@@ -8,6 +8,11 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Pinned to the state-node image builder (monas-state-node/infra/docker/Dockerfile,
+  # `rust:<ver>-bookworm`) so CI checks the toolchain production is built with and a new
+  # stable release cannot break CI on its own. Bump both together.
+  # rustup uses RUSTUP_TOOLCHAIN for every cargo call in the jobs below.
+  RUSTUP_TOOLCHAIN: "1.87"
 
 jobs:
   format:
@@ -15,7 +20,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install toolchain
-        run: rustup toolchain install stable --profile minimal --component rustfmt
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt
       - name: Check code formatting
         run: cargo fmt --check
 
@@ -24,7 +29,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install toolchain
-        run: rustup toolchain install stable --profile minimal
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "all-targets-profile-test"
@@ -37,7 +42,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install toolchain
-        run: rustup toolchain install stable --profile minimal --component clippy
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component clippy
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "all-targets-profile-test"
@@ -51,7 +56,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install toolchain
-        run: rustup toolchain install stable --profile minimal
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "all-targets-profile-test"
@@ -69,7 +74,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install toolchain
-        run: rustup toolchain install stable --profile minimal
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "all-targets-profile-test"
