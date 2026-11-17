@@ -5,8 +5,9 @@ variable "aws_region" {
 }
 
 variable "aws_profile" {
-  description = "AWS CLI profile name"
+  description = "AWS CLI profile name. Leave unset to use the default credential chain (AWS_PROFILE, CI role credentials)."
   type        = string
+  default     = null
 }
 
 variable "domain" {

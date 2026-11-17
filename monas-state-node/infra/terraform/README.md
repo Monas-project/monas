@@ -25,6 +25,16 @@ docker tag monas-state-node:latest <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/m
 docker push <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/monas-state-node:latest
 ```
 
+## State backend
+
+state は S3 に置きます（`backend "s3" {}` の部分設定）。bucket・key・region・(任意で) `dynamodb_table` を書いた設定ファイルを用意し、各 root（このディレクトリと `foundation/`）で次のように初期化してください。
+
+```bash
+terraform init -backend-config=backend.hcl
+```
+
+`aws_profile` は省略できます。省略すると AWS SDK の既定の認証情報（`AWS_PROFILE` など）を使います。
+
 ## Deploy
 
 ### 1. Bootstrap Node (最初のノード)

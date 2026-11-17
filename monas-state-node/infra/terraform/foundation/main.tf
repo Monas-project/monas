@@ -7,6 +7,10 @@ terraform {
       version = "~> 5.0"
     }
   }
+
+  # Partial configuration: bucket/key/lock table are passed with
+  # `terraform init -backend-config=<file>` by the operators' private config.
+  backend "s3" {}
 }
 
 provider "aws" {
