@@ -695,6 +695,30 @@ impl StateNode {
             }
         });
 
+        // Network and NFS (EFS) byte counters, once a minute. Values are
+        // cumulative; rates come from the difference between two lines.
+        // Container Insights' storage metrics cover only the local block
+        // device, not the EFS data directory, so this is the per-node view of
+        // data traffic. Skipped entirely where procfs is unavailable.
+        let token_metrics = token.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = token_metrics.cancelled() => break,
+                    _ = interval.tick() => {
+                        let stats = crate::infrastructure::resource_stats::read().await;
+                        if stats.is_empty() {
+                            tracing::debug!("metrics: procfs unavailable, stopping resource metrics");
+                            break;
+                        }
+                        tracing::info!("metrics: {stats}");
+                    }
+                }
+            }
+        });
+
         let listener = tokio::net::TcpListener::bind(&self.config.http_addr)
             .await
             .context("Failed to bind HTTP listener")?;
