@@ -51,7 +51,8 @@ services:
     entrypoint: ["/bin/bash", "-c"]
     command:
       - |
-        PEER_ID=$$(curl -sf http://node1:8080/node/info | grep -o '"peer_id":"[^"]*"' | cut -d'"' -f4)
+        PEER_ID=$$(curl -sf http://node1:8080/node/info | grep -o '"node_id":"[^"]*"' | cut -d'"' -f4)
+        if [ -z "$$PEER_ID" ]; then echo "could not read node1's peer ID from /node/info" >&2; exit 1; fi
         echo "Bootstrap peer ID: $$PEER_ID"
         exec state-node \
           --data-dir /data \
@@ -88,7 +89,8 @@ services:
     entrypoint: ["/bin/bash", "-c"]
     command:
       - |
-        PEER_ID=$$(curl -sf http://node1:8080/node/info | grep -o '"peer_id":"[^"]*"' | cut -d'"' -f4)
+        PEER_ID=$$(curl -sf http://node1:8080/node/info | grep -o '"node_id":"[^"]*"' | cut -d'"' -f4)
+        if [ -z "$$PEER_ID" ]; then echo "could not read node1's peer ID from /node/info" >&2; exit 1; fi
         echo "Bootstrap peer ID: $$PEER_ID"
         exec state-node \
           --data-dir /data \

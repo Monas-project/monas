@@ -195,6 +195,30 @@ cargo run --bin state-node -- --data-dir ./my-data -l 127.0.0.1:8081
 | `--bootstrap` | `-b` | (なし) | ブートストラップノードのmultiaddr |
 | `--log-level` | | `info` | ログレベル (trace, debug, info, warn, error) |
 
+## Docker で動かす
+
+イメージは `monas-state-node/infra/docker/Dockerfile` でビルドする（リポジトリのルートを context にする）。コンテナは `entrypoint.sh` が次の環境変数を CLI オプションに変換して起動する。
+
+```bash
+docker build -f monas-state-node/infra/docker/Dockerfile -t monas-state-node .
+```
+
+| 環境変数 | デフォルト | 説明 |
+|---|---|---|
+| `DATA_DIR` | `/data` | データ永続化ディレクトリ（ボリュームを割り当てる） |
+| `HTTP_LISTEN` | `0.0.0.0:8080` | HTTP API のリッスンアドレス |
+| `P2P_PORT` | `9001` | P2P（TCP）のポート |
+| `LOG_LEVEL` | `info` | ログレベル |
+| `NODE_ROLE` | `member` | `bootstrap` にすると bootstrap 先を指定しない |
+| `BOOTSTRAP_ADDR` | (なし) | 接続先の multiaddr（カンマ区切り）。`BOOTSTRAP_DNS` より優先 |
+| `BOOTSTRAP_DNS` / `BOOTSTRAP_PEER_ID` | (なし) | 接続先のホスト名（カンマ区切り）と peer ID。`/dns4/<host>/tcp/<P2P_PORT>/p2p/<peer ID>` を組み立て、接続のたびに名前を引き直す |
+| `EXTERNAL_ADDRESS` | (なし) | 他のノードに知らせる自分のアドレス（multiaddr、カンマ区切り） |
+| `DISABLE_MDNS` | (なし) | `true` で mDNS を無効にする |
+
+bootstrap 先の peer ID は、bootstrap ノードの `GET /node/info` の `node_id` で分かる。`monas-state-node/infra/compose.yaml` で 3 ノード構成をローカルに立てられる（`cd monas-state-node/infra && docker compose up --build`、ノードは http://localhost:8081〜8083）。
+
+公開しているデモ環境のデプロイ構成（AWS）は、運用側で別に管理している。
+
 ## ローカル動作確認 (3ノード構成)
 
 ### 自動化スクリプトを使用する方法（推奨）
